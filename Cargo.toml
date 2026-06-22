@@ -54,6 +54,14 @@ ironrdp-dvc = "0.5"
 ironrdp-svc = "0.6"
 nfsserve = "0.11.0"
 
+# Test-only: drive a real IronRDP client through the connect/negotiation
+# handshake against our own server over an in-memory stream (see
+# src/conn_test.rs). Both are redirected to the pinned git rev by the
+# [patch.crates-io] section below, same as the runtime ironrdp-* deps.
+[dev-dependencies]
+ironrdp-connector = "0.8"
+ironrdp-tokio = "0.8"
+
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.24", features = ["highsierra"] }

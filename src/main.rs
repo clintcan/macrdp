@@ -14,6 +14,8 @@ mod auth;
 mod avc444;
 mod capture;
 mod clipboard;
+#[cfg(test)]
+mod conn_test;
 mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
