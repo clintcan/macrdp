@@ -55,10 +55,11 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use ironrdp_dvc::encode_dvc_messages;
 use ironrdp_egfx::pdu::{
-    Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV103Flags, CapabilitiesV104Flags,
-    CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitySet, PixelFormat,
+    Avc420Region, CacheImportOfferPdu, CapabilitiesAdvertisePdu, CapabilitiesV103Flags,
+    CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags,
+    CapabilitySet, PixelFormat,
 };
-use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
+use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
@@ -513,6 +514,13 @@ impl GfxServerFactory for Gfx {
         let handler = Box::new(GfxHandler {
             ctx: self.ctx.clone(),
         });
+        // A fresh `GraphicsPipelineServer` per connection — its surface-id
+        // allocator resets to 0, so every (re)connect creates surface id 0. This
+        // marker brackets each connection in the log; on an mstsc reconnect to a
+        // still-running macrdp, the id-0 `CreateSurface` no-ops against the
+        // surface mstsc retained from the prior session → the reconnect-blank.
+        // See the H.264 reconnect quirk note + `on_close` instrumentation below.
+        debug!("EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)");
         let server = GraphicsPipelineServer::new(handler);
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
@@ -625,12 +633,62 @@ impl GraphicsPipelineHandler for GfxHandler {
         trace!(frame_id, queue_depth, "EGFX frame ack");
     }
 
+    /// Inbound `RDPGFX_CACHE_IMPORT_OFFER`. Behavior is UNCHANGED from the trait
+    /// default (reject all slots → empty reply); logged only. The bitmap cache is
+    /// for offscreen bitmaps, not our AVC surface, so it's irrelevant to the
+    /// reconnect-blank — capturing whether mstsc even offers a cache at
+    /// (re)connect is part of the "no cache-clear PDU" re-audit.
+    fn on_cache_import_offer(&mut self, offer: &CacheImportOfferPdu) -> Vec<u16> {
+        debug!(
+            entries = offer.cache_entries.len(),
+            "EGFX on_cache_import_offer (rejecting all — cache is offscreen bitmaps, not the AVC surface)"
+        );
+        vec![]
+    }
+
+    /// Fires when the server allocates a surface (our `create_surface`). Logged
+    /// so each connection's surface id + geometry is visible alongside the
+    /// `on_close` teardown marker.
+    fn on_surface_created(&mut self, surface: &Surface) {
+        debug!(
+            id = surface.id,
+            w = surface.width,
+            h = surface.height,
+            mapped = surface.is_mapped,
+            "EGFX on_surface_created"
+        );
+    }
+
+    /// Inbound client QoE frame-acknowledge — a client-liveness signal. Logged at
+    /// trace so a graceful-disconnect capture can show whether the client keeps
+    /// sending QoE up to the channel close.
+    fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
+        trace!(?metrics, "EGFX on_qoe_metrics");
+    }
+
     fn on_close(&mut self) {
+        // Disconnect-side instrumentation. This is the EGFX DVC channel close;
+        // whether it fires (and how promptly) on a *graceful* mstsc disconnect
+        // (Disconnect menu) vs an *abrupt* window-close is the key unmeasured
+        // datum for the reconnect-blank investigation — it decides whether a
+        // "DeleteSurface before the channel goes away" approach is even reachable.
+        // We can only log our own per-connection view here: the
+        // `GraphicsPipelineServer` mutex is held while this callback runs, so we
+        // must not lock `server_handle`.
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            debug!(
+                surface_id = ?ctx.surface_id,
+                dims = ?ctx.dims,
+                submitted = ctx.submitted.load(Ordering::Relaxed),
+                shipped = ctx.shipped.load(Ordering::Relaxed),
+                "EGFX on_close: graphics channel closed (client disconnect/teardown)"
+            );
             ctx.is_ready = false;
             ctx.encoder = None;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
+        } else {
+            debug!("EGFX on_close: graphics channel closed (no active context)");
         }
     }
 }
