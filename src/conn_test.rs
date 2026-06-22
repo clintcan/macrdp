@@ -193,6 +193,85 @@ fn client_config(width: u16, height: u16) -> Config {
     }
 }
 
+/// Best-effort tracing init so `RUST_LOG` surfaces server/connector logs under
+/// `--nocapture`. Idempotent (`try_init`).
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+}
+
+/// Build a fresh test server (TLS, test-double display/input, the given bitmap
+/// `codecs`) whose display is fixed at `server_w`×`server_h`. The returned
+/// server can serve **many** sequential connections via `run_connection` — that
+/// reuse is what the reconnect soak test exercises.
+fn build_test_server(server_w: u16, server_h: u16, honor: bool, codecs: BitmapCodecs) -> RdpServer {
+    let display = TestDisplay {
+        size: ServerDesktopSize {
+            width: server_w,
+            height: server_h,
+        },
+    };
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(display)
+        .with_bitmap_codecs(codecs)
+        .build();
+    server.set_honor_client_desktop_size(honor);
+    server
+}
+
+/// Drive a real IronRDP client through the full connect handshake (X.224 nego →
+/// TLS upgrade → capability exchange → connection finalization) over `client_io`,
+/// requesting a `client_w`×`client_h` desktop. Returns the negotiated desktop
+/// size from the client's `ConnectionResult`. Must run inside a `LocalSet`
+/// alongside the server's `run_connection`.
+async fn drive_client(
+    client_io: tokio::io::DuplexStream,
+    client_w: u16,
+    client_h: u16,
+) -> anyhow::Result<(u16, u16)> {
+    // pre-TLS negotiation
+    let mut connector = ClientConnector::new(
+        client_config(client_w, client_h),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    );
+    let mut framed = TokioFramed::new(client_io);
+    let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+    let initial = framed.into_inner_no_leftover();
+
+    // TLS upgrade over the same duplex
+    let mut tls_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+        .with_no_client_auth();
+    // CredSSP would forbid resumption; harmless to disable here regardless.
+    tls_cfg.resumption = rustls::client::Resumption::disabled();
+    let tls_connector = TlsConnector::from(Arc::new(tls_cfg));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
+    let tls_stream = tls_connector.connect(server_name, initial).await?;
+
+    // finalize over TLS
+    let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+    let mut tls_framed = TokioFramed::new(tls_stream);
+    let mut net = NoNetwork;
+    let result = ironrdp_tokio::connect_finalize(
+        upgraded,
+        connector,
+        &mut tls_framed,
+        &mut net,
+        "localhost".into(),
+        // server_public_key: only used for CredSSP channel binding (off).
+        Vec::new(),
+        None,
+    )
+    .await?;
+    Ok((result.desktop_size.width, result.desktop_size.height))
+}
+
 /// Run one full client→server connect over an in-memory duplex with the given
 /// `honor_client_desktop_size` and server-advertised bitmap `codecs`, returning
 /// the negotiated desktop size the client sees. The server's own display is
@@ -205,30 +284,9 @@ async fn negotiate(
     honor: bool,
     codecs: BitmapCodecs,
 ) -> anyhow::Result<(u16, u16)> {
-    // Best-effort: surface server/connector tracing when RUST_LOG is set.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
-
+    init_tracing();
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-
-    // ---- server task ----
-    let acceptor = server_tls_acceptor();
-    let display = TestDisplay {
-        size: ServerDesktopSize {
-            width: server_w,
-            height: server_h,
-        },
-    };
-    let mut server = RdpServer::builder()
-        .with_addr((Ipv4Addr::LOCALHOST, 3389))
-        .with_tls(acceptor)
-        .with_input_handler(TestInput)
-        .with_display_handler(display)
-        .with_bitmap_codecs(codecs)
-        .build();
-    server.set_honor_client_desktop_size(honor);
+    let mut server = build_test_server(server_w, server_h, honor, codecs);
 
     // The server's `run_connection` future is `!Send` (the vendored server uses
     // `Rc` internally), so it can't be `tokio::spawn`ed. Run it as a background
@@ -244,45 +302,9 @@ async fn negotiate(
             let server_task = tokio::task::spawn_local(async move {
                 let _ = server.run_connection(server_io).await;
             });
-
-            // pre-TLS negotiation
-            let mut connector = ClientConnector::new(
-                client_config(client_w, client_h),
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            );
-            let mut framed = TokioFramed::new(client_io);
-            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
-            let initial = framed.into_inner_no_leftover();
-
-            // TLS upgrade over the same duplex
-            let mut tls_cfg = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
-                .with_no_client_auth();
-            // CredSSP would forbid resumption; harmless to disable here regardless.
-            tls_cfg.resumption = rustls::client::Resumption::disabled();
-            let tls_connector = TlsConnector::from(Arc::new(tls_cfg));
-            let server_name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
-            let tls_stream = tls_connector.connect(server_name, initial).await?;
-
-            // finalize over TLS
-            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
-            let mut tls_framed = TokioFramed::new(tls_stream);
-            let mut net = NoNetwork;
-            let result = ironrdp_tokio::connect_finalize(
-                upgraded,
-                connector,
-                &mut tls_framed,
-                &mut net,
-                "localhost".into(),
-                // server_public_key: only used for CredSSP channel binding (off).
-                Vec::new(),
-                None,
-            )
-            .await?;
-
+            let size = drive_client(client_io, client_w, client_h).await;
             server_task.abort();
-            Ok::<(u16, u16), anyhow::Error>((result.desktop_size.width, result.desktop_size.height))
+            size
         })
         .await
 }
@@ -353,4 +375,61 @@ async fn no_shared_codec_falls_back_and_connects() -> anyhow::Result<()> {
         "no-shared-codec connect should still complete (raw fallback)"
     );
     Ok(())
+}
+
+/// Layer-4 reconnect lifecycle soak: one long-lived server serves many
+/// back-to-back client connections (like production's accept loop). Each
+/// reconnect must still negotiate correctly — this guards the
+/// per-connection-state-reset class of bugs (e.g. a flag left set by the
+/// previous session corrupting the next one, the kind of regression that only
+/// shows up on the 2nd+ connection). The requested size alternates so
+/// re-adoption is exercised, not just a repeated identical connect. Count is
+/// `MACRDP_SOAK_RECONNECTS` (default 25 — small + fast for CI); set it high
+/// locally for a heavier stress run.
+///
+/// NOTE: this covers the *connection* lifecycle reachable from a cross-platform
+/// harness. The full real-backend soak (ScreenCaptureKit capture loop, EGFX
+/// encode/ship, RDPSND, drive-mount cleanup over a multi-hour session) needs a
+/// TCC-granted Mac + a real client and stays a manual/local procedure — see the
+/// module docs.
+#[tokio::test]
+async fn server_survives_many_reconnects() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    init_tracing();
+
+    let n: usize = std::env::var("MACRDP_SOAK_RECONNECTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // One server, honoring client size, reused across every reconnect.
+            let mut server = build_test_server(1024, 768, true, crate::bitmap_codecs());
+            for i in 0..n {
+                // Alternate the requested size so each reconnect re-adopts a
+                // (possibly different) resolution rather than repeating one.
+                let (cw, ch) = if i % 2 == 0 {
+                    (1920, 1080)
+                } else {
+                    (1280, 800)
+                };
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                // Move the server into a task serving exactly this one
+                // connection, then hand it back: `run_connection` returns once
+                // the client drops the duplex (when `drive_client` completes).
+                let task = tokio::task::spawn_local(async move {
+                    let _ = server.run_connection(server_io).await;
+                    server
+                });
+                let (w, h) = drive_client(client_io, cw, ch)
+                    .await
+                    .with_context(|| format!("reconnect iteration {i}"))?;
+                assert_eq!((w, h), (cw, ch), "reconnect {i} negotiated the wrong size");
+                server = task.await.context("server task ended unexpectedly")?;
+            }
+            Ok(())
+        })
+        .await
 }
