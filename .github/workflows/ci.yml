@@ -1,0 +1,101 @@
+name: ci
+
+# Per-change regression gate. Unlike release.yml (tags only), this runs the
+# test suite on every push to main and on PRs, so a logic regression is caught
+# before it reaches a release rather than at tag time. Linux runs the
+# platform-independent tests fast and free; macOS runs the full suite including
+# the macOS-gated pure-logic tests.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  test-linux:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Cheap per-push format gate. release.yml only checks fmt at tag time, so a
+      # formatting slip used to surface as a failed release tag; catch it here.
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # The platform-independent tests (pure logic + the non-macOS stub trait
+      # tests) run here. RUSTFLAGS is cleared because the macOS stubs leave some
+      # macOS-only items unused on Linux by design — same rationale as the
+      # release lint job's cross-compile check.
+      - name: Test (Linux stubs)
+        env:
+          RUSTFLAGS: ''
+        run: cargo test --locked
+
+  test-macos:
+    name: test (macos)
+    runs-on: macos-14   # Apple Silicon
+    timeout-minutes: 30
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit # macOS runners only support audit mode
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: '1.95.0'
+          target: aarch64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: aarch64-apple-darwin
+
+      # Full suite including the macOS-gated pure-logic tests (resolve_dest,
+      # keyboard-layout parsing, h264 NAL conversion, aac, etc.). These are
+      # pure-logic and headless — they do NOT require Screen Recording /
+      # Accessibility TCC grants (the capture/input/audio loops aren't unit
+      # tested). RUSTFLAGS keeps the default (-D warnings) so a warning in test
+      # code fails here too, matching the macOS clippy gate in release.yml.
+      - name: Test (macOS — full code paths)
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: cargo test --locked --target aarch64-apple-darwin

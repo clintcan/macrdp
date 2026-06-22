@@ -27,7 +27,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ironrdp_rdpdr::pdu::efs::NtStatus;
 use ironrdp_server::{DirEntry as RdpEntry, RdpdrHandle, RdpdrStatus};
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_size3,
@@ -152,15 +151,7 @@ fn join_remote(dir: &str, name: &str) -> String {
 /// routine client-side outcomes, so they log at debug, not warn.
 fn nfs_err(context: &str, e: &anyhow::Error) -> nfsstat3 {
     let status = e.downcast_ref::<RdpdrStatus>().map(|s| s.status);
-    let mapped = match status {
-        Some(s) if s == NtStatus::ACCESS_DENIED => nfsstat3::NFS3ERR_ACCES,
-        Some(s) if s == NtStatus::OBJECT_NAME_COLLISION => nfsstat3::NFS3ERR_EXIST,
-        Some(s) if s == NtStatus::NO_SUCH_FILE => nfsstat3::NFS3ERR_NOENT,
-        Some(s) if s == NtStatus::NOT_A_DIRECTORY => nfsstat3::NFS3ERR_NOTDIR,
-        Some(s) if s == NtStatus::DIRECTORY_NOT_EMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
-        Some(s) if s == NtStatus::NOT_SUPPORTED => nfsstat3::NFS3ERR_NOTSUPP,
-        _ => nfsstat3::NFS3ERR_IO,
-    };
+    let mapped = super::ntstatus_to_nfsstat3(status);
     debug!(error = %e, "rdpdr nfs: {context}");
     mapped
 }

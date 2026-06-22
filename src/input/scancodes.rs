@@ -165,3 +165,51 @@ pub(crate) fn is_numeric_pad_vk(vk: u16) -> bool {
             | 0x5C
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_letters_and_modifiers_map() {
+        // Spot-check the ANSI block: scancode → kVK_*.
+        assert_eq!(scancode_to_cgkeycode(0x1E, false), Some(0x00)); // A
+        assert_eq!(scancode_to_cgkeycode(0x10, false), Some(0x0C)); // Q
+        assert_eq!(scancode_to_cgkeycode(0x39, false), Some(0x31)); // Space
+        assert_eq!(scancode_to_cgkeycode(0x1C, false), Some(0x24)); // Enter
+        assert_eq!(scancode_to_cgkeycode(0x1D, false), Some(0x3B)); // Left Ctrl
+        assert_eq!(scancode_to_cgkeycode(0x2A, false), Some(0x38)); // Left Shift
+    }
+
+    #[test]
+    fn extended_flag_selects_a_different_table() {
+        // 0x1D is Left Ctrl normally but Right Ctrl when extended.
+        assert_eq!(scancode_to_cgkeycode(0x1D, false), Some(0x3B));
+        assert_eq!(scancode_to_cgkeycode(0x1D, true), Some(0x3E));
+        // 0x48 is numpad-8 normally but the Up arrow when extended.
+        assert_eq!(scancode_to_cgkeycode(0x48, false), Some(0x5B));
+        assert_eq!(scancode_to_cgkeycode(0x48, true), Some(0x7E));
+        // GUI / Windows key only exists in the extended table.
+        assert_eq!(scancode_to_cgkeycode(0x5B, true), Some(0x37));
+        assert_eq!(scancode_to_cgkeycode(0x5B, false), None);
+    }
+
+    #[test]
+    fn unmapped_scancodes_return_none() {
+        assert_eq!(scancode_to_cgkeycode(0x00, false), None);
+        assert_eq!(scancode_to_cgkeycode(0xFF, false), None);
+        assert_eq!(scancode_to_cgkeycode(0x46, false), None); // gap (ScrollLock)
+        assert_eq!(scancode_to_cgkeycode(0x00, true), None);
+        assert_eq!(scancode_to_cgkeycode(0xFF, true), None);
+    }
+
+    #[test]
+    fn numeric_pad_classification() {
+        assert!(is_numeric_pad_vk(0x52)); // numpad 0
+        assert!(is_numeric_pad_vk(0x59)); // numpad 7
+        assert!(is_numeric_pad_vk(0x4C)); // numpad Enter
+        assert!(!is_numeric_pad_vk(0x00)); // A
+        assert!(!is_numeric_pad_vk(0x24)); // Return
+        assert!(!is_numeric_pad_vk(0x46)); // reserved gap in the keypad range
+    }
+}

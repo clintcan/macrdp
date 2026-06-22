@@ -28,15 +28,38 @@ pub fn shutdown_cleanup() {
     surface::shutdown_cleanup();
 }
 
+/// Map a client-returned [`NtStatus`] to the closest NFS status.
+///
+/// Extracted as a pure fn (no platform deps) so it's unit-tested on every
+/// target: these are routine client-side outcomes, and getting the translation
+/// right is what makes Finder report the correct thing. The headline case is a
+/// write to a protected location like the `C:\` root coming back `ACCESS_DENIED`
+/// → `NFS3ERR_ACCES` ("you don't have permission") rather than a generic I/O
+/// error. `None` (the client gave no concrete status) falls back to I/O.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn ntstatus_to_nfsstat3(status: Option<NtStatus>) -> nfsstat3 {
+    match status {
+        Some(s) if s == NtStatus::ACCESS_DENIED => nfsstat3::NFS3ERR_ACCES,
+        Some(s) if s == NtStatus::OBJECT_NAME_COLLISION => nfsstat3::NFS3ERR_EXIST,
+        Some(s) if s == NtStatus::NO_SUCH_FILE => nfsstat3::NFS3ERR_NOENT,
+        Some(s) if s == NtStatus::NOT_A_DIRECTORY => nfsstat3::NFS3ERR_NOTDIR,
+        Some(s) if s == NtStatus::DIRECTORY_NOT_EMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
+        Some(s) if s == NtStatus::NOT_SUPPORTED => nfsstat3::NFS3ERR_NOTSUPP,
+        _ => nfsstat3::NFS3ERR_IO,
+    }
+}
+
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 
 #[cfg(target_os = "macos")]
 use ironrdp_rdpdr::pdu::efs::DeviceType;
+use ironrdp_rdpdr::pdu::efs::NtStatus;
 use ironrdp_server::{
     AnnouncedDevice, RdpdrBackendFactory, RdpdrHandle, RdpdrServerFactory, RdpdrServerHandler,
     ServerEvent, ServerEventSender,
 };
+use nfsserve::nfs::nfsstat3;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -179,4 +202,50 @@ fn hostname() -> String {
         }
     }
     "macrdp".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `matches!` rather than `assert_eq!` so the test needs no PartialEq/Debug
+    // on nfsstat3.
+    #[test]
+    fn ntstatus_maps_to_expected_nfs_errors() {
+        assert!(matches!(
+            ntstatus_to_nfsstat3(Some(NtStatus::ACCESS_DENIED)),
+            nfsstat3::NFS3ERR_ACCES
+        ));
+        assert!(matches!(
+            ntstatus_to_nfsstat3(Some(NtStatus::OBJECT_NAME_COLLISION)),
+            nfsstat3::NFS3ERR_EXIST
+        ));
+        assert!(matches!(
+            ntstatus_to_nfsstat3(Some(NtStatus::NO_SUCH_FILE)),
+            nfsstat3::NFS3ERR_NOENT
+        ));
+        assert!(matches!(
+            ntstatus_to_nfsstat3(Some(NtStatus::NOT_A_DIRECTORY)),
+            nfsstat3::NFS3ERR_NOTDIR
+        ));
+        assert!(matches!(
+            ntstatus_to_nfsstat3(Some(NtStatus::DIRECTORY_NOT_EMPTY)),
+            nfsstat3::NFS3ERR_NOTEMPTY
+        ));
+        assert!(matches!(
+            ntstatus_to_nfsstat3(Some(NtStatus::NOT_SUPPORTED)),
+            nfsstat3::NFS3ERR_NOTSUPP
+        ));
+    }
+
+    #[test]
+    fn unknown_or_absent_status_falls_back_to_io() {
+        // No concrete status returned by the client → generic I/O.
+        assert!(matches!(ntstatus_to_nfsstat3(None), nfsstat3::NFS3ERR_IO));
+        // A status we don't specifically translate → generic I/O.
+        assert!(matches!(
+            ntstatus_to_nfsstat3(Some(NtStatus::UNSUCCESSFUL)),
+            nfsstat3::NFS3ERR_IO
+        ));
+    }
 }

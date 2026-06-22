@@ -135,12 +135,54 @@ fn map_client_to_display(
     }
 }
 
+/// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
+/// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G (copy / paste / cut /
+/// select-all / undo / save / find / new / new-tab / close / open / print /
+/// reload / find-next). Deliberately EXCLUDES Q (`Cmd+Q` quits — a nasty
+/// surprise from `Ctrl+Q`) and all nav keys (Mac word-nav is Option+arrow, not
+/// Cmd+arrow). Windows redo (`Ctrl+Y`) is intentionally not here — Mac redo is
+/// `Cmd+Shift+Z`, reachable via `Ctrl+Shift+Z` through the Z mapping.
+///
+/// Pure (no platform deps) so it lives at file scope and is unit-tested on
+/// every target; `mod macos` reaches it via `use super::is_remappable_shortcut`.
+fn is_remappable_shortcut(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x08 // C
+            | 0x09 // V
+            | 0x07 // X
+            | 0x00 // A
+            | 0x06 // Z
+            | 0x01 // S
+            | 0x03 // F
+            | 0x2D // N
+            | 0x11 // T
+            | 0x0D // W
+            | 0x1F // O
+            | 0x23 // P
+            | 0x0F // R
+            | 0x05 // G
+    )
+}
+
 #[cfg(test)]
 mod coord_tests {
-    use super::map_client_to_display;
+    use super::{is_remappable_shortcut, map_client_to_display};
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.5
+    }
+
+    #[test]
+    fn curated_keys_remap_and_q_does_not() {
+        // Curated editing keys (C, V, X, A, Z, S) remap.
+        for vk in [0x08u16, 0x09, 0x07, 0x00, 0x06, 0x01] {
+            assert!(is_remappable_shortcut(vk), "vk {vk:#x} should remap");
+        }
+        // Q (0x0C) is deliberately excluded so Ctrl+Q can't become Cmd+Q.
+        assert!(!is_remappable_shortcut(0x0C));
+        // Arrows / nav keys are untouched (e.g. left arrow 0x7B).
+        assert!(!is_remappable_shortcut(0x7B));
     }
 
     #[test]
@@ -263,6 +305,7 @@ mod macos {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+    use super::is_remappable_shortcut;
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
 
     use anyhow::{anyhow, Result};
@@ -1468,33 +1511,6 @@ mod macos {
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
         }
-    }
-
-    /// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
-    /// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G (copy / paste / cut /
-    /// select-all / undo / save / find / new / new-tab / close / open / print /
-    /// reload / find-next). Deliberately EXCLUDES Q (`Cmd+Q` quits — a nasty
-    /// surprise from `Ctrl+Q`) and all nav keys (Mac word-nav is Option+arrow, not
-    /// Cmd+arrow). Windows redo (`Ctrl+Y`) is intentionally not here — Mac redo is
-    /// `Cmd+Shift+Z`, reachable via `Ctrl+Shift+Z` through the Z mapping.
-    fn is_remappable_shortcut(vk: u16) -> bool {
-        matches!(
-            vk,
-            0x08 // C
-                | 0x09 // V
-                | 0x07 // X
-                | 0x00 // A
-                | 0x06 // Z
-                | 0x01 // S
-                | 0x03 // F
-                | 0x2D // N
-                | 0x11 // T
-                | 0x0D // W
-                | 0x1F // O
-                | 0x23 // P
-                | 0x0F // R
-                | 0x05 // G
-        )
     }
 
     /// Standalone-terminal bundle ids where the Ctrl→Cmd remap is always
@@ -2956,23 +2972,6 @@ mod macos {
             tm.tm_min,
             tm.tm_sec
         )
-    }
-
-    #[cfg(test)]
-    mod remap_tests {
-        use super::is_remappable_shortcut;
-
-        #[test]
-        fn curated_keys_remap_and_q_does_not() {
-            // Curated editing keys (C, V, X, A, Z, S) remap.
-            for vk in [0x08u16, 0x09, 0x07, 0x00, 0x06, 0x01] {
-                assert!(is_remappable_shortcut(vk), "vk {vk:#x} should remap");
-            }
-            // Q (0x0C) is deliberately excluded so Ctrl+Q can't become Cmd+Q.
-            assert!(!is_remappable_shortcut(0x0C));
-            // Arrows / nav keys are untouched (e.g. left arrow 0x7B).
-            assert!(!is_remappable_shortcut(0x7B));
-        }
     }
 }
 

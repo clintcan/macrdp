@@ -315,6 +315,35 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
     }
 }
 
+/// Decide whether the auto-size path should adopt the client's requested
+/// desktop size. Pure (no platform deps, no shared state) so it's unit-tested
+/// on every target.
+///
+/// With `auto_size` on, the vendored acceptor has already negotiated the
+/// client's requested size (from its Client Core Data) in Demand Active, and
+/// the `client` size here is the client's Confirm Active echo of that. We adopt
+/// it so capture, input scaling, and the H.264 pipeline all serve the
+/// negotiated resolution. The `200..=8192` band is the protocol-legal desktop
+/// range (MS-RDPBCGR); an echo outside it is garbage we refuse to adopt, and a
+/// no-op echo (already current) needs no change.
+///
+/// Returns `Some(adopted)` to switch, or `None` to keep the current size.
+fn adopt_client_size(
+    auto_size: bool,
+    current: (u16, u16),
+    client: DesktopSize,
+) -> Option<DesktopSize> {
+    if auto_size
+        && (client.width, client.height) != current
+        && (200..=8192).contains(&client.width)
+        && (200..=8192).contains(&client.height)
+    {
+        Some(client)
+    } else {
+        None
+    }
+}
+
 #[async_trait::async_trait]
 impl RdpServerDisplay for CaptureDisplay {
     async fn size(&mut self) -> DesktopSize {
@@ -324,28 +353,17 @@ impl RdpServerDisplay for CaptureDisplay {
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         let (width, height) = self.desktop_size.get();
-        // With auto_size on, the vendored acceptor has already negotiated
-        // the client's requested size (from its Client Core Data) in Demand
-        // Active, and `client_size` here is the client's Confirm Active echo
-        // of that. Adopt it into the shared size so capture, input scaling,
-        // and the H.264 pipeline all serve the negotiated resolution. The
-        // 200..=8192 band is the protocol-legal desktop range (MS-RDPBCGR);
-        // an echo outside it is garbage we refuse to adopt.
-        if self.auto_size
-            && (client_size.width, client_size.height) != (width, height)
-            && (200..=8192).contains(&client_size.width)
-            && (200..=8192).contains(&client_size.height)
-        {
+        if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
             tracing::info!(
-                client_w = client_size.width,
-                client_h = client_size.height,
+                client_w = adopted.width,
+                client_h = adopted.height,
                 prev_w = width,
                 prev_h = height,
                 "serving client-requested desktop resolution \
                  (--no-client-resolution disables)"
             );
-            self.desktop_size.set(client_size.width, client_size.height);
-            return client_size;
+            self.desktop_size.set(adopted.width, adopted.height);
+            return adopted;
         }
         DesktopSize { width, height }
     }
@@ -381,6 +399,40 @@ impl RdpServerDisplay for CaptureDisplay {
             None => inner,
         })
     }
+}
+
+/// Max pixels per emitted legacy `BitmapUpdate`. The bitmap encoder packs a
+/// whole rect into one update PDU (one RLE rectangle per ~`65535/(w*4)`
+/// rows); mstsc renders a single ~1280×720 (≈0.9 MP) update but DROPS a
+/// 1920×1080 (≈2.1 MP) one — a per-update size/rectangle-count limit — so
+/// the big initial full-frame paint of a virtual display never shows
+/// (only the small ticking-clock dirty-rects render). Splitting tall rects
+/// into strips at or below this proven-good size keeps every update
+/// renderable. FreeRDP accepts either; it just sees more, smaller updates.
+///
+/// Pure rect math (no platform deps) — lives at file scope so it is
+/// unit-tested on every target; `mod macos` reaches it via `use super::*`.
+const MAX_BITMAP_UPDATE_PIXELS: u32 = 1280 * 720;
+
+/// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
+/// Returns the rect unchanged when it already fits.
+fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    if u32::from(w) * u32::from(h) <= MAX_BITMAP_UPDATE_PIXELS {
+        return vec![(x, y, w, h)];
+    }
+    let strip_rows =
+        u16::try_from((MAX_BITMAP_UPDATE_PIXELS / u32::from(w)).max(1)).unwrap_or(u16::MAX);
+    let mut out = Vec::new();
+    let mut row = 0u16;
+    while row < h {
+        let sh = strip_rows.min(h - row);
+        out.push((x, y + row, w, sh));
+        row += sh;
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
@@ -717,37 +769,6 @@ mod macos {
         }))
     }
 
-    /// Max pixels per emitted legacy `BitmapUpdate`. The bitmap encoder packs a
-    /// whole rect into one update PDU (one RLE rectangle per ~`65535/(w*4)`
-    /// rows); mstsc renders a single ~1280×720 (≈0.9 MP) update but DROPS a
-    /// 1920×1080 (≈2.1 MP) one — a per-update size/rectangle-count limit — so
-    /// the big initial full-frame paint of a virtual display never shows
-    /// (only the small ticking-clock dirty-rects render). Splitting tall rects
-    /// into strips at or below this proven-good size keeps every update
-    /// renderable. FreeRDP accepts either; it just sees more, smaller updates.
-    const MAX_BITMAP_UPDATE_PIXELS: u32 = 1280 * 720;
-
-    /// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
-    /// Returns the rect unchanged when it already fits.
-    fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
-        if w == 0 || h == 0 {
-            return Vec::new();
-        }
-        if u32::from(w) * u32::from(h) <= MAX_BITMAP_UPDATE_PIXELS {
-            return vec![(x, y, w, h)];
-        }
-        let strip_rows =
-            u16::try_from((MAX_BITMAP_UPDATE_PIXELS / u32::from(w)).max(1)).unwrap_or(u16::MAX);
-        let mut out = Vec::new();
-        let mut row = 0u16;
-        while row < h {
-            let sh = strip_rows.min(h - row);
-            out.push((x, y + row, w, sh));
-            row += sh;
-        }
-        out
-    }
-
     impl Drop for ScreenCaptureUpdates {
         fn drop(&mut self) {
             let _ = self.stream.stop_capture();
@@ -1074,9 +1095,16 @@ mod macos {
 mod stub {
     use super::*;
     use anyhow::Context;
+    use std::collections::VecDeque;
 
     pub struct StubUpdates {
-        pending: Option<DisplayUpdate>,
+        queue: VecDeque<DisplayUpdate>,
+        /// When true, `next_update` returns `Ok(None)` once `queue` drains
+        /// (ends the stream) instead of parking forever. Only the test
+        /// constructor sets this; production `new` keeps the park-forever
+        /// behavior so a real non-macOS build's update loop neither spins
+        /// nor exits after the single seed frame.
+        end_on_drain: bool,
     }
 
     impl StubUpdates {
@@ -1089,25 +1117,43 @@ mod stub {
             for _ in 0..pixel_count {
                 data.extend_from_slice(&[0xFF, 0x10, 0x80, 0x90]);
             }
+            let mut queue = VecDeque::new();
+            queue.push_back(DisplayUpdate::Bitmap(BitmapUpdate {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+                format: PixelFormat::ARgb32,
+                data: Bytes::from(data),
+                stride,
+            }));
             Ok(Self {
-                pending: Some(DisplayUpdate::Bitmap(BitmapUpdate {
-                    x: 0,
-                    y: 0,
-                    width: w,
-                    height: h,
-                    format: PixelFormat::ARgb32,
-                    data: Bytes::from(data),
-                    stride,
-                })),
+                queue,
+                end_on_drain: false,
             })
+        }
+
+        /// Test-only: drive an explicit sequence of updates through the
+        /// `RdpServerDisplayUpdates` trait, then end the stream. Lets the
+        /// protocol-layer tests assert the update plumbing without a real
+        /// ScreenCaptureKit backend.
+        #[cfg(test)]
+        pub fn with_updates(updates: impl IntoIterator<Item = DisplayUpdate>) -> Self {
+            Self {
+                queue: updates.into_iter().collect(),
+                end_on_drain: true,
+            }
         }
     }
 
     #[async_trait::async_trait]
     impl RdpServerDisplayUpdates for StubUpdates {
         async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-            if let Some(u) = self.pending.take() {
+            if let Some(u) = self.queue.pop_front() {
                 return Ok(Some(u));
+            }
+            if self.end_on_drain {
+                return Ok(None);
             }
             std::future::pending::<()>().await;
             Ok(None)
@@ -1129,5 +1175,156 @@ mod tests {
         let clone = size.clone();
         clone.set(u16::MAX, 1);
         assert_eq!(size.get(), (u16::MAX, 1));
+    }
+
+    #[test]
+    fn split_strips_passes_small_rects_through() {
+        // A rect already within the limit is returned unchanged (single strip).
+        assert_eq!(split_strips(0, 0, 1280, 720), vec![(0, 0, 1280, 720)]);
+        assert_eq!(split_strips(10, 20, 640, 480), vec![(10, 20, 640, 480)]);
+        // Zero-area rects produce nothing.
+        assert_eq!(split_strips(0, 0, 0, 100), Vec::new());
+        assert_eq!(split_strips(0, 0, 100, 0), Vec::new());
+    }
+
+    #[test]
+    fn split_strips_breaks_tall_rects_into_strips() {
+        // 1920×1080 (≈2.1 MP) exceeds the 1280×720 cap and must be split.
+        let strips = split_strips(0, 0, 1920, 1080);
+        assert!(strips.len() > 1, "oversized rect should split: {strips:?}");
+        // Each strip is within the per-update pixel budget.
+        for &(_, _, w, h) in &strips {
+            assert!(u32::from(w) * u32::from(h) <= MAX_BITMAP_UPDATE_PIXELS);
+            assert_eq!(w, 1920, "width is preserved; only rows are split");
+        }
+        // Strips tile the original rect contiguously with no gaps/overlap and
+        // cover the full height.
+        assert_eq!(strips.first().unwrap().1, 0);
+        let mut next_y = 0u16;
+        for &(x, y, _, h) in &strips {
+            assert_eq!(x, 0);
+            assert_eq!(y, next_y);
+            next_y += h;
+        }
+        assert_eq!(next_y, 1080, "strips cover the whole height");
+    }
+
+    #[test]
+    fn adopt_client_size_adopts_in_band_change_when_auto() {
+        // Auto-size on, a different in-band size → adopt it.
+        assert_eq!(
+            adopt_client_size(
+                true,
+                (1512, 982),
+                DesktopSize {
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            Some(DesktopSize {
+                width: 1920,
+                height: 1080
+            })
+        );
+    }
+
+    #[test]
+    fn adopt_client_size_refuses_when_disabled_or_unchanged_or_out_of_band() {
+        // auto_size off → never adopt.
+        assert_eq!(
+            adopt_client_size(
+                false,
+                (1512, 982),
+                DesktopSize {
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            None
+        );
+        // No-op echo (already current) → no change.
+        assert_eq!(
+            adopt_client_size(
+                true,
+                (1920, 1080),
+                DesktopSize {
+                    width: 1920,
+                    height: 1080
+                }
+            ),
+            None
+        );
+        // Below the 200..=8192 protocol band → refuse.
+        assert_eq!(
+            adopt_client_size(
+                true,
+                (1512, 982),
+                DesktopSize {
+                    width: 199,
+                    height: 1080
+                }
+            ),
+            None
+        );
+        // Above the band → refuse.
+        assert_eq!(
+            adopt_client_size(
+                true,
+                (1512, 982),
+                DesktopSize {
+                    width: 1920,
+                    height: 8193
+                }
+            ),
+            None
+        );
+        // Band edges are inclusive and adoptable.
+        assert_eq!(
+            adopt_client_size(
+                true,
+                (1512, 982),
+                DesktopSize {
+                    width: 200,
+                    height: 8192
+                }
+            ),
+            Some(DesktopSize {
+                width: 200,
+                height: 8192
+            })
+        );
+    }
+
+    // The programmable stub only exists on non-macOS builds (the Linux CI
+    // target); it backs the protocol-layer trait tests below.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn stub_updates_yields_injected_sequence_then_ends() {
+        use stub::StubUpdates;
+
+        let mk = |w: u16| {
+            DisplayUpdate::Bitmap(BitmapUpdate {
+                x: 0,
+                y: 0,
+                width: NonZeroU16::new(w).unwrap(),
+                height: NonZeroU16::new(1).unwrap(),
+                format: PixelFormat::ARgb32,
+                data: Bytes::from(vec![0u8; usize::from(w) * 4]),
+                stride: NonZeroUsize::new(usize::from(w) * 4).unwrap(),
+            })
+        };
+
+        let mut updates: Box<dyn RdpServerDisplayUpdates + Send> =
+            Box::new(StubUpdates::with_updates([mk(10), mk(20), mk(30)]));
+
+        // Driven through the trait, the injected updates come back in order...
+        for expected_w in [10u16, 20, 30] {
+            match updates.next_update().await.unwrap() {
+                Some(DisplayUpdate::Bitmap(b)) => assert_eq!(b.width.get(), expected_w),
+                other => panic!("expected bitmap width {expected_w}, got {other:?}"),
+            }
+        }
+        // ...and then the stream ends (the test constructor sets end_on_drain).
+        assert!(updates.next_update().await.unwrap().is_none());
     }
 }
