@@ -29,6 +29,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{ClientConnector, Config, ConnectorResult, Credentials, DesktopSize};
+use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
 use ironrdp_server::{
     DesktopSize as ServerDesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, RdpServer,
     RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
@@ -193,14 +194,16 @@ fn client_config(width: u16, height: u16) -> Config {
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
-/// `honor_client_desktop_size`, returning the negotiated desktop size the client
-/// sees. The server's own display is fixed at `server_w`×`server_h`.
+/// `honor_client_desktop_size` and server-advertised bitmap `codecs`, returning
+/// the negotiated desktop size the client sees. The server's own display is
+/// fixed at `server_w`×`server_h`.
 async fn negotiate(
     server_w: u16,
     server_h: u16,
     client_w: u16,
     client_h: u16,
     honor: bool,
+    codecs: BitmapCodecs,
 ) -> anyhow::Result<(u16, u16)> {
     // Best-effort: surface server/connector tracing when RUST_LOG is set.
     let _ = tracing_subscriber::fmt()
@@ -223,6 +226,7 @@ async fn negotiate(
         .with_tls(acceptor)
         .with_input_handler(TestInput)
         .with_display_handler(display)
+        .with_bitmap_codecs(codecs)
         .build();
     server.set_honor_client_desktop_size(honor);
 
@@ -287,7 +291,7 @@ async fn negotiate(
 async fn client_resolution_adopted_when_honored() -> anyhow::Result<()> {
     // Server display is 1024×768; client asks for 1920×1080. With honoring on,
     // the vendored acceptor negotiates the client's size in Demand Active.
-    let (w, h) = negotiate(1024, 768, 1920, 1080, true).await?;
+    let (w, h) = negotiate(1024, 768, 1920, 1080, true, crate::bitmap_codecs()).await?;
     assert_eq!(
         (w, h),
         (1920, 1080),
@@ -300,11 +304,53 @@ async fn client_resolution_adopted_when_honored() -> anyhow::Result<()> {
 async fn server_size_kept_when_not_honored() -> anyhow::Result<()> {
     // Same request, honoring off → the client gets the server's own size,
     // proving the adopt is gated by the flag (not incidental).
-    let (w, h) = negotiate(1024, 768, 1920, 1080, false).await?;
+    let (w, h) = negotiate(1024, 768, 1920, 1080, false, crate::bitmap_codecs()).await?;
     assert_eq!(
         (w, h),
         (1024, 768),
         "without honoring, server size is served"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_advertises_macrdp_codecs_and_client_connects() -> anyhow::Result<()> {
+    // Drive macrdp's REAL advertised codec set (`bitmap_codecs()`:
+    // NSCodec + RemoteFx + Image RemoteFx + QOI + QOIZ) through the actual
+    // Demand Active and confirm a real IronRDP client accepts it and completes
+    // capability exchange. Regression guard that `bitmap_codecs()` stays a
+    // wire-valid, encodable, client-acceptable capability set — a malformed
+    // codec added in a future edit would break the handshake here.
+    let (w, h) = negotiate(1280, 800, 1280, 800, false, crate::bitmap_codecs()).await?;
+    assert_eq!(
+        (w, h),
+        (1280, 800),
+        "connect should complete with macrdp's advertised codecs"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_shared_codec_falls_back_and_connects() -> anyhow::Result<()> {
+    // The server advertises ONLY NSCodec, which the IronRDP client does not
+    // support, so client and server share no bitmap codec. The handshake must
+    // still complete — the session simply falls back to raw/legacy
+    // BitmapUpdate. (Codec *selection* — AVC420 over EGFX vs legacy — is
+    // macOS-only and not reachable from this cross-platform harness; this
+    // covers the negotiation-layer fallback: no common codec is not fatal.)
+    let only_nscodec = BitmapCodecs(vec![Codec {
+        id: 0,
+        property: CodecProperty::NsCodec(NsCodec {
+            is_dynamic_fidelity_allowed: false,
+            is_subsampling_allowed: false,
+            color_loss_level: 3,
+        }),
+    }]);
+    let (w, h) = negotiate(1280, 800, 1280, 800, false, only_nscodec).await?;
+    assert_eq!(
+        (w, h),
+        (1280, 800),
+        "no-shared-codec connect should still complete (raw fallback)"
     );
     Ok(())
 }
