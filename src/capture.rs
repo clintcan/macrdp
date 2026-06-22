@@ -414,6 +414,31 @@ impl RdpServerDisplay for CaptureDisplay {
 /// unit-tested on every target; `mod macos` reaches it via `use super::*`.
 const MAX_BITMAP_UPDATE_PIXELS: u32 = 1280 * 720;
 
+/// Decide the capture scaling mode from the configured session size vs the
+/// display's `native` (points) and `backing` (HiDPI pixels) sizes. Pure (no
+/// platform deps) so it's unit-tested on every target; complements the input
+/// side ([`crate::input`]'s `map_client_to_display`, which consumes the
+/// resulting letterbox flag). Returns `(force_full_frame, letterbox)`:
+///
+/// - `force_full_frame`: SCK is scaling — the configured size matches neither
+///   native points NOR backing pixels — so its dirty-rects arrive in source
+///   coords and misalign; we must send whole frames. A 1:1 native OR backing
+///   capture (the `--hidpi` path) keeps dirty-rects valid, so it's `false`.
+/// - `letterbox`: preserve the Mac's aspect ratio with black bars instead of
+///   stretching to fill — only when scaling on the auto-size path and `--stretch`
+///   is not set. No scaling ⇒ nothing to letterbox.
+fn capture_scaling_mode(
+    native: (u16, u16),
+    backing: (u16, u16),
+    configured: (u16, u16),
+    auto_size: bool,
+    stretch: bool,
+) -> (bool, bool) {
+    let force_full_frame = !(native == configured || backing == configured);
+    let letterbox = force_full_frame && auto_size && !stretch;
+    (force_full_frame, letterbox)
+}
+
 /// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
 /// Returns the rect unchanged when it already fits.
 fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
@@ -614,13 +639,16 @@ mod macos {
                     })
                     .unwrap_or((native_w, native_h))
             };
-            let force_full_frame = !((native_w == width && native_h == height)
-                || (backing_w == width && backing_h == height));
-            // Letterbox (preserve the Mac's aspect ratio with black bars) instead
-            // of stretching to fill — only on the auto-size path, unless --stretch
-            // opts back into fill. When the configured size already matches native
-            // (no scaling), there's nothing to letterbox.
-            let letterbox = force_full_frame && auto_size && !stretch;
+            // See `capture_scaling_mode`: full frames when SCK scales (configured
+            // size matches neither native points nor backing pixels), and
+            // letterbox vs stretch on the auto-size path.
+            let (force_full_frame, letterbox) = capture_scaling_mode(
+                (native_w, native_h),
+                (backing_w, backing_h),
+                (width, height),
+                auto_size,
+                stretch,
+            );
             desktop_size.set_letterbox(letterbox);
             if force_full_frame {
                 tracing::warn!(
@@ -1292,6 +1320,45 @@ mod tests {
                 width: 200,
                 height: 8192
             })
+        );
+    }
+
+    #[test]
+    fn capture_scaling_mode_native_or_backing_is_one_to_one() {
+        let native = (1512, 982);
+        let backing = (3024, 1964); // Retina backing pixels
+                                    // Configured == native points: 1:1, no full frame, no letterbox.
+        assert_eq!(
+            capture_scaling_mode(native, backing, (1512, 982), true, false),
+            (false, false)
+        );
+        // Configured == backing pixels (--hidpi): also 1:1, no full frame, no
+        // letterbox — the HiDPI exemption that must NOT force full frames.
+        assert_eq!(
+            capture_scaling_mode(native, backing, (3024, 1964), true, false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn capture_scaling_mode_letterboxes_when_scaling_on_auto_size() {
+        let native = (1512, 982);
+        let backing = (3024, 1964);
+        // Auto-size to a non-native size (scaling), no --stretch → letterbox.
+        assert_eq!(
+            capture_scaling_mode(native, backing, (1920, 1080), true, false),
+            (true, true)
+        );
+        // --stretch opts back into fill: full frames, but no letterbox.
+        assert_eq!(
+            capture_scaling_mode(native, backing, (1920, 1080), true, true),
+            (true, false)
+        );
+        // Explicit --width/--height (auto_size = false): full frames (SCK scales)
+        // but the picture fills (stretch), so no letterbox.
+        assert_eq!(
+            capture_scaling_mode(native, backing, (1920, 1080), false, false),
+            (true, false)
         );
     }
 
