@@ -36,6 +36,8 @@ use std::fs;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,7 +52,7 @@ use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
@@ -546,6 +548,123 @@ struct Args {
     /// for the recognized keys; unknown keys are ignored.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// PROOF-OF-CONCEPT (mirror-primary only): run a thin supervisor that spawns
+    /// a fresh worker PROCESS per RDP connection (fork+exec of this same binary),
+    /// mirroring xrdp's per-connection-frontend model, instead of handling every
+    /// connection inside one long-lived process. Built to test whether
+    /// process-freshness fixes the mstsc H.264 reconnect blank. Incompatible with
+    /// --virtual-display / --capture-primary / --detach-primary (those need a
+    /// persistent display owner, out of PoC scope). The accepted socket fd is
+    /// handed to each worker via the internal MACRDP_WORKER_FD env var. macOS-only.
+    #[arg(long = "fork-workers")]
+    fork_workers: bool,
+}
+
+/// Env var the `--fork-workers` supervisor sets on each spawned worker, carrying
+/// the inherited (already-accepted) client socket fd. Its presence is what marks
+/// a process as a worker (survives `--config` re-expansion, unlike a CLI flag).
+const WORKER_FD_ENV: &str = "MACRDP_WORKER_FD";
+
+/// The `--fork-workers` supervisor: bind the listen address, then for every
+/// inbound connection `fork+exec` a fresh copy of this binary as a worker,
+/// handing it the already-accepted socket fd. The supervisor itself does NO
+/// capture/encode/TLS — it only accepts and hands off, so each connection is
+/// served by a brand-new process (xrdp's frontend model). Mirror-primary only.
+async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
+    let exe = std::env::current_exe().context("resolve current exe for worker spawn")?;
+    // Original argv (minus argv[0]) so each worker gets the same config/flags;
+    // the worker takes the worker branch because MACRDP_WORKER_FD is set, so
+    // re-passing --fork-workers here does NOT recurse.
+    let base_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // The supervisor creates no SCStream, so a plain forced-exit on signal is
+    // enough (no capture cleanup to run here). Workers are separate processes
+    // that finish or die with their own connection.
+    tokio::spawn(async {
+        shutdown_signal().await;
+        info!("fork-workers supervisor: shutdown signal received — exiting");
+        std::process::exit(0);
+    });
+
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind {bind}"))?;
+    info!(
+        %bind,
+        "fork-workers supervisor listening — spawning a fresh worker process per connection (PoC)"
+    );
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!(error = ?e, "supervisor accept failed");
+                continue;
+            }
+        };
+        // Take ownership of the raw fd and stop tokio/std from closing it; the
+        // child inherits it across fork, and we close the parent's copy after
+        // spawn. `into_std` then `into_raw_fd` detaches it from Rust's RAII.
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = ?e, "supervisor: into_std failed");
+                continue;
+            }
+        };
+        let fd: RawFd = std_stream.into_raw_fd();
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&base_args).env(WORKER_FD_ENV, fd.to_string());
+        // The fd must survive exec(): clear its close-on-exec flag in the child
+        // (between fork and exec) so the worker can adopt it by number.
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                info!(
+                    ?peer,
+                    worker_pid = pid,
+                    fd,
+                    "spawned worker process for connection"
+                );
+                // Reap the child so it doesn't become a zombie when the
+                // connection ends. `wait` is blocking; do it off the runtime.
+                tokio::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let mut child = child;
+                        let status = child.wait();
+                        (pid, status)
+                    })
+                    .await
+                    .map(|(pid, status)| {
+                        debug!(worker_pid = pid, ?status, "worker process exited");
+                    });
+                });
+            }
+            Err(e) => error!(error = ?e, "failed to spawn worker process"),
+        }
+
+        // Parent no longer needs its copy of the connection fd (the child owns
+        // its own descriptor via fork). Leaving it open would leak fds and hold
+        // the socket half-open after the worker closes its side.
+        unsafe {
+            libc::close(fd);
+        }
+    }
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -1085,6 +1204,32 @@ async fn async_main() -> Result<()> {
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // --fork-workers PoC. A process is a *worker* iff the supervisor set
+    // MACRDP_WORKER_FD (the already-accepted client socket); that takes
+    // precedence over --fork-workers so a re-passed flag can't recurse.
+    let worker_fd: Option<RawFd> = std::env::var(WORKER_FD_ENV)
+        .ok()
+        .and_then(|s| s.parse::<RawFd>().ok());
+    if args.fork_workers && worker_fd.is_none() {
+        // Supervisor role. Mirror-primary only: the headless/virtual-display
+        // modes need a persistent display owner across reconnects, which the
+        // PoC doesn't provide (each worker would create its own).
+        if args.virtual_display || args.capture_primary || args.detach_primary {
+            return Err(anyhow!(
+                "--fork-workers (PoC) is mirror-primary only; it can't be combined \
+                 with --virtual-display/--capture-primary/--detach-primary (those \
+                 need a persistent display owner across worker reconnects)"
+            ));
+        }
+        return run_fork_supervisor(args.bind).await;
+    }
+    if let Some(fd) = worker_fd {
+        info!(
+            fd,
+            "worker process: serving one connection on the inherited socket"
+        );
+    }
+
     if args.make_primary && !args.virtual_display {
         return Err(anyhow!(
             "--make-primary requires --virtual-display (it promotes the \
@@ -1618,6 +1763,28 @@ async fn async_main() -> Result<()> {
         password: (*password).clone(),
         domain: None,
     }));
+
+    if let Some(fd) = worker_fd {
+        // --fork-workers worker: the supervisor already accepted the TCP
+        // connection and handed us its fd. Adopt it, serve exactly ONE
+        // connection, then exit — so every (re)connect is a brand-new process
+        // (xrdp's frontend model), the whole point of the PoC.
+        // SAFETY: `fd` is a live, owned socket fd inherited from the supervisor
+        // (CLOEXEC cleared before exec); we take sole ownership here.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        std_stream
+            .set_nonblocking(true)
+            .context("set inherited worker socket non-blocking")?;
+        let stream = tokio::net::TcpStream::from_std(std_stream)
+            .context("adopt inherited worker socket into tokio")?;
+        info!(fd, user = %username, "worker: serving one connection on inherited socket");
+        let res = server.run_connection(stream).await;
+        match &res {
+            Ok(()) => info!("worker: connection ended cleanly, exiting"),
+            Err(e) => info!(error = ?e, "worker: connection ended with error, exiting"),
+        }
+        return res;
+    }
 
     info!(
         addr = %args.bind,
