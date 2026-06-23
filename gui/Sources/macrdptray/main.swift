@@ -171,6 +171,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "Un-minimize on Cmd+Tab", key: "UNMINIMIZE", cfg: cfg, sel: #selector(toggleUnminimize)))
         opts.addItem(toggle(
             "App-switcher HUD", key: "APP_SWITCHER_HUD", cfg: cfg, sel: #selector(toggleAppSwitcherHud)))
+        // Per-connection worker processes (xrdp's model): fixes mstsc's blank
+        // screen when reconnecting to a still-running server (a fresh process
+        // dodges its EGFX surface-retention bug). Opt-in; on in the preset.
+        opts.addItem(toggle(
+            "Per-connection workers (reconnect fix)", key: "FORK_WORKERS", cfg: cfg,
+            sel: #selector(toggleForkWorkers)))
         opts.addItem(toggle(
             "Option+Tab switches apps", key: "ALT_TAB_SWITCH", cfg: cfg, sel: #selector(toggleAltTabSwitch)))
         // Ctrl→Cmd Windows-shortcut remap + the per-app exclude list (apps where
@@ -376,13 +382,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// One-click "remote into my Mac": headless virtual display + detach the
     /// physical panel (apps move to the virtual display) + H.264 + the
-    /// app-switcher HUD, then start.
+    /// app-switcher HUD + per-connection workers (so reconnecting to the
+    /// still-running server renders instead of going blank on mstsc), then start.
     @objc func presetRemoteDesktop() {
         writeConfig(key: "VIRTUAL_DISPLAY", value: "1")
         writeConfig(key: "PRIMARY_MODE", value: "detach")
         writeConfig(key: "CAPTURE_PRIMARY", value: "0")
         writeConfig(key: "ENABLE_H264", value: "1")
         writeConfig(key: "APP_SWITCHER_HUD", value: "1")
+        writeConfig(key: "FORK_WORKERS", value: "1")
         let cfg = readConfig()
         if cfg["VD_WIDTH"] == nil { writeConfig(key: "VD_WIDTH", value: "1920") }
         if cfg["VD_HEIGHT"] == nil { writeConfig(key: "VD_HEIGHT", value: "1080") }
@@ -542,6 +550,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleHiDPI() { flip("HIDPI") }
     @objc func toggleUnminimize() { flip("UNMINIMIZE") }
     @objc func toggleAppSwitcherHud() { flip("APP_SWITCHER_HUD") }
+    @objc func toggleForkWorkers() { flip("FORK_WORKERS") }
     @objc func toggleAltTabSwitch() { flip("ALT_TAB_SWITCH") }
     @objc func toggleDriveRedirection() { flip("ENABLE_DRIVE_REDIRECTION") }
     @objc func toggleSmartcardRedirection() { flip("ENABLE_SMARTCARD_REDIRECTION") }
