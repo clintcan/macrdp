@@ -574,9 +574,15 @@ const WORKER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// After the previous worker process dies, give ScreenCaptureKit's capture
 /// daemon a beat to release the capture slot before the next worker opens its
 /// own SCStream. Process death frees the client side synchronously, but the SCK
-/// server side can lag briefly — without this settle, a fast reconnect's new
-/// worker starts capturing into a not-yet-released slot and renders blank.
-const WORKER_SCK_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// server side (replayd) can lag — and a *blank* worker (one whose stream never
+/// delivered) appears to release more slowly, which is what produces an
+/// occasional pair of adjacent blank reconnects. Default chosen conservatively;
+/// override at runtime with `MACRDP_WORKER_SCK_SETTLE_MS` to tune the floor on a
+/// given machine without a rebuild.
+const WORKER_SCK_SETTLE_DEFAULT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Env var to override `WORKER_SCK_SETTLE_DEFAULT` (milliseconds).
+const WORKER_SCK_SETTLE_ENV: &str = "MACRDP_WORKER_SCK_SETTLE_MS";
 
 /// The `--fork-workers` supervisor: bind the listen address, then for every
 /// inbound connection `fork+exec` a fresh copy of this binary as a worker,
@@ -617,6 +623,14 @@ async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
     // SCStream.
     let mut prev_worker: Option<std::process::Child> = None;
 
+    // SCK capture-slot settle, env-overridable for hardware-in-the-loop tuning.
+    let sck_settle = std::env::var(WORKER_SCK_SETTLE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(WORKER_SCK_SETTLE_DEFAULT);
+    info!(settle_ms = sck_settle.as_millis() as u64, "fork-workers: inter-worker SCK settle");
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -649,7 +663,7 @@ async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
                 debug!(worker_pid = prev_pid, "previous worker exited; capture slot freed");
             }
             // Let SCK's daemon release the capture slot before the next SCStream.
-            tokio::time::sleep(WORKER_SCK_SETTLE).await;
+            tokio::time::sleep(sck_settle).await;
         }
         // Take ownership of the raw fd and stop tokio/std from closing it; the
         // child inherits it across fork, and we close the parent's copy after
