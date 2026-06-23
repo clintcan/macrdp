@@ -566,6 +566,12 @@ struct Args {
 /// a process as a worker (survives `--config` re-expansion, unlike a CLI flag).
 const WORKER_FD_ENV: &str = "MACRDP_WORKER_FD";
 
+/// Phase-0 spike env var: the supervisor owns one `CGVirtualDisplay` and passes
+/// its `display_id` to each worker here. Its presence tells the worker to CAPTURE
+/// that supervisor-owned display (by id) instead of creating its own — proving
+/// cross-process vdisplay capture, the make-or-break unknown for productization.
+const WORKER_VD_ID_ENV: &str = "MACRDP_VD_ID";
+
 /// Max time the supervisor waits for the previous worker to fully exit before
 /// spawning the next one (see `run_fork_supervisor`). Bounds the rare case
 /// where an old connection lingers, so a reconnect can't hang indefinitely.
@@ -595,7 +601,15 @@ const WORKER_SCK_SETTLE_ENV: &str = "MACRDP_WORKER_SCK_SETTLE_MS";
 /// handing it the already-accepted socket fd. The supervisor itself does NO
 /// capture/encode/TLS — it only accepts and hands off, so each connection is
 /// served by a brand-new process (xrdp's frontend model). Mirror-primary only.
-async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
+async fn run_fork_supervisor(
+    bind: SocketAddr,
+    // The supervisor-owned virtual display (Phase-0 spike). Bound for the whole
+    // supervisor lifetime so the CGVirtualDisplay registration persists across
+    // worker reconnects; its id is handed to each worker via MACRDP_VD_ID. `None`
+    // = mirror-primary. The OS reaps the registration when the supervisor dies.
+    vd: Option<virtual_display::VirtualDisplay>,
+) -> Result<()> {
+    let vd_id: Option<u32> = vd.as_ref().map(|v| v.display_id());
     let exe = std::env::current_exe().context("resolve current exe for worker spawn")?;
     // Original argv (minus argv[0]) so each worker gets the same config/flags;
     // the worker takes the worker branch because MACRDP_WORKER_FD is set, so
@@ -685,6 +699,11 @@ async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
 
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(&base_args).env(WORKER_FD_ENV, fd.to_string());
+        // Hand the supervisor-owned virtual display id to the worker so it
+        // captures that display by id instead of creating its own (Phase-0 spike).
+        if let Some(id) = vd_id {
+            cmd.env(WORKER_VD_ID_ENV, id.to_string());
+        }
         // The fd must survive exec(): clear its close-on-exec flag in the child
         // (between fork and exec) so the worker can adopt it by number.
         unsafe {
@@ -1269,18 +1288,50 @@ async fn async_main() -> Result<()> {
     let worker_fd: Option<RawFd> = std::env::var(WORKER_FD_ENV)
         .ok()
         .and_then(|s| s.parse::<RawFd>().ok());
+    // Phase-0 spike: if set, this worker captures the SUPERVISOR-owned virtual
+    // display by this id instead of creating its own (see WORKER_VD_ID_ENV).
+    let supervisor_vd_id: Option<u32> = std::env::var(WORKER_VD_ID_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
     if args.fork_workers && worker_fd.is_none() {
-        // Supervisor role. Mirror-primary only: the headless/virtual-display
-        // modes need a persistent display owner across reconnects, which the
-        // PoC doesn't provide (each worker would create its own).
-        if args.virtual_display || args.capture_primary || args.detach_primary {
+        // Supervisor role.
+        //
+        // Phase-0 spike: the SUPERVISOR owns the virtual display (created here,
+        // persisting across worker reconnects) and each worker captures it by id
+        // via MACRDP_VD_ID. This validates the make-or-break unknown for
+        // productization — whether a worker process can capture a CGVirtualDisplay
+        // owned by a *different* process.
+        //
+        // Headless blanking (--capture-primary/--detach-primary) still needs a
+        // supervisor-owned RAII guard (Phase 1, item 2) — out of scope for the
+        // spike, so still rejected with fork-workers for now.
+        if args.capture_primary || args.detach_primary {
             return Err(anyhow!(
-                "--fork-workers (PoC) is mirror-primary only; it can't be combined \
-                 with --virtual-display/--capture-primary/--detach-primary (those \
-                 need a persistent display owner across worker reconnects)"
+                "--fork-workers + --capture-primary/--detach-primary is not yet \
+                 supported (needs supervisor-owned blanking — Phase 1). \
+                 --virtual-display alone IS supported (Phase-0 spike)."
             ));
         }
-        return run_fork_supervisor(args.bind).await;
+        let vd = if args.virtual_display {
+            let w = args
+                .width
+                .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+            let h = args
+                .height
+                .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
+                .context("supervisor: attaching virtual display")?;
+            info!(
+                display_id = vd.display_id(),
+                origin = ?vd.origin_pts(),
+                size = ?vd.size_pts(),
+                "supervisor: virtual display attached — workers capture it by id (Phase-0 spike)"
+            );
+            Some(vd)
+        } else {
+            None
+        };
+        return run_fork_supervisor(args.bind, vd).await;
     }
     if let Some(fd) = worker_fd {
         info!(
@@ -1400,7 +1451,14 @@ async fn async_main() -> Result<()> {
     // normal exit (signal-driven exit goes through std::process::exit
     // and skips Drop, but macOS reaps virtual displays when the owning
     // process dies, so cleanup still happens — just not via Drop).
-    let virtual_display: Option<virtual_display::VirtualDisplay> = if args.virtual_display {
+    // When `supervisor_vd_id` is set we're a fork-worker capturing the
+    // supervisor-owned virtual display by id — do NOT create our own (it would
+    // be a second, redundant display that dies each reconnect; the whole point
+    // of the spike is to capture the persistent supervisor one). Geometry comes
+    // from the supervisor display's CGDisplayBounds in the size block below.
+    let virtual_display: Option<virtual_display::VirtualDisplay> = if args.virtual_display
+        && supervisor_vd_id.is_none()
+    {
         let w = args
             .width
             .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
@@ -1530,7 +1588,32 @@ async fn async_main() -> Result<()> {
     //   - primary panel, no --width/--height override: query SCK for
     //     native size and use CGDisplay::main() for the point-space bounds.
     //   - primary panel with override: use the override + main geometry.
-    let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
+    let (width, height, capture_display_id, screen_size_pts) = if let Some(vd_id) = supervisor_vd_id
+    {
+        // Phase-0 spike: capture the SUPERVISOR-owned virtual display by id.
+        // Geometry: requested w/h for the session; size_pts from the display's
+        // CGDisplayBounds (its origin is picked up by input.rs the same way).
+        let w = args
+            .width
+            .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+        let h = args
+            .height
+            .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+        #[cfg(target_os = "macos")]
+        let size = {
+            let b = core_graphics::display::CGDisplay::new(vd_id).bounds();
+            (b.size.width, b.size.height)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let size = (f64::from(w), f64::from(h));
+        info!(
+            width = w,
+            height = h,
+            display_id = vd_id,
+            "worker: capturing supervisor-owned virtual display (Phase-0 spike)"
+        );
+        (w, h, Some(vd_id), size)
+    } else if let Some(vd) = &virtual_display {
         // Both required earlier, so the unwraps can't fire.
         let w = args
             .width
