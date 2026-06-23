@@ -579,7 +579,13 @@ const WORKER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// occasional pair of adjacent blank reconnects. Default chosen conservatively;
 /// override at runtime with `MACRDP_WORKER_SCK_SETTLE_MS` to tune the floor on a
 /// given machine without a rebuild.
-const WORKER_SCK_SETTLE_DEFAULT: std::time::Duration = std::time::Duration::from_millis(750);
+///
+/// Default 0: live testing showed the settle never helped (the residual blank is
+/// a client-side mstsc re-composite quirk, NOT a capture-slot overlap — the
+/// blank connection's capture/encode/ship logs are identical to a rendering
+/// one), and a *longer* settle made things WORSE. The serialization wait alone
+/// (draining the previous worker) is what matters. Knob kept for experimentation.
+const WORKER_SCK_SETTLE_DEFAULT: std::time::Duration = std::time::Duration::from_millis(0);
 
 /// Env var to override `WORKER_SCK_SETTLE_DEFAULT` (milliseconds).
 const WORKER_SCK_SETTLE_ENV: &str = "MACRDP_WORKER_SCK_SETTLE_MS";
