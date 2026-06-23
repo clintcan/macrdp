@@ -649,7 +649,9 @@ fn engage_headless_blank(
                     info!("supervisor: virtual display promoted to primary");
                     *primary_slot.lock().expect("primary slot poisoned") = Some(g);
                 }
-                Ok(None) => info!("supervisor: virtual display already primary — no override needed"),
+                Ok(None) => {
+                    info!("supervisor: virtual display already primary — no override needed")
+                }
                 Err(e) => warn!("supervisor: could not promote virtual display to primary: {e:#}"),
             },
             BlankMode::None => {}
@@ -698,7 +700,9 @@ async fn run_fork_supervisor(
     // separate processes that finish or die with their own connection.
     tokio::spawn(async {
         shutdown_signal().await;
-        info!("fork-workers supervisor: shutdown signal received — exiting (display auto-restores)");
+        info!(
+            "fork-workers supervisor: shutdown signal received — exiting (display auto-restores)"
+        );
         std::process::exit(0);
     });
 
@@ -726,7 +730,10 @@ async fn run_fork_supervisor(
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(WORKER_SCK_SETTLE_DEFAULT);
-    info!(settle_ms = sck_settle.as_millis() as u64, "fork-workers: inter-worker SCK settle");
+    info!(
+        settle_ms = sck_settle.as_millis() as u64,
+        "fork-workers: inter-worker SCK settle"
+    );
 
     // Headless blanking is engaged on the FIRST connection and HELD for the
     // supervisor's lifetime (continuous — never disengaged between reconnects).
@@ -787,7 +794,10 @@ async fn run_fork_supervisor(
                     "previous worker still alive after wait timeout; spawning next anyway"
                 );
             } else {
-                debug!(worker_pid = prev_pid, "previous worker exited; capture slot freed");
+                debug!(
+                    worker_pid = prev_pid,
+                    "previous worker exited; capture slot freed"
+                );
             }
             // Let SCK's daemon release the capture slot before the next SCStream.
             tokio::time::sleep(sck_settle).await;
@@ -1413,7 +1423,8 @@ async fn async_main() -> Result<()> {
         // --detach-primary / --make-primary) so it persists across reconnects;
         // workers never touch it. Blanking is process-scoped to the supervisor, so
         // it auto-restores when the supervisor dies (incl. SIGKILL/panic).
-        if (args.capture_primary || args.detach_primary || args.make_primary) && !args.virtual_display
+        if (args.capture_primary || args.detach_primary || args.make_primary)
+            && !args.virtual_display
         {
             return Err(anyhow!(
                 "--capture-primary/--detach-primary/--make-primary require \
@@ -1425,6 +1436,19 @@ async fn async_main() -> Result<()> {
                 "--capture-primary and --detach-primary are mutually exclusive \
                  (pick one mechanism for going headless)"
             ));
+        }
+        if args.enable_smartcard_redirection {
+            // Not gated off (it may work — workers are serialized so only one
+            // binds :40242 at a time), but it's UNVERIFIED under fork: the
+            // smart-card bridge is per-connection (the card lives on the client,
+            // the bridge talks to the live worker's RdpdrHandle), so the
+            // supervisor can't own it, and slotd's reconnect behavior across the
+            // worker boundary hasn't been validated with real hardware.
+            warn!(
+                "--enable-smartcard-redirection with --fork-workers is UNVERIFIED \
+                 (per-connection :40242 bridge; slotd reconnect across workers \
+                 untested). It may work or misbehave — verify with your reader."
+            );
         }
         let vd = if args.virtual_display {
             let w = args
@@ -1591,31 +1615,30 @@ async fn async_main() -> Result<()> {
     // be a second, redundant display that dies each reconnect; the whole point
     // of the spike is to capture the persistent supervisor one). Geometry comes
     // from the supervisor display's CGDisplayBounds in the size block below.
-    let virtual_display: Option<virtual_display::VirtualDisplay> = if args.virtual_display
-        && supervisor_vd_id.is_none()
-    {
-        let w = args
-            .width
-            .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
-        let h = args
-            .height
-            .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-        // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
-        // metadata here (capture cadence is governed by --fps); pass a
-        // safe value so CGVirtualDisplay doesn't reject the mode.
-        let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-            .context("attaching virtual display")?;
-        info!(
-            display_id = vd.display_id(),
-            origin = ?vd.origin_pts(),
-            size = ?vd.size_pts(),
-            "virtual display attached — the RDP session uses this surface; \
-             your primary panel is untouched"
-        );
-        Some(vd)
-    } else {
-        None
-    };
+    let virtual_display: Option<virtual_display::VirtualDisplay> =
+        if args.virtual_display && supervisor_vd_id.is_none() {
+            let w = args
+                .width
+                .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+            let h = args
+                .height
+                .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+            // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
+            // metadata here (capture cadence is governed by --fps); pass a
+            // safe value so CGVirtualDisplay doesn't reject the mode.
+            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
+                .context("attaching virtual display")?;
+            info!(
+                display_id = vd.display_id(),
+                origin = ?vd.origin_pts(),
+                size = ?vd.size_pts(),
+                "virtual display attached — the RDP session uses this surface; \
+                 your primary panel is untouched"
+            );
+            Some(vd)
+        } else {
+            None
+        };
 
     // --detach-primary / --capture-primary are lazy: the headless
     // mechanism is only engaged once a client actually connects. A

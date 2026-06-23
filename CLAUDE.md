@@ -136,6 +136,21 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;
                           #   --no-lazy-paste reverts to eager download + auto-paste hack.
+--fork-workers            # EXPERIMENTAL, opt-in (default OFF; FORK_WORKERS=1 in
+                          #   config.env). xrdp's model on macOS: a thin supervisor
+                          #   binds the port and fork+execs a FRESH worker process
+                          #   per connection (socket via MACRDP_WORKER_FD). The fresh
+                          #   process dodges mstsc's reconnect-blank (it re-maps a
+                          #   fresh EGFX surface on a brand-new channel) — reconnect
+                          #   to a still-running server renders instead of going
+                          #   blank; a residual ~1/7 blank recovers by reconnecting
+                          #   once more. The supervisor owns the persistent state
+                          #   (virtual display, headless blanking, caffeinate,
+                          #   app-switcher HUD); workers are per-connection. Works
+                          #   mirror-primary or with --virtual-display (+ optional
+                          #   --capture-primary/--detach-primary). Smart-card
+                          #   redirection under it is UNVERIFIED (warns at startup).
+                          #   macOS-only. See the H.264 reconnect-blank quirk note.
 --cert-dir PATH           # default ~/Library/Application Support/macrdp
 ```
 
