@@ -601,13 +601,72 @@ const WORKER_SCK_SETTLE_ENV: &str = "MACRDP_WORKER_SCK_SETTLE_MS";
 /// handing it the already-accepted socket fd. The supervisor itself does NO
 /// capture/encode/TLS — it only accepts and hands off, so each connection is
 /// served by a brand-new process (xrdp's frontend model). Mirror-primary only.
+/// Headless-blanking mode the fork-workers supervisor engages on first connect
+/// and holds (continuous) for its lifetime. Mirrors the single-process flags.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlankMode {
+    None,
+    Detach,
+    Capture,
+    MakePrimary,
+}
+
+/// Install the chosen headless blanking off the supervisor's accept loop and
+/// stash the guard so it lives for the supervisor's lifetime. The install can
+/// block for seconds (CG / WindowServer), hence the spawned task. Guards are
+/// process-scoped, so they auto-restore when the supervisor dies.
+fn engage_headless_blank(
+    blank: BlankMode,
+    vd_id: u32,
+    detach_slot: Arc<std::sync::Mutex<Option<virtual_display::DetachedPrimary>>>,
+    capture_slot: Arc<std::sync::Mutex<Option<virtual_display::CapturedPrimary>>>,
+    primary_slot: Arc<std::sync::Mutex<Option<virtual_display::PrimaryOverride>>>,
+) {
+    tokio::spawn(async move {
+        match blank {
+            BlankMode::Detach => match virtual_display::DetachedPrimary::install(vd_id) {
+                Ok(g) => {
+                    info!(
+                        "supervisor: headless engaged via --detach-primary (physical \
+                         display disabled; restored when macrdp exits)"
+                    );
+                    *detach_slot.lock().expect("detach slot poisoned") = Some(g);
+                }
+                Err(e) => warn!("supervisor: could not engage --detach-primary: {e:#}"),
+            },
+            BlankMode::Capture => match virtual_display::CapturedPrimary::install(vd_id) {
+                Ok(g) => {
+                    info!(
+                        "supervisor: headless engaged via --capture-primary (physical \
+                         display blanked; restored when macrdp exits)"
+                    );
+                    *capture_slot.lock().expect("capture slot poisoned") = Some(g);
+                }
+                Err(e) => warn!("supervisor: could not engage --capture-primary: {e:#}"),
+            },
+            BlankMode::MakePrimary => match virtual_display::PrimaryOverride::install(vd_id) {
+                Ok(Some(g)) => {
+                    info!("supervisor: virtual display promoted to primary");
+                    *primary_slot.lock().expect("primary slot poisoned") = Some(g);
+                }
+                Ok(None) => info!("supervisor: virtual display already primary — no override needed"),
+                Err(e) => warn!("supervisor: could not promote virtual display to primary: {e:#}"),
+            },
+            BlankMode::None => {}
+        }
+    });
+}
+
 async fn run_fork_supervisor(
     bind: SocketAddr,
-    // The supervisor-owned virtual display (Phase-0 spike). Bound for the whole
-    // supervisor lifetime so the CGVirtualDisplay registration persists across
-    // worker reconnects; its id is handed to each worker via MACRDP_VD_ID. `None`
+    // The supervisor-owned virtual display. Bound for the whole supervisor
+    // lifetime so the CGVirtualDisplay registration persists across worker
+    // reconnects; its id is handed to each worker via MACRDP_VD_ID. `None`
     // = mirror-primary. The OS reaps the registration when the supervisor dies.
     vd: Option<virtual_display::VirtualDisplay>,
+    // Headless blanking the supervisor owns (engaged on first connect, held until
+    // exit). Process-scoped, so it auto-restores when the supervisor dies.
+    blank: BlankMode,
 ) -> Result<()> {
     let vd_id: Option<u32> = vd.as_ref().map(|v| v.display_id());
     let exe = std::env::current_exe().context("resolve current exe for worker spawn")?;
@@ -616,12 +675,15 @@ async fn run_fork_supervisor(
     // re-passing --fork-workers here does NOT recurse.
     let base_args: Vec<String> = std::env::args().skip(1).collect();
 
-    // The supervisor creates no SCStream, so a plain forced-exit on signal is
-    // enough (no capture cleanup to run here). Workers are separate processes
-    // that finish or die with their own connection.
+    // A plain forced-exit on signal is enough: the supervisor creates no
+    // SCStream, and its headless blanking (capture/detach/primary) is
+    // PROCESS-SCOPED — macOS auto-restores the physical display when the
+    // supervisor process dies (incl. SIGKILL/panic), so process::exit(0) here
+    // restores the user's layout without an explicit guard drop. Workers are
+    // separate processes that finish or die with their own connection.
     tokio::spawn(async {
         shutdown_signal().await;
-        info!("fork-workers supervisor: shutdown signal received — exiting");
+        info!("fork-workers supervisor: shutdown signal received — exiting (display auto-restores)");
         std::process::exit(0);
     });
 
@@ -651,6 +713,22 @@ async fn run_fork_supervisor(
         .unwrap_or(WORKER_SCK_SETTLE_DEFAULT);
     info!(settle_ms = sck_settle.as_millis() as u64, "fork-workers: inter-worker SCK settle");
 
+    // Headless blanking is engaged on the FIRST connection and HELD for the
+    // supervisor's lifetime (continuous — never disengaged between reconnects).
+    // Held in slots because the install can block for seconds (esp. --detach,
+    // which awaits a WindowServer commit), so it runs off the accept loop. All
+    // three mechanisms are process-scoped to the supervisor, so they auto-restore
+    // when it dies (incl. SIGKILL/panic) — no explicit teardown on the signal
+    // path. The slots just keep the guards alive so they aren't dropped (which
+    // would restore mid-session).
+    let detach_slot: Arc<std::sync::Mutex<Option<virtual_display::DetachedPrimary>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let capture_slot: Arc<std::sync::Mutex<Option<virtual_display::CapturedPrimary>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let primary_slot: Arc<std::sync::Mutex<Option<virtual_display::PrimaryOverride>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let mut headless_engaged = false;
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -659,6 +737,20 @@ async fn run_fork_supervisor(
                 continue;
             }
         };
+
+        // Engage headless blanking on the first connection (continuous).
+        if !headless_engaged && blank != BlankMode::None {
+            headless_engaged = true;
+            if let Some(id) = vd_id {
+                engage_headless_blank(
+                    blank,
+                    id,
+                    detach_slot.clone(),
+                    capture_slot.clone(),
+                    primary_slot.clone(),
+                );
+            }
+        }
 
         // Drain the previous worker before this connection captures.
         if let Some(prev) = prev_worker.take() {
@@ -1296,20 +1388,24 @@ async fn async_main() -> Result<()> {
     if args.fork_workers && worker_fd.is_none() {
         // Supervisor role.
         //
-        // Phase-0 spike: the SUPERVISOR owns the virtual display (created here,
-        // persisting across worker reconnects) and each worker captures it by id
-        // via MACRDP_VD_ID. This validates the make-or-break unknown for
-        // productization — whether a worker process can capture a CGVirtualDisplay
-        // owned by a *different* process.
-        //
-        // Headless blanking (--capture-primary/--detach-primary) still needs a
-        // supervisor-owned RAII guard (Phase 1, item 2) — out of scope for the
-        // spike, so still rejected with fork-workers for now.
-        if args.capture_primary || args.detach_primary {
+        // The SUPERVISOR owns the virtual display (created here, persisting across
+        // worker reconnects) — each worker captures it by id via MACRDP_VD_ID
+        // (validated by the Phase-0 spike: cross-process capture works, id stable).
+        // The supervisor ALSO owns the headless blanking (--capture-primary /
+        // --detach-primary / --make-primary) so it persists across reconnects;
+        // workers never touch it. Blanking is process-scoped to the supervisor, so
+        // it auto-restores when the supervisor dies (incl. SIGKILL/panic).
+        if (args.capture_primary || args.detach_primary || args.make_primary) && !args.virtual_display
+        {
             return Err(anyhow!(
-                "--fork-workers + --capture-primary/--detach-primary is not yet \
-                 supported (needs supervisor-owned blanking — Phase 1). \
-                 --virtual-display alone IS supported (Phase-0 spike)."
+                "--capture-primary/--detach-primary/--make-primary require \
+                 --virtual-display (you'd be left with no usable display otherwise)"
+            ));
+        }
+        if args.capture_primary && args.detach_primary {
+            return Err(anyhow!(
+                "--capture-primary and --detach-primary are mutually exclusive \
+                 (pick one mechanism for going headless)"
             ));
         }
         let vd = if args.virtual_display {
@@ -1325,13 +1421,22 @@ async fn async_main() -> Result<()> {
                 display_id = vd.display_id(),
                 origin = ?vd.origin_pts(),
                 size = ?vd.size_pts(),
-                "supervisor: virtual display attached — workers capture it by id (Phase-0 spike)"
+                "supervisor: virtual display attached — workers capture it by id"
             );
             Some(vd)
         } else {
             None
         };
-        return run_fork_supervisor(args.bind, vd).await;
+        let blank = if args.detach_primary {
+            BlankMode::Detach
+        } else if args.capture_primary {
+            BlankMode::Capture
+        } else if args.make_primary {
+            BlankMode::MakePrimary
+        } else {
+            BlankMode::None
+        };
+        return run_fork_supervisor(args.bind, vd, blank).await;
     }
     if let Some(fd) = worker_fd {
         info!(
@@ -1489,7 +1594,12 @@ async fn async_main() -> Result<()> {
     // flags subsume --make-primary (each puts the virtual display
     // at (0,0)), so if both are set, only the lazy path runs.
     let session_tracker = capture::SessionTracker::default();
-    if args.detach_primary {
+    if worker_fd.is_some() {
+        // Fork-worker: the SUPERVISOR owns headless blanking (it persists across
+        // reconnects and is engaged there). A worker has no virtual_display of
+        // its own — it captures the supervisor's by id — so the `.expect()`s
+        // below would panic. Skip entirely; blanking is not the worker's job.
+    } else if args.detach_primary {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --detach-primary")
@@ -1941,6 +2051,15 @@ async fn async_main() -> Result<()> {
                 1
             }
         };
+        // process::exit skips Drop, so run the per-connection cleanup explicitly
+        // (same as the signal handler): unmount any RDPDR NFS volumes and remove
+        // clipboard paste temp dirs. Without this a worker LEAKS a mount + temp
+        // dir on every reconnect (Drop normally handles it on a graceful return).
+        #[cfg(target_os = "macos")]
+        {
+            file_promise_lazy::shutdown_cleanup();
+            rdpdr::shutdown_cleanup();
+        }
         std::process::exit(code);
     }
 
