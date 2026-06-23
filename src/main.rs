@@ -667,8 +667,23 @@ async fn run_fork_supervisor(
     // Headless blanking the supervisor owns (engaged on first connect, held until
     // exit). Process-scoped, so it auto-restores when the supervisor dies.
     blank: BlankMode,
+    // Own the single app-switcher HUD helper here (it LISTENS on :40243). Workers
+    // only push SHOW/ADVANCE/HIDE to it (the display id rides in each SHOW), so a
+    // per-worker helper would churn + contend on the port across reconnects.
+    app_switcher_hud: bool,
 ) -> Result<()> {
     let vd_id: Option<u32> = vd.as_ref().map(|v| v.display_id());
+    // Spawn the one persistent HUD helper (parent = supervisor, so it self-exits
+    // when the supervisor dies). Held for the supervisor's lifetime; workers push
+    // to it over loopback. macOS-only (no-op helper-locate elsewhere).
+    #[cfg(target_os = "macos")]
+    let _hud_helper = if app_switcher_hud {
+        spawn_hud_helper()
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = app_switcher_hud;
     let exe = std::env::current_exe().context("resolve current exe for worker spawn")?;
     // Original argv (minus argv[0]) so each worker gets the same config/flags;
     // the worker takes the worker branch because MACRDP_WORKER_FD is set, so
@@ -1448,7 +1463,7 @@ async fn async_main() -> Result<()> {
         if !args.allow_sleep {
             prevent_sleep();
         }
-        return run_fork_supervisor(args.bind, vd, blank).await;
+        return run_fork_supervisor(args.bind, vd, blank, args.app_switcher_hud).await;
     }
     if let Some(fd) = worker_fd {
         info!(
@@ -1872,7 +1887,16 @@ async fn async_main() -> Result<()> {
         let did =
             capture_display_id.unwrap_or_else(|| core_graphics::display::CGDisplay::main().id);
         crate::switcher_hud::set_display_id(did);
-        spawn_hud_helper()
+        // Fork-workers: the SUPERVISOR owns the single persistent HUD helper
+        // (binds :40243); a worker only PUSHES to it (the display id rides in
+        // each SHOW), so it must NOT spawn its own — that would churn the helper
+        // process and contend on the port across reconnects. The single-process
+        // (non-fork) path still spawns + owns its own helper here.
+        if worker_fd.is_none() {
+            spawn_hud_helper()
+        } else {
+            None
+        }
     } else {
         None
     };
