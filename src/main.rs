@@ -1779,11 +1779,27 @@ async fn async_main() -> Result<()> {
             .context("adopt inherited worker socket into tokio")?;
         info!(fd, user = %username, "worker: serving one connection on inherited socket");
         let res = server.run_connection(stream).await;
-        match &res {
-            Ok(()) => info!("worker: connection ended cleanly, exiting"),
-            Err(e) => info!(error = ?e, "worker: connection ended with error, exiting"),
-        }
-        return res;
+        // CRITICAL (fork-workers): force-exit the worker PROCESS here instead of
+        // returning and letting the runtime unwind. Once an SCStream is live,
+        // ScreenCaptureKit's framework threads keep the process from actually
+        // terminating on a normal return — the very hazard the SIGINT handler
+        // dodges with process::exit. A lingering worker holds its capture stream
+        // (and VideoToolbox session) open; after ~2 concurrent capturers macOS
+        // starves frame delivery to the newer ones, so the 3rd+ reconnect renders
+        // BLANK ("first two render, then blank"). Exiting tears down the
+        // SCStream/VT immediately (and the `caffeinate -w <pid>` child exits with
+        // us), so every reconnect's fresh worker captures cleanly.
+        let code = match &res {
+            Ok(()) => {
+                info!("worker: connection ended cleanly, exiting");
+                0
+            }
+            Err(e) => {
+                info!(error = ?e, "worker: connection ended with error, exiting");
+                1
+            }
+        };
+        std::process::exit(code);
     }
 
     info!(
