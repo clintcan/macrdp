@@ -275,6 +275,11 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
                           actually blank the panel on your hardware. Mutually
                           exclusive with --detach-primary. Only with
                           --virtual-display.
+--fork-workers            EXPERIMENTAL, opt-in. Fork a fresh worker process per
+                          connection (xrdp's model) so reconnecting mstsc to a
+                          still-running server renders instead of going blank.
+                          See Known limitations (Video) below. macOS-only; off
+                          by default.
 ```
 
 `RUST_LOG=debug` for verbose logging.
@@ -370,7 +375,9 @@ How it behaves:
 
 ### Known limitations
 
-- **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Reliable workaround:** fully close the mstsc window and open a new connection — quitting the client clears its surface cache, so the desktop renders every time, with no Windows reboot needed. (A server-side fresh-surface-id workaround was tried but only mitigated this unreliably on mstsc, so it was dropped in favor of this documented recovery.)
+- **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Two ways to handle it:**
+  - **`--fork-workers`** (experimental, opt-in, `FORK_WORKERS=1` in `config.env`, or the GUI controller's "Per-connection workers" toggle / "Set Up Remote Desktop" preset): adopts xrdp's process model — a thin supervisor forks a *fresh worker process per connection*, and a brand-new process dodges mstsc's surface retention, so reconnect renders. A rare residual blank (~1 in 7) clears by **reconnecting once more** (no need to close the window). The supervisor owns the persistent state (virtual display, headless blanking, caffeinate, app-switcher HUD); works mirror-primary or with `--virtual-display`. Smart-card redirection under it is unverified. macOS-only.
+  - **Or just close + reopen the mstsc window** — quitting the client clears its surface cache, so the desktop renders every time, no Windows reboot needed. (This was the only recovery before `--fork-workers`; a server-side fresh-surface-id workaround was tried earlier but only mitigated it unreliably, so it was dropped.)
 - H.264 is **macOS-only** (VideoToolbox) and still maturing — bitrate and keyframe behavior are tunable (above), but dirty-region *encoding* is not yet done: every frame is a full encode (dirty rects are used only to time on-demand keyframes, not to encode sub-regions). H.264's own inter-prediction keeps unchanged regions cheap regardless.
 
 ### Color conversion: scalar vs vImage

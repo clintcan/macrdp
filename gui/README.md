@@ -66,10 +66,12 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
   **⚠️ error** line appears when stopped and the log shows a known failure (login
   failed / port in use / crash). The menu-bar icon dims when not running.
 - **Set Up Remote Desktop** — one click applies the recommended config (virtual
-  display + detach + H.264) and starts. Shown until that config is active.
+  display + detach + H.264 + app-switcher HUD + per-connection workers) and
+  starts. Shown until that config is active.
 - **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
   `bootout` the agent (with EIO retry).
-- **Options** — H.264 / AAC / HiDPI / **Un-minimize on Cmd+Tab** checkmarks, plus **Allow network
+- **Options** — H.264 / AAC / HiDPI / **Un-minimize on Cmd+Tab** / **App-switcher HUD** /
+  **Per-connection workers (reconnect fix)** checkmarks, plus **Allow network
   connections** (flips `BIND` between `127.0.0.1` and `0.0.0.0`, preserving the
   port, with a confirmation before exposing to the LAN); shows the current
   listening address. All write `config.env` and live-`kickstart` if running.
