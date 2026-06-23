@@ -1311,6 +1311,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_SMARTCARD_REDIRECTION", false) {
         argv.push("--enable-smartcard-redirection".into());
     }
+    if on("FORK_WORKERS", false) {
+        argv.push("--fork-workers".into());
+    }
     if on("VIRTUAL_DISPLAY", false) {
         argv.push("--virtual-display".into());
         argv.push("--width".into());
@@ -1436,6 +1439,15 @@ async fn async_main() -> Result<()> {
         } else {
             BlankMode::None
         };
+        // Prevent sleep at the SUPERVISOR level (one `caffeinate -w <supervisor
+        // pid>` for the whole session) rather than per-worker — an always-on
+        // headless server must stay awake across the brief gaps between worker
+        // reconnects too, and the workers skip their own prevent_sleep (gated
+        // below on worker_fd). caffeinate exits with the supervisor.
+        #[cfg(target_os = "macos")]
+        if !args.allow_sleep {
+            prevent_sleep();
+        }
         return run_fork_supervisor(args.bind, vd, blank).await;
     }
     if let Some(fd) = worker_fd {
@@ -1532,7 +1544,10 @@ async fn async_main() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        if !args.allow_sleep {
+        // Fork-workers: the SUPERVISOR already holds a `caffeinate` for the whole
+        // session, so workers skip their own (avoids per-reconnect caffeinate
+        // churn). Single-process (worker_fd None, non-fork) keeps it.
+        if !args.allow_sleep && worker_fd.is_none() {
             prevent_sleep();
         }
         ensure_screen_recording_access();
@@ -2127,6 +2142,7 @@ mod config_tests {
              VD_WIDTH=2560\n\
              VD_HEIGHT=1440\n\
              PRIMARY_MODE=detach\n\
+             FORK_WORKERS=1\n\
              EXTRA_FLAGS=\"--fps 30\"\n",
         );
         let args = args_from_config(&path).unwrap();
@@ -2143,6 +2159,7 @@ mod config_tests {
         assert_eq!(args.height, Some(1440));
         assert!(args.detach_primary);
         assert!(!args.capture_primary);
+        assert!(args.fork_workers);
         // USE_KEYCHAIN defaults on (matches the old wrapper).
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
@@ -2159,6 +2176,7 @@ mod config_tests {
         assert!(args.keychain);
         assert!(!args.virtual_display);
         assert!(!args.enable_h264);
+        assert!(!args.fork_workers);
     }
 
     #[test]
