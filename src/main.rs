@@ -566,6 +566,18 @@ struct Args {
 /// a process as a worker (survives `--config` re-expansion, unlike a CLI flag).
 const WORKER_FD_ENV: &str = "MACRDP_WORKER_FD";
 
+/// Max time the supervisor waits for the previous worker to fully exit before
+/// spawning the next one (see `run_fork_supervisor`). Bounds the rare case
+/// where an old connection lingers, so a reconnect can't hang indefinitely.
+const WORKER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// After the previous worker process dies, give ScreenCaptureKit's capture
+/// daemon a beat to release the capture slot before the next worker opens its
+/// own SCStream. Process death frees the client side synchronously, but the SCK
+/// server side can lag briefly — without this settle, a fast reconnect's new
+/// worker starts capturing into a not-yet-released slot and renders blank.
+const WORKER_SCK_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The `--fork-workers` supervisor: bind the listen address, then for every
 /// inbound connection `fork+exec` a fresh copy of this binary as a worker,
 /// handing it the already-accepted socket fd. The supervisor itself does NO
@@ -595,6 +607,16 @@ async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
         "fork-workers supervisor listening — spawning a fresh worker process per connection (PoC)"
     );
 
+    // The handle to the most-recently-spawned worker. macrdp mirror-primary is
+    // inherently single-session, so we serialize: before spawning the next
+    // worker we wait for the previous one to fully exit (+ a short SCK settle),
+    // guaranteeing the old capture stream is released before the new worker
+    // opens its own. This kills the intermittent reconnect-blank that remained
+    // after fixing the worker to process::exit — a fast reconnect could still
+    // overlap the new worker's capture with the dying worker's not-yet-released
+    // SCStream.
+    let mut prev_worker: Option<std::process::Child> = None;
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -603,6 +625,32 @@ async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
                 continue;
             }
         };
+
+        // Drain the previous worker before this connection captures.
+        if let Some(prev) = prev_worker.take() {
+            let prev_pid = prev.id();
+            let waited = tokio::time::timeout(
+                WORKER_WAIT_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    let mut prev = prev;
+                    let _ = prev.wait();
+                }),
+            )
+            .await;
+            if waited.is_err() {
+                // Timed out: the old connection is still alive. The detached
+                // spawn_blocking keeps running and reaps it; proceed anyway so a
+                // genuinely stuck old session can't wedge reconnects forever.
+                warn!(
+                    worker_pid = prev_pid,
+                    "previous worker still alive after wait timeout; spawning next anyway"
+                );
+            } else {
+                debug!(worker_pid = prev_pid, "previous worker exited; capture slot freed");
+            }
+            // Let SCK's daemon release the capture slot before the next SCStream.
+            tokio::time::sleep(WORKER_SCK_SETTLE).await;
+        }
         // Take ownership of the raw fd and stop tokio/std from closing it; the
         // child inherits it across fork, and we close the parent's copy after
         // spawn. `into_std` then `into_raw_fd` detaches it from Rust's RAII.
@@ -641,19 +689,10 @@ async fn run_fork_supervisor(bind: SocketAddr) -> Result<()> {
                     fd,
                     "spawned worker process for connection"
                 );
-                // Reap the child so it doesn't become a zombie when the
-                // connection ends. `wait` is blocking; do it off the runtime.
-                tokio::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let mut child = child;
-                        let status = child.wait();
-                        (pid, status)
-                    })
-                    .await
-                    .map(|(pid, status)| {
-                        debug!(worker_pid = pid, ?status, "worker process exited");
-                    });
-                });
+                // Hold the child so the NEXT accept waits for it to exit before
+                // spawning (the serialization above) — that wait is also what
+                // reaps it, so it never becomes a lingering zombie.
+                prev_worker = Some(child);
             }
             Err(e) => error!(error = ?e, "failed to spawn worker process"),
         }
