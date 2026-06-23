@@ -149,7 +149,8 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   app-switcher HUD); workers are per-connection. Works
                           #   mirror-primary or with --virtual-display (+ optional
                           #   --capture-primary/--detach-primary). Smart-card
-                          #   redirection under it is UNVERIFIED (warns at startup).
+                          #   redirection works under it too (per-connection
+                          #   :40242 bridge; verified incl. reconnect).
                           #   macOS-only. See the H.264 reconnect-blank quirk note.
 --cert-dir PATH           # default ~/Library/Application Support/macrdp
 ```

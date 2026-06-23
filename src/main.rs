@@ -1438,16 +1438,16 @@ async fn async_main() -> Result<()> {
             ));
         }
         if args.enable_smartcard_redirection {
-            // Not gated off (it may work — workers are serialized so only one
-            // binds :40242 at a time), but it's UNVERIFIED under fork: the
-            // smart-card bridge is per-connection (the card lives on the client,
-            // the bridge talks to the live worker's RdpdrHandle), so the
-            // supervisor can't own it, and slotd's reconnect behavior across the
-            // worker boundary hasn't been validated with real hardware.
-            warn!(
-                "--enable-smartcard-redirection with --fork-workers is UNVERIFIED \
-                 (per-connection :40242 bridge; slotd reconnect across workers \
-                 untested). It may work or misbehave — verify with your reader."
+            // Smart-card redirection is per-connection under --fork-workers: the
+            // bridge can't be supervisor-owned (the card lives on the client and
+            // the bridge talks to the live worker's RdpdrHandle), so each worker
+            // binds :40242 for its own connection. Verified end-to-end (establish
+            // / list / get-status+ATR / connect / transmit) including reconnect —
+            // slotd cleanly re-attaches to the fresh worker — so this is just an
+            // informational note, not a warning.
+            info!(
+                "smart-card redirection runs per-connection under --fork-workers \
+                 (the :40242 bridge re-binds in each worker); verified incl. reconnect."
             );
         }
         let vd = if args.virtual_display {
