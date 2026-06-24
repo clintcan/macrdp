@@ -54,6 +54,12 @@ pub struct Acceptor {
     /// `BasicSettingsWaitInitial` and surfaced on `AcceptorResult` so the
     /// server can serve the client's keyboard layout. 0 = unknown / not sent.
     client_keyboard_layout: u32,
+    /// (vendored) The client's announced multitransport support flags
+    /// (MS-RDPEMT) from its GCC MultiTransportChannelData block, captured in
+    /// `BasicSettingsWaitInitial` and surfaced on `AcceptorResult` so the
+    /// server can decide whether to offer a UDP transport. Empty if the client
+    /// sent no multitransport block.
+    client_multitransport: gcc::MultiTransportFlags,
 }
 
 #[derive(Debug)]
@@ -67,6 +73,10 @@ pub struct AcceptorResult {
     /// (vendored) The client's announced keyboard-layout identifier (KLID)
     /// from its GCC Client Core Data; 0 if the client didn't send one.
     pub keyboard_layout: u32,
+    /// (vendored) The client's announced multitransport (MS-RDPEMT) support
+    /// flags from its GCC MultiTransportChannelData block; empty if the client
+    /// sent no multitransport block.
+    pub multitransport_flags: gcc::MultiTransportFlags,
     /// Credentials received from the client during SecureSettingsExchange.
     ///
     /// Present for TLS-mode connections where the client sends credentials
@@ -99,6 +109,7 @@ impl Acceptor {
             reactivation: false,
             honor_client_desktop_size: false,
             client_keyboard_layout: 0,
+            client_multitransport: gcc::MultiTransportFlags::empty(),
         }
     }
 
@@ -150,6 +161,7 @@ impl Acceptor {
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             client_keyboard_layout: consumed.client_keyboard_layout,
+            client_multitransport: consumed.client_multitransport,
         })
     }
 
@@ -205,6 +217,7 @@ impl Acceptor {
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
                 keyboard_layout: self.client_keyboard_layout,
+                multitransport_flags: self.client_multitransport,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -464,6 +477,16 @@ impl Sequence for Acceptor {
                 // the server can serve a non-US layout. Always recorded (it's
                 // free); whether to act on it is the server's choice.
                 self.client_keyboard_layout = gcc_blocks.core.keyboard_layout;
+
+                // (vendored) Capture the client's multitransport (MS-RDPEMT)
+                // support flags so the server can decide whether to offer a UDP
+                // transport. Always recorded (it's free); whether to act on it
+                // is the server's choice. Empty if the client sent no block.
+                self.client_multitransport = gcc_blocks
+                    .multi_transport_channel
+                    .as_ref()
+                    .map(|m| m.flags)
+                    .unwrap_or_else(gcc::MultiTransportFlags::empty);
 
                 // (vendored) Adopt the client's requested desktop size from
                 // its Client Core Data before the server's Demand Active is

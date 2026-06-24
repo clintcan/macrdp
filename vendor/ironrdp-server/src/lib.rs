@@ -18,6 +18,8 @@ mod gfx;
 mod handler;
 #[cfg(feature = "helper")]
 mod helper;
+#[cfg(feature = "multitransport")]
+mod multitransport;
 mod rdpdr;
 mod server;
 mod sound;
@@ -33,6 +35,8 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+#[cfg(feature = "multitransport")]
+pub use multitransport::MultitransportProvider;
 pub use rdpdr::{
     AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrHandle, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler,
     RdpdrServerMessage, RdpdrStatus, SCARD_EJECT_CARD, SCARD_LEAVE_CARD, SCARD_RESET_CARD, SCARD_SHARE_DIRECT,

@@ -226,3 +226,32 @@ AND released — #1276 landing is NOT sufficient.
     upstreamable alongside the acceptor change. Verified live: sdl-freerdp
     `/kbd:layout:0x040C` → server logs `client keyboard layout announced
     klid=1036`, input handler logs `auto-selected … layout=com.apple.keylayout.French`.
+
+(12) RDP UDP multitransport (MS-RDPEMT) server support — **M1: negotiation only**
+    (NOT upstreamed; added 2026-06-25; behind the new `multitransport` cargo
+    feature, default OFF so the standard build is byte-identical; pairs with
+    `vendor/ironrdp-acceptor` divergence (3)). New `src/multitransport/mod.rs`
+    defines the `MultitransportProvider` trait (M1: one method,
+    `requested_protocol()`) + `MigrationState`. `RdpServer` gains
+    `multitransport: Option<Box<dyn MultitransportProvider>>` (setter
+    `set_multitransport_provider`, mirroring the handle-setter pattern) and a
+    per-connection `multitransport_migration: Option<MigrationState>`. In
+    `client_accepted` (initial accept only, not reactivation),
+    `maybe_offer_multitransport` sends a `MultitransportRequestPdu`
+    (`UdpFecR`/reliable) on the IO channel via a `SendDataIndication`
+    (BasicSecurityHeader-wrapped; NOT a ShareControl PDU — framed like
+    `encode_share_data_pdu` minus the ShareControl/ShareData wrapping) when the
+    client advertised `TRANSPORT_TYPE_UDP_FECR` + `SOFT_SYNC_TCP_TO_UDP`
+    (from acceptor divergence (3)). `handle_io_channel_data` tries `ShareControl`
+    decode first and, on failure, decodes a `MultitransportResponsePdu`
+    (re-validates the `TRANSPORT_RSP` flag) → `handle_multitransport_response`.
+    **M1 has NO UDP listener**: the client's out-of-band UDP attempt times out
+    and it reports `E_ABORT`, and the session continues on TCP unchanged — this
+    proves the negotiation/framing contract + graceful fallback before any
+    socket code. The negotiation PDUs (`MultitransportRequest/ResponsePdu`,
+    `RequestedProtocol`) and GCC `MultiTransportFlags` already exist in
+    `ironrdp-pdu` (unused upstream); only the server-side wiring is new. Later
+    milestones add `listener`/`session`/`router`/`migration` submodules (the UDP
+    transport + EGFX channel migration) and grow the trait. Feature-off path is
+    cfg-split to keep the original `?`-based decode byte-identical. See
+    `docs/rdp-udp-multitransport-feasibility.md` (the M1→M5 plan).

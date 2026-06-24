@@ -26,6 +26,10 @@ rayon = ["dep:rayon"]
 qoi = ["dep:qoicoubeh", "ironrdp-pdu/qoi"]
 qoiz = ["dep:zstd-safe", "qoi", "ironrdp-pdu/qoiz"]
 egfx = ["dep:ironrdp-egfx"]
+# (vendored) RDP UDP multitransport (MS-RDPEMT) server support. Default off so
+# the standard build is byte-identical. M1 only performs the negotiation
+# handshake (Initiate Request -> Response) and always continues on TCP.
+multitransport = []
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at any time.

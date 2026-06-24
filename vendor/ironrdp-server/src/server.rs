@@ -332,6 +332,17 @@ pub struct RdpServer {
     /// `MacInputHandler`) holds a clone and auto-selects a matching layout, so
     /// non-US clients type correctly with no manual configuration. 0 = unknown.
     keyboard_layout: Option<Arc<AtomicU32>>,
+    /// (vendored) Optional UDP-multitransport provider (MS-RDPEMT). When set,
+    /// the server offers an auxiliary UDP transport to clients that advertise
+    /// support in their GCC MultiTransportChannelData block. M1: negotiation
+    /// only (no UDP listener); see `src/multitransport/`.
+    #[cfg(feature = "multitransport")]
+    multitransport: Option<Box<dyn crate::multitransport::MultitransportProvider>>,
+    /// (vendored) Per-connection multitransport negotiation state (the issued
+    /// `request_id` + cookie) used to match the client's
+    /// `MultitransportResponsePdu`. Reset every connection in `client_accepted`.
+    #[cfg(feature = "multitransport")]
+    multitransport_migration: Option<crate::multitransport::MigrationState>,
 }
 
 #[derive(Debug)]
@@ -430,6 +441,10 @@ impl RdpServer {
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
             honor_client_desktop_size: false,
+            #[cfg(feature = "multitransport")]
+            multitransport: None,
+            #[cfg(feature = "multitransport")]
+            multitransport_migration: None,
         }
     }
 
@@ -484,6 +499,19 @@ impl RdpServer {
     /// called before any client connects.
     pub fn set_keyboard_layout_handle(&mut self, handle: Arc<AtomicU32>) {
         self.keyboard_layout = Some(handle);
+    }
+
+    /// (vendored) Install a UDP-multitransport provider (MS-RDPEMT). When set,
+    /// the server offers an auxiliary UDP transport to clients that advertise
+    /// support in their GCC MultiTransportChannelData block (surfaced by the
+    /// acceptor). M1 performs only the negotiation handshake and always
+    /// continues on TCP. Must be called before any client connects.
+    #[cfg(feature = "multitransport")]
+    pub fn set_multitransport_provider(
+        &mut self,
+        provider: Option<Box<dyn crate::multitransport::MultitransportProvider>>,
+    ) {
+        self.multitransport = provider;
     }
 
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
@@ -1291,6 +1319,123 @@ impl RdpServer {
         state
     }
 
+    /// (vendored, feature=multitransport) Send a Server Initiate Multitransport
+    /// Request (MS-RDPEMT) on the IO channel when a provider is installed and the
+    /// client advertised matching UDP support + soft-sync. M1 has no UDP
+    /// listener, so this only proves the negotiation/framing contract and the
+    /// graceful `E_ABORT` fallback; the session stays on TCP.
+    #[cfg(feature = "multitransport")]
+    async fn maybe_offer_multitransport<W>(
+        &mut self,
+        writer: &mut Framed<W>,
+        io_channel_id: u16,
+        user_channel_id: u16,
+        client_flags: ironrdp_pdu::gcc::MultiTransportFlags,
+    ) -> Result<()>
+    where
+        W: FramedWrite,
+    {
+        use ironrdp_pdu::gcc::MultiTransportFlags;
+        use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+        use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, RequestedProtocol};
+
+        let Some(provider) = self.multitransport.as_ref() else {
+            return Ok(());
+        };
+        let protocol = provider.requested_protocol();
+        let needed = match protocol {
+            RequestedProtocol::UdpFecR => MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR,
+            RequestedProtocol::UdpFecL => MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL,
+        };
+        if !client_flags.contains(needed) || !client_flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP) {
+            debug!(
+                ?protocol,
+                ?client_flags,
+                "not offering multitransport: client lacks the requested UDP transport + soft-sync"
+            );
+            return Ok(());
+        }
+
+        // `request_id` is a process-wide counter; the 16-byte cookie will bind
+        // the future UDP flow to this TCP session. M1 has no listener, so the
+        // cookie is never validated — a deterministic placeholder is fine here.
+        // TODO(M3): generate the cookie from a CSPRNG once the listener exists.
+        static MT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
+        let request_id = MT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let mut cookie = [0u8; 16];
+        for (i, b) in cookie.iter_mut().enumerate() {
+            *b = (request_id.wrapping_mul(2_654_435_761).wrapping_add(i as u32) & 0xff) as u8;
+        }
+
+        let pdu = MultitransportRequestPdu {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::TRANSPORT_REQ,
+            },
+            request_id,
+            requested_protocol: protocol,
+            security_cookie: cookie,
+        };
+        let user_data = encode_vec(&pdu)?.into();
+        let mcs_pdu = SendDataIndication {
+            initiator_id: user_channel_id,
+            channel_id: io_channel_id,
+            user_data,
+        };
+        let data = encode_vec(&X224(mcs_pdu))?;
+        writer.write_all(&data).await?;
+        self.multitransport_migration = Some(crate::multitransport::MigrationState {
+            request_id,
+            cookie,
+            protocol,
+        });
+        debug!(
+            request_id,
+            ?protocol,
+            "sent Server Initiate Multitransport Request (M1: negotiation only; expecting E_ABORT fallback)"
+        );
+        Ok(())
+    }
+
+    /// (vendored, feature=multitransport) Handle the client's Initiate
+    /// Multitransport Response. M1 has no UDP transport, so this only logs the
+    /// outcome and clears the in-flight request; the session stays on TCP.
+    #[cfg(feature = "multitransport")]
+    fn handle_multitransport_response(
+        &mut self,
+        resp: &ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu,
+    ) {
+        match self.multitransport_migration.take() {
+            Some(state) if state.request_id == resp.request_id => {
+                if resp.is_success() {
+                    debug!(
+                        request_id = resp.request_id,
+                        protocol = ?state.protocol,
+                        "multitransport response S_OK (unexpected in M1 with no listener); staying on TCP"
+                    );
+                } else {
+                    debug!(
+                        request_id = resp.request_id,
+                        protocol = ?state.protocol,
+                        hr = format_args!("{:#010x}", resp.hr_response),
+                        "multitransport response: client could not establish UDP; continuing on TCP (expected in M1)"
+                    );
+                }
+            }
+            Some(other) => {
+                let in_flight = other.request_id;
+                self.multitransport_migration = Some(other);
+                warn!(
+                    got = resp.request_id,
+                    in_flight, "multitransport response with mismatched request_id; ignoring"
+                );
+            }
+            None => warn!(
+                request_id = resp.request_id,
+                "multitransport response with no request in flight; ignoring"
+            ),
+        }
+    }
+
     async fn client_accepted<R, W>(
         &mut self,
         reader: &mut Framed<R>,
@@ -1332,6 +1477,22 @@ impl RdpServer {
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
             }
+        }
+
+        // (vendored, feature=multitransport) Offer an auxiliary UDP transport
+        // (MS-RDPEMT) when a provider is installed and the client advertised
+        // matching support. Initial accept only (not a reactivation resize).
+        // M1: negotiation only — no UDP listener, so the client's UDP attempt
+        // times out and it reports E_ABORT; the session continues on TCP.
+        #[cfg(feature = "multitransport")]
+        if !result.reactivation {
+            self.maybe_offer_multitransport(
+                writer,
+                result.io_channel_id,
+                result.user_channel_id,
+                result.multitransport_flags,
+            )
+            .await?;
         }
 
         let mut update_codecs = UpdateEncoderCodecs::new();
@@ -1493,7 +1654,26 @@ impl RdpServer {
     }
 
     async fn handle_io_channel_data(&mut self, data: SendDataRequest<'_>) -> Result<bool> {
+        #[cfg(not(feature = "multitransport"))]
         let control: rdp::headers::ShareControlHeader = decode(data.user_data.as_ref())?;
+        // (vendored, feature=multitransport) The client's Initiate Multitransport
+        // Response rides the IO channel as a BasicSecurityHeader PDU (not a
+        // ShareControl PDU). Try ShareControl first (the common case, and it
+        // validates its pduType so a security-header PDU fails it); only on
+        // failure attempt the response, which re-checks the TRANSPORT_RSP flag.
+        #[cfg(feature = "multitransport")]
+        let control: rdp::headers::ShareControlHeader = match decode(data.user_data.as_ref()) {
+            Ok(control) => control,
+            Err(e) => {
+                if let Ok(resp) = decode::<ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu>(
+                    data.user_data.as_ref(),
+                ) {
+                    self.handle_multitransport_response(&resp);
+                    return Ok(false);
+                }
+                return Err(e.into());
+            }
+        };
 
         match control.share_control_pdu {
             ShareControlPdu::Data(header) => match header.share_data_pdu {

@@ -57,3 +57,19 @@ vendor dir until divergence (1) is upstreamed AND released.
     (1), since exposing core-data fields on `AcceptorResult` is the same shape
     CBenoit floated for the desktop size. See the keyboard-layout quirk note
     in docs/known-quirks.md.
+
+(3) Expose the client's multitransport (MS-RDPEMT) support flags from its GCC
+    MultiTransportChannelData block (NOT upstreamed; added 2026-06-25 for UDP
+    multitransport M1): `Acceptor` gains a private
+    `client_multitransport: gcc::MultiTransportFlags` (captured in
+    `BasicSettingsWaitInitial` alongside (1)/(2), UNCONDITIONALLY — free and
+    harmless; empty if the client sent no block), carried across
+    `new_deactivation_reactivation`, and surfaced as a new
+    `pub multitransport_flags: gcc::MultiTransportFlags` field on
+    `AcceptorResult`. Upstream parses the block into
+    `ClientGccBlocks.multi_transport_channel` and then discards it (only
+    early-capability flags, core size, and keyboard layout are kept). Consumed
+    by `vendor/ironrdp-server` divergence (12), which decides whether to send a
+    Server Initiate Multitransport Request. Purely additive (same shape as (2)),
+    so trivially upstreamable — offer alongside (1)/(2). See the
+    docs/rdp-udp-multitransport-feasibility.md plan.

@@ -25,6 +25,7 @@ mod file_promise_lazy;
 mod h264;
 mod input;
 mod keyboard_layout;
+mod multitransport;
 mod rdpdr;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
@@ -447,6 +448,17 @@ struct Args {
     /// /smartcard). macOS-only.
     #[arg(long)]
     enable_smartcard_redirection: bool,
+
+    /// EXPERIMENTAL (M1, opt-in, default OFF). Offer RDP UDP multitransport
+    /// (MS-RDPEMT) to clients that advertise it. **M1 is negotiation only:**
+    /// the server sends the Initiate Multitransport Request and handles the
+    /// client's response, but there is NO UDP transport yet — the client's UDP
+    /// attempt times out (E_ABORT) and the session continues on TCP, unchanged.
+    /// This exists to prove the negotiation/framing + graceful fallback ahead of
+    /// the UDP data path (later milestones). No reason for end users to enable
+    /// it. macOS-only build; see docs/rdp-udp-multitransport-feasibility.md.
+    #[arg(long)]
+    enable_udp_multitransport: bool,
 
     /// Don't adopt the client's requested desktop resolution. By default —
     /// when mirroring the primary display without --width/--height/--hidpi —
@@ -1336,6 +1348,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_SMARTCARD_REDIRECTION", false) {
         argv.push("--enable-smartcard-redirection".into());
     }
+    if on("ENABLE_UDP_MULTITRANSPORT", false) {
+        argv.push("--enable-udp-multitransport".into());
+    }
     if on("FORK_WORKERS", false) {
         argv.push("--fork-workers".into());
     }
@@ -2069,6 +2084,14 @@ async fn async_main() -> Result<()> {
     // pipeline all read.
     server.set_honor_client_desktop_size(auto_size);
 
+    // EXPERIMENTAL UDP multitransport (MS-RDPEMT) — M1 negotiation only. When
+    // enabled, install the provider so the server offers reliable UDP to clients
+    // that advertise it. There is no UDP transport yet (M1), so the client's UDP
+    // attempt times out and the session continues on TCP. See src/multitransport.rs.
+    if args.enable_udp_multitransport {
+        server.set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
+    }
+
     // ironrdp_server::Credentials holds a plain String, so this copy is
     // outside our control and won't be zeroed when the server shuts down.
     // Our Zeroizing<String> still wipes its own allocation at scope exit.
@@ -2190,6 +2213,7 @@ mod config_tests {
              VD_HEIGHT=1440\n\
              PRIMARY_MODE=detach\n\
              FORK_WORKERS=1\n\
+             ENABLE_UDP_MULTITRANSPORT=1\n\
              EXTRA_FLAGS=\"--fps 30\"\n",
         );
         let args = args_from_config(&path).unwrap();
@@ -2207,6 +2231,7 @@ mod config_tests {
         assert!(args.detach_primary);
         assert!(!args.capture_primary);
         assert!(args.fork_workers);
+        assert!(args.enable_udp_multitransport);
         // USE_KEYCHAIN defaults on (matches the old wrapper).
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
@@ -2224,6 +2249,7 @@ mod config_tests {
         assert!(!args.virtual_display);
         assert!(!args.enable_h264);
         assert!(!args.fork_workers);
+        assert!(!args.enable_udp_multitransport);
     }
 
     #[test]
