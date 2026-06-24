@@ -52,8 +52,13 @@ RDP's generic USB redirection is **MS-RDPEUSB** (RemoteFX USB redirection): raw
 **URB** (USB Request Block) forwarding over a **dynamic virtual channel** (DVC),
 with device add/remove, channel setup, isoch/bulk/interrupt/control transfers, etc.
 
-- **Not in IronRDP.** This would be substantial server-direction vendoring — bigger
-  than the RDPDR / RDPESC work already done.
+- **Server-direction is not in IronRDP** — this would be substantial vendoring,
+  bigger than the RDPDR / RDPESC work already done. (Update 2026-06-25: IronRDP is
+  adding *client*-side RDPEUSB — see [issue #1140 "[ironrdp-client] Wire up
+  RDPEUSB with libusb backend"](https://github.com/Devolutions/IronRDP/issues/1140).
+  That's the consuming/client direction; macrdp would still need the *server*
+  direction, which remains absent. The client work could still be a useful PDU /
+  URB-codec reference if it lands.)
 - **Server-side EUSB is essentially unprecedented.** FreeRDP implements the *client*
   side (`urbdrc`); the server side is normally just Windows' own USB stack. macrdp
   would be charting new ground.
