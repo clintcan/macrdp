@@ -611,12 +611,87 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applyIfRunning()
     }
 
+    /// An attached USB device, for the smart-card trigger picker.
+    struct UsbDevice {
+        let vid: String // "0x2174" (4-digit lowercase hex)
+        let pid: String // "0x2100"
+        let label: String // human-readable name
+    }
+
+    /// Enumerate attached USB devices via `ioreg -a -r -c IOUSBHostDevice`, which
+    /// emits an XML-plist array of device dicts (idVendor/idProduct as decimal
+    /// ints, plus name strings). We deliberately use ioreg, NOT
+    /// `system_profiler SPUSBDataType`: some USB-C devices (e.g. a Transcend
+    /// ESD310C SSD — the dev trigger) are visible in ioreg but never appear in
+    /// the SPUSBDataType tree, so a system_profiler-based picker silently misses
+    /// them. install-ifd-handler.sh's hint dump already uses ioreg for the same
+    /// reason. VID/PID are formatted as the 4-digit lowercase hex the bundle's
+    /// Info.plist wants.
+    func usbDevices() -> [UsbDevice] {
+        let out = run("/usr/sbin/ioreg", ["-a", "-r", "-c", "IOUSBHostDevice"])
+        guard out.code == 0, let data = out.stdout.data(using: .utf8),
+              let list = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil) as? [[String: Any]] else { return [] }
+        func hex4(_ any: Any?) -> String? {
+            // idVendor/idProduct come as NSNumber; tolerate a string too.
+            if let n = any as? Int { return String(format: "0x%04x", n & 0xFFFF) }
+            if let s = any as? String, let n = Int(s) { return String(format: "0x%04x", n & 0xFFFF) }
+            return nil
+        }
+        var devices: [UsbDevice] = []
+        var seen = Set<String>()
+        for it in list {
+            guard let vid = hex4(it["idVendor"]), let pid = hex4(it["idProduct"]) else { continue }
+            let name = (it["USB Product Name"] as? String)
+                ?? (it["IORegistryEntryName"] as? String) ?? "USB device"
+            let man = (it["USB Vendor Name"] as? String) ?? ""
+            let label = (man.isEmpty || name.contains(man)) ? name : "\(name) (\(man))"
+            // De-dupe identical VID/PID (e.g. two of the same stick) by key.
+            let key = "\(vid):\(pid):\(label)"
+            if seen.insert(key).inserted { devices.append(UsbDevice(vid: vid, pid: pid, label: label)) }
+        }
+        return devices
+    }
+
+    enum TriggerChoice {
+        case cancel // abort the install
+        case keepDefault // install, leave the bundle's baked-in trigger
+        case device(vid: String, pid: String) // install, rebind to this device
+    }
+
+    /// Show a native popup of attached USB devices to use as the smart-card load
+    /// trigger (macOS loads the IFD driver only on a USB hotplug whose VID/PID
+    /// match the bundle). Returns the user's choice; "Keep default" leaves the
+    /// trigger unchanged, a device rebinds it via IFD_VID/IFD_PID.
+    func pickUsbTrigger() -> TriggerChoice {
+        let devices = usbDevices()
+        let a = NSAlert()
+        a.messageText = "Choose the USB trigger device"
+        a.informativeText = "macOS loads the smart-card driver only while a USB device with a "
+            + "matching ID is plugged in. Pick the device you'll keep attached as the trigger "
+            + "(any USB stick works), or choose \u{201C}Keep default trigger\u{201D} to leave it "
+            + "unchanged."
+        a.addButton(withTitle: "Install")
+        a.addButton(withTitle: "Cancel")
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26))
+        popup.addItem(withTitle: "Keep default trigger")
+        for d in devices { popup.addItem(withTitle: "\(d.label)  —  \(d.vid):\(d.pid)") }
+        a.accessoryView = popup
+        a.window.initialFirstResponder = popup
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return .cancel }
+        let idx = popup.indexOfSelectedItem
+        if idx <= 0 { return .keepDefault }
+        let d = devices[idx - 1]
+        return .device(vid: d.vid, pid: d.pid)
+    }
+
     /// One-time privileged install of the smart-card IFD handler (the toggle only
     /// flips the server flag; the handler still has to be copied into the system
-    /// drivers dir). Runs macrdp.app's embedded installer, which prompts for admin
-    /// via its own GUI dialog. No USB picker here (no tty when launched from the
-    /// menu) — it uses the bundle's default trigger; advanced users can rebind via
-    /// the CLI installer with IFD_VID/IFD_PID.
+    /// drivers dir). Lets the user pick the USB trigger device from a popup
+    /// (matching the CLI's select-usb-trigger.sh), passes it to the embedded
+    /// installer as IFD_VID/IFD_PID, then runs it (it prompts for admin via its
+    /// own GUI dialog).
     @objc func installSmartcardHandler() {
         func say(_ msg: String, _ info: String) {
             let a = NSAlert()
@@ -636,10 +711,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 "This macrdp.app build doesn't bundle the smart-card handler installer.")
             return
         }
-        let out = run("/bin/bash", [installer])
+        var env: [String: String] = [:]
+        var picked: String?
+        switch pickUsbTrigger() {
+        case .cancel: return
+        case .keepDefault: break
+        case let .device(vid, pid):
+            env["IFD_VID"] = vid
+            env["IFD_PID"] = pid
+            picked = "\(vid):\(pid)"
+        }
+        let out = run("/bin/bash", [installer], env: env)
         if out.code == 0 {
+            let trigger = picked.map { "the chosen trigger device (\($0))" } ?? "the USB trigger device"
             say("Smart-card handler installed",
-                "Unplug/replug the USB trigger device so macOS loads the driver, and make sure "
+                "Unplug/replug \(trigger) so macOS loads the driver, and make sure "
                     + "the connecting client redirects its smart card.")
         } else {
             say("Install failed",
@@ -854,10 +940,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Process helper
 
-    func run(_ path: String, _ args: [String]) -> (code: Int32, stdout: String) {
+    func run(_ path: String, _ args: [String], env: [String: String]? = nil)
+        -> (code: Int32, stdout: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
+        if let env = env, !env.isEmpty {
+            var merged = ProcessInfo.processInfo.environment
+            for (k, v) in env { merged[k] = v }
+            p.environment = merged
+        }
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe

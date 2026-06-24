@@ -71,10 +71,17 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
 - **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
   `bootout` the agent (with EIO retry).
 - **Options** — H.264 / AAC / HiDPI / **Un-minimize on Cmd+Tab** / **App-switcher HUD** /
-  **Per-connection workers (reconnect fix)** checkmarks, plus **Allow network
-  connections** (flips `BIND` between `127.0.0.1` and `0.0.0.0`, preserving the
-  port, with a confirmation before exposing to the LAN); shows the current
-  listening address. All write `config.env` and live-`kickstart` if running.
+  **Per-connection workers (reconnect fix)** checkmarks, **Drive / Smart-card
+  redirection** toggles, plus **Allow network connections** (flips `BIND` between
+  `127.0.0.1` and `0.0.0.0`, preserving the port, with a confirmation before
+  exposing to the LAN); shows the current listening address. All write
+  `config.env` and live-`kickstart` if running.
+- **Install smart-card handler…** — one-time privileged install of the PC/SC IFD
+  handler (the redirection toggle only flips the server flag). Pops up a list of
+  your **attached USB devices** to pick the load trigger (macOS loads the driver
+  only on a USB hotplug matching its VID/PID), passes the choice to the embedded
+  installer as `IFD_VID`/`IFD_PID`, and runs it (one admin prompt). Choose
+  *Keep default trigger* to leave the bundle's baked-in IDs.
 - **Display** — **Virtual display (headless)** toggle, a **Primary screen** radio
   (`PRIMARY_MODE`: *Keep local screen on* / *Detach — move apps to remote* /
   *Blank — keep apps on Mac*), and a **Virtual display resolution** picker

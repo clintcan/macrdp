@@ -15,38 +15,43 @@
 # So install-ifd-handler.sh can do:  sel="$(select-usb-trigger.sh)" && bind $sel
 set -euo pipefail
 
-# Enumerate USB devices via system_profiler JSON (VID/PID already come as 0x..
-# strings there; ioreg reports them in decimal). Flatten the hub tree, keep only
-# leaves that expose both a hex vendor_id and a product_id. Emits TSV:
+# Enumerate USB devices via `ioreg -a` (an XML plist; idVendor/idProduct come as
+# decimal ints). Keep only entries that expose both. Emits TSV:
 #   <vid>\t<pid>\t<label>
+#
+# We use ioreg, NOT `system_profiler SPUSBDataType`: some USB-C devices (e.g. a
+# Transcend ESD310C SSD — the dev trigger default) are visible in ioreg but never
+# appear in the SPUSBDataType tree, so a system_profiler-based list silently
+# misses them. The GUI controller's picker uses ioreg for the same reason.
 list_devices() {
     # NOTE: `python3 -c`, NOT `python3 - <<HEREDOC` — a heredoc would BECOME
-    # python's stdin, so json.load(sys.stdin) would read the script instead of
-    # the piped JSON. With -c the pipe stays stdin. The python body is single-
-    # quote-safe (only double quotes / f-strings inside). Each match is printed
-    # newline-terminated so bash `while read` doesn't drop the last line.
-    system_profiler -json SPUSBDataType 2>/dev/null | /usr/bin/python3 -c '
-import json, sys, re
-def walk(items, out):
-    for it in items or []:
-        pid = it.get("product_id", "")
-        m = re.search(r"0x[0-9a-fA-F]+", it.get("vendor_id", ""))
-        if pid.startswith("0x") and m:
-            name = it.get("_name", "?")
-            man = it.get("manufacturer", "")
-            label = name if (not man or man in name) else f"{name} ({man})"
-            vid = "0x%04x" % int(m.group(0), 16)   # 4-digit lc hex, as Info.plist wants
-            pidn = "0x%04x" % int(pid, 16)
-            out.append(f"{vid}\t{pidn}\t{label}")
-        walk(it.get("_items"), out)
-out = []
+    # python's stdin, so plistlib would read the script instead of the piped
+    # plist. With -c the pipe stays stdin. The python body is single-quote-safe
+    # (only double quotes / f-strings inside). Each match is printed newline-
+    # terminated so bash `while read` doesn't drop the last line.
+    ioreg -a -r -c IOUSBHostDevice 2>/dev/null | /usr/bin/python3 -c '
+import sys, plistlib
 try:
-    d = json.load(sys.stdin)
+    devs = plistlib.loads(sys.stdin.buffer.read())
 except Exception:
-    d = {}
-walk(d.get("SPUSBDataType"), out)
-for line in out:
-    print(line)
+    devs = []
+if not isinstance(devs, list):
+    devs = [devs] if devs else []
+seen = set()
+for it in devs:
+    v = it.get("idVendor"); p = it.get("idProduct")
+    if not isinstance(v, int) or not isinstance(p, int):
+        continue
+    name = it.get("USB Product Name") or it.get("IORegistryEntryName") or "USB device"
+    man = it.get("USB Vendor Name") or ""
+    label = name if (not man or man in name) else f"{name} ({man})"
+    vid = "0x%04x" % (v & 0xFFFF)   # 4-digit lc hex, as Info.plist wants
+    pidn = "0x%04x" % (p & 0xFFFF)
+    key = (vid, pidn, label)
+    if key in seen:
+        continue
+    seen.add(key)
+    print(f"{vid}\t{pidn}\t{label}")
 ' 2>/dev/null || true
 }
 
