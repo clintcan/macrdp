@@ -29,14 +29,19 @@ bitflags! {
         const CN = 0x0020;
         /// RDPUDP_FLAG_CWR — congestion window reset.
         const CWR = 0x0040;
-        /// RDPUDP_FLAG_SYNLOSSY — connection does not require retransmission.
-        const SYN_LOSSY = 0x0080;
-        /// RDPUDP_FLAG_ACK_DELAYED — the ACK was delayed.
-        const ACK_DELAYED = 0x0100;
+        /// RDPUDP_FLAG_SACK_OPTION — not used (per spec).
+        const SACK_OPTION = 0x0080;
+        /// RDPUDP_FLAG_ACK_OF_ACKS — an RDPUDP_ACK_OF_ACKVECTOR_HEADER is present.
+        const ACK_OF_ACKS = 0x0100;
+        /// RDPUDP_FLAG_SYNLOSSY — connection does not require persistent retransmits.
+        const SYN_LOSSY = 0x0200;
+        /// RDPUDP_FLAG_ACKDELAYED — the receiver delayed generating the ACK
+        /// (do not use it for RTT estimation).
+        const ACK_DELAYED = 0x0400;
         /// RDPUDP_FLAG_CORRELATION_ID — a correlation-id payload is present.
-        const CORRELATION_ID = 0x0200;
+        const CORRELATION_ID = 0x0800;
         /// RDPUDP_FLAG_SYNEX — a SYNDATAEX payload is present.
-        const SYNEX = 0x0400;
+        const SYNEX = 0x1000;
     }
 }
 
@@ -319,6 +324,125 @@ impl Decode<'_> for SourcePayloadHeader {
     }
 }
 
+/// VECTOR_ELEMENT_STATE (MS-RDPEUDP 2.2.1.1) — the state of a run of datagrams
+/// in the receiver's queue, carried in the top 2 bits of an ACK vector element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorElementState {
+    /// DATAGRAM_RECEIVED (0).
+    Received,
+    /// DATAGRAM_RESERVED_1 (1).
+    Reserved1,
+    /// DATAGRAM_RESERVED_2 (2).
+    Reserved2,
+    /// DATAGRAM_NOT_YET_RECEIVED (3).
+    NotYetReceived,
+}
+
+impl VectorElementState {
+    fn from_bits(v: u8) -> Self {
+        match v & 0b11 {
+            0 => Self::Received,
+            1 => Self::Reserved1,
+            2 => Self::Reserved2,
+            _ => Self::NotYetReceived,
+        }
+    }
+
+    fn to_bits(self) -> u8 {
+        match self {
+            Self::Received => 0,
+            Self::Reserved1 => 1,
+            Self::Reserved2 => 2,
+            Self::NotYetReceived => 3,
+        }
+    }
+}
+
+/// One run in the ACK vector: a `state` shared by `run_length` consecutive
+/// datagrams. One byte on the wire: `(state << 6) | run_length` — 2-bit state in
+/// the high bits, 6-bit length in the low bits (MS-RDPEUDP "ACK Vector Element").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckVectorElement {
+    pub state: VectorElementState,
+    /// Run length, 0..=63 (6 bits).
+    pub run_length: u8,
+}
+
+impl AckVectorElement {
+    fn to_byte(self) -> u8 {
+        (self.state.to_bits() << 6) | (self.run_length & 0x3f)
+    }
+
+    fn from_byte(b: u8) -> Self {
+        Self {
+            state: VectorElementState::from_bits(b >> 6),
+            run_length: b & 0x3f,
+        }
+    }
+}
+
+/// RDPUDP_ACK_VECTOR_HEADER (MS-RDPEUDP 2.2.2.7) — the selective-ACK vector,
+/// present when [`FecFlags::ACK`] is set. Run-length-encoded datagram states for
+/// the window after `FecHeader::snd_source_ack`. On the wire, `uAckVectorSize`
+/// (the element count) plus the element bytes are zero-padded to a multiple of
+/// 4 bytes (confirmed against the spec's ACK-packet capture).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckVectorHeader {
+    pub elements: Vec<AckVectorElement>,
+}
+
+impl AckVectorHeader {
+    const NAME: &'static str = "RDPUDP_ACK_VECTOR_HEADER";
+    pub const FIXED_PART_SIZE: usize = 2; // uAckVectorSize
+
+    /// Total on-wire size for `n` elements: `uAckVectorSize` + elements, padded
+    /// up to a 4-byte multiple.
+    fn padded_len(n: usize) -> usize {
+        (Self::FIXED_PART_SIZE + n).next_multiple_of(4)
+    }
+}
+
+impl Encode for AckVectorHeader {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        let n = self.elements.len();
+        let total = Self::padded_len(n);
+        ensure_size!(in: dst, size: total);
+        dst.write_u16_be(n as u16); // uAckVectorSize
+        for e in &self.elements {
+            dst.write_u8(e.to_byte());
+        }
+        for _ in 0..(total - Self::FIXED_PART_SIZE - n) {
+            dst.write_u8(0); // zero-padding to the 4-byte boundary
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        Self::padded_len(self.elements.len())
+    }
+}
+
+impl Decode<'_> for AckVectorHeader {
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        ensure_fixed_part_size!(in: src);
+        let n = usize::from(src.read_u16_be());
+        ensure_size!(in: src, size: n);
+        let mut elements = Vec::with_capacity(n);
+        for _ in 0..n {
+            elements.push(AckVectorElement::from_byte(src.read_u8()));
+        }
+        // Consume the zero-padding to the 4-byte boundary.
+        let pad = Self::padded_len(n) - Self::FIXED_PART_SIZE - n;
+        ensure_size!(in: src, size: pad);
+        let _ = src.read_slice(pad);
+        Ok(Self { elements })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ironrdp_core::{decode, encode_vec};
@@ -407,6 +531,97 @@ mod tests {
         assert_eq!(bytes.len(), 32);
         assert_eq!(&bytes[16..], &[0u8; 16], "uReserved must be zero");
         assert_eq!(decode::<CorrelationId>(&bytes).unwrap(), c);
+    }
+
+    #[test]
+    fn fec_flag_values_match_spec() {
+        // Authoritative values from MS-RDPEUDP 2.2.2.1 (uFlags). Locks the M2a
+        // correction (0x0080+ were wrong from memory).
+        assert_eq!(FecFlags::SYN.bits(), 0x0001);
+        assert_eq!(FecFlags::FIN.bits(), 0x0002);
+        assert_eq!(FecFlags::ACK.bits(), 0x0004);
+        assert_eq!(FecFlags::DATA.bits(), 0x0008);
+        assert_eq!(FecFlags::FEC.bits(), 0x0010);
+        assert_eq!(FecFlags::CN.bits(), 0x0020);
+        assert_eq!(FecFlags::CWR.bits(), 0x0040);
+        assert_eq!(FecFlags::SACK_OPTION.bits(), 0x0080);
+        assert_eq!(FecFlags::ACK_OF_ACKS.bits(), 0x0100);
+        assert_eq!(FecFlags::SYN_LOSSY.bits(), 0x0200);
+        assert_eq!(FecFlags::ACK_DELAYED.bits(), 0x0400);
+        assert_eq!(FecFlags::CORRELATION_ID.bits(), 0x0800);
+        assert_eq!(FecFlags::SYNEX.bits(), 0x1000);
+    }
+
+    #[test]
+    fn fec_header_ack_packet_flags_match_spec_capture() {
+        // MS-RDPEUDP "ACK Packet" example FEC header: d6 cf 0a b8 04 00 01 0c
+        // → uFlags 0x010c = ACK_OF_ACKS | DATA | ACK.
+        let bytes = [0xd6, 0xcf, 0x0a, 0xb8, 0x04, 0x00, 0x01, 0x0c];
+        let h = decode::<FecHeader>(&bytes).unwrap();
+        assert_eq!(
+            h.flags,
+            FecFlags::ACK_OF_ACKS | FecFlags::DATA | FecFlags::ACK
+        );
+    }
+
+    #[test]
+    fn ack_vector_round_trips_and_pads_to_4_bytes() {
+        for elems in [
+            vec![],
+            vec![AckVectorElement {
+                state: VectorElementState::Received,
+                run_length: 4,
+            }],
+            vec![
+                AckVectorElement {
+                    state: VectorElementState::Received,
+                    run_length: 10,
+                },
+                AckVectorElement {
+                    state: VectorElementState::NotYetReceived,
+                    run_length: 2,
+                },
+            ],
+            vec![
+                AckVectorElement {
+                    state: VectorElementState::Received,
+                    run_length: 1,
+                },
+                AckVectorElement {
+                    state: VectorElementState::NotYetReceived,
+                    run_length: 1,
+                },
+                AckVectorElement {
+                    state: VectorElementState::Received,
+                    run_length: 1,
+                },
+            ],
+        ] {
+            let h = AckVectorHeader { elements: elems };
+            let bytes = encode_vec(&h).unwrap();
+            assert_eq!(bytes.len() % 4, 0, "padded to a 4-byte multiple");
+            assert_eq!(decode::<AckVectorHeader>(&bytes).unwrap(), h);
+        }
+    }
+
+    #[test]
+    fn ack_vector_matches_spec_capture() {
+        // From the "ACK Packet" capture: 00 01 04 00 (size=1, element 0x04
+        // = state Received + run length 4, then 1 byte of padding).
+        let bytes = [0x00, 0x01, 0x04, 0x00];
+        let h = decode::<AckVectorHeader>(&bytes).unwrap();
+        assert_eq!(
+            h.elements,
+            vec![AckVectorElement {
+                state: VectorElementState::Received,
+                run_length: 4
+            }]
+        );
+        assert_eq!(
+            encode_vec(&h).unwrap(),
+            bytes,
+            "re-encodes byte-identically incl. padding"
+        );
     }
 
     #[test]
