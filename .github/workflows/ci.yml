@@ -63,6 +63,17 @@ jobs:
           RUSTFLAGS: ''
         run: cargo test --locked
 
+      # vendor/ironrdp-rdpeudp is a STANDALONE crate (not a workspace member, so
+      # the root cargo test/fmt don't reach it). It's platform-independent
+      # (sans-I/O wire codecs + reliability state machine), so test + fmt-check
+      # it here. It resolves ironrdp-core via its own [patch.crates-io].
+      - name: Test ironrdp-rdpeudp (standalone vendored crate)
+        env:
+          RUSTFLAGS: ''
+        run: |
+          cargo fmt --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml -- --check
+          cargo test --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml
+
   test-macos:
     name: test (macos)
     runs-on: macos-14   # Apple Silicon

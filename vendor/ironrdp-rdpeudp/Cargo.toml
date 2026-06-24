@@ -1,0 +1,26 @@
+[package]
+name = "ironrdp-rdpeudp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "MS-RDPEUDP / MS-RDPEUDP2 wire types + reliability state machine for RDP UDP multitransport (macrdp, candidate for upstream)"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+# Resolved to the same git-pinned IronRDP rev as the rest of macrdp: in the
+# macrdp build, the ROOT Cargo.toml's [patch.crates-io] redirects this; built
+# STANDALONE (cargo test --manifest-path …) the [patch] block below applies. The
+# two resolve to the same rev, so the crate behaves identically either way.
+# `alloc` gives encode_vec / decode (used by the codecs + tests). macrdp's build
+# enables it transitively; the standalone build needs it explicitly.
+ironrdp-core = { version = "0.1", features = ["alloc"] }
+bitflags = "2"
+
+[patch.crates-io]
+# Honored only when this crate is built as the top-level (standalone tests).
+# Ignored when it's a path dependency of macrdp (the root's [patch] wins). Keep
+# the rev in sync with the root Cargo.toml.
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
