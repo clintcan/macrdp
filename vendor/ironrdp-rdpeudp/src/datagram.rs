@@ -254,4 +254,70 @@ mod tests {
         assert_eq!(back, d);
         assert!(back.source.is_none() && back.syn.is_none());
     }
+
+    /// Decode a **real Microsoft RDP client's SYN** captured against macrdp
+    /// (`docs/.../mstscpcap`, UDP→:3390). This is the strongest validation of the
+    /// v1 SYN / CORRELATION_ID / SYNEX codecs — real client bytes, not a
+    /// hand-built struct — and it confirms the `FecFlags` correction
+    /// (`0x1801 = SYN|CORRELATION_ID|SYNEX`) and that the client negotiates
+    /// `uUdpVer = V3` (EUDP2) with a SHA-256 `cookieHash` (i.e. it received and
+    /// acted on macrdp's Initiate Multitransport Request).
+    #[test]
+    fn decodes_real_client_syn_capture() {
+        // The first 84 bytes of the captured 1232-byte UDP payload (the rest is
+        // zero-padding): FEC(8) + SYNDATA(8) + CORRELATION_ID(32) + SYNEX(4+32).
+        #[rustfmt::skip]
+        let bytes: [u8; 84] = [
+            // FEC header
+            0xff, 0xff, 0xff, 0xff,             // snSourceAck = -1
+            0x00, 0x40,                         // uReceiveWindowSize = 64
+            0x18, 0x01,                         // uFlags = SYN|CORRELATION_ID|SYNEX
+            // SYNDATA
+            0x70, 0x14, 0xc0, 0xfb,             // snInitialSequenceNumber
+            0x04, 0xd0,                         // uUpStreamMtu = 1232
+            0x04, 0xd0,                         // uDownStreamMtu = 1232
+            // CORRELATION_ID: 16 id + 16 reserved(0)
+            0x25, 0x06, 0x04, 0xe2, 0x05, 0xd5, 0x47, 0x4d,
+            0x9a, 0x97, 0x96, 0x76, 0x8f, 0x7d, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // SYNEX
+            0x00, 0x01,                         // uSynExFlags = VERSION_INFO_VALID
+            0x01, 0x01,                         // uUdpVer = 0x0101 = V3 (EUDP2)
+            // cookieHash (32 bytes)
+            0x7f, 0x7d, 0x57, 0x77, 0x45, 0x80, 0x73, 0x6f,
+            0xea, 0x6c, 0x52, 0x4c, 0x59, 0x82, 0xe1, 0x31,
+            0x0e, 0x2a, 0x9c, 0x97, 0x39, 0xad, 0x15, 0xab,
+            0x28, 0xb2, 0xb2, 0x21, 0x59, 0xce, 0xf0, 0xef,
+        ];
+
+        let d = Datagram::decode(&bytes).unwrap();
+        assert_eq!(d.fec.snd_source_ack, -1);
+        assert_eq!(d.fec.recv_window, 64);
+        assert_eq!(
+            d.fec.flags,
+            FecFlags::SYN | FecFlags::CORRELATION_ID | FecFlags::SYNEX
+        );
+
+        let syn = d.syn.expect("SYNDATA present");
+        assert_eq!(syn.initial_seq, 0x7014_c0fb);
+        assert_eq!(syn.upstream_mtu, 1232);
+        assert_eq!(syn.downstream_mtu, 1232);
+
+        assert_eq!(
+            d.correlation.expect("CORRELATION_ID present").id,
+            [
+                0x25, 0x06, 0x04, 0xe2, 0x05, 0xd5, 0x47, 0x4d, 0x9a, 0x97, 0x96, 0x76, 0x8f, 0x7d,
+                0x00, 0x00
+            ]
+        );
+
+        let ex = d.syn_ex.expect("SYNEX present");
+        assert_eq!(ex.flags, crate::pdu::SynExFlags::VERSION_INFO_VALID);
+        assert_eq!(ex.udp_version, UdpVersion::V3, "client negotiates EUDP2");
+        assert!(
+            ex.cookie_hash.is_some(),
+            "V3 carries the SHA-256 cookie hash"
+        );
+    }
 }
