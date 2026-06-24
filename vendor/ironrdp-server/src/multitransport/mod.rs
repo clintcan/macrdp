@@ -21,7 +21,12 @@
 //! `migration` submodules (the UDP transport + channel migration); the trait
 //! will gain methods accordingly.
 
-use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
+use anyhow::Result;
+use ironrdp_core::encode_vec;
+use ironrdp_pdu::mcs::SendDataIndication;
+use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, RequestedProtocol};
+use ironrdp_pdu::x224::X224;
 
 /// Server-side hook for RDP UDP multitransport. A provider, when installed via
 /// [`RdpServer::set_multitransport_provider`](crate::RdpServer::set_multitransport_provider),
@@ -34,6 +39,37 @@ pub trait MultitransportProvider: Send {
     /// M1 implementations return [`RequestedProtocol::UdpFecR`] (reliable —
     /// RDPEUDP2 + TLS, no DTLS). Lossy (`UdpFecL`) is a later milestone.
     fn requested_protocol(&self) -> RequestedProtocol;
+}
+
+/// Encode a Server Initiate Multitransport Request (MS-RDPBCGR 2.2.15.1) as a
+/// `SendDataIndication` on the IO channel. The Initiate Request is a
+/// `BasicSecurityHeader`-wrapped PDU, **not** a ShareControl PDU — so this
+/// mirrors `server::encode_share_data_pdu` minus the ShareControl/ShareData
+/// wrapping. Pure + exported so the framing can be round-trip tested (the
+/// vendored crate itself is built with `test = false`, so the test lives in the
+/// macrdp crate).
+pub fn encode_initiate_request(
+    request_id: u32,
+    protocol: RequestedProtocol,
+    security_cookie: [u8; 16],
+    io_channel_id: u16,
+    user_channel_id: u16,
+) -> Result<Vec<u8>> {
+    let pdu = MultitransportRequestPdu {
+        security_header: BasicSecurityHeader {
+            flags: BasicSecurityHeaderFlags::TRANSPORT_REQ,
+        },
+        request_id,
+        requested_protocol: protocol,
+        security_cookie,
+    };
+    let user_data = encode_vec(&pdu)?.into();
+    let mcs_pdu = SendDataIndication {
+        initiator_id: user_channel_id,
+        channel_id: io_channel_id,
+        user_data,
+    };
+    Ok(encode_vec(&X224(mcs_pdu))?)
 }
 
 /// Per-connection negotiation state for an in-flight multitransport request:

@@ -1336,8 +1336,7 @@ impl RdpServer {
         W: FramedWrite,
     {
         use ironrdp_pdu::gcc::MultiTransportFlags;
-        use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
-        use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, RequestedProtocol};
+        use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
 
         let Some(provider) = self.multitransport.as_ref() else {
             return Ok(());
@@ -1367,21 +1366,13 @@ impl RdpServer {
             *b = (request_id.wrapping_mul(2_654_435_761).wrapping_add(i as u32) & 0xff) as u8;
         }
 
-        let pdu = MultitransportRequestPdu {
-            security_header: BasicSecurityHeader {
-                flags: BasicSecurityHeaderFlags::TRANSPORT_REQ,
-            },
+        let data = crate::multitransport::encode_initiate_request(
             request_id,
-            requested_protocol: protocol,
-            security_cookie: cookie,
-        };
-        let user_data = encode_vec(&pdu)?.into();
-        let mcs_pdu = SendDataIndication {
-            initiator_id: user_channel_id,
-            channel_id: io_channel_id,
-            user_data,
-        };
-        let data = encode_vec(&X224(mcs_pdu))?;
+            protocol,
+            cookie,
+            io_channel_id,
+            user_channel_id,
+        )?;
         writer.write_all(&data).await?;
         self.multitransport_migration = Some(crate::multitransport::MigrationState {
             request_id,
