@@ -1379,10 +1379,14 @@ impl RdpServer {
             cookie,
             protocol,
         });
+        // Log the issued cookie (hex) so it can be correlated with the UDP
+        // listener's logged client SYNEX `cookieHash` to derive the hash formula
+        // from a live run (cookie validation is still soft — see M3 in the plan).
         debug!(
             request_id,
             ?protocol,
-            "sent Server Initiate Multitransport Request (M1: negotiation only; expecting E_ABORT fallback)"
+            cookie = %cookie.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "sent Server Initiate Multitransport Request"
         );
         Ok(())
     }

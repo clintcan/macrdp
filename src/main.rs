@@ -449,14 +449,14 @@ struct Args {
     #[arg(long)]
     enable_smartcard_redirection: bool,
 
-    /// EXPERIMENTAL (M1, opt-in, default OFF). Offer RDP UDP multitransport
-    /// (MS-RDPEMT) to clients that advertise it. **M1 is negotiation only:**
-    /// the server sends the Initiate Multitransport Request and handles the
-    /// client's response, but there is NO UDP transport yet — the client's UDP
-    /// attempt times out (E_ABORT) and the session continues on TCP, unchanged.
-    /// This exists to prove the negotiation/framing + graceful fallback ahead of
-    /// the UDP data path (later milestones). No reason for end users to enable
-    /// it. macOS-only build; see docs/rdp-udp-multitransport-feasibility.md.
+    /// EXPERIMENTAL (M3, opt-in, default OFF). Offer RDP UDP multitransport
+    /// (MS-RDPEMT) to clients that advertise it, and bind a UDP listener on the
+    /// same address/port as TCP. **The session still runs over TCP:** the listener
+    /// answers the RDPEUDP SYN→SYN+ACK handshake (negotiating RDPEUDP2), but there
+    /// is no TLS/EMT tunnel or channel migration yet, so nothing actually moves to
+    /// UDP. Cookie validation is soft. No reason for end users to enable it. Not
+    /// supported under --fork-workers (falls back to TCP). macOS-only build; see
+    /// docs/rdp-udp-multitransport-feasibility.md.
     #[arg(long)]
     enable_udp_multitransport: bool,
 
@@ -1502,6 +1502,16 @@ async fn async_main() -> Result<()> {
         if !args.allow_sleep {
             prevent_sleep();
         }
+        if args.enable_udp_multitransport {
+            // The persistent UDP socket would have to live in the supervisor (one
+            // socket per port, demuxed across worker reconnects); that's not wired
+            // yet. The M1 offer still happens in each worker, so clients fall back
+            // to TCP. Deferred — see the multitransport plan.
+            warn!(
+                "UDP multitransport listener is not started under --fork-workers yet; \
+                 clients will fall back to TCP"
+            );
+        }
         return run_fork_supervisor(args.bind, vd, blank, args.app_switcher_hud).await;
     }
     if let Some(fd) = worker_fd {
@@ -2084,13 +2094,55 @@ async fn async_main() -> Result<()> {
     // pipeline all read.
     server.set_honor_client_desktop_size(auto_size);
 
-    // EXPERIMENTAL UDP multitransport (MS-RDPEMT) — M1 negotiation only. When
-    // enabled, install the provider so the server offers reliable UDP to clients
-    // that advertise it. There is no UDP transport yet (M1), so the client's UDP
-    // attempt times out and the session continues on TCP. See src/multitransport.rs.
-    if args.enable_udp_multitransport {
-        server.set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
-    }
+    // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
+    // provider so the server offers reliable UDP to clients that advertise it,
+    // and (M3) bind a real UDP listener on the same address/port as TCP — the
+    // client reuses the server address for the auxiliary UDP flow. The handle is
+    // held in `_udp_listener` for the process lifetime (Drop aborts its task).
+    //
+    // M3 scope: the listener answers the RDPEUDP SYN→SYN+ACK handshake (V3/EUDP2
+    // negotiation); cookie validation is soft and there's no TLS/EMT tunnel or
+    // channel migration yet, so a client that completes the handshake still runs
+    // the session over TCP. Single-process path only — under --fork-workers the
+    // persistent UDP socket would have to live in the supervisor (deferred; we
+    // warn above and fall back to TCP). worker_fd.is_some() ⇒ a fork worker.
+    let _udp_listener = if args.enable_udp_multitransport && worker_fd.is_none() {
+        // The server ISN isn't client-validated; seed it from the clock to avoid a
+        // new RNG dependency (the security-relevant value is the cookie, not this).
+        let isn_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let cfg = ironrdp_server::ListenerConfig {
+            server_isn_seed: isn_seed,
+            ..Default::default()
+        };
+        match ironrdp_server::UdpMultitransportListener::bind(args.bind, cfg).await {
+            Ok(listener) => {
+                info!(
+                    addr = %args.bind,
+                    "UDP multitransport listener bound (M3: RDPEUDP handshake; \
+                     session still runs over TCP)"
+                );
+                server
+                    .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
+                Some(listener)
+            }
+            Err(e) => {
+                // Non-fatal: fall back to TCP-only. Most common cause is the UDP
+                // port already being in use.
+                warn!(error = %e, addr = %args.bind, "could not bind UDP multitransport listener; continuing TCP-only");
+                None
+            }
+        }
+    } else {
+        if args.enable_udp_multitransport {
+            // Fork worker: the provider still offers UDP (M1), but the listener is
+            // the supervisor's job (deferred), so the client falls back to TCP.
+            server.set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
+        }
+        None
+    };
 
     // ironrdp_server::Credentials holds a plain String, so this copy is
     // outside our control and won't be zeroed when the server shuts down.

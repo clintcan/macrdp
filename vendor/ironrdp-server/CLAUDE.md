@@ -274,3 +274,12 @@ AND released — #1276 landing is NOT sufficient.
     `test = false`): bind to `127.0.0.1:0`, send a real captured client SYN, assert
     the MTU-padded SYN+ACK fields. Cross-platform (pure tokio/std), so Linux CI
     runs it.
+    **M3c (added 2026-06-25): wired into the accept path.** macrdp's `main.rs` now
+    binds the listener on the same address/port as TCP at startup when
+    `--enable-udp-multitransport` is set (single-process path; `--fork-workers`
+    warns + falls back — the persistent UDP socket would belong to the supervisor,
+    deferred). The only server-crate change here is that `maybe_offer_multitransport`
+    now logs the issued 16-byte security cookie (hex) at `debug`, so it can be
+    correlated with the listener's logged client SYNEX `cookieHash` to derive the
+    hash formula from a live run (cookie validation is still soft). The session
+    still runs over TCP (no TLS/EMT tunnel or migration yet).

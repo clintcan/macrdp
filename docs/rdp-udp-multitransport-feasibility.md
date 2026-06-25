@@ -4,25 +4,48 @@
 All "what IronRDP/FreeRDP do today" claims were web-verified on the date above;
 verify again before acting, code moves.*
 
-> **Status: M1 + M2 LANDED (2026-06-25).**
+> **Status: M1 + M2 + EUDP2 codec + M3a/M3b/M3c LANDED (2026-06-25).**
 > - **M1** (PR #15, `bf26824`): MS-RDPEMT negotiation + safe TCP fallback behind
 >   the `multitransport` cargo feature + `--enable-udp-multitransport` (default
 >   OFF). Verified live on mstsc + sdl-freerdp; Initiate Request framing has a
->   round-trip CI test. Loopback can't exercise the actual *send* (no client
->   advertises UDP for 127.0.0.1) → real-Windows send acceptance deferred to M3.
+>   round-trip CI test.
 > - **M2** (PRs #16/#17/#18): the offline `ironrdp-rdpeudp` crate — RDPEUDP v1 PDU
 >   codecs (`pdu.rs`, big-endian, spec-capture-anchored; flag values corrected
 >   against the spec), ACK-vector codec, whole-datagram assemble/parse
 >   (`datagram.rs`), and the **sans-I/O reliable transport state machine**
 >   (`state.rs`): handshake + in-order de-duplicated delivery + cumulative-ACK +
 >   RTO retransmit, proven by a two-instance in-memory loss/reorder/dup test.
+> - **EUDP2 codec** (PRs #21/#22/#23): the RDPEUDP2 (`0x0101`) data framing,
+>   reverse-engineered from FreeRDP's `rdp-udp.lua` dissector + a real capture and
+>   verified byte-exact — network-format transform (byte 0↔7 swap), base header,
+>   the full sub-header walk to the `DataBody`, and a framing-neutral inbound view.
+>   The underdocumented framing that previously blocked M3 is now fully decodable.
+> - **M3a** (PR #24): the server's RDPEUDP **SYN+ACK** wire-shaped byte-exact to a
+>   real Windows server (ACK flag without ack-vector; SYNEX without cookie hash;
+>   `snSourceAck` = client ISN; V3 negotiation) — capture-validated end to end.
+> - **M3b** (PR #25): the **UDP listener** (`UdpMultitransportListener`, vendored
+>   `ironrdp-server`, behind the feature) — owns a `tokio` `UdpSocket`, demuxes by
+>   peer, drives a per-peer `RdpeudpState` through SYN→SYN+ACK, MTU-pads handshake
+>   packets. CI-tested over loopback with the real captured client SYN.
+> - **M3c** (this change): **wired into macrdp's accept path** — when
+>   `--enable-udp-multitransport` is set (single-process path), macrdp binds the
+>   listener on the **same address/port as TCP** at startup, so a client's UDP SYN
+>   now reaches a live endpoint and gets a SYN+ACK. The session **still runs over
+>   TCP** (no TLS/EMT tunnel/migration yet). Cookie validation is soft; the server
+>   logs the issued cookie and the listener logs the client's `cookieHash` so the
+>   hash formula can be derived from a live run. Not supported under
+>   `--fork-workers` (the persistent UDP socket would belong to the supervisor —
+>   deferred; warns + falls back to TCP).
 >
-> **Next: M3 — UDP listener + RDPEUDP SYN handshake on the wire. BLOCKED on a
-> spike that needs the USER:** a real mstsc UDP capture (Wireshark) to author the
-> underdocumented **RDPEUDP2 (`0x0101`) bit-packed data framing** — mstsc's data
-> path — against real bytes. The crate's algorithm is framing-agnostic and ready
-> to reuse; cumulative-ACK only so far (selective retransmit + congestion control
-> deferred).
+> **Next: derive the cookie-hash formula + the EUDP2 data path.** What remains
+> needs a **real, non-loopback client** (pure loopback suppresses the client's UDP
+> advertisement): point mstsc-in-a-VM at macrdp on the host IP, capture macrdp's
+> own cookie (server log) + the client's resulting `cookieHash` (listener log) →
+> derive/verify the hash → tighten validation. Then **M4** (rustls over the
+> reliable stream + the MS-RDPEMT tunnel) and **M5** (migrate the EGFX channel to
+> UDP). The reliability SM is framing-agnostic and the EUDP2 inbound adapter is
+> ready; the EUDP2 *encode*/SM-send side is the remaining piece that a live V3
+> bidirectional capture will validate.
 
 ## TL;DR
 
