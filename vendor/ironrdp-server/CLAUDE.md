@@ -508,6 +508,12 @@ AND released — #1276 landing is NOT sufficient.
     **VERIFIED on real mstsc 2026-06-26:** `tunnels: [1]` accepted → EGFX H.264
     **renders and stays live** (mouse/keyboard/window changes all update over UDP),
     inbound `RDP_TUNNEL_DATA` now delivered+processed (the "not handled yet" lines
-    are gone), audio still on TCP (RDPSND channel 1005) throughout. This is the
-    first open-source RDP **server** serving real EGFX video over a UDP
-    multitransport tunnel. Flag-OFF (empty safe spike) re-verified no-regression.
+    are gone), audio still on TCP (RDPSND channel 1005) throughout. As far as is
+    known this is the first open-source RDP **server** with a working UDP
+    multitransport *data path* (serving real EGFX video over the tunnel) — FreeRDP,
+    the most complete OSS stack, has client-side RDPEUDP/RDPEUDP2 but only a
+    server-side multitransport *bootstrap stub* (`multitransport_server_request` /
+    `_handle_response`, no UDP socket or data path; verified 2026-06-26), and
+    xrdp / ogon / gnome-remote-desktop / Weston are TCP-only or ride FreeRDP's
+    server lib. ("first" can't be proven exhaustively — phrase it "first known".)
+    Flag-OFF (empty safe spike) re-verified no-regression.
