@@ -255,13 +255,16 @@ mod tests {
         assert!(back.source.is_none() && back.syn.is_none());
     }
 
-    /// Decode a **real Microsoft RDP client's SYN** captured against macrdp
-    /// (`docs/.../mstscpcap`, UDP→:3390). This is the strongest validation of the
-    /// v1 SYN / CORRELATION_ID / SYNEX codecs — real client bytes, not a
-    /// hand-built struct — and it confirms the `FecFlags` correction
+    /// Decode a **real Microsoft RDP client's SYN** from a user capture — the
+    /// client connecting to a **Windows RDP server in a VM** (VirtualBox NAT,
+    /// host:3390 forwarded to the VM's :3389; the UDP SYNs went unanswered
+    /// because only TCP was forwarded). It is *not* a macrdp capture, so it does
+    /// not exercise macrdp's own send path — but it's the strongest validation of
+    /// the v1 SYN / CORRELATION_ID / SYNEX codecs (real client bytes, not a
+    /// hand-built struct): it confirms the `FecFlags` correction
     /// (`0x1801 = SYN|CORRELATION_ID|SYNEX`) and that the client negotiates
-    /// `uUdpVer = V3` (EUDP2) with a SHA-256 `cookieHash` (i.e. it received and
-    /// acted on macrdp's Initiate Multitransport Request).
+    /// `uUdpVer = V3` (EUDP2) with a 32-byte SHA-256 `cookieHash` (the client
+    /// received and acted on the *server's* Initiate Multitransport Request).
     #[test]
     fn decodes_real_client_syn_capture() {
         // The first 84 bytes of the captured 1232-byte UDP payload (the rest is
