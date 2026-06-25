@@ -69,6 +69,43 @@ verify again before acting, code moves.*
 > (the persistent UDP socket would belong to the supervisor — deferred; warns +
 > falls back to TCP).
 
+## Landscape — UDP multitransport across open-source RDP servers
+
+Where macrdp sits among open-source RDP **servers** on UDP multitransport
+(MS-RDPEMT over MS-RDPEUDP). The distinction that matters is **three separate
+things**, often conflated:
+
+1. **Negotiation / bootstrap** — the server sends the *Initiate Multitransport
+   Request* over the TCP connection (MS-RDPBCGR). Cheap; just a PDU.
+2. **Server UDP *data path*** — the server actually binds a UDP socket, runs the
+   RDPEUDP reliability handshake, secures it (TLS/DTLS), establishes the MS-RDPEMT
+   tunnel, and **carries channel data over it**. This is the hard part.
+3. **Client UDP support** — a *client* that connects out over UDP. Several OSS
+   clients have this; it's a different (and easier-to-reach) codebase than the
+   server.
+
+| RDP **server** | Base / lang | (1) Negotiation | (2) **UDP data path** | Notes |
+|---|---|---|---|---|
+| **macrdp** | Rust / IronRDP (vendored) | ✅ (via the acceptor) | ✅ **EGFX H.264 over reliable RDPEUDP + rustls TLS + MS-RDPEMT tunnel — verified on mstsc** | First *known* OSS RDP server with a working server-side UDP data path. Opt-in (default OFF). Lossy/DTLS/FEC = Phase 2. |
+| FreeRDP (server: `freerdp-shadow`, libfreerdp server) | C | ⚠️ bootstrap only (`multitransport_server_request`) | ❌ no UDP socket / data path (response handler is a no-op) | FreeRDP's **client** has full RDPEUDP/RDPEUDP2 + multitransport; the *server* side was never finished. |
+| ogon | C / FreeRDP server | ⚠️ inherits FreeRDP | ❌ | TCP-only data path (rides FreeRDP's server stub). |
+| gnome-remote-desktop | C / FreeRDP server lib | ⚠️ inherits FreeRDP | ❌ | TCP-only data path. |
+| Weston RDP backend | C / FreeRDP server | ⚠️ inherits FreeRDP | ❌ | TCP-only data path. |
+| xrdp | C | ❌ | ❌ | TCP-only; no multitransport. |
+| IronRDP (upstream Devolutions server) | Rust | ❌ | ❌ | No MS-RDPEUDP/EMT in the tree (the gap macrdp's vendored `ironrdp-rdpeudp` fills). Other IronRDP-based servers (lamco-rdp-server, hypr-rdp, cosmic-ext-rdp-server, ARISU) inherit the same TCP-only model. |
+| *(reference)* Microsoft RDS | — (proprietary) | ✅ | ✅ reliable **and** lossy + FEC + DTLS | The spec baseline; not open source. The protocol target macrdp implements against. |
+
+**Bottom line:** every other open-source RDP *server* either has no multitransport
+at all (xrdp, IronRDP upstream) or stops at the TCP-side negotiation handshake and
+never opens a UDP data path (FreeRDP and everything built on its server library).
+macrdp actually carries EGFX video over the tunnel — so, **as far as is known, it is
+the first open-source RDP server with a working UDP multitransport data path**
+(verified 2026-06-26; "first" can't be proven exhaustively — read it as "first
+known"). The reason this gap existed so long is exactly point (2) above: the
+server-only glue (UDP listener, cookie→session binding, channel migration via
+`drdynvc`, sender-side reliability) is the part FreeRDP left as a stub and that no
+spec walks you through — client implementations get none of it for free.
+
 ## TL;DR
 
 *Original feasibility framing (2026-06-25), kept for the record. The "don't / not
