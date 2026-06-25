@@ -350,6 +350,14 @@ pub struct RdpServer {
     /// CREATEREQUEST). Set once via `set_multitransport_cookie_registry`.
     #[cfg(feature = "multitransport")]
     multitransport_cookies: Option<crate::multitransport::CookieRegistry>,
+    /// (M5c) Shared per-connection flag the UDP listener sets `true` when it binds
+    /// this connection's tunnel (cookie match). The TCP side reads it to know the
+    /// UDP multitransport connection is up — the trigger to send the Soft-Sync
+    /// request that moves EGFX onto the tunnel. mstsc signals multitransport
+    /// success by *creating the tunnel*, NOT by an Initiate Response over TCP, so
+    /// this listener→server flag (not a message-channel PDU) is the real gate.
+    #[cfg(feature = "multitransport")]
+    udp_tunnel_bound: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -454,6 +462,8 @@ impl RdpServer {
             multitransport_migration: None,
             #[cfg(feature = "multitransport")]
             multitransport_cookies: None,
+            #[cfg(feature = "multitransport")]
+            udp_tunnel_bound: None,
         }
     }
 
@@ -665,7 +675,9 @@ impl RdpServer {
                 if let Some(prev) = self.multitransport_migration.as_ref() {
                     registry.remove(&prev.cookie);
                 }
-                registry.insert(offer.cookie);
+                // Keep the tunnel-bound flag: the listener flips it on a cookie
+                // match, and the EGFX dispatch path reads it to fire Soft-Sync.
+                self.udp_tunnel_bound = Some(registry.register(offer.cookie));
             }
             acceptor.set_advertise_extended_client_data(true);
             acceptor.set_multitransport_offer(Some(offer));
@@ -1127,6 +1139,11 @@ impl RdpServer {
                             .context("DRDYNVC channel not found")?;
                         let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
+                        // (M5c) Now that EGFX is actively shipping (its DVC channel
+                        // is open) AND the UDP tunnel is bound, fire the Soft-Sync
+                        // request once — the cue to migrate EGFX onto the tunnel.
+                        #[cfg(feature = "multitransport")]
+                        self.maybe_soft_sync_on_egfx(writer, user_channel_id).await?;
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
@@ -1407,6 +1424,124 @@ impl RdpServer {
         }
     }
 
+    /// (M5c) Try to interpret a message-channel PDU as the client's Initiate
+    /// Multitransport Response. Returns `true` if it WAS one (handled — caller
+    /// should not warn "Unexpected channel"). On `S_OK` — the UDP multitransport
+    /// connection (incl. our MS-RDPEMT tunnel) is established — this opens the
+    /// Soft-Sync gate and sends the `DYNVC_SOFT_SYNC_REQUEST` exactly once.
+    #[cfg(feature = "multitransport")]
+    async fn maybe_handle_multitransport_response(
+        &mut self,
+        writer: &mut impl FramedWrite,
+        user_data: &[u8],
+        user_channel_id: u16,
+    ) -> Result<bool> {
+        use ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu;
+
+        // The response is a BasicSecurityHeader-wrapped PDU (decode re-validates
+        // the TRANSPORT_RSP flag). If it doesn't decode, this wasn't a response —
+        // let the caller fall through to its "Unexpected channel" warning.
+        let Ok(resp) = decode::<MultitransportResponsePdu>(user_data) else {
+            return Ok(false);
+        };
+
+        let Some(state) = self.multitransport_migration.as_mut() else {
+            warn!(
+                request_id = resp.request_id,
+                "Initiate Multitransport Response with no request in flight; ignoring"
+            );
+            return Ok(true);
+        };
+        if state.request_id != resp.request_id {
+            warn!(
+                got = resp.request_id,
+                in_flight = state.request_id,
+                "Initiate Multitransport Response request_id mismatch; ignoring"
+            );
+            return Ok(true);
+        }
+        if !resp.is_success() {
+            debug!(
+                request_id = resp.request_id,
+                hr = format_args!("{:#010x}", resp.hr_response),
+                "Initiate Multitransport Response: client could not establish UDP; staying on TCP"
+            );
+            self.multitransport_migration = None;
+            return Ok(true);
+        }
+        if state.soft_sync_sent {
+            debug!(
+                request_id = resp.request_id,
+                "Initiate Multitransport Response S_OK (Soft-Sync already sent); ignoring retransmit"
+            );
+            return Ok(true);
+        }
+        state.soft_sync_sent = true;
+        debug!(
+            request_id = resp.request_id,
+            "Initiate Multitransport Response S_OK — Soft-Sync gate open"
+        );
+        self.send_soft_sync_request(writer, user_channel_id).await?;
+        Ok(true)
+    }
+
+    /// (M5c) Called from the EGFX dispatch path. If the UDP tunnel is bound (the
+    /// listener flipped our shared flag on a cookie match) and we haven't sent the
+    /// Soft-Sync yet, send it now — EGFX shipping means its DVC channel is open and
+    /// the client is fully in DVC mode, the right moment to begin the migration.
+    /// This (not a TCP Initiate Response) is the real success gate: mstsc signals
+    /// multitransport success by creating the tunnel, never by a TCP response.
+    #[cfg(feature = "multitransport")]
+    async fn maybe_soft_sync_on_egfx(
+        &mut self,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+    ) -> Result<()> {
+        let bound = self
+            .udp_tunnel_bound
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed));
+        if !bound {
+            return Ok(());
+        }
+        let Some(state) = self.multitransport_migration.as_mut() else {
+            return Ok(());
+        };
+        if state.soft_sync_sent {
+            return Ok(());
+        }
+        state.soft_sync_sent = true;
+        debug!("UDP tunnel bound + EGFX active — Soft-Sync gate open");
+        self.send_soft_sync_request(writer, user_channel_id).await
+    }
+
+    /// (M5c) Send a `DYNVC_SOFT_SYNC_REQUEST` over the DRDYNVC static channel on
+    /// TCP. **Safe spike:** an EMPTY channel list (TCP_FLUSHED only) — it
+    /// exercises the send path and the client's Soft-Sync Response decode without
+    /// actually migrating any DVC, so video keeps flowing over TCP. The real
+    /// migration (listing the EGFX channel id) layers on once this is proven.
+    #[cfg(feature = "multitransport")]
+    async fn send_soft_sync_request(
+        &mut self,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+    ) -> Result<()> {
+        let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+            warn!("No DRDYNVC channel; cannot send Soft-Sync request");
+            return Ok(());
+        };
+
+        let req = dvc::pdu::SoftSyncRequestPdu::switch_to_udpfecr(Vec::new());
+        let pdu = dvc::pdu::DrdynvcServerPdu::SoftSyncRequest(req);
+        // Soft-Sync is a top-level DRDYNVC PDU (not sub-channel DATA), so it ships
+        // as a plain SvcMessage on the drdynvc static channel.
+        let msg = ironrdp_svc::SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL);
+        let data = server_encode_svc_messages(vec![msg], drdynvc_channel_id, user_channel_id)?;
+        writer.write_all(&data).await?;
+        debug!("Sent DYNVC_SOFT_SYNC_REQUEST (M5c safe spike: empty channel list)");
+        Ok(())
+    }
+
     async fn client_accepted<R, W>(
         &mut self,
         reader: &mut Framed<R>,
@@ -1462,6 +1597,7 @@ impl RdpServer {
                     request_id: offer.request_id,
                     cookie: offer.cookie,
                     protocol: offer.protocol,
+                    soft_sync_sent: false,
                 });
                 debug!(
                     request_id = offer.request_id,
@@ -1736,6 +1872,18 @@ impl RdpServer {
                     let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)?;
                     writer.write_all(&response).await?;
                 } else {
+                    // (vendored, feature=multitransport) The client's Initiate
+                    // Multitransport Response rides the MCS message channel (granted
+                    // by the acceptor when an offer is active, M3c), so it lands here
+                    // rather than on the IO channel or a static channel. On S_OK it's
+                    // the gate to begin Soft-Sync (move EGFX onto the UDP tunnel).
+                    #[cfg(feature = "multitransport")]
+                    if self
+                        .maybe_handle_multitransport_response(writer, data.user_data.as_ref(), user_channel_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     warn!(channel_id = data.channel_id, "Unexpected channel received: ID",);
                 }
             }

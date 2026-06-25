@@ -23,8 +23,8 @@
 
 pub mod listener;
 
-use core::sync::atomic::{AtomicU32, Ordering};
-use std::collections::HashSet;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -90,7 +90,7 @@ pub fn encode_initiate_request(
 /// removes a cookie when it accepts the tunnel, and the offer path evicts the
 /// previous connection's (unconsumed) cookie before registering a new one.
 #[derive(Clone, Default)]
-pub struct CookieRegistry(Arc<Mutex<HashSet<[u8; 16]>>>);
+pub struct CookieRegistry(Arc<Mutex<HashMap<[u8; 16], Arc<AtomicBool>>>>);
 
 impl CookieRegistry {
     /// A fresh, empty registry. Create one in `main` and share it (clone) with
@@ -99,27 +99,40 @@ impl CookieRegistry {
         Self::default()
     }
 
-    /// Register an issued cookie as valid.
-    pub fn insert(&self, cookie: [u8; 16]) {
-        if let Ok(mut set) = self.0.lock() {
-            set.insert(cookie);
+    /// Register an issued cookie as valid and return its **tunnel-bound flag**:
+    /// the listener sets it `true` when it binds the matching tunnel (M5c), and
+    /// the offer-issuing [`RdpServer`](crate::RdpServer) reads it to know the UDP
+    /// multitransport connection is up (the cue to send the Soft-Sync request).
+    pub fn register(&self, cookie: [u8; 16]) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut map) = self.0.lock() {
+            map.insert(cookie, Arc::clone(&flag));
         }
+        flag
     }
 
-    /// Drop a cookie (consumed on tunnel bind, or evicted on teardown).
+    /// Drop a cookie (evicted on teardown / TCP fallback).
     pub fn remove(&self, cookie: &[u8; 16]) {
-        if let Ok(mut set) = self.0.lock() {
-            set.remove(cookie);
+        if let Ok(mut map) = self.0.lock() {
+            map.remove(cookie);
         }
     }
 
-    /// Atomically check-and-consume a cookie: returns `true` (and removes it) if
-    /// it was registered. One-time use — a retransmitted/replayed CREATEREQUEST
-    /// with the same cookie won't bind a second tunnel.
+    /// Atomically check-and-consume a cookie: returns `true` (and removes it,
+    /// **setting its tunnel-bound flag**) if it was registered. One-time use — a
+    /// retransmitted/replayed CREATEREQUEST with the same cookie won't bind a
+    /// second tunnel.
     pub fn take(&self, cookie: &[u8; 16]) -> bool {
-        match self.0.lock() {
-            Ok(mut set) => set.remove(cookie),
-            Err(_) => false,
+        let removed = match self.0.lock() {
+            Ok(mut map) => map.remove(cookie),
+            Err(_) => None,
+        };
+        match removed {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -166,4 +179,8 @@ pub(crate) struct MigrationState {
     #[allow(dead_code)]
     pub cookie: [u8; 16],
     pub protocol: RequestedProtocol,
+    /// (M5c) Set once we've sent the `DYNVC_SOFT_SYNC_REQUEST` for this
+    /// connection, so a retransmitted Initiate Multitransport Response (or any
+    /// other message-channel PDU) doesn't make us re-send it.
+    pub soft_sync_sent: bool,
 }

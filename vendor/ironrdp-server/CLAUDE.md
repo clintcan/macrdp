@@ -389,3 +389,45 @@ AND released — #1276 landing is NOT sufficient.
     server. Verified on real mstsc: random cookie `f76fdf2b…`, "bound to session",
     tunnel establishes. One-time-use logic unit-tested in the macrdp crate
     (`cookie_registry_take_is_one_time_and_rejects_unknown`).
+    **M5b-2 (merged 2026-06-26, PR #34): server-side MS-RDPEDYC Soft-Sync codec.**
+    Vendored `ironrdp-dvc` (4th fork) gained `SoftSyncRequestPdu`/
+    `SoftSyncResponsePdu` + the `DrdynvcClientPdu::SoftSyncResponse` decode arm so
+    the client's Soft-Sync reply no longer tears the session down. No behavior
+    change here yet (codec only). See `vendor/ironrdp-dvc/CLAUDE.md`.
+    **M5c step 1+2 (added 2026-06-26): Soft-Sync gate + send (SAFE SPIKE — empty
+    channel list) — VERIFIED on real mstsc.** KEY FINDING (from the first live
+    run): **mstsc signals multitransport success by *creating the UDP tunnel*, NOT
+    by an Initiate Multitransport Response over TCP.** A TCP Initiate Response only
+    comes on *failure* (E_ABORT). So the success gate has to come from the
+    listener, not a message-channel PDU. Two pieces:
+    1. **Gate (listener-driven).** `MigrationState` gained `soft_sync_sent: bool`.
+       `CookieRegistry` now maps each cookie → a shared **tunnel-bound flag**
+       (`Arc<AtomicBool>`); the offer path keeps the flag (`RdpServer::
+       udp_tunnel_bound`), and the listener flips it `true` inside `take()` when it
+       binds the matching tunnel (cookie match). In the **EGFX dispatch arm**
+       (`ServerEvent::Egfx`, after shipping a frame), `maybe_soft_sync_on_egfx`
+       checks the flag: once the tunnel is bound AND EGFX is shipping (its DVC
+       channel is open, client fully in DVC mode), it sends the Soft-Sync request
+       exactly once (`soft_sync_sent` guard). This couples the trigger to the right
+       moment (tunnel up + EGFX live), which is also where the real migration will
+       hook. A SECONDARY TCP gate (`maybe_handle_multitransport_response` in
+       `handle_x224`'s `else` branch — message channel) still handles a client that
+       *does* send an Initiate Response (E_ABORT → stay on TCP; S_OK → also send),
+       but mstsc never exercises it. (The M1 `handle_io_channel_data` IO-channel
+       response-decode branch is legacy/dead for real clients, left harmless.)
+    2. **Send.** `send_soft_sync_request` ships a `DYNVC_SOFT_SYNC_REQUEST` as a
+       top-level `SvcMessage` on the drdynvc static channel (NOT sub-channel DATA —
+       so `SvcMessage::from(DrdynvcServerPdu::SoftSyncRequest(..))`, not
+       `encode_dvc_messages`). **Safe spike:** the request carries an EMPTY channel
+       list (`switch_to_udpfecr(vec![])` → TCP_FLUSHED only, NumberOfTunnels=0), so
+       it migrates nothing and video keeps flowing over TCP — it only proves the
+       send path + the client's Soft-Sync Response decode (M5b-2) without risk.
+    **Verified on real mstsc 2026-06-26:** "UDP tunnel bound + EGFX active —
+    Soft-Sync gate open" → "Sent DYNVC_SOFT_SYNC_REQUEST" → mstsc replied with a
+    `DYNVC_SOFT_SYNC_RESPONSE` (`tunnels: []`, decoded cleanly by the vendored
+    ironrdp-dvc — the M5b-2 fix proven on the wire) → **EGFX + audio kept flowing,
+    session ended only on the user's graceful disconnect.** The real migration
+    (list the EGFX channel id + the server→listener data handoff + route EGFX over
+    the tunnel as RDP_TUNNEL_DATA) is the next step. Watch
+    `RUST_LOG=...ironrdp_server::server=debug,ironrdp_dvc=debug` for the gate /
+    send / "Got DVC Soft-Sync Response" lines.

@@ -43,6 +43,8 @@ mod tests {
     // the vendored (test = false) server crate, so its behavior is tested here.
     #[test]
     fn cookie_registry_take_is_one_time_and_rejects_unknown() {
+        use std::sync::atomic::Ordering;
+
         let reg = CookieRegistry::new();
         let cookie = [0xABu8; 16];
         let other = [0x11u8; 16];
@@ -50,16 +52,22 @@ mod tests {
         // Unknown cookie is rejected.
         assert!(!reg.take(&other), "unregistered cookie must not bind");
 
-        // Registered cookie binds exactly once, then is consumed.
-        reg.insert(cookie);
+        // Registered cookie binds exactly once, then is consumed — and the bind
+        // flips the tunnel-bound flag the offer path keeps (M5c).
+        let flag = reg.register(cookie);
+        assert!(!flag.load(Ordering::Relaxed), "flag starts unset");
         assert!(reg.take(&cookie), "registered cookie must bind once");
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "binding the cookie sets its tunnel-bound flag"
+        );
         assert!(
             !reg.take(&cookie),
             "a consumed cookie must not bind again (replay protection)"
         );
 
         // Explicit removal (teardown / eviction) also clears it.
-        reg.insert(other);
+        reg.register(other);
         reg.remove(&other);
         assert!(!reg.take(&other), "removed cookie must not bind");
     }
@@ -122,6 +130,27 @@ mod tests {
             0x01, 0x00, 0x00, 0x00, // TunnelType = TUNNELTYPE_UDPFECR
             0x01, 0x00,             // NumberOfDVCs = 1
             0x07, 0x00, 0x00, 0x00, // ListOfDVCIds[0] = 0x0007
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    // The M5c "safe spike": an empty channel list (flush TCP, migrate nothing) —
+    // no list is emitted, NumberOfTunnels = 0, CHANNEL_LIST_PRESENT unset.
+    #[test]
+    fn soft_sync_request_empty_list_encodes_flush_only() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncRequestPdu};
+
+        let pdu = DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::switch_to_udpfecr(vec![]));
+        let bytes = encode_vec(&pdu).unwrap();
+
+        #[rustfmt::skip]
+        let expected: [u8; 10] = [
+            0x80,                   // Header: Cmd=SoftSyncRequest(0x08)<<4
+            0x00,                   // Pad
+            0x08, 0x00, 0x00, 0x00, // Length = 8 (Length+Flags+NumberOfTunnels, no lists)
+            0x01, 0x00,             // Flags = TCP_FLUSHED only (no CHANNEL_LIST_PRESENT)
+            0x00, 0x00,             // NumberOfTunnels = 0
         ];
         assert_eq!(bytes, expected);
     }

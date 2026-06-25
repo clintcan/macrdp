@@ -725,18 +725,27 @@ pub struct SoftSyncRequestPdu {
 
 impl SoftSyncRequestPdu {
     /// A request moving `channel_ids` onto the reliable-UDP tunnel.
+    ///
+    /// An **empty** `channel_ids` is a valid "flush TCP, migrate nothing" probe:
+    /// no channel list is emitted (`NumberOfTunnels` = 0, `CHANNEL_LIST_PRESENT`
+    /// unset), which is the safe spike used to confirm the send path + the
+    /// client's response decode without actually migrating any DVC.
     pub fn switch_to_udpfecr(channel_ids: Vec<DynamicChannelId>) -> Self {
-        let mut flags = SOFT_SYNC_TCP_FLUSHED;
-        if !channel_ids.is_empty() {
-            flags |= SOFT_SYNC_CHANNEL_LIST_PRESENT;
-        }
+        let (flags, channel_lists) = if channel_ids.is_empty() {
+            (SOFT_SYNC_TCP_FLUSHED, vec![])
+        } else {
+            (
+                SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT,
+                vec![SoftSyncChannelList {
+                    tunnel_type: TUNNELTYPE_UDPFECR,
+                    channel_ids,
+                }],
+            )
+        };
         Self {
             header: Header::new(0, 0, Cmd::SoftSyncRequest),
             flags,
-            channel_lists: vec![SoftSyncChannelList {
-                tunnel_type: TUNNELTYPE_UDPFECR,
-                channel_ids,
-            }],
+            channel_lists,
         }
     }
 

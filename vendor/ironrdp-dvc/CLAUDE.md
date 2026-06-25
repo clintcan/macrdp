@@ -61,7 +61,9 @@ since the lib is `test = false`.
       DYNVC_SOFT_SYNC_REQUEST (Header byte `Cmd<<4`; Pad u8; `Length` u32 counting
       Length+Flags+NumberOfTunnels+lists; Flags u16; NumberOfTunnels **u16**;
       then the lists). `switch_to_udpfecr(channel_ids)` convenience builds the
-      common "move these DVCs to the reliable tunnel" request. Wired into
+      common "move these DVCs to the reliable tunnel" request — an **empty**
+      `channel_ids` is a valid "flush TCP, migrate nothing" probe (no list,
+      NumberOfTunnels=0, CHANNEL_LIST_PRESENT unset), the M5c safe spike. Wired into
       `DrdynvcServerPdu::SoftSyncRequest` (Encode/name/size only — the server
       never *decodes* its own request, so no `DrdynvcServerPdu::decode` arm).
     - `SoftSyncResponsePdu { header, tunnels: Vec<u32> }` — client→server
