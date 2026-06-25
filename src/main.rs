@@ -2140,10 +2140,13 @@ async fn async_main() -> Result<()> {
         .await
         {
             Ok(listener) => {
+                let migrate_egfx = std::env::var_os("MACRDP_UDP_MIGRATE_EGFX").is_some();
                 info!(
                     addr = %args.bind,
-                    "UDP multitransport listener bound (M3: RDPEUDP handshake; \
-                     session still runs over TCP)"
+                    migrate_egfx,
+                    "UDP multitransport listener bound — EGFX migrates to the reliable UDP tunnel \
+                     when MACRDP_UDP_MIGRATE_EGFX is set (otherwise EGFX stays on TCP); \
+                     input/audio/clipboard always ride TCP"
                 );
                 server
                     .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
