@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -36,7 +37,8 @@ use ironrdp_rdpeudp::pdu::FecFlags;
 use ironrdp_rdpeudp::state::{Config, RdpeudpState, Role};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tracing::{debug, trace};
+use tokio_rustls::rustls::{ServerConfig, ServerConnection};
+use tracing::{debug, trace, warn};
 
 /// Configuration for the UDP multitransport listener.
 #[derive(Debug, Clone, Copy)]
@@ -64,17 +66,25 @@ impl Default for ListenerConfig {
     }
 }
 
-/// A per-peer handshake/transport session: the reliability SM plus the
-/// reassembled inbound reliable byte-stream (M4a).
+/// A per-peer handshake/transport session: the reliability SM, the reassembled
+/// inbound reliable byte-stream, and (M4b) the server-side TLS connection that
+/// secures the MS-RDPEMT tunnel riding that stream.
 struct Peer {
     sm: RdpeudpState,
     /// The client's reliable application stream, reassembled in order from the
     /// SM's `delivered` output. After the handshake this carries the client's
-    /// MS-RDPEMT-over-TLS bytes (its TLS ClientHello first). M4a only accumulates
-    /// + logs it; M4b feeds it into a rustls server, M4c into the EMT tunnel.
+    /// MS-RDPEMT-over-TLS bytes (its TLS ClientHello first). Kept for the
+    /// ClientHello sniff log; the bytes themselves feed `tls`.
     inbound: Vec<u8>,
     /// Whether we've already logged the TLS ClientHello sniff (avoid log spam).
     tls_hello_logged: bool,
+    /// The MS-RDPEMT TLS server connection (M4b), created lazily on the first
+    /// reliable data when a TLS config is configured. `read_tls`/`write_tls` are
+    /// driven sans-I/O off the reliable byte-stream. `None` until then, or when
+    /// the listener has no TLS config (the handshake-only / test path).
+    tls: Option<ServerConnection>,
+    /// Whether we've logged TLS-handshake completion (avoid log spam).
+    tls_done_logged: bool,
 }
 
 /// A running UDP multitransport listener. The receive loop runs on a spawned
@@ -88,12 +98,20 @@ impl UdpMultitransportListener {
     /// Bind a UDP socket and start serving the RDPEUDP handshake on a background
     /// task. `addr` is typically the same address/port as the TCP RDP listener
     /// (the client reuses the server address for the UDP flow), or `:0` in tests.
-    pub async fn bind(addr: SocketAddr, cfg: ListenerConfig) -> io::Result<Self> {
+    ///
+    /// `tls_config` is the rustls server config that secures the MS-RDPEMT tunnel
+    /// (M4b) — pass the SAME cert as the main TCP connection. `None` runs the
+    /// handshake-only path (no TLS), used by the loopback handshake test.
+    pub async fn bind(
+        addr: SocketAddr,
+        cfg: ListenerConfig,
+        tls_config: Option<Arc<ServerConfig>>,
+    ) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
         let socket = Arc::new(socket);
-        debug!(%local_addr, ?cfg, "RDPEUDP multitransport listener bound");
-        let task = tokio::spawn(run_recv_loop(Arc::clone(&socket), cfg));
+        debug!(%local_addr, ?cfg, tls = tls_config.is_some(), "RDPEUDP multitransport listener bound");
+        let task = tokio::spawn(run_recv_loop(Arc::clone(&socket), cfg, tls_config));
         Ok(Self { local_addr, task })
     }
 
@@ -115,7 +133,25 @@ fn is_syn_family(bytes: &[u8]) -> bool {
     Datagram::peek_fec_flags(bytes).is_some_and(|f| f.contains(FecFlags::SYN))
 }
 
-async fn run_recv_loop(socket: Arc<UdpSocket>, cfg: ListenerConfig) {
+/// Send every datagram the SM produced, zero-padding SYN-family packets to the
+/// MTU (MS-RDPEUDP path-MTU validation). A send error is per-datagram (UDP), so
+/// log and keep going.
+async fn send_datagrams(socket: &UdpSocket, peer_addr: SocketAddr, to_send: Vec<Vec<u8>>, mtu: u16) {
+    for mut dg in to_send {
+        if is_syn_family(&dg) && dg.len() < mtu as usize {
+            dg.resize(mtu as usize, 0);
+        }
+        if let Err(e) = socket.send_to(&dg, peer_addr).await {
+            trace!(error = %e, %peer_addr, "udp send_to error");
+        }
+    }
+}
+
+async fn run_recv_loop(
+    socket: Arc<UdpSocket>,
+    cfg: ListenerConfig,
+    tls_config: Option<Arc<ServerConfig>>,
+) {
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
     let mut session_counter: u32 = 0;
     let start = tokio::time::Instant::now();
@@ -182,20 +218,15 @@ async fn run_recv_loop(socket: Arc<UdpSocket>, cfg: ListenerConfig) {
                 ),
                 inbound: Vec::new(),
                 tls_hello_logged: false,
+                tls: None,
+                tls_done_logged: false,
             }
         });
 
         let was_established = peer.sm.is_established();
         let had_data = Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::DATA));
         let out = peer.sm.step(now_ms, Some(data));
-        for mut dg in out.to_send {
-            if is_syn_family(&dg) && dg.len() < cfg.mtu as usize {
-                dg.resize(cfg.mtu as usize, 0); // path-MTU validation padding
-            }
-            if let Err(e) = socket.send_to(&dg, peer_addr).await {
-                trace!(error = %e, %peer_addr, "udp send_to error");
-            }
-        }
+        send_datagrams(&socket, peer_addr, out.to_send, cfg.mtu).await;
 
         if !was_established && peer.sm.is_established() {
             debug!(
@@ -229,8 +260,82 @@ async fn run_recv_loop(socket: Arc<UdpSocket>, cfg: ListenerConfig) {
                 peer.tls_hello_logged = true;
                 debug!(
                     %peer_addr,
-                    "RDPEUDP reliable stream carries a TLS ClientHello (MS-RDPEMT handshake starting; TLS + tunnel are M4b/M4c)"
+                    "RDPEUDP reliable stream carries a TLS ClientHello (MS-RDPEMT handshake starting)"
                 );
+            }
+
+            // M4b: drive the MS-RDPEMT server-side TLS handshake over the reliable
+            // stream. Feed the just-delivered bytes into rustls, then ship whatever
+            // TLS output it produces back through the SM (reliable, fragmented to
+            // the MTU). Plaintext tunnel bytes (the EMT PDUs after the handshake)
+            // are M4c. No-op when the listener has no TLS config (test path).
+            if let Some(tls_cfg) = tls_config.as_ref() {
+                if peer.tls.is_none() {
+                    match ServerConnection::new(Arc::clone(tls_cfg)) {
+                        Ok(conn) => peer.tls = Some(conn),
+                        Err(e) => warn!(%peer_addr, error = %e, "failed to create MS-RDPEMT TLS server"),
+                    }
+                }
+                let mut tls_out = Vec::new();
+                let mut plaintext = Vec::new();
+                let mut handshake_done = false;
+                if let Some(tls) = peer.tls.as_mut() {
+                    let mut tls_err = false;
+                    for chunk in &out.delivered {
+                        // Feed the reliable byte-stream into rustls. `read_tls`
+                        // returns Ok(0) once the cursor is drained (or its internal
+                        // buffer is full); loop until then so a chunk carrying more
+                        // than one TLS record is fully consumed.
+                        let mut rd = io::Cursor::new(chunk.as_slice());
+                        loop {
+                            match tls.read_tls(&mut rd) {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(_) => {
+                                    tls_err = true;
+                                    break;
+                                }
+                            }
+                            if let Err(e) = tls.process_new_packets() {
+                                warn!(%peer_addr, error = %e, "MS-RDPEMT TLS error");
+                                tls_err = true;
+                                break;
+                            }
+                            // Drain decrypted application data (the MS-RDPEMT tunnel
+                            // PDUs — parsed in M4c) so rustls's plaintext buffer
+                            // can't fill and stall record processing. The trailing
+                            // WouldBlock once the buffer empties is expected.
+                            let _ = tls.reader().read_to_end(&mut plaintext);
+                        }
+                        if tls_err {
+                            break;
+                        }
+                    }
+                    while tls.wants_write() {
+                        if tls.write_tls(&mut tls_out).is_err() {
+                            break;
+                        }
+                    }
+                    handshake_done = !tls_err && !tls.is_handshaking();
+                }
+                if !tls_out.is_empty() {
+                    let o = peer.sm.enqueue(now_ms, &tls_out);
+                    send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
+                }
+                if handshake_done && !peer.tls_done_logged {
+                    peer.tls_done_logged = true;
+                    debug!(
+                        %peer_addr,
+                        "MS-RDPEMT TLS handshake complete (tunnel CREATEREQUEST + cookie are M4c)"
+                    );
+                }
+                if !plaintext.is_empty() {
+                    debug!(
+                        %peer_addr,
+                        plaintext_len = plaintext.len(),
+                        "MS-RDPEMT decrypted tunnel bytes received (parsing is M4c)"
+                    );
+                }
             }
         } else if had_data {
             // A DATA datagram that produced no delivery means our receive sequence

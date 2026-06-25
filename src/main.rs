@@ -1072,7 +1072,7 @@ fn generate_and_persist(
     Ok((vec![cert_der], key_der))
 }
 
-fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>)> {
+fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>, Arc<ServerConfig>)> {
     let cert_path = cert_dir.join("cert.pem");
     let key_path = cert_dir.join("key.pem");
 
@@ -1102,11 +1102,16 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>)> {
         .raw_bytes()
         .to_vec();
 
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("build rustls ServerConfig")?;
-    Ok((TlsAcceptor::from(Arc::new(config)), spki_der))
+    let config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .context("build rustls ServerConfig")?,
+    );
+    // The same cert/config also secures the auxiliary UDP multitransport (MS-RDPEMT
+    // over TLS) — the client trusts it via the main connection's TOFU. Returned so
+    // the UDP listener can reuse it without re-loading the cert.
+    Ok((TlsAcceptor::from(Arc::clone(&config)), spki_der, config))
 }
 
 /// Spawn the session-transition watcher used by `--detach-primary`
@@ -1768,7 +1773,7 @@ async fn async_main() -> Result<()> {
         Some(p) => p,
         None => default_cert_dir()?,
     };
-    let (tls, spki_der) = make_tls_acceptor(&cert_dir)?;
+    let (tls, spki_der, udp_tls_config) = make_tls_acceptor(&cert_dir)?;
 
     // Resolve desktop dimensions + geometry. Three paths:
     //   - virtual display: width/height are already enforced as required
@@ -2117,7 +2122,13 @@ async fn async_main() -> Result<()> {
             server_isn_seed: isn_seed,
             ..Default::default()
         };
-        match ironrdp_server::UdpMultitransportListener::bind(args.bind, cfg).await {
+        match ironrdp_server::UdpMultitransportListener::bind(
+            args.bind,
+            cfg,
+            Some(udp_tls_config.clone()),
+        )
+        .await
+        {
             Ok(listener) => {
                 info!(
                     addr = %args.bind,

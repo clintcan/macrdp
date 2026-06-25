@@ -35,6 +35,19 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **M4b decode fix (done — verified on real mstsc, 2026-06-25):** `Datagram::decode`
+  now **skips the 4-byte RDPUDP_ACK_OF_ACKVECTOR_HEADER** (`snAckOfAcksSeqNum`) that
+  sits between the ack vector and the source payload when the `ACK_OF_ACKS` flag is
+  set. Real mstsc sets this flag periodically once a session is up; without the
+  skip those 4 bytes were folded into the reliable byte-stream (`delivered` jumped
+  50→54 on exactly those packets), which corrupted the TLS records riding the
+  stream — observed live as rustls `received corrupt message of type
+  InvalidContentType` mid-session, right after the first ACK_OF_ACKS packet. We
+  don't act on the ack-of-acks value (cumulative-ACK only); we just consume it so
+  the source-payload offset stays right. The encoder still never *produces* the
+  section. Regression test `data_packet_with_ack_of_acks_skips_the_section`
+  hand-assembles such a packet and asserts the payload doesn't absorb the 4 bytes.
+  35 crate tests.
 - **M4a (done — reliable data path verified on real mstsc, 2026-06-25):** the
   reliability SM now actually carries the client's reliable byte-stream end to
   end. Two fixes, both forced by real mstsc (the in-memory two-instance test was

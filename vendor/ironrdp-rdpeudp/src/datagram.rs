@@ -4,15 +4,17 @@
 //!
 //! This is the wire layer the reliability state machine ([`crate::state`]) emits
 //! and consumes. It deliberately models only what that machine needs (SYN /
-//! SYN+ACK / data / ack), not every optional MS-RDPEUDP section (ACK-of-acks and
-//! FEC payloads are not produced). The RDPEUDP2 (`0x0101`) data framing is a
-//! separate, spike-gated codec — see the crate docs.
+//! SYN+ACK / data / ack); it never *produces* the optional FEC or ACK-of-acks
+//! sections. On decode it *skips* an inbound RDPUDP_ACK_OF_ACKVECTOR_HEADER
+//! (real mstsc sets it periodically) so the source payload after it stays
+//! aligned. The RDPEUDP2 (`0x0101`) data framing is a separate, spike-gated
+//! codec — see the crate docs.
 //!
 //! [`pdu`]: crate::pdu
 //! [`FecFlags`]: crate::pdu::FecFlags
 
 use ironrdp_core::{
-    decode_cursor, encode_cursor, DecodeResult, EncodeResult, ReadCursor, WriteCursor,
+    decode_cursor, encode_cursor, ensure_size, DecodeResult, EncodeResult, ReadCursor, WriteCursor,
 };
 
 use crate::pdu::{
@@ -208,6 +210,17 @@ impl Datagram {
             None
         };
 
+        // An RDPUDP_ACK_OF_ACKVECTOR_HEADER (single u32 snAckOfAcksSeqNum, 4
+        // bytes) sits between the ack vector and the source payload when the
+        // ACK_OF_ACKS flag is set. We don't act on it (cumulative-ACK only), but
+        // it MUST be skipped or the source-payload offset is wrong — real mstsc
+        // sets this periodically, and folding the 4 bytes into the reliable
+        // stream corrupts the TLS record framing (InvalidContentType).
+        if flags.contains(FecFlags::ACK_OF_ACKS) && !flags.contains(FecFlags::SYN) {
+            ensure_size!(in: cursor, size: 4);
+            let _sn_ack_of_acks = cursor.read_u32_be();
+        }
+
         // For a SYN datagram the trailing bytes are SYN sections, not a source
         // payload; for a data datagram they are the source header + payload.
         let (source, syn, correlation, syn_ex) = if flags.contains(FecFlags::SYN) {
@@ -301,6 +314,41 @@ mod tests {
         let back = Datagram::decode(&bytes).unwrap();
         assert_eq!(back, d);
         assert_eq!(back.source.unwrap().payload, b"hello rdpeudp");
+    }
+
+    /// Real mstsc periodically sets the ACK_OF_ACKS flag on a data packet, which
+    /// inserts a 4-byte RDPUDP_ACK_OF_ACKVECTOR_HEADER between the ack vector and
+    /// the source payload. The decoder must skip it, or those 4 bytes are folded
+    /// into the reliable byte-stream and corrupt the TLS records riding it
+    /// (observed live as rustls `InvalidContentType` mid-session).
+    #[test]
+    fn data_packet_with_ack_of_acks_skips_the_section() {
+        #[rustfmt::skip]
+        let bytes: Vec<u8> = vec![
+            // RDPUDP_FEC_HEADER
+            0x00, 0x00, 0x00, 0x29, // snSourceAck = 41
+            0x00, 0x40,             // uReceiveWindowSize = 64
+            0x01, 0x0c,             // uFlags = ACK | DATA | ACK_OF_ACKS (0x010c)
+            // RDPUDP_ACK_VECTOR_HEADER (empty, padded to 4 bytes)
+            0x00, 0x00,             // uAckVectorSize = 0
+            0x00, 0x00,             // zero-padding to the 4-byte boundary
+            // RDPUDP_ACK_OF_ACKVECTOR_HEADER (snAckOfAcksSeqNum) — must be skipped
+            0xde, 0xad, 0xbe, 0xef,
+            // RDPUDP_SOURCE_PAYLOAD_HEADER
+            0x00, 0x00, 0x00, 0x2a, // snCoded = 42
+            0x00, 0x00, 0x00, 0x2a, // snSourceStart = 42
+            // payload
+            b'h', b'e', b'l', b'l', b'o',
+        ];
+
+        let dg = Datagram::decode(&bytes).unwrap();
+        assert!(dg.ack_vector.is_some());
+        let src = dg.source.expect("source payload present");
+        assert_eq!(src.header.sn_coded, 42);
+        assert_eq!(
+            src.payload, b"hello",
+            "the 4-byte ack-of-acks section must NOT leak into the payload"
+        );
     }
 
     #[test]

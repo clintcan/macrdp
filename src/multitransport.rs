@@ -97,7 +97,8 @@ mod tests {
         ];
 
         let cfg = ListenerConfig::default();
-        let listener = UdpMultitransportListener::bind("127.0.0.1:0".parse().unwrap(), cfg)
+        // No TLS config: this test only exercises the SYN→SYN+ACK handshake.
+        let listener = UdpMultitransportListener::bind("127.0.0.1:0".parse().unwrap(), cfg, None)
             .await
             .expect("bind listener");
         let server_addr = listener.local_addr();

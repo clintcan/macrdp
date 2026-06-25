@@ -325,3 +325,25 @@ AND released — #1276 landing is NOT sufficient.
     mstsc stops retransmitting and idles on `ACK|ACK_DELAYED` keepalives, waiting
     for our TLS ServerHello. No TLS/EMT yet (M4b/M4c); listener still not bound to
     the per-connection cookie/MigrationState.
+    **M4b (added 2026-06-25): rustls server TLS over the reliable stream — verified
+    on real mstsc.** The listener now drives a per-`Peer` `rustls::ServerConnection`
+    (`Peer::tls`, created lazily on first reliable data) over the SM's reliable
+    byte-stream: each delivered chunk is fed to `read_tls` + `process_new_packets`
+    in a loop (until the cursor drains), `tls.reader()` is drained so the decrypted
+    plaintext can't stall record processing, and any `write_tls` output is
+    `enqueue`d back through the SM (reliable, MTU-fragmented via a new
+    `send_datagrams` helper used for both SM and TLS output). The rustls
+    `ServerConfig` is the **same cert/config as the main TCP connection** — passed
+    into `UdpMultitransportListener::bind(addr, cfg, tls_config: Option<Arc<ServerConfig>>)`
+    from `main.rs` (`make_tls_acceptor` now also returns the `Arc<ServerConfig>`);
+    the client trusts it via the main connection's TOFU. Result on real mstsc: the
+    TLS handshake **completes** (`MS-RDPEMT TLS handshake complete`) and mstsc then
+    streams encrypted tunnel PDUs which decrypt cleanly (logged as `MS-RDPEMT
+    decrypted tunnel bytes received plaintext_len=28`, repeating ~every 200 ms — its
+    `RDP_TUNNEL_CREATEREQUEST` retransmitted while it waits for our `CREATERESPONSE`
+    = M4c). The decisive interop fix was in `ironrdp-rdpeudp` (skip the inbound
+    ACK_OF_ACKS section — see its CLAUDE.md M4b): mstsc sets that flag periodically
+    once up, and folding its 4 bytes into the stream corrupted the TLS records
+    (`InvalidContentType`). The `tls_config: None` path (the loopback handshake
+    test) is unchanged. Still no EMT tunnel parsing / cookie binding / migration
+    (M4c/M5); the 28-byte plaintext is logged, not yet parsed.
