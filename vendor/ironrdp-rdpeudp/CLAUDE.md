@@ -62,7 +62,17 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
   1 ack). Sub-header order + sizes are known (ACK 7+nacks, OverheadSize 1,
   DelayAckInfo 3, AckOfAcks 2, DataHeader 4 [seq2+chanseq2], AckVector var) and
   confirmed against the capture's DataBody offsets.
-- **EUDP2 next:** walk the optional sub-headers to extract the DataBody (pin the
-  ACK NumDelayedAcks/TimeScale bit-split + the AckVector internals first), then
-  wire EUDP2 into the reliability state machine (the algorithm is
-  framing-agnostic) for the V3 data path. Capture: ~/Documents/Projects/mstscpcap.pcapng.
+- **EUDP2 sub-header walk (done):** `Eudp2Packet::parse` walks the ordered
+  optional sub-headers and returns the `DataBody` slice. Field splits taken from
+  the FreeRDP dissector's `dissectV2` and validated against the same 3 captured
+  packets (`parse_real_*` tests). Order: ACK, OverheadSize, DelayAckInfo,
+  AckOfAcks, Data(SeqNumber), AckVector, Data(ChannelSeqNumber)+DataBody. **The
+  DataHeader is SPLIT** — `SeqNumber` (2B) before the AckVector, `ChannelSeqNumber`
+  (2B) + body after it; a dummy packet (`Packet_Type_Index==8`) carries only
+  `SeqNumber`, no body. Sub-header sizes: ACK = 7 + NumDelayedAcks (combined byte
+  = NumDelayedAcks low-nibble | DelayedTimeScale high-nibble; AckTimestamp is
+  24-bit LE), OverheadSize 1, DelayAckInfo 3, AckOfAcks 2, AckVector =
+  BaseSeq(2)+sizeByte(1, high-bit=have-ts, low-7=coded size)+[Timestamp(4)]+vector.
+- **EUDP2 next:** wire `Eudp2Packet`/`body` into the reliability state machine
+  (`src/state.rs` — the algorithm is framing-agnostic), then M3 (UDP listener +
+  on-wire SYN+ACK). Capture: ~/Documents/Projects/mstscpcap.pcapng.
