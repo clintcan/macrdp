@@ -449,13 +449,15 @@ struct Args {
     #[arg(long)]
     enable_smartcard_redirection: bool,
 
-    /// EXPERIMENTAL (M3, opt-in, default OFF). Offer RDP UDP multitransport
-    /// (MS-RDPEMT) to clients that advertise it, and bind a UDP listener on the
-    /// same address/port as TCP. **The session still runs over TCP:** the listener
-    /// answers the RDPEUDP SYN→SYN+ACK handshake (negotiating RDPEUDP2), but there
-    /// is no TLS/EMT tunnel or channel migration yet, so nothing actually moves to
-    /// UDP. Cookie validation is soft. No reason for end users to enable it. Not
-    /// supported under --fork-workers (falls back to TCP). macOS-only build; see
+    /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
+    /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
+    /// UDP listener on the same address/port as TCP. With the env var
+    /// MACRDP_UDP_MIGRATE_EGFX=1 the EGFX (H.264) channel is migrated onto the
+    /// reliable UDP tunnel via MS-RDPEDYC Soft-Sync (verified rendering on mstsc);
+    /// without it, EGFX stays on TCP (the proven safe spike). Input, audio (RDPSND),
+    /// and clipboard always ride TCP. The win is on lossy/high-latency links (no
+    /// head-of-line blocking), marginal on a clean LAN. Not supported under
+    /// --fork-workers (falls back to TCP). macOS-only build; see
     /// docs/rdp-udp-multitransport-feasibility.md.
     #[arg(long)]
     enable_udp_multitransport: bool,
