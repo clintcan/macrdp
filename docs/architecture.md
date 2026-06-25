@@ -144,6 +144,22 @@ src/videotoolbox.rs  VideoToolbox H.264 encoder (AVCC NALs + SPS/PPS).
                   YUV, which mstsc renders washed-out. The BGRA→NV12 conversion
                   is vImage (Accelerate/NEON) accelerated, ~24-32x over the
                   scalar reference kept as a fallback + benchmark baseline.
+src/multitransport.rs  macrdp-side RDP UDP multitransport provider
+                  (--enable-udp-multitransport, feature `multitransport`,
+                  default OFF). Thin: a MacMultitransport that tells the
+                  vendored server to offer reliable UDP (UdpFecR). The transport
+                  itself (RDPEUDP state machine + RDPEUDP2/EMT codecs) is the
+                  sans-I/O vendor/ironrdp-rdpeudp crate; the UDP listener + rustls
+                  TLS + MS-RDPEMT tunnel + DYNVC Soft-Sync EGFX migration live in
+                  vendored ironrdp-server (src/multitransport/, divergence (12))
+                  + vendored ironrdp-dvc (Soft-Sync codec). main.rs binds the
+                  listener on the TCP address/port and wires the cookie registry +
+                  the server↔listener tunnel handoff. EGFX-over-UDP rendering is
+                  additionally env-gated by MACRDP_UDP_MIGRATE_EGFX until soaked.
+                  Cross-platform (pure protocol policy); byte-exact Soft-Sync +
+                  cookie-registry + Initiate-Request tests live here (the vendored
+                  crates are test=false). See docs/rdp-udp-multitransport-
+                  feasibility.md.
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via
@@ -182,6 +198,26 @@ vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.5.0 (added 2026-06-16,
                           server-side RdpdrServer processor itself lives in
                           vendor/ironrdp-server/src/rdpdr.rs. See
                           vendor/ironrdp-rdpdr/CLAUDE.md.
+
+vendor/ironrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
+                          multitransport (--enable-udp-multitransport, feature
+                          `multitransport`, default OFF). No sockets/tokio: PDU
+                          codecs for RDPEUDP v1 (pdu.rs, big-endian) + RDPEUDP2
+                          (eudp2.rs) + the MS-RDPEMT tunnel PDUs (emt.rs), and the
+                          reliable transport state machine (state.rs: handshake +
+                          in-order dedup delivery + cumulative-ACK + RTO retransmit)
+                          driven by the listener. Candidate for upstream. See
+                          vendor/ironrdp-rdpeudp/CLAUDE.md.
+
+vendor/ironrdp-dvc/       Local fork of ironrdp-dvc 0.5.0 (added 2026-06-26, 4th
+                          fork). Adds the server-direction MS-RDPEDYC **Soft-Sync**
+                          codec (SoftSyncRequest/Response PDUs + the client
+                          Soft-Sync-Response decode arm) so the server can move a
+                          DVC (EGFX) onto the UDP tunnel and not tear down on the
+                          client's reply. Patch wiring is TWO-SIDED (it's a path dep
+                          of the git-pinned ironrdp crates) — see its CLAUDE.md.
+                          Soft-Sync rides drdynvc on the MAIN TCP connection; only
+                          channel data after the switch rides the UDP tunnel.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298
