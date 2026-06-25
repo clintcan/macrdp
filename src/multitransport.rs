@@ -97,6 +97,60 @@ mod tests {
         assert_eq!(req.security_cookie, cookie);
     }
 
+    // M5b-2: the server-side MS-RDPEDYC Soft-Sync codec lives in the vendored
+    // (test = false) ironrdp-dvc crate, so its byte-exact round-trips are asserted
+    // here through the public DrdynvcServerPdu / DrdynvcClientPdu Encode/Decode
+    // traits — exactly the path the server uses to emit the Soft-Sync Request and
+    // decode the client's Soft-Sync Response. (Soft-Sync rides drdynvc on the MAIN
+    // TCP connection; only channel DATA after the switch rides the UDP tunnel.)
+    #[test]
+    fn soft_sync_request_encodes_to_exact_wire_bytes() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncRequestPdu};
+
+        let pdu =
+            DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::switch_to_udpfecr(vec![0x0007]));
+        let bytes = encode_vec(&pdu).unwrap();
+
+        #[rustfmt::skip]
+        let expected: [u8; 20] = [
+            0x80,                   // Header: Cmd=SoftSyncRequest(0x08)<<4, cbId=0, Sp=0
+            0x00,                   // Pad
+            0x12, 0x00, 0x00, 0x00, // Length = 18 (Length+Flags+NumberOfTunnels+lists)
+            0x03, 0x00,             // Flags = TCP_FLUSHED | CHANNEL_LIST_PRESENT
+            0x01, 0x00,             // NumberOfTunnels = 1 (u16 in the request)
+            0x01, 0x00, 0x00, 0x00, // TunnelType = TUNNELTYPE_UDPFECR
+            0x01, 0x00,             // NumberOfDVCs = 1
+            0x07, 0x00, 0x00, 0x00, // ListOfDVCIds[0] = 0x0007
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn soft_sync_response_decodes_from_wire_and_round_trips() {
+        use ironrdp_core::{decode, encode_vec};
+        use ironrdp_dvc::pdu::{DrdynvcClientPdu, TUNNELTYPE_UDPFECR};
+
+        #[rustfmt::skip]
+        let wire: [u8; 10] = [
+            0x90,                   // Header: Cmd=SoftSyncResponse(0x09)<<4
+            0x00,                   // Pad
+            0x01, 0x00, 0x00, 0x00, // NumberOfTunnels = 1 (u32 here — asymmetric vs the request's u16)
+            0x01, 0x00, 0x00, 0x00, // TunnelsToSwitch[0] = TUNNELTYPE_UDPFECR
+        ];
+
+        let pdu = decode::<DrdynvcClientPdu>(&wire).unwrap();
+        let resp = match pdu {
+            DrdynvcClientPdu::SoftSyncResponse(r) => r,
+            other => panic!("expected SoftSyncResponse, got {other:?}"),
+        };
+        assert_eq!(resp.tunnels, vec![TUNNELTYPE_UDPFECR]);
+
+        // Re-encoding the decoded PDU reproduces the exact input bytes.
+        let reencoded = encode_vec(&DrdynvcClientPdu::SoftSyncResponse(resp)).unwrap();
+        assert_eq!(reencoded, wire);
+    }
+
     // M3b: the real UDP listener over loopback. The vendored ironrdp-server is
     // built `test = false`, so this socket-level test lives here. It binds the
     // listener to an ephemeral 127.0.0.1 UDP port, sends a REAL captured Microsoft

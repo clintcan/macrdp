@@ -99,6 +99,11 @@ ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
 # encode/decode halves the client-oriented upstream crate lacks. See
 # vendor/ironrdp-rdpdr/CLAUDE.md.
 ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
+# ironrdp-dvc is vendored (same upstream rev) for server-side MS-RDPEDYC Soft-Sync
+# support — moving dynamic virtual channels (EGFX) onto the UDP multitransport
+# tunnel. Upstream is client-oriented and errors on the server-inbound
+# SoftSyncResponse. See vendor/ironrdp-dvc/CLAUDE.md.
+ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 # ironrdp-error isn't depended on directly by macrdp, but the vendored
 # ironrdp-rdpdr names it as a crates.io dep; pin it to the same git rev as the
 # rest so it unifies with the copy the other ironrdp crates pull transitively.
@@ -110,13 +115,21 @@ ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-dvc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+
+# The git-pinned ironrdp crates above (egfx, displaycontrol, echo, …) depend on
+# ironrdp-dvc as a path dep WITHIN the git workspace, so the [patch.crates-io]
+# redirect above doesn't reach them — without this they'd pull the git
+# ironrdp-dvc while vendored ironrdp-server pulls the vendored one, giving two
+# incompatible versions (trait mismatch). Patch the git source too so every
+# consumer resolves to the single vendored copy.
+[patch."https://github.com/Devolutions/IronRDP.git"]
+ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 
 [profile.release]
 lto = "thin"

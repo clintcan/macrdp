@@ -29,5 +29,4 @@ pub mod datagram;
 pub mod emt;
 pub mod eudp2;
 pub mod pdu;
-pub mod softsync;
 pub mod state;

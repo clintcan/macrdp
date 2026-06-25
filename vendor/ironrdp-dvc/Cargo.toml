@@ -1,0 +1,38 @@
+[package]
+name = "ironrdp-dvc"
+version = "0.5.0"
+readme = "README.md"
+description = "DRDYNVC static channel implementation and traits to implement dynamic virtual channels"
+# Vendored copy of upstream master ironrdp-dvc (copied 2026-06-26 from
+# Devolutions/IronRDP@879ffed, same rev as the git pins in the root Cargo.toml).
+# Workspace-inherited fields are inlined below because we're not inside the
+# IronRDP cargo workspace. The divergence: server-side MS-RDPEDYC Soft-Sync
+# support (decode the client's SoftSyncResponse instead of erroring, encode the
+# server's SoftSyncRequest) needed to move dynamic virtual channels onto the UDP
+# multitransport tunnel. See CLAUDE.md for the divergence log.
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Devolutions/IronRDP"
+repository = "https://github.com/Devolutions/IronRDP"
+authors = ["Devolutions Inc. <infos@devolutions.net>"]
+keywords = ["rdp", "remote-desktop", "network", "client", "protocol"]
+categories = ["network-programming"]
+
+[lib]
+doctest = false
+test = false
+
+[features]
+default = []
+std = []
+
+[dependencies]
+# path = "../ironrdp-*" entries dropped — we live outside the upstream
+# workspace, so cargo resolves these via the root macrdp Cargo.toml's
+# [patch.crates-io] redirects (git pin to upstream master).
+ironrdp-core = { version = "0.1", features = ["alloc"] } # public
+ironrdp-svc = { version = "0.6" } # public
+ironrdp-pdu = { version = "0.7", features = ["alloc"] } # public
+tracing = { version = "0.1", features = ["log"] }
+slab = "0.4"

@@ -1594,7 +1594,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-dvc"
 version = "0.5.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?rev=879ffed866c32748d30d26b54f9d667ad001c51c#879ffed866c32748d30d26b54f9d667ad001c51c"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
