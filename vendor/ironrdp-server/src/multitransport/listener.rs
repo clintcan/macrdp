@@ -36,6 +36,8 @@ use std::sync::Arc;
 use ironrdp_rdpeudp::datagram::Datagram;
 use ironrdp_rdpeudp::pdu::FecFlags;
 use ironrdp_rdpeudp::state::{Config, RdpeudpState, Role};
+
+use crate::multitransport::CookieRegistry;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio_rustls::rustls::{ServerConfig, ServerConnection};
@@ -111,16 +113,34 @@ impl UdpMultitransportListener {
     /// `tls_config` is the rustls server config that secures the MS-RDPEMT tunnel
     /// (M4b) — pass the SAME cert as the main TCP connection. `None` runs the
     /// handshake-only path (no TLS), used by the loopback handshake test.
+    ///
+    /// `cookie_registry` (M5a) is the shared set of issued multitransport cookies
+    /// (the same one handed to
+    /// [`RdpServer::set_multitransport_cookie_registry`](crate::RdpServer::set_multitransport_cookie_registry)).
+    /// When set, an inbound tunnel `CREATEREQUEST` is accepted only if its echoed
+    /// cookie is registered (binding the UDP flow to a real TCP session, one-time
+    /// use). `None` leaves binding soft (accept any cookie — handshake-test path).
     pub async fn bind(
         addr: SocketAddr,
         cfg: ListenerConfig,
         tls_config: Option<Arc<ServerConfig>>,
+        cookie_registry: Option<CookieRegistry>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
         let socket = Arc::new(socket);
-        debug!(%local_addr, ?cfg, tls = tls_config.is_some(), "RDPEUDP multitransport listener bound");
-        let task = tokio::spawn(run_recv_loop(Arc::clone(&socket), cfg, tls_config));
+        debug!(
+            %local_addr, ?cfg,
+            tls = tls_config.is_some(),
+            cookie_binding = cookie_registry.is_some(),
+            "RDPEUDP multitransport listener bound"
+        );
+        let task = tokio::spawn(run_recv_loop(
+            Arc::clone(&socket),
+            cfg,
+            tls_config,
+            cookie_registry,
+        ));
         Ok(Self { local_addr, task })
     }
 
@@ -164,11 +184,18 @@ async fn send_datagrams(socket: &UdpSocket, peer_addr: SocketAddr, to_send: Vec<
 /// request until it sees the response, so we reply once (gated by
 /// `tunnel_created`) and drop the retransmits. RDP_TUNNEL_DATA (channel
 /// migration) is M5 — logged and skipped for now.
+///
+/// `cookie_registry` (M5a) binds the tunnel to a real TCP session: when present,
+/// the CREATEREQUEST's echoed cookie must be one the server issued (and not yet
+/// consumed). A forged / replayed / stale cookie is rejected (no response → the
+/// client's UDP attempt times out and it stays on TCP). `None` accepts any
+/// cookie (the soft pre-M5a behavior, used by the handshake-only test path).
 fn handle_emt_tunnel(
     peer_addr: SocketAddr,
     tls: &mut ServerConnection,
     buf: &mut Vec<u8>,
     tunnel_created: &mut bool,
+    cookie_registry: Option<&CookieRegistry>,
 ) {
     use ironrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
 
@@ -187,11 +214,26 @@ fn handle_emt_tunnel(
                             .iter()
                             .map(|b| format!("{b:02x}"))
                             .collect::<String>();
+                        // M5a: bind to a real TCP session. `take` is atomic
+                        // check-and-consume, so a cookie is one-time use.
+                        let bound = match cookie_registry {
+                            Some(reg) => reg.take(&req.security_cookie),
+                            None => true, // soft binding (test path)
+                        };
+                        if !bound {
+                            warn!(
+                                %peer_addr,
+                                request_id = req.request_id,
+                                %cookie,
+                                "MS-RDPEMT tunnel CREATEREQUEST cookie not recognized — rejecting tunnel (client stays on TCP)"
+                            );
+                            continue;
+                        }
                         debug!(
                             %peer_addr,
                             request_id = req.request_id,
                             %cookie,
-                            "MS-RDPEMT tunnel CREATEREQUEST received — replying CREATERESPONSE(S_OK)"
+                            "MS-RDPEMT tunnel CREATEREQUEST bound to session — replying CREATERESPONSE(S_OK)"
                         );
                         let resp = TunnelCreateResponse::ok().to_vec();
                         if tls.writer().write_all(&resp).is_ok() {
@@ -222,6 +264,7 @@ async fn run_recv_loop(
     socket: Arc<UdpSocket>,
     cfg: ListenerConfig,
     tls_config: Option<Arc<ServerConfig>>,
+    cookie_registry: Option<CookieRegistry>,
 ) {
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
     let mut session_counter: u32 = 0;
@@ -399,8 +442,15 @@ async fn run_recv_loop(
 
                     // M4c: answer the client's RDP_TUNNEL_CREATEREQUEST. Writing the
                     // response into the TLS connection here means the wants_write
-                    // drain below picks up its encrypted bytes.
-                    handle_emt_tunnel(peer_addr, tls, emt_inbound, tunnel_created);
+                    // drain below picks up its encrypted bytes. M5a: bind the
+                    // tunnel to a real TCP session via the cookie registry.
+                    handle_emt_tunnel(
+                        peer_addr,
+                        tls,
+                        emt_inbound,
+                        tunnel_created,
+                        cookie_registry.as_ref(),
+                    );
 
                     while tls.wants_write() {
                         if tls.write_tls(&mut tls_out).is_err() {

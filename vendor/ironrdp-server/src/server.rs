@@ -343,6 +343,13 @@ pub struct RdpServer {
     /// `MultitransportResponsePdu`. Reset every connection in `client_accepted`.
     #[cfg(feature = "multitransport")]
     multitransport_migration: Option<crate::multitransport::MigrationState>,
+    /// (vendored) Shared registry of issued multitransport security cookies. When
+    /// set, the offer path registers each cookie here so the process-global UDP
+    /// listener can bind an inbound tunnel to a real TCP session (reject forged /
+    /// replayed cookies). `None` leaves binding soft (the listener accepts any
+    /// CREATEREQUEST). Set once via `set_multitransport_cookie_registry`.
+    #[cfg(feature = "multitransport")]
+    multitransport_cookies: Option<crate::multitransport::CookieRegistry>,
 }
 
 #[derive(Debug)]
@@ -445,6 +452,8 @@ impl RdpServer {
             multitransport: None,
             #[cfg(feature = "multitransport")]
             multitransport_migration: None,
+            #[cfg(feature = "multitransport")]
+            multitransport_cookies: None,
         }
     }
 
@@ -512,6 +521,19 @@ impl RdpServer {
         provider: Option<Box<dyn crate::multitransport::MultitransportProvider>>,
     ) {
         self.multitransport = provider;
+    }
+
+    /// (vendored) Install the shared multitransport [`CookieRegistry`](crate::CookieRegistry)
+    /// so issued cookies are registered for the UDP listener to bind against.
+    /// Pass the **same** registry that was handed to
+    /// [`UdpMultitransportListener::bind`](crate::UdpMultitransportListener::bind).
+    /// Must be called before any client connects.
+    #[cfg(feature = "multitransport")]
+    pub fn set_multitransport_cookie_registry(
+        &mut self,
+        registry: Option<crate::multitransport::CookieRegistry>,
+    ) {
+        self.multitransport_cookies = registry;
     }
 
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
@@ -633,8 +655,20 @@ impl RdpServer {
         // mstsc and FreeRDP misparse it as a share-control PDU and disconnect.)
         #[cfg(feature = "multitransport")]
         if let Some(provider) = self.multitransport.as_ref() {
+            let offer = crate::multitransport::new_offer(provider.requested_protocol());
+            // Register this connection's cookie so the UDP listener can bind an
+            // inbound tunnel to it. Evict the previous connection's cookie first
+            // (the listener consumes a cookie on a successful bind, so a leftover
+            // here is from a connection that fell back to TCP — bound to ~one
+            // entry per live RdpServer instance).
+            if let Some(registry) = self.multitransport_cookies.as_ref() {
+                if let Some(prev) = self.multitransport_migration.as_ref() {
+                    registry.remove(&prev.cookie);
+                }
+                registry.insert(offer.cookie);
+            }
             acceptor.set_advertise_extended_client_data(true);
-            acceptor.set_multitransport_offer(Some(crate::multitransport::new_offer(provider.requested_protocol())));
+            acceptor.set_multitransport_offer(Some(offer));
         }
 
         self.attach_channels(&mut acceptor);

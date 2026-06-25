@@ -38,7 +38,7 @@ pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 #[cfg(feature = "multitransport")]
 pub use multitransport::listener::{ListenerConfig, UdpMultitransportListener};
 #[cfg(feature = "multitransport")]
-pub use multitransport::{MultitransportProvider, encode_initiate_request};
+pub use multitransport::{CookieRegistry, MultitransportProvider, encode_initiate_request};
 pub use rdpdr::{
     AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrHandle, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler,
     RdpdrServerMessage, RdpdrStatus, SCARD_EJECT_CARD, SCARD_LEAVE_CARD, SCARD_RESET_CARD, SCARD_SHARE_DIRECT,

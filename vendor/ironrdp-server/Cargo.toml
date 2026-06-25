@@ -30,7 +30,7 @@ egfx = ["dep:ironrdp-egfx"]
 # the standard build is byte-identical. M1 performs the negotiation handshake;
 # M3 adds the UDP listener + RDPEUDP SYN/SYN+ACK handshake (pulls in the
 # sans-I/O ironrdp-rdpeudp crate for the wire codecs + reliability SM).
-multitransport = ["dep:ironrdp-rdpeudp"]
+multitransport = ["dep:ironrdp-rdpeudp", "dep:getrandom"]
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at any time.
@@ -63,6 +63,7 @@ ironrdp-rdpdr = "0.5" # public (vendored — server-direction RDPDR)
 # [patch.crates-io] is ignored in the macrdp build, where ironrdp-core resolves
 # via the root patch to the same git rev.
 ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", optional = true }
+getrandom = { version = "0.2", optional = true } # multitransport: CSPRNG cookie
 tracing = { version = "0.1", features = ["log"] }
 x509-cert = { version = "0.2.5", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }

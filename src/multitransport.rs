@@ -34,7 +34,35 @@ mod tests {
     use ironrdp_pdu::mcs::McsMessage;
     use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, RequestedProtocol};
     use ironrdp_pdu::x224::X224;
-    use ironrdp_server::encode_initiate_request;
+    use ironrdp_server::{encode_initiate_request, CookieRegistry};
+
+    // M5a: the cookie registry binds an inbound UDP tunnel to a real TCP session.
+    // Its security property is one-time use — a registered cookie is accepted by
+    // `take` exactly once (so a forged/replayed CREATEREQUEST can't open a second
+    // tunnel), and an unregistered cookie is never accepted. The registry lives in
+    // the vendored (test = false) server crate, so its behavior is tested here.
+    #[test]
+    fn cookie_registry_take_is_one_time_and_rejects_unknown() {
+        let reg = CookieRegistry::new();
+        let cookie = [0xABu8; 16];
+        let other = [0x11u8; 16];
+
+        // Unknown cookie is rejected.
+        assert!(!reg.take(&other), "unregistered cookie must not bind");
+
+        // Registered cookie binds exactly once, then is consumed.
+        reg.insert(cookie);
+        assert!(reg.take(&cookie), "registered cookie must bind once");
+        assert!(
+            !reg.take(&cookie),
+            "a consumed cookie must not bind again (replay protection)"
+        );
+
+        // Explicit removal (teardown / eviction) also clears it.
+        reg.insert(other);
+        reg.remove(&other);
+        assert!(!reg.take(&other), "removed cookie must not bind");
+    }
 
     // The Initiate Multitransport Request the server sends in M1 is the one bit
     // of new on-wire behavior that no real loopback client exercises (mstsc /
@@ -97,10 +125,12 @@ mod tests {
         ];
 
         let cfg = ListenerConfig::default();
-        // No TLS config: this test only exercises the SYN→SYN+ACK handshake.
-        let listener = UdpMultitransportListener::bind("127.0.0.1:0".parse().unwrap(), cfg, None)
-            .await
-            .expect("bind listener");
+        // No TLS config and no cookie registry: this test only exercises the
+        // SYN→SYN+ACK handshake (soft cookie binding).
+        let listener =
+            UdpMultitransportListener::bind("127.0.0.1:0".parse().unwrap(), cfg, None, None)
+                .await
+                .expect("bind listener");
         let server_addr = listener.local_addr();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

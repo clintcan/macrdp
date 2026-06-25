@@ -367,3 +367,25 @@ AND released — #1276 landing is NOT sufficient.
     prerequisite** (M5 is when channel data actually rides the tunnel, so
     hijack-resistance starts to matter; nothing rides it yet). RDP_TUNNEL_DATA
     (action 0x2) is logged "not handled yet (channel migration is M5)" and skipped.
+    **M5a (added 2026-06-25): strict cookie binding — verified on real mstsc.**
+    The tunnel is now bound to a real, current TCP session so a forged/replayed
+    cookie can't open one (the security prerequisite before any data rides the
+    tunnel in M5b/c). New `CookieRegistry` (multitransport/mod.rs, re-exported):
+    a shared `Arc<Mutex<HashSet<[u8;16]>>>` with insert / remove / `take`
+    (atomic check-and-consume = one-time use). `new_offer` now generates the
+    16-byte cookie via **getrandom (CSPRNG)** instead of the predictable
+    request_id-derived pattern (getrandom added under the `multitransport`
+    feature; it's already in the tree via rustls so no real build-graph cost).
+    `RdpServer` gained `multitransport_cookies: Option<CookieRegistry>` +
+    `set_multitransport_cookie_registry`; the offer site registers the issued
+    cookie (and evicts the previous connection's, so TCP-fallback connections
+    leave at most ~one stale entry per live RdpServer). The listener's `bind`
+    gained a `cookie_registry: Option<CookieRegistry>` param threaded to
+    `handle_emt_tunnel`, which `take`s the CREATEREQUEST's echoed cookie before
+    replying — on a miss it logs "cookie not recognized — rejecting tunnel" and
+    sends nothing (client times out the UDP attempt, stays on TCP). `None`
+    registry = soft binding (accept any cookie — the handshake-only test path).
+    main.rs creates one registry and hands the same clone to both `bind` and the
+    server. Verified on real mstsc: random cookie `f76fdf2b…`, "bound to session",
+    tunnel establishes. One-time-use logic unit-tested in the macrdp crate
+    (`cookie_registry_take_is_one_time_and_rejects_unknown`).

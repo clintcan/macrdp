@@ -24,6 +24,8 @@
 pub mod listener;
 
 use core::sync::atomic::{AtomicU32, Ordering};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use ironrdp_acceptor::MultitransportOffer;
@@ -77,20 +79,72 @@ pub fn encode_initiate_request(
     Ok(encode_vec(&X224(mcs_pdu))?)
 }
 
+/// A shared set of multitransport security cookies the server has issued and not
+/// yet consumed/torn down. The per-connection offer path
+/// ([`RdpServer`](crate::RdpServer)) registers the cookie it puts in its
+/// Initiate Multitransport Request; the process-global UDP
+/// [`listener`](crate::multitransport::listener) checks an inbound tunnel
+/// `RDP_TUNNEL_CREATEREQUEST`'s echoed cookie against it before accepting the
+/// tunnel — **binding the UDP flow to a real, current TCP session** so a forged
+/// or replayed cookie can't open a tunnel. Cookies are one-time: the listener
+/// removes a cookie when it accepts the tunnel, and the offer path evicts the
+/// previous connection's (unconsumed) cookie before registering a new one.
+#[derive(Clone, Default)]
+pub struct CookieRegistry(Arc<Mutex<HashSet<[u8; 16]>>>);
+
+impl CookieRegistry {
+    /// A fresh, empty registry. Create one in `main` and share it (clone) with
+    /// both the [`RdpServer`](crate::RdpServer) and the UDP listener.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an issued cookie as valid.
+    pub fn insert(&self, cookie: [u8; 16]) {
+        if let Ok(mut set) = self.0.lock() {
+            set.insert(cookie);
+        }
+    }
+
+    /// Drop a cookie (consumed on tunnel bind, or evicted on teardown).
+    pub fn remove(&self, cookie: &[u8; 16]) {
+        if let Ok(mut set) = self.0.lock() {
+            set.remove(cookie);
+        }
+    }
+
+    /// Atomically check-and-consume a cookie: returns `true` (and removes it) if
+    /// it was registered. One-time use — a retransmitted/replayed CREATEREQUEST
+    /// with the same cookie won't bind a second tunnel.
+    pub fn take(&self, cookie: &[u8; 16]) -> bool {
+        match self.0.lock() {
+            Ok(mut set) => set.remove(cookie),
+            Err(_) => false,
+        }
+    }
+}
+
 /// Build a fresh [`MultitransportOffer`] for one connection: a process-wide
-/// monotonic `request_id` plus a 16-byte security cookie. The acceptor sends it
-/// as the Server Initiate Multitransport Request after licensing (before Demand
-/// Active); the client echoes `request_id` + `cookie` back over the UDP flow.
-///
-/// The cookie is a deterministic placeholder for now — validation is soft (the
-/// listener logs the client's SYNEX `cookieHash` so the hash formula can be
-/// derived from a live capture). TODO: switch to a CSPRNG once binding is strict.
+/// monotonic `request_id` plus a **cryptographically-random** 16-byte security
+/// cookie. The acceptor sends it as the Server Initiate Multitransport Request
+/// after licensing (before Demand Active); the client echoes `request_id` +
+/// `cookie` back inside the UDP tunnel's `RDP_TUNNEL_CREATEREQUEST`, where the
+/// listener matches it against the [`CookieRegistry`] to bind the flow. The
+/// cookie is CSPRNG-generated (not derivable from `request_id`) so it can't be
+/// forged by an attacker who can see the predictable request id.
 pub(crate) fn new_offer(protocol: RequestedProtocol) -> MultitransportOffer {
     static MT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
     let request_id = MT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let mut cookie = [0u8; 16];
-    for (i, b) in cookie.iter_mut().enumerate() {
-        *b = (request_id.wrapping_mul(2_654_435_761).wrapping_add(i as u32) & 0xff) as u8;
+    if let Err(e) = getrandom::getrandom(&mut cookie) {
+        // The system RNG failing is catastrophic and near-impossible; fall back
+        // to a non-secret derived value so we don't panic the whole server. The
+        // tunnel binding still works (registry match); only unpredictability is
+        // lost in this degenerate case.
+        tracing::error!(error = %e, "system RNG failed for multitransport cookie; using a weak fallback");
+        for (i, b) in cookie.iter_mut().enumerate() {
+            *b = (request_id.wrapping_mul(2_654_435_761).wrapping_add(i as u32) & 0xff) as u8;
+        }
     }
     MultitransportOffer {
         request_id,

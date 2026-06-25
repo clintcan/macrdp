@@ -2122,10 +2122,15 @@ async fn async_main() -> Result<()> {
             server_isn_seed: isn_seed,
             ..Default::default()
         };
+        // M5a: a shared cookie registry binds an inbound UDP tunnel to a real TCP
+        // session. The server registers each issued cookie here; the listener
+        // accepts a tunnel CREATEREQUEST only if its echoed cookie matches.
+        let cookie_registry = ironrdp_server::CookieRegistry::new();
         match ironrdp_server::UdpMultitransportListener::bind(
             args.bind,
             cfg,
             Some(udp_tls_config.clone()),
+            Some(cookie_registry.clone()),
         )
         .await
         {
@@ -2137,6 +2142,7 @@ async fn async_main() -> Result<()> {
                 );
                 server
                     .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
+                server.set_multitransport_cookie_registry(Some(cookie_registry));
                 Some(listener)
             }
             Err(e) => {

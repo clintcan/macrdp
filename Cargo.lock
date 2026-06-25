@@ -1711,6 +1711,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "getrandom 0.2.17",
  "ironrdp-acceptor",
  "ironrdp-ainput",
  "ironrdp-async",
