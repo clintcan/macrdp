@@ -73,3 +73,48 @@ vendor dir until divergence (1) is upstreamed AND released.
     Server Initiate Multitransport Request. Purely additive (same shape as (2)),
     so trivially upstreamable — offer alongside (1)/(2). See the
     docs/rdp-udp-multitransport-feasibility.md plan.
+
+    M3c (2026-06-25): the acceptor now also *advertises* and *emits* the
+    multitransport offer, not just surfaces the client's flags. Four additions,
+    all gated on the offer being set (so the default build is unchanged):
+    - **`advertise_extended_client_data: bool`** (setter
+      `set_advertise_extended_client_data`): when set, the X.224 Negotiation
+      Response carries `EXTENDED_CLIENT_DATA_SUPPORTED`. Load-bearing —
+      WITHOUT it mstsc omits ALL optional GCC client blocks (CS_MULTITRANSPORT,
+      CS_MCS_MSGCHANNEL, CS_MONITOR), so the server never sees UDP support.
+    - **`multitransport_offer: Option<MultitransportOffer>`** (setter
+      `set_multitransport_offer`; `MultitransportOffer { request_id, protocol,
+      cookie }` is a new pub type, re-exported from `lib.rs`). When set, the
+      server's GCC Connect Response echoes **SC_MULTITRANSPORT**
+      (`MultiTransportChannelData`) AND grants an **SC_MCS_MSGCHANNEL**
+      (`ServerMessageChannelData`) with an allocated MCS message channel id
+      (= io_channel + channel_count + 1, e.g. 1008). The message channel is a
+      hard requirement: clients route the bootstrap/autodetect PDUs by
+      `messageChannelId` and ignore an Initiate Request on the I/O channel
+      (FreeRDP logs `expected messageChannelId=1008, got 1003`).
+    - **Emit the Server Initiate Multitransport Request in `LicensingExchange`**
+      — after the licensing PDU, BEFORE Demand Active, on the message channel.
+      This is the ONLY window clients honor it (FreeRDP's
+      MULTITRANSPORT_BOOTSTRAPPING_REQUEST state, between LICENSING and
+      DEMAND_ACTIVE; mstsc the same). Sent post-finalization (the original M1
+      shape, on the I/O channel from the server crate) the client is ACTIVE and
+      misreads it as a share-control PDU and tears the session down. The issued
+      offer is recorded on `multitransport_offered: Option<MultitransportOffer>`
+      (new `AcceptorResult` field) so the server can build its MigrationState.
+    - **Finalization channel-skip** (`finalization.rs` + `CapabilitiesWaitConfirm`
+      in `connection.rs`): once a message channel exists, the client interleaves
+      PDUs on it — notably its **Client Initiate Multitransport Response**
+      (E_ABORT when it can't bring up UDP, or simply when it falls back) —
+      with the io-channel finalization PDUs. Both decode sites blindly decoded
+      the next `SendDataRequest`'s payload as a `ShareControlHeader`, so a
+      message-channel PDU killed the session with `invalid pdu_type` during
+      `accept_finalize`. Fix: skip any `SendDataRequest` whose `channel_id` !=
+      the io channel and stay in the same state. (Strictly more correct than the
+      old behaviour even ignoring multitransport: `WaitSynchronize`/
+      `WaitControlCooperate` previously swallowed a decode error AND advanced,
+      which would desync.) Verified live: FreeRDP + mstsc both reach ACTIVE and
+      render; mstsc additionally completes the RDPEUDP SYN→SYN+ACK handshake on
+      the wire (see server divergence (12) M3c). **Cookie finding:** mstsc
+      negotiates RDPEUDP **V2**, where the 16-byte security cookie is NOT in the
+      SYN (the SYN `cookieHash` is V3/RDPEUDP2 only) — it rides the MS-RDPEMT
+      `RDP_TUNNEL_CREATEREQUEST`, so strict cookie binding is an M4 concern.

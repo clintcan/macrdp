@@ -60,6 +60,50 @@ pub struct Acceptor {
     /// server can decide whether to offer a UDP transport. Empty if the client
     /// sent no multitransport block.
     client_multitransport: gcc::MultiTransportFlags,
+    /// (vendored) When true, set `EXTENDED_CLIENT_DATA_SUPPORTED` in the X.224
+    /// RDP Negotiation Response. mstsc only sends the OPTIONAL GCC client data
+    /// blocks — `CS_MULTITRANSPORT` (UDP support), `CS_MONITOR`,
+    /// `CS_MONITOR_EX`, `CS_MESSAGE_CHANNEL` — when the server advertises this
+    /// flag; without it, mstsc omits them all (so multitransport can never be
+    /// negotiated). Default false to keep the standard handshake byte-identical;
+    /// the server turns it on only when a multitransport provider is installed,
+    /// since enabling extended data can change the core-data desktop size a
+    /// multi-monitor client reports.
+    advertise_extended_client_data: bool,
+    /// (vendored) The UDP multitransport (MS-RDPEMT) offer to send, if any. When
+    /// set (and the client advertised matching support), the acceptor emits a
+    /// Server Initiate Multitransport Request **right after the licensing PDU and
+    /// before Demand Active** — the only window in which clients accept it
+    /// (FreeRDP's `MULTITRANSPORT_BOOTSTRAPPING_REQUEST` state sits between
+    /// `LICENSING` and `CAPABILITIES_EXCHANGE_DEMAND_ACTIVE`; mstsc is the same).
+    /// Sending it after finalization — once the client is ACTIVE — makes the
+    /// client misparse it as a share-control PDU and tear the session down.
+    multitransport_offer: Option<MultitransportOffer>,
+    /// (vendored) Set to the offer actually emitted (offer present AND the client
+    /// advertised the requested transport), so the server can bind the UDP flow /
+    /// match the client's Multitransport Response. `None` if nothing was sent.
+    multitransport_offered: Option<MultitransportOffer>,
+    /// (vendored) The MCS message-channel id allocated when offering UDP
+    /// multitransport, announced to the client in `SC_MCS_MSGCHANNEL`. The Server
+    /// Initiate Multitransport Request MUST ride this channel (not the I/O
+    /// channel): clients route the autodetect/multitransport bootstrap PDUs by
+    /// channel id and silently ignore a request on the I/O channel when a message
+    /// channel exists (verified — FreeRDP logs `expected messageChannelId=0`).
+    /// `None` when not offering multitransport (default path unchanged).
+    message_channel_id: Option<u16>,
+}
+
+/// (vendored) A UDP multitransport (MS-RDPEMT) offer the server asks the acceptor
+/// to send during the connection sequence. See [`Acceptor::set_multitransport_offer`].
+#[derive(Debug, Clone, Copy)]
+pub struct MultitransportOffer {
+    /// Correlates the request with the client's Multitransport Response and the
+    /// tunnel-creation request over the new transport.
+    pub request_id: u32,
+    /// Which UDP transport the server is requesting (reliable / lossy).
+    pub protocol: rdp::multitransport::RequestedProtocol,
+    /// 16-byte security cookie echoed by the client to bind the UDP flow.
+    pub cookie: [u8; 16],
 }
 
 #[derive(Debug)]
@@ -77,6 +121,11 @@ pub struct AcceptorResult {
     /// flags from its GCC MultiTransportChannelData block; empty if the client
     /// sent no multitransport block.
     pub multitransport_flags: gcc::MultiTransportFlags,
+    /// (vendored) The UDP multitransport offer the acceptor actually sent during
+    /// the connection sequence (after licensing, before Demand Active), or `None`
+    /// if none was sent. The server uses it to match the client's Multitransport
+    /// Response and bind the inbound UDP flow.
+    pub multitransport_offered: Option<MultitransportOffer>,
     /// Credentials received from the client during SecureSettingsExchange.
     ///
     /// Present for TLS-mode connections where the client sends credentials
@@ -110,6 +159,10 @@ impl Acceptor {
             honor_client_desktop_size: false,
             client_keyboard_layout: 0,
             client_multitransport: gcc::MultiTransportFlags::empty(),
+            advertise_extended_client_data: false,
+            multitransport_offer: None,
+            multitransport_offered: None,
+            message_channel_id: None,
         }
     }
 
@@ -118,6 +171,22 @@ impl Acceptor {
     /// `honor_client_desktop_size` field for the rationale.
     pub fn set_honor_client_desktop_size(&mut self, honor: bool) {
         self.honor_client_desktop_size = honor;
+    }
+
+    /// (vendored) Advertise `EXTENDED_CLIENT_DATA_SUPPORTED` so the client sends
+    /// its optional GCC blocks (notably `CS_MULTITRANSPORT`). See the field doc.
+    pub fn set_advertise_extended_client_data(&mut self, advertise: bool) {
+        self.advertise_extended_client_data = advertise;
+    }
+
+    /// (vendored) Offer an auxiliary UDP multitransport (MS-RDPEMT) transport.
+    /// When set, the acceptor sends a Server Initiate Multitransport Request right
+    /// after the licensing PDU (before Demand Active) — the only point in the
+    /// sequence at which clients accept it — provided the client advertised the
+    /// requested transport in its GCC `MultiTransportChannelData`. The emitted
+    /// offer is reported back on [`AcceptorResult::multitransport_offered`].
+    pub fn set_multitransport_offer(&mut self, offer: Option<MultitransportOffer>) {
+        self.multitransport_offer = offer;
     }
 
     pub fn new_deactivation_reactivation(
@@ -162,6 +231,12 @@ impl Acceptor {
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             client_keyboard_layout: consumed.client_keyboard_layout,
             client_multitransport: consumed.client_multitransport,
+            advertise_extended_client_data: consumed.advertise_extended_client_data,
+            // Reactivation skips LicensingExchange, so nothing is re-emitted;
+            // carry both so the fields stay consistent.
+            multitransport_offer: consumed.multitransport_offer,
+            multitransport_offered: consumed.multitransport_offered,
+            message_channel_id: consumed.message_channel_id,
         })
     }
 
@@ -218,6 +293,7 @@ impl Acceptor {
                 credentials: self.received_credentials.take(),
                 keyboard_layout: self.client_keyboard_layout,
                 multitransport_flags: self.client_multitransport,
+                multitransport_offered: self.multitransport_offered,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -409,10 +485,14 @@ impl Sequence for Acceptor {
                         requested_protocol,
                     ));
                 };
-                let connection_confirm = nego::ConnectionConfirm::Response {
-                    flags: nego::ResponseFlags::empty(),
-                    protocol,
-                };
+                // (vendored) Advertise EXTENDED_CLIENT_DATA_SUPPORTED when asked,
+                // so the client sends its optional GCC blocks (CS_MULTITRANSPORT
+                // et al.). mstsc omits ALL of them without this flag.
+                let mut flags = nego::ResponseFlags::empty();
+                if self.advertise_extended_client_data {
+                    flags |= nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED;
+                }
+                let connection_confirm = nego::ConnectionConfirm::Response { flags, protocol };
 
                 debug!(message = ?connection_confirm, "Send");
 
@@ -487,6 +567,11 @@ impl Sequence for Acceptor {
                     .as_ref()
                     .map(|m| m.flags)
                     .unwrap_or_else(gcc::MultiTransportFlags::empty);
+
+                debug!(
+                    multitransport_flags = ?self.client_multitransport,
+                    "client multitransport support captured from GCC"
+                );
 
                 // (vendored) Adopt the client's requested desktop size from
                 // its Client Core Data before the server's Demand Active is
@@ -570,11 +655,36 @@ impl Sequence for Acceptor {
                 let skip_channel_join = early_capability
                     .is_some_and(|client| client.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN));
 
+                // (vendored) Advertise reliable UDP multitransport + soft-sync
+                // in `SC_MULTITRANSPORT` when the server enabled the extended
+                // client data path (which it does only when a multitransport
+                // provider is installed). Lossy (`UDP_FECL`) is a later phase.
+                let multitransport = self.advertise_extended_client_data.then_some(
+                    gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                        | gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+                );
+
+                // (vendored) Allocate a message channel (the next id after the
+                // virtual channels) when offering multitransport — the Initiate
+                // Request rides it. Same gate as `SC_MULTITRANSPORT`: the client
+                // sends `CS_MCS_MSGCHANNEL` only because we set
+                // EXTENDED_CLIENT_DATA_SUPPORTED, so granting one back is in-contract.
+                let message_channel_id = if self.advertise_extended_client_data {
+                    let count = u16::try_from(channel_ids.len()).expect("channel count fits u16");
+                    let id = self.io_channel_id.saturating_add(1).saturating_add(count);
+                    self.message_channel_id = Some(id);
+                    Some(id)
+                } else {
+                    None
+                };
+
                 let server_blocks = create_gcc_blocks(
                     self.io_channel_id,
                     channel_ids.clone(),
                     requested_protocol,
                     skip_channel_join,
+                    multitransport,
+                    message_channel_id,
                 );
 
                 let settings_response = mcs::ConnectResponse {
@@ -598,7 +708,13 @@ impl Sequence for Acceptor {
                         connection: if skip_channel_join {
                             ChannelConnectionSequence::skip_channel_join(self.user_channel_id)
                         } else {
-                            ChannelConnectionSequence::new(self.user_channel_id, self.io_channel_id, channel_ids)
+                            // The message channel (if any) is joined like the
+                            // others when the client doesn't skip channel joins.
+                            let mut join_ids = channel_ids;
+                            if let Some(id) = message_channel_id {
+                                join_ids.push(id);
+                            }
+                            ChannelConnectionSequence::new(self.user_channel_id, self.io_channel_id, join_ids)
                         },
                     },
                 )
@@ -697,8 +813,52 @@ impl Sequence for Acceptor {
 
                 debug!(message = ?license, "Send");
 
-                let written =
+                let mut written =
                     util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &license, output)?;
+
+                // (vendored) Emit the Server Initiate Multitransport Request HERE
+                // — after licensing, before Demand Active. This is the only window
+                // clients honor it in (FreeRDP's MULTITRANSPORT_BOOTSTRAPPING_REQUEST
+                // state; mstsc the same). Sent later (post-finalization) the client
+                // is ACTIVE and misreads it as a share-control PDU, tearing down.
+                if let Some(offer) = self.multitransport_offer {
+                    let needed = match offer.protocol {
+                        rdp::multitransport::RequestedProtocol::UdpFecR => {
+                            gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                        }
+                        rdp::multitransport::RequestedProtocol::UdpFecL => {
+                            gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                        }
+                    };
+                    if self.client_multitransport.contains(needed) {
+                        let request = rdp::multitransport::MultitransportRequestPdu {
+                            security_header: rdp::headers::BasicSecurityHeader {
+                                flags: rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ,
+                            },
+                            request_id: offer.request_id,
+                            requested_protocol: offer.protocol,
+                            security_cookie: offer.cookie,
+                        };
+                        // Ride the message channel if one was granted (clients
+                        // route the bootstrap PDU by channel id); fall back to the
+                        // I/O channel only if somehow no message channel exists.
+                        let mt_channel = self.message_channel_id.unwrap_or(self.io_channel_id);
+                        debug!(channel_id = mt_channel, message = ?request, "Send Server Initiate Multitransport Request");
+                        written = written.saturating_add(util::encode_send_data_indication(
+                            self.user_channel_id,
+                            mt_channel,
+                            &request,
+                            output,
+                        )?);
+                        self.multitransport_offered = Some(offer);
+                    } else {
+                        debug!(
+                            client_flags = ?self.client_multitransport,
+                            ?needed,
+                            "not sending multitransport request: client didn't advertise the requested transport"
+                        );
+                    }
+                }
 
                 self.saved_for_reactivation = AcceptorState::CapabilitiesSendServer {
                     early_capability,
@@ -791,6 +951,18 @@ impl Sequence for Acceptor {
                 };
                 match message {
                     mcs::McsMessage::SendDataRequest(data) => {
+                        // (vendored) Skip message-channel PDUs (autodetect /
+                        // multitransport response) that ride a channel != io once a
+                        // message channel is granted; only io-channel ShareControl
+                        // PDUs (Confirm Active) belong here. Stay put for the next.
+                        if data.channel_id != self.io_channel_id {
+                            debug!(
+                                channel_id = data.channel_id,
+                                "Skipping non-io-channel PDU during capabilities-wait"
+                            );
+                            self.state = prev_state;
+                            return Ok(Written::Nothing);
+                        }
                         let capabilities_confirm = decode::<rdp::headers::ShareControlHeader>(data.user_data.as_ref())
                             .map_err(ConnectorError::decode);
                         let capabilities_confirm = match capabilities_confirm {
@@ -872,6 +1044,8 @@ fn create_gcc_blocks(
     channel_ids: Vec<u16>,
     requested: SecurityProtocol,
     skip_channel_join: bool,
+    multitransport: Option<gcc::MultiTransportFlags>,
+    message_channel_id: Option<u16>,
 ) -> gcc::ServerGccBlocks {
     gcc::ServerGccBlocks {
         core: gcc::ServerCoreData {
@@ -887,7 +1061,19 @@ fn create_gcc_blocks(
             channel_ids,
             io_channel,
         },
-        message_channel: None,
-        multi_transport_channel: None,
+        // (vendored) Grant a message channel (`SC_MCS_MSGCHANNEL`) when offering
+        // UDP multitransport: clients route the Server Initiate Multitransport
+        // Request (and connect-time autodetect) by channel id and ignore it on
+        // the I/O channel once they've sent `CS_MCS_MSGCHANNEL`. `None` on the
+        // default (non-multitransport) path keeps the handshake byte-identical.
+        message_channel: message_channel_id.map(|id| gcc::ServerMessageChannelData {
+            mcs_message_channel_id: id,
+        }),
+        // (vendored) Echo `SC_MULTITRANSPORT` advertising the server's supported
+        // UDP transports when a multitransport provider is installed. mstsc
+        // validates an incoming Initiate Multitransport Request against this
+        // advertisement; without it, the otherwise well-formed request is
+        // out-of-contract and mstsc raises a protocol error + disconnects.
+        multi_transport_channel: multitransport.map(|flags| gcc::MultiTransportChannelData { flags }),
     }
 }

@@ -79,6 +79,22 @@ impl Sequence for FinalizationSequence {
     }
 
     fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+        // (vendored) When a message channel is granted (for UDP multitransport /
+        // autodetect), the client interleaves PDUs on that channel — e.g. its
+        // Client Initiate Multitransport Response (E_ABORT when it can't bring up
+        // UDP) — with the io-channel finalization PDUs. Those are NOT ShareControl
+        // PDUs; the wait-states below would mis-decode them ("invalid pdu_type")
+        // and tear the session down. In any input-driven (wait) state, skip a PDU
+        // that isn't on the io channel and stay put to read the next one.
+        if self.next_pdu_hint().is_some() {
+            if let Some(channel_id) = peek_channel_id(input) {
+                if channel_id != self.io_channel_id {
+                    debug!(channel_id, "Skipping non-io-channel PDU during finalization");
+                    return Ok(Written::Nothing);
+                }
+            }
+        }
+
         let (written, next_state) = match core::mem::take(&mut self.state) {
             FinalizationState::WaitSynchronize => {
                 let synchronize = decode_share_control(input);
@@ -221,6 +237,16 @@ fn create_control_confirm(user_id: u16) -> rdp::headers::ShareDataPdu {
 
 fn create_font_map() -> rdp::headers::ShareDataPdu {
     rdp::headers::ShareDataPdu::FontMap(rdp::finalization_messages::FontPdu::default())
+}
+
+/// (vendored) Peek the MCS channel id of an inbound `SendDataRequest` frame, if
+/// it is one. Used to skip message-channel PDUs (autodetect / multitransport
+/// response) during finalization. Returns `None` if the frame isn't a
+/// `SendDataRequest` (the caller then falls through to the normal decode).
+fn peek_channel_id(input: &[u8]) -> Option<u16> {
+    ironrdp_core::decode::<X224<ironrdp_pdu::mcs::SendDataRequest<'_>>>(input)
+        .ok()
+        .map(|p| p.0.channel_id)
 }
 
 fn decode_share_control(input: &[u8]) -> ConnectorResult<rdp::headers::ShareControlHeader> {

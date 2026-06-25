@@ -23,7 +23,10 @@
 
 pub mod listener;
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use anyhow::Result;
+use ironrdp_acceptor::MultitransportOffer;
 use ironrdp_core::encode_vec;
 use ironrdp_pdu::mcs::SendDataIndication;
 use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
@@ -72,6 +75,28 @@ pub fn encode_initiate_request(
         user_data,
     };
     Ok(encode_vec(&X224(mcs_pdu))?)
+}
+
+/// Build a fresh [`MultitransportOffer`] for one connection: a process-wide
+/// monotonic `request_id` plus a 16-byte security cookie. The acceptor sends it
+/// as the Server Initiate Multitransport Request after licensing (before Demand
+/// Active); the client echoes `request_id` + `cookie` back over the UDP flow.
+///
+/// The cookie is a deterministic placeholder for now — validation is soft (the
+/// listener logs the client's SYNEX `cookieHash` so the hash formula can be
+/// derived from a live capture). TODO: switch to a CSPRNG once binding is strict.
+pub(crate) fn new_offer(protocol: RequestedProtocol) -> MultitransportOffer {
+    static MT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
+    let request_id = MT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let mut cookie = [0u8; 16];
+    for (i, b) in cookie.iter_mut().enumerate() {
+        *b = (request_id.wrapping_mul(2_654_435_761).wrapping_add(i as u32) & 0xff) as u8;
+    }
+    MultitransportOffer {
+        request_id,
+        protocol,
+        cookie,
+    }
 }
 
 /// Per-connection negotiation state for an in-flight multitransport request:

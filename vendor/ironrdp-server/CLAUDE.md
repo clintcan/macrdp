@@ -245,6 +245,10 @@ AND released — #1276 landing is NOT sufficient.
     (from acceptor divergence (3)). `handle_io_channel_data` tries `ShareControl`
     decode first and, on failure, decodes a `MultitransportResponsePdu`
     (re-validates the `TRANSPORT_RSP` flag) → `handle_multitransport_response`.
+    **(SUPERSEDED in M3c: this post-finalization, IO-channel send was rejected by
+    real clients — emission moved into the acceptor's `LicensingExchange` on the
+    message channel; see the M3c note below. `maybe_offer_multitransport` and the
+    `handle_io_channel_data` response-decode branch were removed.)**
     **M1 has NO UDP listener**: the client's out-of-band UDP attempt times out
     and it reports `E_ABORT`, and the session continues on TCP unchanged — this
     proves the negotiation/framing contract + graceful fallback before any
@@ -274,12 +278,39 @@ AND released — #1276 landing is NOT sufficient.
     `test = false`): bind to `127.0.0.1:0`, send a real captured client SYN, assert
     the MTU-padded SYN+ACK fields. Cross-platform (pure tokio/std), so Linux CI
     runs it.
-    **M3c (added 2026-06-25): wired into the accept path.** macrdp's `main.rs` now
-    binds the listener on the same address/port as TCP at startup when
-    `--enable-udp-multitransport` is set (single-process path; `--fork-workers`
-    warns + falls back — the persistent UDP socket would belong to the supervisor,
-    deferred). The only server-crate change here is that `maybe_offer_multitransport`
-    now logs the issued 16-byte security cookie (hex) at `debug`, so it can be
-    correlated with the listener's logged client SYNEX `cookieHash` to derive the
-    hash formula from a live run (cookie validation is still soft). The session
-    still runs over TCP (no TLS/EMT tunnel or migration yet).
+    **M3c (added 2026-06-25): wired into the accept path + offer moved to the
+    acceptor; VERIFIED on real mstsc.** Two parts:
+    1. macrdp's `main.rs` binds the listener on the same address/port as TCP at
+       startup when `--enable-udp-multitransport` is set (single-process path;
+       `--fork-workers` warns + falls back — the persistent UDP socket would
+       belong to the supervisor, deferred).
+    2. The negotiation offer + emission **moved out of the server crate into the
+       acceptor** (acceptor divergence (3) M3c) because the M1 post-finalization
+       IO-channel send was rejected by real clients. `run_connection` now, when a
+       `MultitransportProvider` is installed, calls
+       `acceptor.set_advertise_extended_client_data(true)` +
+       `acceptor.set_multitransport_offer(Some(new_offer(...)))`; the acceptor
+       advertises EXTENDED_CLIENT_DATA, echoes SC_MULTITRANSPORT, grants
+       SC_MCS_MSGCHANNEL, and emits the Initiate Request on the message channel
+       after licensing (before Demand Active). `client_accepted` reads
+       `result.multitransport_offered` to build the per-connection
+       `MigrationState`. `new_offer(protocol) -> MultitransportOffer` (in
+       `multitransport/mod.rs`) issues the process-monotonic `request_id` + a
+       16-byte cookie. The old `maybe_offer_multitransport` method and the
+       `handle_io_channel_data` response-decode branch were deleted.
+    **VERIFIED end-to-end on real mstsc (Win11, over WiFi LAN) 2026-06-25:** mstsc
+    connects cleanly (the earlier protocol-error/white-screen is gone — fixed by
+    the acceptor finalize channel-skip), sends a real RDPEUDP **SYN** to the
+    listener, we answer SYN+ACK, the handshake **establishes**, and mstsc starts
+    pushing `ACK | DATA` datagrams (its MS-RDPEMT TLS handshake; we don't carry it
+    up yet, so it retransmits w/ CWR — expected). Session renders over TCP
+    throughout. FreeRDP also reaches ACTIVE + renders (it consumes the offer but
+    sends no UDP — graceful fallback). **Cookie finding:** mstsc negotiates RDPEUDP
+    **V2** — the 16-byte SYN `cookieHash` is V3/RDPEUDP2-only, so at V2 there is no
+    SYN cookie to capture; the security cookie rides the MS-RDPEMT
+    `RDP_TUNNEL_CREATEREQUEST` (behind TLS), making strict cookie binding an M4
+    concern. Also de-risks M4: mstsc's reliable transport here is plain RDPEUDP
+    **v2** carrying TLS (FecFlags ACK|DATA), NOT EUDP2 — so the v1 state machine is
+    the correct codepath and the EUDP2 wire-format spike may be off mstsc's
+    critical path for the reliable channel. The session still runs over TCP (no
+    TLS/EMT tunnel or migration yet — M4).

@@ -126,6 +126,16 @@ async fn run_recv_loop(socket: Arc<UdpSocket>, cfg: ListenerConfig) {
         let now_ms = start.elapsed().as_millis() as u64;
         let data = &buf[..len];
 
+        // Per-datagram receipt trace: confirms a real client's UDP actually
+        // reaches the socket (the core M3 question) and shows how we classify
+        // it, so a SYN that fails to decode is still visible rather than silent.
+        debug!(
+            %peer_addr,
+            len,
+            fec_flags = ?Datagram::peek_fec_flags(data),
+            "RDPEUDP datagram received"
+        );
+
         // Log the client's SYN cookie hash + negotiated version (cookie check is
         // soft in M3b — this is the data the future strict-validation work needs).
         if is_syn_family(data) {

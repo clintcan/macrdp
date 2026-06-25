@@ -623,6 +623,20 @@ impl RdpServer {
         // size from Client Core Data before Demand Active goes out.
         acceptor.set_honor_client_desktop_size(self.honor_client_desktop_size);
 
+        // (vendored, feature=multitransport) When offering UDP multitransport:
+        // (1) advertise EXTENDED_CLIENT_DATA_SUPPORTED so the client actually
+        // sends its CS_MULTITRANSPORT GCC block — mstsc omits all optional GCC
+        // blocks unless the server sets this X.224 flag; and (2) hand the acceptor
+        // the offer so it emits the Server Initiate Multitransport Request at the
+        // ONLY point clients honor it — after licensing, before Demand Active.
+        // (Sending it post-finalization, once the client is ACTIVE, makes both
+        // mstsc and FreeRDP misparse it as a share-control PDU and disconnect.)
+        #[cfg(feature = "multitransport")]
+        if let Some(provider) = self.multitransport.as_ref() {
+            acceptor.set_advertise_extended_client_data(true);
+            acceptor.set_multitransport_offer(Some(crate::multitransport::new_offer(provider.requested_protocol())));
+        }
+
         self.attach_channels(&mut acceptor);
 
         let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
@@ -1319,78 +1333,6 @@ impl RdpServer {
         state
     }
 
-    /// (vendored, feature=multitransport) Send a Server Initiate Multitransport
-    /// Request (MS-RDPEMT) on the IO channel when a provider is installed and the
-    /// client advertised matching UDP support + soft-sync. M1 has no UDP
-    /// listener, so this only proves the negotiation/framing contract and the
-    /// graceful `E_ABORT` fallback; the session stays on TCP.
-    #[cfg(feature = "multitransport")]
-    async fn maybe_offer_multitransport<W>(
-        &mut self,
-        writer: &mut Framed<W>,
-        io_channel_id: u16,
-        user_channel_id: u16,
-        client_flags: ironrdp_pdu::gcc::MultiTransportFlags,
-    ) -> Result<()>
-    where
-        W: FramedWrite,
-    {
-        use ironrdp_pdu::gcc::MultiTransportFlags;
-        use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
-
-        let Some(provider) = self.multitransport.as_ref() else {
-            return Ok(());
-        };
-        let protocol = provider.requested_protocol();
-        let needed = match protocol {
-            RequestedProtocol::UdpFecR => MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR,
-            RequestedProtocol::UdpFecL => MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL,
-        };
-        if !client_flags.contains(needed) || !client_flags.contains(MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP) {
-            debug!(
-                ?protocol,
-                ?client_flags,
-                "not offering multitransport: client lacks the requested UDP transport + soft-sync"
-            );
-            return Ok(());
-        }
-
-        // `request_id` is a process-wide counter; the 16-byte cookie will bind
-        // the future UDP flow to this TCP session. M1 has no listener, so the
-        // cookie is never validated — a deterministic placeholder is fine here.
-        // TODO(M3): generate the cookie from a CSPRNG once the listener exists.
-        static MT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
-        let request_id = MT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let mut cookie = [0u8; 16];
-        for (i, b) in cookie.iter_mut().enumerate() {
-            *b = (request_id.wrapping_mul(2_654_435_761).wrapping_add(i as u32) & 0xff) as u8;
-        }
-
-        let data = crate::multitransport::encode_initiate_request(
-            request_id,
-            protocol,
-            cookie,
-            io_channel_id,
-            user_channel_id,
-        )?;
-        writer.write_all(&data).await?;
-        self.multitransport_migration = Some(crate::multitransport::MigrationState {
-            request_id,
-            cookie,
-            protocol,
-        });
-        // Log the issued cookie (hex) so it can be correlated with the UDP
-        // listener's logged client SYNEX `cookieHash` to derive the hash formula
-        // from a live run (cookie validation is still soft — see M3 in the plan).
-        debug!(
-            request_id,
-            ?protocol,
-            cookie = %cookie.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "sent Server Initiate Multitransport Request"
-        );
-        Ok(())
-    }
-
     /// (vendored, feature=multitransport) Handle the client's Initiate
     /// Multitransport Response. M1 has no UDP transport, so this only logs the
     /// outcome and clears the in-flight request; the session stays on TCP.
@@ -1474,20 +1416,29 @@ impl RdpServer {
             }
         }
 
-        // (vendored, feature=multitransport) Offer an auxiliary UDP transport
-        // (MS-RDPEMT) when a provider is installed and the client advertised
-        // matching support. Initial accept only (not a reactivation resize).
-        // M1: negotiation only — no UDP listener, so the client's UDP attempt
-        // times out and it reports E_ABORT; the session continues on TCP.
+        // (vendored, feature=multitransport) The acceptor has already emitted the
+        // Server Initiate Multitransport Request (after licensing, before Demand
+        // Active — the only window clients honor it). Here we just record what it
+        // sent so the client's Multitransport Response can be matched and the
+        // inbound UDP flow bound to this session. Initial accept only.
         #[cfg(feature = "multitransport")]
         if !result.reactivation {
-            self.maybe_offer_multitransport(
-                writer,
-                result.io_channel_id,
-                result.user_channel_id,
-                result.multitransport_flags,
-            )
-            .await?;
+            if let Some(offer) = result.multitransport_offered {
+                self.multitransport_migration = Some(crate::multitransport::MigrationState {
+                    request_id: offer.request_id,
+                    cookie: offer.cookie,
+                    protocol: offer.protocol,
+                });
+                debug!(
+                    request_id = offer.request_id,
+                    protocol = ?offer.protocol,
+                    soft_sync = result
+                        .multitransport_flags
+                        .contains(ironrdp_pdu::gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP),
+                    cookie = %offer.cookie.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    "Server Initiate Multitransport Request was sent by the acceptor"
+                );
+            }
         }
 
         let mut update_codecs = UpdateEncoderCodecs::new();
