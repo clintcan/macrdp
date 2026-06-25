@@ -255,3 +255,22 @@ AND released — #1276 landing is NOT sufficient.
     transport + EGFX channel migration) and grow the trait. Feature-off path is
     cfg-split to keep the original `?`-based decode byte-identical. See
     `docs/rdp-udp-multitransport-feasibility.md` (the M1→M5 plan).
+    **M3b (added 2026-06-25): the UDP listener.** New
+    `src/multitransport/listener.rs` (`UdpMultitransportListener` +
+    `ListenerConfig`, re-exported from `lib.rs`) owns a `tokio::net::UdpSocket`,
+    demuxes inbound datagrams by peer address, and drives a per-peer
+    `RdpeudpState` (from the new `ironrdp-rdpeudp` dep, pulled in by the
+    `multitransport` feature: `multitransport = ["dep:ironrdp-rdpeudp"]`) through
+    the RDPEUDP SYN→SYN+ACK handshake — answering a real client's SYN with the
+    wire-correct SYN+ACK (M3a) and negotiating V3/EUDP2. SYN-family packets are
+    zero-padded to the MTU (`Datagram::peek_fec_flags` detects them). Background
+    task; `Drop` aborts it. **Cookie validation is soft** (the SYNEX `cookieHash`
+    is logged, not verified) — the listener produces the first macrdp↔client
+    capture needed to derive the hash formula; strict binding + wiring the
+    listener to bind on connect (with the `MigrationState` cookie, on the same
+    port as TCP) is M3c. Not yet connected to the server's accept path or to a
+    data consumer — it's a standalone, separately-testable unit. Tested via a
+    loopback integration test in the **macrdp** crate (this vendored crate is
+    `test = false`): bind to `127.0.0.1:0`, send a real captured client SYN, assert
+    the MTU-padded SYN+ACK fields. Cross-platform (pure tokio/std), so Linux CI
+    runs it.

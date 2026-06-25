@@ -68,4 +68,69 @@ mod tests {
         assert_eq!(req.requested_protocol, RequestedProtocol::UdpFecR);
         assert_eq!(req.security_cookie, cookie);
     }
+
+    // M3b: the real UDP listener over loopback. The vendored ironrdp-server is
+    // built `test = false`, so this socket-level test lives here. It binds the
+    // listener to an ephemeral 127.0.0.1 UDP port, sends a REAL captured Microsoft
+    // client SYN from a second socket, and asserts the listener replies with a
+    // wire-correct, MTU-padded SYN+ACK (flags SYN|ACK|SYNEX, snSourceAck = the
+    // client's ISN, V3 negotiated, no cookie hash, no ack vector). Runs in CI
+    // (loopback UDP); a real Windows client accepting the SYN+ACK is verified
+    // live. The server ISN is listener-chosen, so we decode + assert fields
+    // rather than byte-compare the whole packet.
+    #[tokio::test]
+    async fn listener_answers_real_client_syn_over_loopback() {
+        use ironrdp_rdpeudp::datagram::Datagram;
+        use ironrdp_rdpeudp::pdu::{FecFlags, UdpVersion};
+        use ironrdp_server::{ListenerConfig, UdpMultitransportListener};
+        use std::time::Duration;
+        use tokio::net::UdpSocket;
+
+        #[rustfmt::skip]
+        let client_syn: [u8; 84] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x40, 0x18, 0x01, 0x64, 0x7a, 0x02, 0xbc, 0x04, 0xd0,
+            0x04, 0xd0, 0x43, 0x33, 0x3c, 0x63, 0xee, 0x77, 0x40, 0x6e, 0x97, 0xdf, 0x80, 0x0c,
+            0xa1, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0xcb, 0x86, 0x4c, 0x5b,
+            0x54, 0x3a, 0xdc, 0x7a, 0x7a, 0x36, 0x7b, 0xb8, 0x11, 0x20, 0x71, 0x7c, 0x28, 0x6d,
+            0x09, 0x3d, 0x3f, 0x3a, 0xd8, 0x80, 0x2c, 0x59, 0x4f, 0x4f, 0x21, 0x99, 0x86, 0x94,
+        ];
+
+        let cfg = ListenerConfig::default();
+        let listener = UdpMultitransportListener::bind("127.0.0.1:0".parse().unwrap(), cfg)
+            .await
+            .expect("bind listener");
+        let server_addr = listener.local_addr();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&client_syn, server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let len = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("listener should reply within 2s")
+            .expect("recv");
+        let reply = &buf[..len];
+
+        // SYN/SYN+ACK packets are MTU-padded for path validation.
+        assert_eq!(len, cfg.mtu as usize, "SYN+ACK must be padded to the MTU");
+
+        let dg = Datagram::decode(reply).expect("decode SYN+ACK");
+        assert_eq!(
+            dg.fec.flags,
+            FecFlags::SYN | FecFlags::ACK | FecFlags::SYNEX
+        );
+        assert_eq!(
+            dg.fec.snd_source_ack as u32, 0x647a_02bc,
+            "snSourceAck must echo the client's ISN"
+        );
+        assert!(dg.ack_vector.is_none(), "SYN+ACK carries no ack vector");
+        let ex = dg.syn_ex.expect("SYNEX present");
+        assert_eq!(ex.udp_version, UdpVersion::V3, "V3/EUDP2 negotiated");
+        assert!(
+            ex.cookie_hash.is_none(),
+            "server SYN+ACK omits the cookie hash"
+        );
+        assert_eq!(dg.syn.expect("SYNDATA").upstream_mtu, 1232);
+    }
 }

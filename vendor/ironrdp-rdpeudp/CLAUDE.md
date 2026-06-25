@@ -35,6 +35,14 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **M3b (done — UDP listener, in `ironrdp-server`):** this crate became a real
+  dependency of `vendor/ironrdp-server` for the first time (path dep, gated by its
+  `multitransport` feature; revs already aligned so `ironrdp-core` unifies). The
+  listener (`src/multitransport/listener.rs` over there) drives a per-peer
+  `RdpeudpState` through the SYN→SYN+ACK handshake on a real socket. New here:
+  `Datagram::peek_fec_flags` (cheap SYN-detection so the listener MTU-pads
+  handshake packets). Tested over loopback from the macrdp crate (this crate stays
+  `test=true`/standalone; the server is `test=false`). 34 crate tests.
 - **M3a (done — server handshake wire-shaped to real Windows):** the server's
   **SYN+ACK** now matches a real Windows RDP server byte-exact (validated against
   a capture). `Datagram::syn_ack(client_isn, win, syn, version)` sets flags

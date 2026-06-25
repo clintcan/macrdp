@@ -143,6 +143,21 @@ impl Datagram {
         }
     }
 
+    /// Peek the FEC flags of a **v1** datagram without a full decode — cheap
+    /// enough to call per outbound datagram so the UDP listener can tell whether
+    /// a packet is a SYN-family handshake packet (which MS-RDPEUDP requires be
+    /// zero-padded to the MTU) vs an ordinary data/ack packet (not padded).
+    /// Returns `None` if the buffer is shorter than the 8-byte FEC header.
+    pub fn peek_fec_flags(bytes: &[u8]) -> Option<FecFlags> {
+        if bytes.len() < FecHeader::FIXED_PART_SIZE {
+            return None;
+        }
+        // FEC header: snSourceAck(4) + uReceiveWindowSize(2) + uFlags(2, BE).
+        Some(FecFlags::from_bits_retain(u16::from_be_bytes([
+            bytes[6], bytes[7],
+        ])))
+    }
+
     pub fn encode(&self) -> EncodeResult<Vec<u8>> {
         // Worst-case size; the cursor encoder only writes what's present.
         let cap = 8 + 8 + 8 + 4 + 32 + 36 + self.source.as_ref().map_or(0, |s| s.payload.len());
@@ -286,6 +301,33 @@ mod tests {
         let back = Datagram::decode(&bytes).unwrap();
         assert_eq!(back, d);
         assert_eq!(back.source.unwrap().payload, b"hello rdpeudp");
+    }
+
+    #[test]
+    fn peek_fec_flags_reads_syn_without_full_decode() {
+        let syn = Datagram::syn(
+            -1,
+            64,
+            SynData {
+                initial_seq: 1,
+                upstream_mtu: 1232,
+                downstream_mtu: 1232,
+            },
+            None,
+            None,
+        )
+        .encode()
+        .unwrap();
+        assert!(Datagram::peek_fec_flags(&syn)
+            .unwrap()
+            .contains(FecFlags::SYN));
+
+        // A pure ack has no SYN bit; a too-short buffer returns None.
+        let ack = Datagram::ack(7, 64, empty_ack()).encode().unwrap();
+        assert!(!Datagram::peek_fec_flags(&ack)
+            .unwrap()
+            .contains(FecFlags::SYN));
+        assert!(Datagram::peek_fec_flags(&[0, 1, 2]).is_none());
     }
 
     #[test]

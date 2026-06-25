@@ -61,6 +61,8 @@ nfsserve = "0.11.0"
 [dev-dependencies]
 ironrdp-connector = "0.8"
 ironrdp-tokio = "0.8"
+# For the UDP multitransport loopback test: decode the listener's SYN+ACK reply.
+ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
 
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]

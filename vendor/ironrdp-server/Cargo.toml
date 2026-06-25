@@ -27,9 +27,10 @@ qoi = ["dep:qoicoubeh", "ironrdp-pdu/qoi"]
 qoiz = ["dep:zstd-safe", "qoi", "ironrdp-pdu/qoiz"]
 egfx = ["dep:ironrdp-egfx"]
 # (vendored) RDP UDP multitransport (MS-RDPEMT) server support. Default off so
-# the standard build is byte-identical. M1 only performs the negotiation
-# handshake (Initiate Request -> Response) and always continues on TCP.
-multitransport = []
+# the standard build is byte-identical. M1 performs the negotiation handshake;
+# M3 adds the UDP listener + RDPEUDP SYN/SYN+ACK handshake (pulls in the
+# sans-I/O ironrdp-rdpeudp crate for the wire codecs + reliability SM).
+multitransport = ["dep:ironrdp-rdpeudp"]
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at any time.
@@ -57,6 +58,11 @@ ironrdp-acceptor = "0.8" # public
 ironrdp-graphics = "0.7" # public
 ironrdp-rdpsnd = "0.7" # public
 ironrdp-rdpdr = "0.5" # public (vendored — server-direction RDPDR)
+# (vendored, multitransport-only) sans-I/O RDPEUDP/RDPEUDP2 wire codecs +
+# reliability state machine. Local path crate (not on crates.io); its own
+# [patch.crates-io] is ignored in the macrdp build, where ironrdp-core resolves
+# via the root patch to the same git rev.
+ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", optional = true }
 tracing = { version = "0.1", features = ["log"] }
 x509-cert = { version = "0.2.5", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
