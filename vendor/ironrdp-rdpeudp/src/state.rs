@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::datagram::{Datagram, SourcePacket};
-use crate::pdu::{AckVectorHeader, SourcePayloadHeader};
+use crate::pdu::{AckVectorHeader, SourcePayloadHeader, UdpVersion};
 
 /// Which end of the connection this instance is. macrdp (the RDP server) is the
 /// passive [`Role::Server`]; [`Role::Client`] exists so two instances can be
@@ -92,6 +92,13 @@ pub struct RdpeudpState {
 
     // Negotiated from the peer's SYN / SYN+ACK.
     peer_recv_window: u16,
+    /// The peer's initial sequence number (from its SYNDATA). The server echoes
+    /// it as `snSourceAck` in the SYN+ACK (matching real Windows).
+    peer_isn: u32,
+    /// The RDP-UDP version negotiated from the client's SYNEX (defaults to
+    /// [`UdpVersion::V2`] if the client sent no SYNEX). A `V3` result means the
+    /// data path upgrades to RDPEUDP2 framing after the handshake.
+    negotiated_version: UdpVersion,
 
     // Send side.
     send_next: u32,
@@ -121,6 +128,8 @@ impl RdpeudpState {
             },
             cfg,
             peer_recv_window: 1,
+            peer_isn: 0,
+            negotiated_version: UdpVersion::V2,
             send_next: cfg.initial_seq,
             out_queue: VecDeque::new(),
             unacked: VecDeque::new(),
@@ -134,6 +143,12 @@ impl RdpeudpState {
 
     pub fn is_established(&self) -> bool {
         self.state == ConnState::Established
+    }
+
+    /// The RDP-UDP version negotiated from the client's SYNEX. [`UdpVersion::V3`]
+    /// means the data path should use RDPEUDP2 framing after the handshake.
+    pub fn negotiated_version(&self) -> UdpVersion {
+        self.negotiated_version
     }
 
     /// Client: emit the initial SYN. Server: no-op (it waits for the SYN).
@@ -173,6 +188,12 @@ impl RdpeudpState {
         // Learn the peer's first sequence number from its SYN / SYN+ACK.
         if let Some(syn) = &dg.syn {
             self.peer_recv_window = self.peer_recv_window.max(dg.fec.recv_window).max(1);
+            self.peer_isn = syn.initial_seq;
+            // Negotiate the data-path version from the client's SYNEX (V3 = upgrade
+            // to RDPEUDP2). A SYN with no SYNEX leaves the V2 default.
+            if let Some(ex) = &dg.syn_ex {
+                self.negotiated_version = ex.udp_version;
+            }
             if !self.have_peer_seq {
                 self.recv_next = syn.initial_seq;
                 self.have_peer_seq = true;
@@ -181,7 +202,7 @@ impl RdpeudpState {
                 // Server: a (possibly duplicate) SYN — (re)send SYN+ACK and be established.
                 Role::Server => {
                     self.state = ConnState::Established;
-                    out.to_send.push(self.encode_syn());
+                    out.to_send.push(self.encode_syn_ack());
                 }
                 // Client: the SYN+ACK completes our open.
                 Role::Client => {
@@ -330,6 +351,25 @@ impl RdpeudpState {
             .encode()
             .expect("encode syn")
     }
+
+    /// Server reply: a SYN+ACK echoing the client's ISN as `snSourceAck` and the
+    /// negotiated version in its SYNEX — byte-shaped like a real Windows server's
+    /// (no ack vector, no cookie hash). See [`Datagram::syn_ack`].
+    fn encode_syn_ack(&self) -> Vec<u8> {
+        let syn = crate::pdu::SynData {
+            initial_seq: self.cfg.initial_seq,
+            upstream_mtu: self.cfg.mtu,
+            downstream_mtu: self.cfg.mtu,
+        };
+        Datagram::syn_ack(
+            self.peer_isn,
+            self.cfg.recv_window,
+            syn,
+            self.negotiated_version,
+        )
+        .encode()
+        .expect("encode syn+ack")
+    }
 }
 
 /// FEC header (8) + ACK vector (4, empty) + source payload header (8).
@@ -432,6 +472,54 @@ mod tests {
             wire = next_wire;
         }
         assert_eq!(delivered, msg);
+    }
+
+    /// End-to-end capture validation: feed a **real Microsoft client's SYN**
+    /// (V3/EUDP2, with cookie hash) into a server `RdpeudpState` configured with
+    /// the **real server's** ISN/window/MTU, and assert the SYN+ACK it emits is
+    /// byte-identical to the **real server's SYN+ACK** captured in reply. This
+    /// pins the whole server handshake path (decode client SYN → negotiate V3 →
+    /// encode SYN+ACK) to the wire, not just the isolated codecs.
+    #[test]
+    fn server_syn_ack_matches_capture_end_to_end() {
+        #[rustfmt::skip]
+        let client_syn: [u8; 84] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x40, 0x18, 0x01, 0x64, 0x7a, 0x02, 0xbc, 0x04, 0xd0,
+            0x04, 0xd0, 0x43, 0x33, 0x3c, 0x63, 0xee, 0x77, 0x40, 0x6e, 0x97, 0xdf, 0x80, 0x0c,
+            0xa1, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0xcb, 0x86, 0x4c, 0x5b,
+            0x54, 0x3a, 0xdc, 0x7a, 0x7a, 0x36, 0x7b, 0xb8, 0x11, 0x20, 0x71, 0x7c, 0x28, 0x6d,
+            0x09, 0x3d, 0x3f, 0x3a, 0xd8, 0x80, 0x2c, 0x59, 0x4f, 0x4f, 0x21, 0x99, 0x86, 0x94,
+        ];
+        #[rustfmt::skip]
+        let expected_syn_ack: [u8; 20] = [
+            0x64, 0x7a, 0x02, 0xbc, 0x00, 0x40, 0x10, 0x05, 0x61, 0xf7, 0xb6, 0xe3, 0x04, 0xd0,
+            0x04, 0xd0, 0x00, 0x01, 0x01, 0x01,
+        ];
+
+        // The real server used ISN 0x61f7b6e3, window 64, MTU 1232.
+        let mut server = RdpeudpState::new(
+            Role::Server,
+            Config {
+                recv_window: 64,
+                mtu: 1232,
+                initial_seq: 0x61f7_b6e3,
+                rto_ms: 300,
+            },
+        );
+        let out = server.step(0, Some(&client_syn));
+
+        assert!(server.is_established());
+        assert_eq!(
+            server.negotiated_version(),
+            UdpVersion::V3,
+            "client requested V3 (EUDP2) in its SYNEX"
+        );
+        assert_eq!(out.to_send.len(), 1, "exactly one SYN+ACK, no extra acks");
+        assert_eq!(
+            out.to_send[0], expected_syn_ack,
+            "server SYN+ACK must be byte-identical to the captured Windows server reply"
+        );
     }
 
     /// Deterministic lossy/reordering/duplicating channel: a tiny LCG decides,

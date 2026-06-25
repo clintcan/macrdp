@@ -17,6 +17,7 @@ use ironrdp_core::{
 
 use crate::pdu::{
     AckVectorHeader, CorrelationId, FecFlags, FecHeader, SourcePayloadHeader, SynData, SynDataEx,
+    SynExFlags, UdpVersion,
 };
 
 /// The application payload carried by a source (DATA) packet, with its sequence
@@ -42,9 +43,10 @@ pub struct Datagram {
 }
 
 impl Datagram {
-    /// A SYN (or SYN+ACK, when `ack_vector` is `Some`) datagram: carries SYNDATA
+    /// A client→server **SYN** (or a generic SYN-with-ack-vector): carries SYNDATA
     /// and optionally SYNEX (version negotiation). `snSourceAck` is the caller's
-    /// (use `-1` for an initial SYN).
+    /// (use `-1` for an initial SYN). For the server's reply use the dedicated
+    /// [`Datagram::syn_ack`], which matches real Windows (ACK flag, no vector).
     pub fn syn(
         snd_source_ack: i32,
         recv_window: u16,
@@ -70,6 +72,37 @@ impl Datagram {
             syn: Some(syn),
             correlation: None,
             syn_ex,
+        }
+    }
+
+    /// A server→client **SYN+ACK** matching what a real Windows RDP server emits
+    /// (verified byte-exact against a capture): flags `SYN | ACK | SYNEX`,
+    /// `snSourceAck = client_isn` (the ISN from the client's SYNDATA), our own
+    /// SYNDATA, and a SYNEX echoing the negotiated `udp_version`. Two quirks the
+    /// generic [`Datagram::syn`] can't express: the ACK flag is set but **no
+    /// ack-vector section is appended** (the ack rides `snSourceAck`), and the
+    /// SYNEX **omits the cookie hash even for V3** (it's client→server only).
+    pub fn syn_ack(
+        client_isn: u32,
+        recv_window: u16,
+        syn: SynData,
+        udp_version: UdpVersion,
+    ) -> Self {
+        Self {
+            fec: FecHeader {
+                snd_source_ack: client_isn as i32,
+                recv_window,
+                flags: FecFlags::SYN | FecFlags::ACK | FecFlags::SYNEX,
+            },
+            ack_vector: None,
+            source: None,
+            syn: Some(syn),
+            correlation: None,
+            syn_ex: Some(SynDataEx {
+                flags: SynExFlags::VERSION_INFO_VALID,
+                udp_version,
+                cookie_hash: None,
+            }),
         }
     }
 
@@ -151,7 +184,10 @@ impl Datagram {
         let fec: FecHeader = decode_cursor(&mut cursor)?;
         let flags = fec.flags;
 
-        let ack_vector = if flags.contains(FecFlags::ACK) {
+        // A SYN / SYN+ACK carries NO ack-vector section even when the ACK flag is
+        // set (its acknowledgment rides `snSourceAck`); the vector appears only on
+        // non-SYN data/ack packets. Verified against a real SYN+ACK capture.
+        let ack_vector = if flags.contains(FecFlags::ACK) && !flags.contains(FecFlags::SYN) {
             Some(decode_cursor::<AckVectorHeader>(&mut cursor)?)
         } else {
             None
@@ -167,7 +203,13 @@ impl Datagram {
                 None
             };
             let syn_ex = if flags.contains(FecFlags::SYNEX) {
-                Some(decode_cursor::<SynDataEx>(&mut cursor)?)
+                // A SYN+ACK (ACK flag set) omits the cookie hash; a plain client
+                // SYN includes it for V3.
+                let expect_cookie_hash = !flags.contains(FecFlags::ACK);
+                Some(SynDataEx::decode_directional(
+                    &mut cursor,
+                    expect_cookie_hash,
+                )?)
             } else {
                 None
             };
@@ -253,6 +295,45 @@ mod tests {
         let back = Datagram::decode(&bytes).unwrap();
         assert_eq!(back, d);
         assert!(back.source.is_none() && back.syn.is_none());
+    }
+
+    /// The server's SYN+ACK must be byte-shaped exactly like a real Windows RDP
+    /// server's. These 20 bytes are the meaningful prefix (before MTU zero-pad) of
+    /// the **server→client SYN+ACK** captured opposite the client SYN below:
+    /// FEC(snSourceAck=client ISN, win 64, flags SYN|ACK|SYNEX) + SYNDATA(server
+    /// ISN, MTUs) + SYNEX(VERSION_INFO_VALID, V3) — no ack vector, no cookie hash.
+    #[test]
+    fn syn_ack_matches_real_server_capture() {
+        #[rustfmt::skip]
+        let expected: [u8; 20] = [
+            0x64, 0x7a, 0x02, 0xbc, // snSourceAck = client ISN 0x647a02bc
+            0x00, 0x40,             // uReceiveWindowSize = 64
+            0x10, 0x05,             // uFlags = SYN|ACK|SYNEX
+            0x61, 0xf7, 0xb6, 0xe3, // SYNDATA snInitialSequenceNumber (server ISN)
+            0x04, 0xd0,             // uUpStreamMtu = 1232
+            0x04, 0xd0,             // uDownStreamMtu = 1232
+            0x00, 0x01,             // uSynExFlags = VERSION_INFO_VALID
+            0x01, 0x01,             // uUdpVer = 0x0101 = V3 (no cookie hash follows)
+        ];
+
+        let d = Datagram::syn_ack(
+            0x647a_02bc,
+            64,
+            SynData {
+                initial_seq: 0x61f7_b6e3,
+                upstream_mtu: 1232,
+                downstream_mtu: 1232,
+            },
+            UdpVersion::V3,
+        );
+        let bytes = d.encode().unwrap();
+        assert_eq!(
+            bytes, expected,
+            "SYN+ACK must match the captured server bytes"
+        );
+        // And it must round-trip back (ACK flag set but no ack vector; V3 SYNEX
+        // with no cookie hash — the directional-decode path).
+        assert_eq!(Datagram::decode(&bytes).unwrap(), d);
     }
 
     /// Decode a **real Microsoft RDP client's SYN** from a user capture — the

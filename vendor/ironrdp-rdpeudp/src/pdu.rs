@@ -195,6 +195,36 @@ impl SynDataEx {
     const NAME: &'static str = "RDPUDP_SYNDATAEX_PAYLOAD";
     pub const FIXED_PART_SIZE: usize = 2 /* uSynExFlags */ + 2 /* uUdpVer */;
     const COOKIE_HASH_SIZE: usize = 32;
+
+    /// Decode a SYNEX, choosing whether to expect the 32-byte `cookie_hash`.
+    ///
+    /// The hash's presence is **directional**, not derivable from the version
+    /// alone: the **client→server SYN** carries it (V3), but the **server→client
+    /// SYN+ACK omits it even for V3** (verified against a real capture). The
+    /// caller — which knows the FEC flags — passes `expect_cookie_hash = false`
+    /// for a SYN+ACK (ACK flag set) and `true` for a plain client SYN. The
+    /// [`Decode`] impl defaults to the client-SYN case (the only one decoded in
+    /// the server's production path).
+    pub fn decode_directional(
+        src: &mut ReadCursor<'_>,
+        expect_cookie_hash: bool,
+    ) -> DecodeResult<Self> {
+        ensure_fixed_part_size!(in: src);
+        let flags = SynExFlags::from_bits_retain(src.read_u16_be());
+        let udp_version = UdpVersion::from_u16(src.read_u16_be())
+            .ok_or_else(|| invalid_field_err!("uUdpVer", "unknown RDP-UDP protocol version"))?;
+        let cookie_hash = if expect_cookie_hash && udp_version == UdpVersion::V3 {
+            ensure_size!(in: src, size: Self::COOKIE_HASH_SIZE);
+            Some(src.read_array::<{ Self::COOKIE_HASH_SIZE }>())
+        } else {
+            None
+        };
+        Ok(Self {
+            flags,
+            udp_version,
+            cookie_hash,
+        })
+    }
 }
 
 impl Encode for SynDataEx {
@@ -224,23 +254,11 @@ impl Encode for SynDataEx {
 }
 
 impl Decode<'_> for SynDataEx {
+    /// Decodes a **client→server SYN**'s SYNEX (the production server path), where
+    /// a V3 version carries the cookie hash. A SYN+ACK's SYNEX is decoded via
+    /// [`SynDataEx::decode_directional`] with `expect_cookie_hash = false`.
     fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
-        ensure_fixed_part_size!(in: src);
-        let flags = SynExFlags::from_bits_retain(src.read_u16_be());
-        let udp_version = UdpVersion::from_u16(src.read_u16_be())
-            .ok_or_else(|| invalid_field_err!("uUdpVer", "unknown RDP-UDP protocol version"))?;
-        // The cookie hash is present only for protocol version 3.
-        let cookie_hash = if udp_version == UdpVersion::V3 {
-            ensure_size!(in: src, size: Self::COOKIE_HASH_SIZE);
-            Some(src.read_array::<{ Self::COOKIE_HASH_SIZE }>())
-        } else {
-            None
-        };
-        Ok(Self {
-            flags,
-            udp_version,
-            cookie_hash,
-        })
+        Self::decode_directional(src, true)
     }
 }
 

@@ -35,6 +35,21 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **M3a (done — server handshake wire-shaped to real Windows):** the server's
+  **SYN+ACK** now matches a real Windows RDP server byte-exact (validated against
+  a capture). `Datagram::syn_ack(client_isn, win, syn, version)` sets flags
+  `SYN|ACK|SYNEX`, `snSourceAck = client_isn`, and a SYNEX with the negotiated
+  version — with two quirks the generic `syn` couldn't express: **ACK flag set
+  but NO ack-vector section** (the ack rides `snSourceAck`), and **SYNEX omits the
+  cookie hash even for V3** (it's client→server only). `SynDataEx::decode_directional`
+  decides cookie-hash presence by direction (the `Decode` impl defaults to the
+  client-SYN case); `Datagram::decode` reads an ack vector only for
+  `ACK && !SYN`, and decodes the SYNEX hash only on a plain SYN. `RdpeudpState`
+  (server) captures the client's ISN + SYNEX version from the incoming SYN and
+  emits the proper SYN+ACK (`negotiated_version()` accessor exposes V3). Tests:
+  byte-exact `syn_ack` vs capture + an **end-to-end** test feeding the real client
+  SYN through the SM and asserting the emitted SYN+ACK == the real server's.
+  33 crate tests.
 - **M2a (done):** MS-RDPEUDP **v1** PDU codecs in `src/pdu.rs` — `FecHeader` +
   `FecFlags`, `SynData`, `SynDataEx` (+ `UdpVersion`/`SynExFlags`, the `0x0101`
   selector for RDPEUDP2), `CorrelationId`, `SourcePayloadHeader`. Round-trip
