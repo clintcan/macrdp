@@ -511,9 +511,12 @@ AND released — #1276 landing is NOT sufficient.
     are gone), audio still on TCP (RDPSND channel 1005) throughout. As far as is
     known this is the first open-source RDP **server** with a working UDP
     multitransport *data path* (serving real EGFX video over the tunnel) — FreeRDP,
-    the most complete OSS stack, has client-side RDPEUDP/RDPEUDP2 but only a
-    server-side multitransport *bootstrap stub* (`multitransport_server_request` /
-    `_handle_response`, no UDP socket or data path; verified 2026-06-26), and
-    xrdp / ogon / gnome-remote-desktop / Weston are TCP-only or ride FreeRDP's
-    server lib. ("first" can't be proven exhaustively — phrase it "first known".)
+    the most complete OSS stack, has **no working UDP data path on either side**:
+    its server is a multitransport *bootstrap stub* (`multitransport_server_request`
+    / `_handle_response`, no UDP socket or data path) and its client declines UDP
+    with `E_ABORT` (`multitransport_no_udp`). The RDPEUDP/RDPEUDP2 work (David Fort,
+    2021/2023 blog posts) is out-of-tree prototype only — never a merged PR or
+    released feature (re-verified against full FreeRDP git history 2026-06-26). xrdp
+    / ogon / gnome-remote-desktop / Weston are TCP-only or ride FreeRDP's server
+    lib. ("first" can't be proven exhaustively — phrase it "first known".)
     Flag-OFF (empty safe spike) re-verified no-regression.

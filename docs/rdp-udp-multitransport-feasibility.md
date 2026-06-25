@@ -11,10 +11,15 @@ verify again before acting, code moves.*
 > `MACRDP_UDP_MIGRATE_EGFX` env var (default off → EGFX stays on TCP, the proven
 > safe spike) until it's soaked. As far as is known this is the **first open-source
 > RDP *server* with a working UDP multitransport data path** — FreeRDP, the most
-> complete OSS stack, has client-side RDPEUDP/RDPEUDP2 but only a server-side
-> *bootstrap stub* (no UDP socket / data path; re-verified 2026-06-26); xrdp / ogon
-> / gnome-remote-desktop / Weston are TCP-only or ride FreeRDP's server lib.
-> ("first" can't be proven exhaustively — read it as "first known".)
+> complete OSS stack, has **no working UDP data path on either side**: its server
+> is a TCP-side *bootstrap stub* (emits the Initiate Request PDU, no UDP socket /
+> RDPEUDP / RDPEMT) and its client **declines UDP with `E_ABORT`** (and has since
+> ~2016). The RDPEUDP/RDPEUDP2 work a FreeRDP maintainer (David Fort) described in
+> his 2021/2023 blog posts has only ever been **out-of-tree prototype code — never
+> a merged PR or released feature** (re-verified against full FreeRDP git history
+> 2026-06-26). xrdp / ogon / gnome-remote-desktop / Weston are TCP-only or ride
+> FreeRDP's server lib. ("first" can't be proven exhaustively — read it as "first
+> known".)
 >
 > Milestone history (all landed on `main`):
 > - **M1** (PR #15): MS-RDPEMT negotiation + safe TCP fallback. Round-trip CI test
@@ -80,14 +85,16 @@ things**, often conflated:
 2. **Server UDP *data path*** — the server actually binds a UDP socket, runs the
    RDPEUDP reliability handshake, secures it (TLS/DTLS), establishes the MS-RDPEMT
    tunnel, and **carries channel data over it**. This is the hard part.
-3. **Client UDP support** — a *client* that connects out over UDP. Several OSS
-   clients have this; it's a different (and easier-to-reach) codebase than the
-   server.
+3. **Client UDP support** — a *client* that connects out over UDP. A different
+   (and easier-to-reach) codebase than the server. Notably, even FreeRDP — the
+   most complete OSS stack — has never merged this either: its client declines
+   UDP with `E_ABORT`, and the RDPEUDP/RDPEUDP2 work stayed an out-of-tree
+   prototype (re-verified against full git history 2026-06-26).
 
 | RDP **server** | Base / lang | (1) Negotiation | (2) **UDP data path** | Notes |
 |---|---|---|---|---|
 | **macrdp** | Rust / IronRDP (vendored) | ✅ (via the acceptor) | ✅ **EGFX H.264 over reliable RDPEUDP + rustls TLS + MS-RDPEMT tunnel — verified on mstsc** | First *known* OSS RDP server with a working server-side UDP data path. Opt-in (default OFF). Lossy/DTLS/FEC = Phase 2. |
-| FreeRDP (server: `freerdp-shadow`, libfreerdp server) | C | ⚠️ bootstrap only (`multitransport_server_request`) | ❌ no UDP socket / data path (response handler is a no-op) | FreeRDP's **client** has full RDPEUDP/RDPEUDP2 + multitransport; the *server* side was never finished. |
+| FreeRDP (server: `freerdp-shadow`, libfreerdp server) | C | ⚠️ bootstrap only (`multitransport_server_request`) | ❌ no UDP socket / data path (response handler is a no-op) | FreeRDP's **client** also has no UDP path — it declines with `E_ABORT` (`multitransport_no_udp`). RDPEUDP/RDPEUDP2 was prototyped out-of-tree (David Fort, 2021/2023) but never merged. |
 | ogon | C / FreeRDP server | ⚠️ inherits FreeRDP | ❌ | TCP-only data path (rides FreeRDP's server stub). |
 | gnome-remote-desktop | C / FreeRDP server lib | ⚠️ inherits FreeRDP | ❌ | TCP-only data path. |
 | Weston RDP backend | C / FreeRDP server | ⚠️ inherits FreeRDP | ❌ | TCP-only data path. |
@@ -104,7 +111,8 @@ the first open-source RDP server with a working UDP multitransport data path**
 known"). The reason this gap existed so long is exactly point (2) above: the
 server-only glue (UDP listener, cookie→session binding, channel migration via
 `drdynvc`, sender-side reliability) is the part FreeRDP left as a stub and that no
-spec walks you through — client implementations get none of it for free.
+spec walks you through — and FreeRDP never finished the *client* UDP path either,
+so there was no OSS implementation of any of it to crib from.
 
 ## TL;DR
 
@@ -414,9 +422,10 @@ side** — as far as is known the first OSS RDP server with a working UDP data p
 (FreeRDP's server is a bootstrap stub; verified 2026-06-26). **Still to do:** upstream
 the `MultitransportProvider` extension point + the transport crate to Devolutions once
 the data path is soaked — until then it rides as a vendor divergence. Implementation
-tracked the MS-RDPEUDP/EMT specs, with FreeRDP's client as a partial reference and
-mstsc as the gate (which caught the v2-carrying-TLS reality and the bare-DRDYNVC tunnel
-framing).
+tracked the MS-RDPEUDP/EMT specs, with David Fort's out-of-tree FreeRDP RDPEUDP
+prototype + the `rdp-udp` Wireshark dissector as partial references (FreeRDP's
+*merged* client has no UDP path), and mstsc as the gate (which caught the
+v2-carrying-TLS reality and the bare-DRDYNVC tunnel framing).
 
 ## Distribution / packaging implications
 
