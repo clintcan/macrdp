@@ -13,11 +13,11 @@
 //!   source-packet framing (`FecHeader`, `SynData`, `SynDataEx`,
 //!   `CorrelationId`, `SourcePayloadHeader`). Round-trip tested, with one test
 //!   anchored to the real network capture in the MS-RDPEUDP spec.
-//! - **M2b (next):** the `RDPUDP_ACK_VECTOR_HEADER` + the reliability state
+//! - **M2b (done):** the `RDPUDP_ACK_VECTOR_HEADER` + the reliability state
 //!   machine (sequencing / ACK / retransmit / reassembly), tested in-memory.
-//! - **EUDP2 (spike-gated):** the RDPEUDP2 (`0x0101`) bit-packed framing is
-//!   underdocumented; it must be validated against a real mstsc capture before
-//!   the structs are authored. Not in this crate yet.
+//! - **EUDP2 foundation (done):** `eudp2` — the RDPEUDP2 (`0x0101`) framing,
+//!   cracked from FreeRDP's `rdp-udp.lua` dissector and verified byte-exact
+//!   against a real mstsc capture (the wire format swaps byte 0 and byte 7).
 //!
 //! # Endianness
 //!
@@ -26,5 +26,6 @@
 //! `to_be_bytes`/`from_be_bytes`), confirmed against the spec's capture example.
 
 pub mod datagram;
+pub mod eudp2;
 pub mod pdu;
 pub mod state;

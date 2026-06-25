@@ -52,8 +52,17 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
   caveats:** cumulative-ACK only (selective retransmit via the ACK *vector* and
   congestion control are deferred); the two-instance test proves the *algorithm*
   (my SM ↔ my SM), not Windows wire-compat — mstsc's data path is EUDP2.
-- **EUDP2 (spike-gated, NOT started):** the RDPEUDP2 (`0x0101`) bit-packed
-  framing is underdocumented and is what mstsc actually uses for data — **validate
-  against a real mstsc capture + FreeRDP's `rdpudp` source before authoring the
-  structs** (do NOT author from the spec alone; internal round-trip tests would
-  be circular). Needs a capture from the user; gates M3/M4 real-client interop.
+- **EUDP2 foundation (done):** `src/eudp2.rs` — the RDPEUDP2 (`0x0101`) framing,
+  **cracked** via FreeRDP's `tools/wireshark/rdp-udp.lua` dissector + a real
+  client capture. The non-obvious part: the wire "network format" **swaps byte 0
+  and byte 7** (`unwrap_packet`, an involution); then `prefix(1) + LE-u16 (Flags
+  low-12 | LogWindowSize high-4) + sub-headers + DataBody`. `Eudp2Flags`
+  (ACK/DATA/ACKVEC/AOA/OVERHEAD/DELAYACK), `PacketPrefix`, `Eudp2Header`.
+  **Verified byte-exact against 3 real captured packets** (2 data carrying TLS,
+  1 ack). Sub-header order + sizes are known (ACK 7+nacks, OverheadSize 1,
+  DelayAckInfo 3, AckOfAcks 2, DataHeader 4 [seq2+chanseq2], AckVector var) and
+  confirmed against the capture's DataBody offsets.
+- **EUDP2 next:** walk the optional sub-headers to extract the DataBody (pin the
+  ACK NumDelayedAcks/TimeScale bit-split + the AckVector internals first), then
+  wire EUDP2 into the reliability state machine (the algorithm is
+  framing-agnostic) for the V3 data path. Capture: ~/Documents/Projects/mstscpcap.pcapng.
