@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::Read as _;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -85,6 +86,14 @@ struct Peer {
     tls: Option<ServerConnection>,
     /// Whether we've logged TLS-handshake completion (avoid log spam).
     tls_done_logged: bool,
+    /// TLS-decrypted plaintext awaiting MS-RDPEMT tunnel-PDU parsing (M4c). The
+    /// client's `RDP_TUNNEL_CREATEREQUEST` arrives here once TLS is up; complete
+    /// tunnel PDUs are consumed from the front.
+    emt_inbound: Vec<u8>,
+    /// Whether we've answered the tunnel `CREATEREQUEST` with a `CREATERESPONSE`
+    /// (M4c). The client retransmits the request until it sees the response, so
+    /// we reply once and then ignore the retransmits.
+    tunnel_created: bool,
 }
 
 /// A running UDP multitransport listener. The receive loop runs on a spawned
@@ -143,6 +152,68 @@ async fn send_datagrams(socket: &UdpSocket, peer_addr: SocketAddr, to_send: Vec<
         }
         if let Err(e) = socket.send_to(&dg, peer_addr).await {
             trace!(error = %e, %peer_addr, "udp send_to error");
+        }
+    }
+}
+
+/// Parse complete MS-RDPEMT tunnel PDUs from the TLS-decrypted plaintext and, on
+/// the client's `RDP_TUNNEL_CREATEREQUEST`, write a `CREATERESPONSE(S_OK)` into
+/// the TLS connection (its encrypted bytes are picked up by the caller's
+/// `write_tls` drain). Consumes parsed PDUs from the front of `buf`; leaves a
+/// partial trailing PDU buffered for the next call. The client retransmits the
+/// request until it sees the response, so we reply once (gated by
+/// `tunnel_created`) and drop the retransmits. RDP_TUNNEL_DATA (channel
+/// migration) is M5 — logged and skipped for now.
+fn handle_emt_tunnel(
+    peer_addr: SocketAddr,
+    tls: &mut ServerConnection,
+    buf: &mut Vec<u8>,
+    tunnel_created: &mut bool,
+) {
+    use ironrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
+
+    while let Some(total) = emt::peek_pdu_len(buf) {
+        if buf.len() < total {
+            break; // wait for the rest of this PDU
+        }
+        let pdu: Vec<u8> = buf.drain(..total).collect();
+
+        match emt::peek_action(&pdu) {
+            Some(emt::action::CREATE_REQUEST) => match TunnelCreateRequest::decode(&pdu) {
+                Ok((req, _)) => {
+                    if !*tunnel_created {
+                        let cookie = req
+                            .security_cookie
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>();
+                        debug!(
+                            %peer_addr,
+                            request_id = req.request_id,
+                            %cookie,
+                            "MS-RDPEMT tunnel CREATEREQUEST received — replying CREATERESPONSE(S_OK)"
+                        );
+                        let resp = TunnelCreateResponse::ok().to_vec();
+                        if tls.writer().write_all(&resp).is_ok() {
+                            *tunnel_created = true;
+                        } else {
+                            warn!(%peer_addr, "failed to write MS-RDPEMT CREATERESPONSE into TLS");
+                        }
+                    }
+                }
+                Err(e) => warn!(%peer_addr, error = %e, "malformed MS-RDPEMT CREATEREQUEST"),
+            },
+            Some(other) => {
+                // RDP_TUNNEL_DATA (action 0x2) and friends carry migrated channel
+                // data — M5. Skip until then.
+                debug!(
+                    %peer_addr,
+                    action = other,
+                    len = total,
+                    "MS-RDPEMT tunnel PDU not handled yet (channel migration is M5)"
+                );
+            }
+            None => break,
         }
     }
 }
@@ -220,6 +291,8 @@ async fn run_recv_loop(
                 tls_hello_logged: false,
                 tls: None,
                 tls_done_logged: false,
+                emt_inbound: Vec::new(),
+                tunnel_created: false,
             }
         });
 
@@ -264,11 +337,12 @@ async fn run_recv_loop(
                 );
             }
 
-            // M4b: drive the MS-RDPEMT server-side TLS handshake over the reliable
-            // stream. Feed the just-delivered bytes into rustls, then ship whatever
-            // TLS output it produces back through the SM (reliable, fragmented to
-            // the MTU). Plaintext tunnel bytes (the EMT PDUs after the handshake)
-            // are M4c. No-op when the listener has no TLS config (test path).
+            // M4b/M4c: drive the MS-RDPEMT server-side TLS handshake over the
+            // reliable stream, then handle the tunnel PDUs inside it. Feed the
+            // just-delivered bytes into rustls, parse any decrypted tunnel PDUs
+            // (M4c: answer CREATEREQUEST with CREATERESPONSE), and ship whatever
+            // TLS output that produces back through the SM (reliable, fragmented
+            // to the MTU). No-op when the listener has no TLS config (test path).
             if let Some(tls_cfg) = tls_config.as_ref() {
                 if peer.tls.is_none() {
                     match ServerConnection::new(Arc::clone(tls_cfg)) {
@@ -276,10 +350,20 @@ async fn run_recv_loop(
                         Err(e) => warn!(%peer_addr, error = %e, "failed to create MS-RDPEMT TLS server"),
                     }
                 }
+                // Disjoint field borrows so the TLS feed/write can run alongside
+                // the EMT tunnel buffer + state.
+                let Peer {
+                    sm,
+                    tls: tls_opt,
+                    tls_done_logged,
+                    emt_inbound,
+                    tunnel_created,
+                    ..
+                } = peer;
+
                 let mut tls_out = Vec::new();
-                let mut plaintext = Vec::new();
                 let mut handshake_done = false;
-                if let Some(tls) = peer.tls.as_mut() {
+                if let Some(tls) = tls_opt.as_mut() {
                     let mut tls_err = false;
                     for chunk in &out.delivered {
                         // Feed the reliable byte-stream into rustls. `read_tls`
@@ -302,15 +386,22 @@ async fn run_recv_loop(
                                 break;
                             }
                             // Drain decrypted application data (the MS-RDPEMT tunnel
-                            // PDUs — parsed in M4c) so rustls's plaintext buffer
-                            // can't fill and stall record processing. The trailing
-                            // WouldBlock once the buffer empties is expected.
-                            let _ = tls.reader().read_to_end(&mut plaintext);
+                            // PDUs) so rustls's plaintext buffer can't fill and
+                            // stall record processing; accumulate it for parsing.
+                            // The trailing WouldBlock once the buffer empties is
+                            // expected.
+                            let _ = tls.reader().read_to_end(emt_inbound);
                         }
                         if tls_err {
                             break;
                         }
                     }
+
+                    // M4c: answer the client's RDP_TUNNEL_CREATEREQUEST. Writing the
+                    // response into the TLS connection here means the wants_write
+                    // drain below picks up its encrypted bytes.
+                    handle_emt_tunnel(peer_addr, tls, emt_inbound, tunnel_created);
+
                     while tls.wants_write() {
                         if tls.write_tls(&mut tls_out).is_err() {
                             break;
@@ -319,22 +410,12 @@ async fn run_recv_loop(
                     handshake_done = !tls_err && !tls.is_handshaking();
                 }
                 if !tls_out.is_empty() {
-                    let o = peer.sm.enqueue(now_ms, &tls_out);
+                    let o = sm.enqueue(now_ms, &tls_out);
                     send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
                 }
-                if handshake_done && !peer.tls_done_logged {
-                    peer.tls_done_logged = true;
-                    debug!(
-                        %peer_addr,
-                        "MS-RDPEMT TLS handshake complete (tunnel CREATEREQUEST + cookie are M4c)"
-                    );
-                }
-                if !plaintext.is_empty() {
-                    debug!(
-                        %peer_addr,
-                        plaintext_len = plaintext.len(),
-                        "MS-RDPEMT decrypted tunnel bytes received (parsing is M4c)"
-                    );
+                if handshake_done && !*tls_done_logged {
+                    *tls_done_logged = true;
+                    debug!(%peer_addr, "MS-RDPEMT TLS handshake complete");
                 }
             }
         } else if had_data {

@@ -347,3 +347,23 @@ AND released — #1276 landing is NOT sufficient.
     (`InvalidContentType`). The `tls_config: None` path (the loopback handshake
     test) is unchanged. Still no EMT tunnel parsing / cookie binding / migration
     (M4c/M5); the 28-byte plaintext is logged, not yet parsed.
+    **M4c (added 2026-06-25): MS-RDPEMT tunnel established — verified on real
+    mstsc.** The listener now parses the decrypted tunnel PDUs and answers the
+    handshake. Each `Peer` accumulates TLS-decrypted plaintext (`emt_inbound`);
+    `handle_emt_tunnel` frames complete tunnel PDUs (via `ironrdp_rdpeudp::emt`'s
+    `peek_pdu_len`) and, on the client's `RDP_TUNNEL_CREATEREQUEST`, writes a
+    `RDP_TUNNEL_CREATERESPONSE(S_OK)` into the TLS connection — whose encrypted
+    bytes the existing `write_tls` drain ships back through the SM. Gated by
+    `Peer::tunnel_created` so the client's retransmits (it resends the request
+    until it sees the response) are answered exactly once. The TLS block now
+    destructures `Peer` into disjoint field borrows so the rustls feed/write runs
+    alongside the EMT buffer/state. Result on real mstsc: CREATEREQUEST
+    (request_id=2, the issued cookie echoed back verbatim) → our CREATERESPONSE →
+    mstsc ACKs, **stops retransmitting**, tunnel idles on `ACK|ACK_DELAYED`
+    keepalives = established. **Cookie binding is still SOFT** (logged + verified
+    by eye to match the issued offer; we reply S_OK regardless) — strict
+    enforcement needs a shared (request_id, cookie) registry between the
+    offer-issuing acceptor path and the process-global listener, which is an **M5
+    prerequisite** (M5 is when channel data actually rides the tunnel, so
+    hijack-resistance starts to matter; nothing rides it yet). RDP_TUNNEL_DATA
+    (action 0x2) is logged "not handled yet (channel migration is M5)" and skipped.

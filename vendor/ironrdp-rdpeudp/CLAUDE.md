@@ -35,6 +35,24 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **M4c (done — MS-RDPEMT tunnel established on real mstsc, 2026-06-25):** new
+  `src/emt.rs` — the MS-RDPEMT *tunnel* PDU codecs (a different protocol from the
+  RDPEUDP transport below it; rides the TLS-secured reliable stream). **MS-RDPEMT
+  is little-endian** (an RDP byte-stream protocol like MS-RDPBCGR), *unlike*
+  RDPEUDP's big-endian — the one endianness exception in this crate. Models the
+  handshake PDUs macrdp needs: `TunnelHeader` (Action low-nibble | Flags
+  high-nibble, LE PayloadLength, HeaderLength; full PDU = HeaderLength +
+  PayloadLength), `TunnelCreateRequest::decode` (client→server: RequestID +
+  Reserved + 16-byte SecurityCookie = 24-byte payload; the 28-byte plaintext real
+  mstsc sends), `TunnelCreateResponse::ok().to_vec()` (server→client, HrResponse
+  = S_OK), and stream-framing helpers `peek_pdu_len` / `peek_action` (frame a PDU
+  from a partial buffer by reading just the 4 fixed header bytes — avoids the
+  sub-header decode's need-more-bytes-vs-malformed ambiguity). The server's
+  listener drives these (see ironrdp-server CLAUDE.md M4c). 40 crate tests (+5).
+  Verified live: mstsc's CREATEREQUEST (request_id=2, the issued cookie echoed
+  back) is answered with CREATERESPONSE(S_OK); mstsc ACKs, stops retransmitting,
+  and the tunnel idles on keepalives — established. RDP_TUNNEL_DATA (channel
+  migration) is M5.
 - **M4b decode fix (done — verified on real mstsc, 2026-06-25):** `Datagram::decode`
   now **skips the 4-byte RDPUDP_ACK_OF_ACKVECTOR_HEADER** (`snAckOfAcksSeqNum`) that
   sits between the ack vector and the source payload when the `ACK_OF_ACKS` flag is

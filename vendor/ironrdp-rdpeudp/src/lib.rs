@@ -26,6 +26,7 @@
 //! `to_be_bytes`/`from_be_bytes`), confirmed against the spec's capture example.
 
 pub mod datagram;
+pub mod emt;
 pub mod eudp2;
 pub mod pdu;
 pub mod state;
