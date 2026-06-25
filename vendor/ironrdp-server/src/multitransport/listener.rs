@@ -131,11 +131,19 @@ async fn run_recv_loop(socket: Arc<UdpSocket>, cfg: ListenerConfig) {
         if is_syn_family(data) {
             if let Ok(dg) = Datagram::decode(data) {
                 if let Some(ex) = dg.syn_ex {
+                    // Log the full client cookie hash (hex). Cookie validation is
+                    // still soft; pair this with the server's logged issued cookie
+                    // ("sent Server Initiate Multitransport Request", cookie=…) from
+                    // a live run to derive the hash formula, then tighten.
+                    let cookie_hash = ex
+                        .cookie_hash
+                        .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                        .unwrap_or_else(|| "none".to_owned());
                     debug!(
                         %peer_addr,
                         version = ?ex.udp_version,
-                        has_cookie_hash = ex.cookie_hash.is_some(),
-                        "RDPEUDP SYN received (cookie validation is soft in M3b)"
+                        %cookie_hash,
+                        "RDPEUDP SYN received (cookie validation is soft; correlate cookie_hash with the issued cookie)"
                     );
                 }
             }
