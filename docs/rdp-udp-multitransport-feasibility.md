@@ -71,11 +71,17 @@ verify again before acting, code moves.*
 
 ## TL;DR
 
+*Original feasibility framing (2026-06-25), kept for the record. The "don't / not
+done / multi-month" tone predates the build — Phase 1 has since shipped (EGFX over UDP,
+verified on mstsc); see the status block at the top. Outcomes noted inline.*
+
 - **It's possible to extend IronRDP for UDP multitransport (MS-RDPEMT over
   MS-RDPEUDP/EUDP2), and IronRDP's sans-I/O design is arguably a *better*
   foundation for it than FreeRDP's** — the PDU codecs and the reliability/FEC
-  engine fit the sans-I/O idiom and stay unit-testable. But it is a large,
-  mostly-from-scratch effort with an invasive `ironrdp-server` I/O refactor.
+  engine fit the sans-I/O idiom and stay unit-testable. (Borne out — though the
+  feared "invasive `ironrdp-server` I/O refactor" wasn't needed: EGFX rides an mpsc
+  handoff to the listener via a flag-gated branch, so the hot path is unchanged when
+  the feature is off.)
 - **The advantage is entirely a lossy/high-latency-link story** (WAN, Wi-Fi,
   cellular): no head-of-line blocking, drop-stale instead of retransmit, FEC
   recovery without a round-trip. **On a clean LAN — macrdp's design target — the
@@ -87,20 +93,29 @@ verify again before acting, code moves.*
   (rustls 0.23's default provider is `aws-lc-rs` = AWS-LC, a BoringSSL fork, + `ring`),
   so a C DTLS lib is a smaller leap than "pure-Rust → C" implies; and (2) the
   server-side transport glue (UDP listener, cookie→session mapping, channel
-  migration via `drdynvc`, a second writer in the dispatch loop). **Server-side UDP
-  is pioneering** — even FreeRDP only finished the *client*; its server path is a
-  bootstrap stub.
-- **Recommendation:** treat as a multi-month research project, gated on whether
-  macrdp's target shifts from LAN to remote-over-internet. On the LAN it's built
-  for, don't.
+  migration via `drdynvc`). **Server-side UDP is pioneering** — even FreeRDP only
+  finished the *client*; its server path is a bootstrap stub. (Phase 1 did the server
+  glue — listener, cookie→session binding, drdynvc Soft-Sync migration — as a
+  flag-gated mpsc handoff rather than "a second writer in the dispatch loop"; DTLS is
+  still untouched, deferred to Phase 2.)
+- **Recommendation (as it played out):** it was built — Phase 1 (reliable UDP, EGFX
+  migration) ships **default-OFF**, there for the off-LAN use case when wanted, not the
+  LAN default. Phase 2 (lossy + DTLS + FEC) stays gated on the LAN→WAN use-case shift.
 
 ## Context — what macrdp / IronRDP do today
 
-macrdp serves **everything over one TLS-over-TCP connection** — EGFX video,
+*(This section describes the pre-multitransport baseline that motivated the work; as
+of Phase 1, macrdp can additionally serve EGFX over a UDP tunnel — see the status
+block at the top.)*
+
+macrdp served **everything over one TLS-over-TCP connection** — EGFX video,
 RDPSND audio, input, clipboard, RDPDR — multiplexed through a single
 `SharedWriter` (`Rc<Mutex<&mut W>>`) in the vendored `ironrdp-server`'s
-`client_loop`. IronRDP is **TCP-only**: no MS-RDPEUDP / MS-RDPEMT, no UDP
-transport crate. (Confirmed 2026-06-25: no such crate in the IronRDP tree.)
+`client_loop`. **Upstream** IronRDP is **TCP-only**: no MS-RDPEUDP / MS-RDPEMT, no UDP
+transport crate (confirmed 2026-06-25: no such crate in the upstream tree) — which is
+why macrdp built the vendored `ironrdp-rdpeudp` crate + server-side glue. With Phase 1,
+EGFX (when migrated) now rides a UDP tunnel; input, audio, clipboard, and RDPDR still
+ride the TCP `SharedWriter`.
 
 The whole IronRDP I/O model assumes **one reliable, ordered byte stream**:
 `ironrdp-async`/`ironrdp-tokio` wrap an `AsyncRead`/`AsyncWrite` in a `Framed`
@@ -148,8 +163,9 @@ I/O. Two layers map cleanly onto that:
    ACK, sliding window, retransmit, forward error correction (and the
    RDPEUDP→EUDP2 upgrade; EUDP2 is reliable-only). This is fundamentally
    "datagram in → datagrams out + delivered payload," the canonical sans-I/O
-   shape IronRDP favors, so it can be built and tested without sockets. Nothing
-   like it exists yet, but the *idiom* is right. Because the UDP data path is
+   shape IronRDP favors, so it can be built and tested without sockets. (Built as
+   `ironrdp-rdpeudp`'s `state.rs`, proven by a two-instance in-memory
+   loss/reorder/dup test — the idiom held.) Because the UDP data path is
    **bidirectional** (both peers run sender + receiver), a future IronRDP *client*
    RDPEUDP and this server engine would share most of this core.
 
@@ -186,7 +202,8 @@ I/O. Two layers map cleanly onto that:
    with DTLS 1.3, but its cross-platform build is fussier.
    (Reliable-UDP-only via RDPEUDP2 + normal TLS would sidestep DTLS entirely — see below.)
 
-4. **Server I/O integration — architecturally invasive (`ironrdp-server`).** The
+4. **Server I/O integration (`ironrdp-server`).** *(Predicted "architecturally
+   invasive"; the build came in lighter — see the inline corrections.)* The
    server model assumes one `Framed` byte-stream writer. UDP needs:
    - A **UDP listener** that accepts arbitrary inbound flows and **associates
      each with an existing TCP session** by generating + **validating the cookie**
@@ -195,14 +212,35 @@ I/O. Two layers map cleanly onto that:
      only sends the bootstrap PDU; the response handler is a no-op).
    - **Channel migration**: steering DVC traffic (EGFX video) off the TCP writer
      onto the UDP transport, which requires `drdynvc` (only channel data rides
-     UDP) and a **second writer path** threaded through the
-     `tokio::select!`-over-`SharedWriter` dispatch loop. This is a refactor of
-     `client_loop`, not an additive patch.
+     UDP). *(As-built: this was an **additive** flag-gated branch in the existing
+     `ServerEvent::Egfx` arm — `egfx_on_udp` → ship via an mpsc `TunnelSender` to the
+     listener — plus a new inbound `dispatch_tunnel_inbound` select arm; NOT the
+     feared `client_loop` writer refactor. The hot path is byte-identical with the
+     feature off.)*
    - **Server-grade sender behavior**: congestion window, RTT estimation, FEC
      ratios, retransmit timers — as the *bulk* sender (video). The FreeRDP client
      shows the mechanism but not the tuning (its sender is lightly exercised).
 
 ## Modular integration design (making the server hook elegant)
+
+> **As-built (2026-06-26) — the shipped Phase 1 differs from the sketch below; the
+> *reasoning* holds but the type/file names don't.** No `TransportRouter` / per-channel
+> writer handles / `Channel` enum were built. EGFX is shipped over the tunnel by
+> `RdpServer::route_egfx_over_udp` — it encodes each message via
+> `SvcMessage::encode_unframed_pdu` (bare DRDYNVC PDU; the tunnel provides framing) and
+> hands it to a `TunnelSender` mpsc the listener drains — gated by an `egfx_on_udp`
+> bool that the **listener-driven Soft-Sync path** sets, so the `ServerEvent::Egfx`
+> dispatch arm just branches on that flag (and a symmetric inbound path drains
+> `RDP_TUNNEL_DATA` back into the drdynvc processor). The `MultitransportProvider`
+> trait is a single method (`requested_protocol`), NOT `offer`/`start` — the
+> negotiation **offer moved into the acceptor** (it must go out after licensing, before
+> Demand Active; a post-finalization send is rejected by real clients). The server
+> `src/multitransport/` tree is just `mod.rs` (trait + `CookieRegistry` + `TunnelSender`)
+> + `listener.rs` (UDP socket + RDPEUDP SM + rustls + MS-RDPEMT tunnel); there is no
+> separate `session.rs`/`router.rs`/`migration.rs`/`dtls.rs` (DTLS is Phase 2). The
+> `ironrdp-rdpeudp` crate's files are `pdu.rs`/`eudp2.rs`/`emt.rs`/`datagram.rs`/
+> `state.rs`, not `reliability.rs`. Soft-Sync needed a 4th vendored crate
+> (`ironrdp-dvc`). The original sketch is kept below for the design rationale.
 
 The server-side integration (#4) sounds invasive, but the vendored `ironrdp-server`
 already has **the two seams** needed to keep it clean and quarantined — so the UDP
@@ -303,7 +341,13 @@ passthrough wrapper plus two no-op-by-default hook calls.
   specs** ([MS-RDPEUDP], [MS-RDPEUDP2], [MS-RDPEMT]) and the **conformance gate
   is mstsc**.
 
-## A cheaper middle path (if ever pursued)
+## A cheaper middle path (this is what Phase 1 built)
+
+> **This section's "middle path" is exactly what shipped as Phase 1** — reliable UDP +
+> ordinary rustls TLS, no DTLS, no new crypto dep. (One spec nuance found in the build:
+> with **mstsc** the reliable channel is plain RDPEUDP **v1/v2 carrying TLS**, not
+> EUDP2 — so the v1 reliability SM is the live codepath; the EUDP2 codecs exist but are
+> off mstsc's reliable critical path.)
 
 **Reliable-UDP-only (RDPEUDP2 + normal TLS), no lossy/DTLS.** EUDP2 is
 reliable-only, so it rides ordinary TLS over the reliable RDPEUDP stream —
@@ -318,13 +362,24 @@ blocker — see DTLS above.
 
 ## Upstream vs. vendor
 
-This is **far bigger than macrdp's existing vendored divergences** (small,
-targeted patches). A whole new transport stack + an invasive `ironrdp-server` I/O
-refactor is not a sane long-term vendor fork. It should be done **upstream with
-Devolutions** — and you'd be **pioneering the server side** (no open-source RDP
-server has a working UDP data path; FreeRDP's is a stub). Implementation would
-track the MS-RDPEUDP/EMT specs, with FreeRDP's client as a partial reference and
-mstsc as the gate.
+This is **far bigger than macrdp's existing vendored divergences** (small, targeted
+patches): a whole new transport stack (`ironrdp-rdpeudp`) + server-side glue in
+vendored `ironrdp-server` + a Soft-Sync codec in vendored `ironrdp-dvc`.
+
+**What was actually done (and why):** the user explicitly accepted **building it
+vendored first, upstreaming later once proven** — so Phase 1 shipped as vendored
+divergences, deliberately forgoing the "don't carry big vendor forks" preference for
+now. The server-side data path turned out to be **less invasive than feared**: no
+`client_loop` writer refactor was needed (EGFX rides an mpsc `TunnelSender` to the
+listener via a flag-gated branch in the existing `ServerEvent::Egfx` arm), so the hot
+path stays byte-identical when the feature/flag is off. This **pioneered the server
+side** — as far as is known the first OSS RDP server with a working UDP data path
+(FreeRDP's server is a bootstrap stub; verified 2026-06-26). **Still to do:** upstream
+the `MultitransportProvider` extension point + the transport crate to Devolutions once
+the data path is soaked — until then it rides as a vendor divergence. Implementation
+tracked the MS-RDPEUDP/EMT specs, with FreeRDP's client as a partial reference and
+mstsc as the gate (which caught the v2-carrying-TLS reality and the bare-DRDYNVC tunnel
+framing).
 
 ## Distribution / packaging implications
 
@@ -340,15 +395,24 @@ mstsc as the gate.
 
 ## Recommendation
 
+*Original recommendation, with outcomes noted inline — the original framing
+("possible / multi-month / not started") is kept for the record.*
+
 - **Gate on the use case, not on feasibility.** It's *possible* and IronRDP is a
-  decent host; it's just multi-month and only pays off off-LAN.
-- If pursued: **Phase 1 = the PDU crate + a reliable-UDP-only (RDPEUDP2/TLS) path**
-  (no DTLS, no new crypto dep, smaller refactor) to prove the transport-migration
-  plumbing in `ironrdp-server`. **Phase 2 = lossy UDP + DTLS + FEC** for the real
-  video win, securing the lossy transport with **`boring`** (or `openssl`) — DTLS
-  is a known, reachable dependency, not a blocker.
-- **Do it upstream**, not as a vendor fork.
-- Validate against FreeRDP *and* mstsc; treat the specs as authoritative.
+  decent host; it's just multi-month and only pays off off-LAN. → **DONE for Phase 1**
+  (default OFF; it's there for the off-LAN use case when wanted, not the LAN default).
+- **Phase 1 = the PDU crate + a reliable-UDP-only (RDPEUDP2/TLS) path** (no DTLS, no
+  new crypto dep, smaller refactor) to prove the transport-migration plumbing in
+  `ironrdp-server`. → **DONE** — `ironrdp-rdpeudp` + the listener + rustls + MS-RDPEMT
+  tunnel + Soft-Sync EGFX migration; EGFX renders over UDP on mstsc. (Note: mstsc's
+  reliable channel is RDPEUDP **v2 carrying TLS**, not EUDP2 — the v1 SM is the live
+  codepath; the EUDP2 codecs are built but off mstsc's reliable critical path.)
+- **Phase 2 = lossy UDP + DTLS + FEC** for the real video win, securing the lossy
+  transport with **`boring`** (or `openssl`). → **NOT started** (deferred; the
+  known-reachable follow-up).
+- **Upstream** the extension point + transport crate to Devolutions once soaked. →
+  built **vendored first** (the accepted approach); upstreaming is the open follow-up.
+- Validate against FreeRDP *and* mstsc; treat the specs as authoritative. → did both.
 
 ## Sources
 
@@ -374,7 +438,11 @@ mstsc as the gate.
 
 ## Status
 
-**Exploratory / not started.** No code. Gated on a LAN→WAN use-case shift.
+**Phase 1 BUILT and verified — see the status block at the top of this doc for the
+milestone-by-milestone detail.** (This section originally read "exploratory / not
+started, no code"; that's long obsolete — EGFX H.264 renders over the reliable UDP
+tunnel on real mstsc, behind `--enable-udp-multitransport` + `MACRDP_UDP_MIGRATE_EGFX`,
+default OFF.) Phase 2 (lossy `UdpFecL` + DTLS + FEC) remains exploratory / not started.
 Cross-reference: `docs/usb-redirection-feasibility.md` (the other
 "big protocol + new transport layer" scoping doc) and the A/V-contention quirk in
-`docs/known-quirks.md` (the single-connection coupling this would partly relieve).
+`docs/known-quirks.md` (the single-connection coupling this partly relieves for video).
