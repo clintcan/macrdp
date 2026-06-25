@@ -35,6 +35,27 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **M5b-1 (done — data-path wire codecs, 2026-06-26; integration pending):** the
+  pure, spec-verified codecs the EGFX-over-UDP data path needs, ahead of the
+  (larger) server integration — same codecs-before-wiring pattern as M2. Two adds:
+  - `emt.rs`: `encode_tunnel_data(higher_layer)` / `tunnel_data_payload(pdu)` —
+    RDP_TUNNEL_DATA (MS-RDPEMT 2.2.2.3, action 0x2): just a `TunnelHeader{DATA}` +
+    the HigherLayerData (which, post-switch, is the **same DRDYNVC DATA PDU** that
+    would otherwise ride the main connection — only the wrapper differs).
+  - **new `softsync.rs`**: the **MS-RDPEDYC Soft-Sync** PDUs. KEY ARCHITECTURE
+    FINDING: Soft-Sync is RDPEDYC (drdynvc), NOT RDPEMT — both PDUs travel over the
+    **DRDYNVC static channel on the MAIN (TCP) connection**, not the UDP tunnel;
+    only the channel *data* after the switch rides the tunnel. `SoftSyncRequest`
+    (Cmd 0x08; first byte = Cmd<<4; Pad; Length [counts Length+Flags+
+    NumberOfTunnels+lists]; Flags TCP_FLUSHED=0x01|CHANNEL_LIST_PRESENT=0x02;
+    NumberOfTunnels u16; then DYNVC_SOFT_SYNC_CHANNEL_LISTs of TunnelType u32 +
+    NumberOfDVCs u16 + u32 channel ids) + `decode_soft_sync_response` (Cmd 0x09;
+    Pad; **NumberOfTunnels is u32 here — 2-byte in request, asymmetric**;
+    TunnelsToSwitch u32 each). LE throughout. `switch_to_udpfecr(channel_ids)`
+    convenience. Byte-exact unit tests vs the spec field tables. 46 crate tests.
+  Integration (send the request over drdynvc, the Initiate-Response gate, the
+  server→listener handoff + recv-loop bidi refactor, route EGFX) is the next,
+  bigger step — see ironrdp-server CLAUDE.md (12) M5 plan.
 - **M4c (done — MS-RDPEMT tunnel established on real mstsc, 2026-06-25):** new
   `src/emt.rs` — the MS-RDPEMT *tunnel* PDU codecs (a different protocol from the
   RDPEUDP transport below it; rides the TLS-secured reliable stream). **MS-RDPEMT

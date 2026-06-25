@@ -241,6 +241,43 @@ impl Encode for TunnelCreateResponse {
     }
 }
 
+/// Wrap `higher_layer_data` in an RDP_TUNNEL_DATA PDU (MS-RDPEMT 2.2.2.3) ready
+/// to write into the tunnel's TLS. After Soft-Sync, the server carries migrated
+/// dynamic-channel traffic this way: `HigherLayerData` is the **same DRDYNVC PDU**
+/// (e.g. a DYNVC DATA carrying an EGFX message) that would otherwise ride the
+/// main connection's drdynvc SVC — only the transport wrapper differs.
+pub fn encode_tunnel_data(higher_layer_data: &[u8]) -> Vec<u8> {
+    let header = TunnelHeader::simple(
+        action::DATA,
+        u16::try_from(higher_layer_data.len()).unwrap_or(u16::MAX),
+    );
+    let mut out = vec![0u8; TunnelHeader::FIXED_PART_SIZE + higher_layer_data.len()];
+    {
+        let mut dst = WriteCursor::new(&mut out);
+        // Infallible: the buffer is sized exactly for the fixed header.
+        let _ = header.encode(&mut dst);
+    }
+    out[TunnelHeader::FIXED_PART_SIZE..].copy_from_slice(higher_layer_data);
+    out
+}
+
+/// Extract the `HigherLayerData` of an inbound RDP_TUNNEL_DATA PDU (the bytes
+/// after the variable-length [`TunnelHeader`]). Used when the client sends
+/// migrated dynamic-channel data back over the tunnel. Returns a borrowed slice
+/// into `pdu`. Errors if the header is malformed or the buffer is short.
+pub fn tunnel_data_payload(pdu: &[u8]) -> DecodeResult<&[u8]> {
+    let mut src = ReadCursor::new(pdu);
+    let header = TunnelHeader::decode(&mut src)?;
+    // `TunnelHeader::decode` consumes exactly `header_length` bytes (4 fixed +
+    // sub-headers), so the payload starts there.
+    let start = usize::from(header.header_length);
+    let end = start
+        .checked_add(usize::from(header.payload_length))
+        .filter(|&e| e <= pdu.len())
+        .ok_or_else(|| invalid_field_err!("PayloadLength", "exceeds buffer"))?;
+    Ok(&pdu[start..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +334,26 @@ mod tests {
             b
         };
         assert!(TunnelCreateRequest::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn tunnel_data_wraps_and_unwraps_higher_layer() {
+        let payload = b"a drdynvc DATA pdu carrying EGFX";
+        let pdu = encode_tunnel_data(payload);
+        // action|flags=0x02 (DATA), payloadLength=LE len, headerLength=4.
+        assert_eq!(pdu[0], action::DATA);
+        assert_eq!(u16::from_le_bytes([pdu[1], pdu[2]]) as usize, payload.len());
+        assert_eq!(pdu[3], TunnelHeader::FIXED_PART_SIZE as u8);
+        assert_eq!(&pdu[4..], payload);
+        // Round-trips back to the same HigherLayerData.
+        assert_eq!(tunnel_data_payload(&pdu).unwrap(), payload);
+    }
+
+    #[test]
+    fn tunnel_data_payload_rejects_overlong_length() {
+        // headerLength=4, payloadLength=99 but only 2 payload bytes present.
+        let bad = [action::DATA, 0x63, 0x00, 0x04, 0xaa, 0xbb];
+        assert!(tunnel_data_payload(&bad).is_err());
     }
 
     #[test]
