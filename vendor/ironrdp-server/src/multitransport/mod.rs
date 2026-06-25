@@ -166,6 +166,43 @@ pub(crate) fn new_offer(protocol: RequestedProtocol) -> MultitransportOffer {
     }
 }
 
+/// (M5c) One unit of server-originated data to ship over a bound UDP tunnel: the
+/// `cookie` selects which peer (the listener maps cookie → peer address on bind),
+/// and `data` is the **HigherLayerData** for an `RDP_TUNNEL_DATA` PDU (one SVC
+/// channel-data chunk — `CHANNEL_PDU_HEADER` + the DRDYNVC PDU — the same bytes
+/// that would otherwise ride the drdynvc static channel over TCP). The listener
+/// wraps it in `RDP_TUNNEL_DATA`, encrypts via the peer's MS-RDPEMT TLS, and sends
+/// it reliably over RDPEUDP.
+#[derive(Debug)]
+pub struct TunnelOutbound {
+    pub cookie: [u8; 16],
+    pub data: Vec<u8>,
+}
+
+/// (M5c) Clonable handle the per-connection [`RdpServer`](crate::RdpServer) uses to
+/// push channel data onto the process-global UDP listener's bound tunnel (the
+/// server→listener handoff). The listener owns the receiving end. Best-effort: a
+/// send failure (listener gone / channel full-less unbounded) is dropped — the
+/// channel is for the optional UDP fast-path, never the correctness-critical TCP
+/// path.
+#[derive(Clone)]
+pub struct TunnelSender(tokio::sync::mpsc::UnboundedSender<TunnelOutbound>);
+
+impl TunnelSender {
+    /// Queue one HigherLayerData chunk for the peer bound to `cookie`.
+    pub(crate) fn send(&self, cookie: [u8; 16], data: Vec<u8>) {
+        let _ = self.0.send(TunnelOutbound { cookie, data });
+    }
+}
+
+/// (M5c) Create the server→listener handoff channel. Hand the [`TunnelSender`] to
+/// the [`RdpServer`](crate::RdpServer) (via `set_multitransport_tunnel_sender`) and
+/// the receiver to [`UdpMultitransportListener::bind`](crate::multitransport::listener::UdpMultitransportListener::bind).
+pub fn tunnel_channel() -> (TunnelSender, tokio::sync::mpsc::UnboundedReceiver<TunnelOutbound>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (TunnelSender(tx), rx)
+}
+
 /// Per-connection negotiation state for an in-flight multitransport request:
 /// the `request_id` + 16-byte security cookie the server issued in the
 /// `MultitransportRequestPdu`, used to match the client's

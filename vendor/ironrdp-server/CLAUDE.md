@@ -431,3 +431,47 @@ AND released — #1276 landing is NOT sufficient.
     the tunnel as RDP_TUNNEL_DATA) is the next step. Watch
     `RUST_LOG=...ironrdp_server::server=debug,ironrdp_dvc=debug` for the gate /
     send / "Got DVC Soft-Sync Response" lines.
+    **M5c step 3a (added 2026-06-26): real EGFX migration request + outbound
+    server→tunnel route — migration ACCEPTED by real mstsc.** Behind a second env
+    gate `MACRDP_UDP_MIGRATE_EGFX` (default OFF; when off, the M5c step-1+2 empty
+    safe spike is byte-for-byte unchanged — verified no-regression on mstsc). When
+    set:
+    1. **Name the EGFX DVC in the Soft-Sync.** `DrdynvcServer` gained
+       `get_channel_id_by_name` (vendored `ironrdp-dvc`); `maybe_soft_sync_on_egfx`
+       looks up `"Microsoft::Windows::RDS::Graphics"`, sets `RdpServer::egfx_on_udp`,
+       and sends `switch_to_udpfecr(vec![gfx_id])` (TCP_FLUSHED|CHANNEL_LIST_PRESENT).
+    2. **Outbound handoff (server→listener).** New `tunnel_channel()` →
+       (`TunnelSender`, `UnboundedReceiver<TunnelOutbound>`); `RdpServer` gained
+       `multitransport_tunnel_sender` (setter `set_multitransport_tunnel_sender`).
+       The `ServerEvent::Egfx` dispatch arm, when `egfx_on_udp`, calls
+       `route_egfx_over_udp` — `StaticVirtualChannel::chunkify(messages)` → each
+       chunk handed to the sender keyed by the connection's migration cookie
+       (instead of `server_encode_svc_messages` over TCP). The listener's recv loop
+       is now bidirectional (`tokio::select!` recv + an outbound arm); `ship_outbound`
+       wraps each chunk in `RDP_TUNNEL_DATA` (`emt::encode_tunnel_data`), encrypts
+       through the peer's MS-RDPEMT TLS, and ships it reliably over RDPEUDP (peer
+       looked up by cookie via `bound_addrs`, populated when `handle_emt_tunnel`
+       binds the tunnel). `main.rs` wires `tunnel_channel()` → sender to the server,
+       rx to `bind`. `TunnelOutbound` is `pub` (it leaks through the public `bind`
+       signature); when the feature/flag is off the outbound arm is just a
+       never-ready future, so the recv-only path is unchanged.
+    **VERIFIED on real mstsc 2026-06-26 — migration accepted, NOT yet rendering:**
+    `Sent DYNVC_SOFT_SYNC_REQUEST (migrating EGFX onto the UDP tunnel) gfx_channel_id=3`
+    → mstsc replied `DYNVC_SOFT_SYNC_RESPONSE { tunnels: [1] }` (**it agreed to
+    switch the EGFX channel onto the reliable UDP tunnel** — the migration request
+    is wire-correct). Then the session froze (~300 ms) and the user disconnected.
+    **Root cause (diagnosed, this is step 3b):** after migration EGFX is
+    bidirectional over the tunnel — mstsc's **frame acknowledgements** come back as
+    inbound `RDP_TUNNEL_DATA` (`action=2 len=10`, logged "not handled yet"), and we
+    drop them; macrdp's H.264 ship loop gates on frame acks (`max_in_flight=2`), so
+    after ~2 unacked frames it stalls → frozen video. The OUTBOUND route + the
+    migration handshake are proven; the missing piece is the **inbound tunnel →
+    drdynvc path**: un-tunnel the HigherLayerData (an SVC channel-data blob =
+    `CHANNEL_PDU_HEADER` + DRDYNVC PDU, identical to what `handle_x224` feeds
+    `svc.process(&data.user_data)` over TCP), route it back to the owning
+    connection's `client_loop` (a per-cookie reverse channel), and run it through
+    the drdynvc `StaticVirtualChannel::process` so the EGFX handler sees the acks
+    (shipping any reply PDUs back over the tunnel). That reverse handoff is M5c
+    step 3b. Watch the gate/send lines plus
+    `MACRDP_UDP_MIGRATE_EGFX: Soft-Sync will migrate the EGFX DVC` and (listener)
+    `MS-RDPEMT tunnel PDU not handled yet … action=2`.

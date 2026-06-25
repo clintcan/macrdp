@@ -37,8 +37,9 @@ use ironrdp_rdpeudp::datagram::Datagram;
 use ironrdp_rdpeudp::pdu::FecFlags;
 use ironrdp_rdpeudp::state::{Config, RdpeudpState, Role};
 
-use crate::multitransport::CookieRegistry;
+use crate::multitransport::{CookieRegistry, TunnelOutbound};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tokio_rustls::rustls::{ServerConfig, ServerConnection};
 use tracing::{debug, trace, warn};
@@ -125,6 +126,7 @@ impl UdpMultitransportListener {
         cfg: ListenerConfig,
         tls_config: Option<Arc<ServerConfig>>,
         cookie_registry: Option<CookieRegistry>,
+        tunnel_rx: Option<UnboundedReceiver<TunnelOutbound>>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
@@ -133,6 +135,7 @@ impl UdpMultitransportListener {
             %local_addr, ?cfg,
             tls = tls_config.is_some(),
             cookie_binding = cookie_registry.is_some(),
+            tunnel_handoff = tunnel_rx.is_some(),
             "RDPEUDP multitransport listener bound"
         );
         let task = tokio::spawn(run_recv_loop(
@@ -140,6 +143,7 @@ impl UdpMultitransportListener {
             cfg,
             tls_config,
             cookie_registry,
+            tunnel_rx,
         ));
         Ok(Self { local_addr, task })
     }
@@ -176,6 +180,53 @@ async fn send_datagrams(socket: &UdpSocket, peer_addr: SocketAddr, to_send: Vec<
     }
 }
 
+/// (M5c) Ship one server-originated HigherLayerData chunk to a bound peer: wrap it
+/// in `RDP_TUNNEL_DATA` (action 0x2), encrypt through the peer's MS-RDPEMT TLS, and
+/// send the resulting ciphertext reliably over RDPEUDP. Best-effort — an unbound
+/// cookie / unknown peer / no-TLS peer / write error is logged and dropped (the
+/// tunnel is the optional UDP fast-path; the TCP path remains authoritative).
+async fn ship_outbound(
+    socket: &UdpSocket,
+    peers: &mut HashMap<SocketAddr, Peer>,
+    bound_addrs: &HashMap<[u8; 16], SocketAddr>,
+    cookie: [u8; 16],
+    higher_layer: &[u8],
+    now_ms: u64,
+    mtu: u16,
+) {
+    use ironrdp_rdpeudp::emt;
+
+    let Some(&peer_addr) = bound_addrs.get(&cookie) else {
+        trace!("tunnel data for an unbound cookie; dropping");
+        return;
+    };
+    let Some(peer) = peers.get_mut(&peer_addr) else {
+        trace!(%peer_addr, "tunnel data for an unknown peer; dropping");
+        return;
+    };
+    let Peer { sm, tls, .. } = peer;
+    let Some(tls) = tls.as_mut() else {
+        warn!(%peer_addr, "tunnel data to a peer with no TLS; dropping");
+        return;
+    };
+
+    let pdu = emt::encode_tunnel_data(higher_layer);
+    if tls.writer().write_all(&pdu).is_err() {
+        warn!(%peer_addr, "failed to write RDP_TUNNEL_DATA into TLS");
+        return;
+    }
+    let mut tls_out = Vec::new();
+    while tls.wants_write() {
+        if tls.write_tls(&mut tls_out).is_err() {
+            break;
+        }
+    }
+    if !tls_out.is_empty() {
+        let o = sm.enqueue(now_ms, &tls_out);
+        send_datagrams(socket, peer_addr, o.to_send, mtu).await;
+    }
+}
+
 /// Parse complete MS-RDPEMT tunnel PDUs from the TLS-decrypted plaintext and, on
 /// the client's `RDP_TUNNEL_CREATEREQUEST`, write a `CREATERESPONSE(S_OK)` into
 /// the TLS connection (its encrypted bytes are picked up by the caller's
@@ -196,8 +247,12 @@ fn handle_emt_tunnel(
     buf: &mut Vec<u8>,
     tunnel_created: &mut bool,
     cookie_registry: Option<&CookieRegistry>,
-) {
+) -> Option<[u8; 16]> {
     use ironrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
+
+    // The cookie of a tunnel bound during this call, so the caller can map it to
+    // this peer address for the server→listener data handoff (M5c).
+    let mut bound_cookie: Option<[u8; 16]> = None;
 
     while let Some(total) = emt::peek_pdu_len(buf) {
         if buf.len() < total {
@@ -238,6 +293,7 @@ fn handle_emt_tunnel(
                         let resp = TunnelCreateResponse::ok().to_vec();
                         if tls.writer().write_all(&resp).is_ok() {
                             *tunnel_created = true;
+                            bound_cookie = Some(req.security_cookie);
                         } else {
                             warn!(%peer_addr, "failed to write MS-RDPEMT CREATERESPONSE into TLS");
                         }
@@ -258,6 +314,8 @@ fn handle_emt_tunnel(
             None => break,
         }
     }
+
+    bound_cookie
 }
 
 async fn run_recv_loop(
@@ -265,19 +323,48 @@ async fn run_recv_loop(
     cfg: ListenerConfig,
     tls_config: Option<Arc<ServerConfig>>,
     cookie_registry: Option<CookieRegistry>,
+    mut tunnel_rx: Option<UnboundedReceiver<TunnelOutbound>>,
 ) {
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
+    // (M5c) cookie -> peer address, populated when a tunnel binds, so
+    // server-originated `TunnelOutbound` (keyed by cookie) reaches the right peer.
+    let mut bound_addrs: HashMap<[u8; 16], SocketAddr> = HashMap::new();
     let mut session_counter: u32 = 0;
     let start = tokio::time::Instant::now();
     let mut buf = vec![0u8; 2048];
 
     loop {
-        let (len, peer_addr) = match socket.recv_from(&mut buf).await {
-            Ok(v) => v,
-            // UDP recv_from can surface a prior send_to's ICMP error (e.g. a
-            // ConnReset on Windows); it's per-datagram, so keep serving.
-            Err(e) => {
-                trace!(error = %e, "udp recv_from error; continuing");
+        // (M5c) The recv loop is now bidirectional: it reads inbound datagrams AND
+        // ships server-originated channel data (EGFX over the tunnel). When no
+        // handoff channel is wired, the outbound arm is a never-ready future, so
+        // behavior is identical to the recv-only path.
+        let outbound = async {
+            match tunnel_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+
+        let (len, peer_addr) = tokio::select! {
+            recv = socket.recv_from(&mut buf) => match recv {
+                Ok(v) => v,
+                // UDP recv_from can surface a prior send_to's ICMP error (e.g. a
+                // ConnReset on Windows); it's per-datagram, so keep serving.
+                Err(e) => {
+                    trace!(error = %e, "udp recv_from error; continuing");
+                    continue;
+                }
+            },
+            out = outbound => {
+                let now_ms = start.elapsed().as_millis() as u64;
+                match out {
+                    Some(TunnelOutbound { cookie, data }) => {
+                        ship_outbound(&socket, &mut peers, &bound_addrs, cookie, &data, now_ms, cfg.mtu).await;
+                    }
+                    // Sender dropped: the owning connection went away. Nothing more
+                    // will be sent over the tunnel; keep serving inbound.
+                    None => tunnel_rx = None,
+                }
                 continue;
             }
         };
@@ -444,13 +531,17 @@ async fn run_recv_loop(
                     // response into the TLS connection here means the wants_write
                     // drain below picks up its encrypted bytes. M5a: bind the
                     // tunnel to a real TCP session via the cookie registry.
-                    handle_emt_tunnel(
+                    if let Some(cookie) = handle_emt_tunnel(
                         peer_addr,
                         tls,
                         emt_inbound,
                         tunnel_created,
                         cookie_registry.as_ref(),
-                    );
+                    ) {
+                        // (M5c) Record cookie -> this peer so server-originated
+                        // tunnel data (keyed by the same cookie) reaches it.
+                        bound_addrs.insert(cookie, peer_addr);
+                    }
 
                     while tls.wants_write() {
                         if tls.write_tls(&mut tls_out).is_err() {

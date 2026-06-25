@@ -85,6 +85,17 @@ impl DrdynvcServer {
         self.type_id_to_channel_id.get(&TypeId::of::<T>()).copied()
     }
 
+    /// (macrdp divergence) Find a dynamic channel's id by its announced name (e.g.
+    /// `"Microsoft::Windows::RDS::Graphics"` for EGFX). Used by the multitransport
+    /// path to name the DVC in a Soft-Sync request without needing its concrete
+    /// processor type. Returns the first match (channel names are unique).
+    pub fn get_channel_id_by_name(&self, name: &str) -> Option<u32> {
+        self.dynamic_channels
+            .iter()
+            .find(|(_, c)| c.processor.channel_name() == name)
+            .and_then(|(id, _)| u32::try_from(id).ok())
+    }
+
     /// Returns `true` if the DVC channel with the given ID has completed
     /// its creation handshake and is in the `Opened` state.
     pub fn is_channel_opened(&self, channel_id: u32) -> bool {

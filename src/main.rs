@@ -2126,11 +2126,16 @@ async fn async_main() -> Result<()> {
         // session. The server registers each issued cookie here; the listener
         // accepts a tunnel CREATEREQUEST only if its echoed cookie matches.
         let cookie_registry = ironrdp_server::CookieRegistry::new();
+        // M5c: the server→listener handoff. The server pushes EGFX frames (when
+        // migrated onto the tunnel) through the sender; the listener owns the rx
+        // and ships them as RDP_TUNNEL_DATA over the bound peer's UDP tunnel.
+        let (tunnel_sender, tunnel_rx) = ironrdp_server::tunnel_channel();
         match ironrdp_server::UdpMultitransportListener::bind(
             args.bind,
             cfg,
             Some(udp_tls_config.clone()),
             Some(cookie_registry.clone()),
+            Some(tunnel_rx),
         )
         .await
         {
@@ -2143,6 +2148,7 @@ async fn async_main() -> Result<()> {
                 server
                     .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
                 server.set_multitransport_cookie_registry(Some(cookie_registry));
+                server.set_multitransport_tunnel_sender(Some(tunnel_sender));
                 Some(listener)
             }
             Err(e) => {

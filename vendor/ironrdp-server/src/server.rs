@@ -281,6 +281,22 @@ impl DisplayControlHandler for DisplayControlBackend {
 /// Ok(())
 ///# }
 /// ```
+/// (M5c) The EGFX dynamic virtual channel's announced name (MS-RDPEGFX). Used to
+/// find its DVC id so it can be named in a Soft-Sync request.
+#[cfg(feature = "multitransport")]
+const EGFX_DVC_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+
+/// (M5c) EXPERIMENTAL: whether to actually migrate the EGFX channel onto the UDP
+/// tunnel (vs. the proven safe spike that sends an empty Soft-Sync and keeps EGFX
+/// on TCP). Gated on the `MACRDP_UDP_MIGRATE_EGFX` env var so the default build
+/// behaves exactly as the verified M5c step-1+2. Read once and cached.
+#[cfg(feature = "multitransport")]
+fn migrate_egfx_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MACRDP_UDP_MIGRATE_EGFX").is_some())
+}
+
 pub struct RdpServer {
     opts: RdpServerOptions,
     // FIXME: replace with a channel and poll/process the handler?
@@ -358,6 +374,16 @@ pub struct RdpServer {
     /// this listener→server flag (not a message-channel PDU) is the real gate.
     #[cfg(feature = "multitransport")]
     udp_tunnel_bound: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// (M5c) Handoff to the process-global UDP listener for shipping channel data
+    /// (EGFX) over the bound tunnel. `None` = no UDP data path (EGFX stays on TCP).
+    #[cfg(feature = "multitransport")]
+    multitransport_tunnel_sender: Option<crate::multitransport::TunnelSender>,
+    /// (M5c) Set once a Soft-Sync request has migrated the EGFX DVC channel to the
+    /// UDP tunnel — from then on EGFX frames route over UDP, not TCP. Only ever set
+    /// when the experimental `MACRDP_UDP_MIGRATE_EGFX` env flag is on; the default
+    /// path leaves EGFX on TCP (the proven empty-Soft-Sync spike).
+    #[cfg(feature = "multitransport")]
+    egfx_on_udp: bool,
 }
 
 #[derive(Debug)]
@@ -464,6 +490,10 @@ impl RdpServer {
             multitransport_cookies: None,
             #[cfg(feature = "multitransport")]
             udp_tunnel_bound: None,
+            #[cfg(feature = "multitransport")]
+            multitransport_tunnel_sender: None,
+            #[cfg(feature = "multitransport")]
+            egfx_on_udp: false,
         }
     }
 
@@ -544,6 +574,16 @@ impl RdpServer {
         registry: Option<crate::multitransport::CookieRegistry>,
     ) {
         self.multitransport_cookies = registry;
+    }
+
+    /// (M5c) Install the handoff to the UDP listener so the server can ship channel
+    /// data (EGFX) over a bound multitransport tunnel. Pair it with the matching
+    /// receiver passed to
+    /// [`UdpMultitransportListener::bind`](crate::multitransport::listener::UdpMultitransportListener::bind)
+    /// (both from one [`tunnel_channel`](crate::multitransport::tunnel_channel)).
+    #[cfg(feature = "multitransport")]
+    pub fn set_multitransport_tunnel_sender(&mut self, sender: Option<crate::multitransport::TunnelSender>) {
+        self.multitransport_tunnel_sender = sender;
     }
 
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
@@ -1134,6 +1174,15 @@ impl RdpServer {
                 #[cfg(feature = "egfx")]
                 ServerEvent::Egfx(msg) => match msg {
                     EgfxServerMessage::SendMessages { messages } => {
+                        // (M5c) Once EGFX has been migrated onto the UDP tunnel
+                        // (`egfx_on_udp`, only under MACRDP_UDP_MIGRATE_EGFX), route
+                        // its frames over the tunnel instead of the TCP drdynvc
+                        // channel. Default path is unchanged TCP.
+                        #[cfg(feature = "multitransport")]
+                        if self.egfx_on_udp {
+                            self.route_egfx_over_udp(messages)?;
+                            continue;
+                        }
                         let drdynvc_channel_id = self
                             .get_channel_id_by_type::<dvc::DrdynvcServer>()
                             .context("DRDYNVC channel not found")?;
@@ -1481,7 +1530,10 @@ impl RdpServer {
             request_id = resp.request_id,
             "Initiate Multitransport Response S_OK — Soft-Sync gate open"
         );
-        self.send_soft_sync_request(writer, user_channel_id).await?;
+        // Secondary TCP gate (a client that *does* send an Initiate Response S_OK
+        // — mstsc never does). Keep it an empty spike: EGFX migration is driven by
+        // the listener-bound gate (`maybe_soft_sync_on_egfx`), not this path.
+        self.send_soft_sync_request(writer, user_channel_id, Vec::new()).await?;
         Ok(true)
     }
 
@@ -1504,41 +1556,97 @@ impl RdpServer {
         if !bound {
             return Ok(());
         }
-        let Some(state) = self.multitransport_migration.as_mut() else {
-            return Ok(());
-        };
-        if state.soft_sync_sent {
-            return Ok(());
+        // One-time guard (drops the &mut borrow before the get_svc_processor below).
+        match self.multitransport_migration.as_mut() {
+            Some(state) if !state.soft_sync_sent => state.soft_sync_sent = true,
+            _ => return Ok(()),
         }
-        state.soft_sync_sent = true;
+
+        // EXPERIMENTAL (`MACRDP_UDP_MIGRATE_EGFX`): name the EGFX DVC in the request
+        // so the client actually moves it onto the UDP tunnel, and flip
+        // `egfx_on_udp` so subsequent frames route over UDP. Default (flag off) is
+        // the proven safe spike — an empty channel list, EGFX stays on TCP.
+        let channel_ids = if migrate_egfx_enabled() {
+            match self
+                .get_svc_processor::<dvc::DrdynvcServer>()
+                .and_then(|d| d.get_channel_id_by_name(EGFX_DVC_CHANNEL_NAME))
+            {
+                Some(id) => {
+                    self.egfx_on_udp = true;
+                    debug!(
+                        gfx_channel_id = id,
+                        "MACRDP_UDP_MIGRATE_EGFX: Soft-Sync will migrate the EGFX DVC onto the UDP tunnel"
+                    );
+                    vec![id]
+                }
+                None => {
+                    warn!("MACRDP_UDP_MIGRATE_EGFX set but EGFX DVC channel not found; sending empty Soft-Sync");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         debug!("UDP tunnel bound + EGFX active — Soft-Sync gate open");
-        self.send_soft_sync_request(writer, user_channel_id).await
+        self.send_soft_sync_request(writer, user_channel_id, channel_ids).await
     }
 
     /// (M5c) Send a `DYNVC_SOFT_SYNC_REQUEST` over the DRDYNVC static channel on
-    /// TCP. **Safe spike:** an EMPTY channel list (TCP_FLUSHED only) — it
-    /// exercises the send path and the client's Soft-Sync Response decode without
-    /// actually migrating any DVC, so video keeps flowing over TCP. The real
-    /// migration (listing the EGFX channel id) layers on once this is proven.
+    /// TCP. `channel_ids` are the DVC channels to migrate onto the reliable UDP
+    /// tunnel — **empty** is the safe spike (TCP_FLUSHED only, migrate nothing, so
+    /// everything stays on TCP); a non-empty list (the EGFX id) commits those
+    /// channels' data to the tunnel.
     #[cfg(feature = "multitransport")]
     async fn send_soft_sync_request(
         &mut self,
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
+        channel_ids: Vec<u32>,
     ) -> Result<()> {
         let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
             warn!("No DRDYNVC channel; cannot send Soft-Sync request");
             return Ok(());
         };
 
-        let req = dvc::pdu::SoftSyncRequestPdu::switch_to_udpfecr(Vec::new());
+        let migrating = !channel_ids.is_empty();
+        let req = dvc::pdu::SoftSyncRequestPdu::switch_to_udpfecr(channel_ids);
         let pdu = dvc::pdu::DrdynvcServerPdu::SoftSyncRequest(req);
         // Soft-Sync is a top-level DRDYNVC PDU (not sub-channel DATA), so it ships
         // as a plain SvcMessage on the drdynvc static channel.
         let msg = ironrdp_svc::SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL);
         let data = server_encode_svc_messages(vec![msg], drdynvc_channel_id, user_channel_id)?;
         writer.write_all(&data).await?;
-        debug!("Sent DYNVC_SOFT_SYNC_REQUEST (M5c safe spike: empty channel list)");
+        if migrating {
+            debug!("Sent DYNVC_SOFT_SYNC_REQUEST (migrating EGFX onto the UDP tunnel)");
+        } else {
+            debug!("Sent DYNVC_SOFT_SYNC_REQUEST (empty channel list — EGFX stays on TCP)");
+        }
+        Ok(())
+    }
+
+    /// (M5c) Route one EGFX frame's DVC messages over the bound UDP tunnel instead
+    /// of TCP: chunk them to SVC channel-data (`CHANNEL_PDU_HEADER` + DRDYNVC PDU,
+    /// the HigherLayerData the tunnel carries) and hand each chunk to the listener
+    /// (keyed by this connection's cookie). Best-effort — if the handoff or cookie
+    /// is missing the frame is dropped (the experimental UDP path; only reached
+    /// when `egfx_on_udp` was set under `MACRDP_UDP_MIGRATE_EGFX`).
+    #[cfg(feature = "multitransport")]
+    fn route_egfx_over_udp(&self, messages: Vec<ironrdp_svc::SvcMessage>) -> Result<()> {
+        let Some(sender) = self.multitransport_tunnel_sender.as_ref() else {
+            warn!("egfx_on_udp set but no tunnel sender; dropping EGFX frame");
+            return Ok(());
+        };
+        let Some(cookie) = self.multitransport_migration.as_ref().map(|m| m.cookie) else {
+            warn!("egfx_on_udp set but no migration cookie; dropping EGFX frame");
+            return Ok(());
+        };
+        let chunks = ironrdp_svc::StaticVirtualChannel::chunkify(messages)
+            .map_err(|e| anyhow::anyhow!("chunkify EGFX for tunnel: {e}"))?;
+        let n = chunks.len();
+        for chunk in chunks {
+            sender.send(cookie, chunk.into_inner());
+        }
+        trace!(chunks = n, "routed EGFX frame over the UDP tunnel");
         Ok(())
     }
 
