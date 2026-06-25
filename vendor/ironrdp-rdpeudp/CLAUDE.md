@@ -35,6 +35,29 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **M4a (done — reliable data path verified on real mstsc, 2026-06-25):** the
+  reliability SM now actually carries the client's reliable byte-stream end to
+  end. Two fixes, both forced by real mstsc (the in-memory two-instance test was
+  self-consistent and hid them):
+  1. **The SYN consumes one sequence number.** The first *source* packet is
+     `initial_seq + 1`, not `initial_seq` — symmetric on both ends (`send_next`
+     init `+1`; `recv_next` on the peer's SYN `+1`). Matches real Windows (a
+     server SYN+ACK acks `client_ISN` for the SYN alone; the client's first data
+     is `client_ISN + 1`). Without it the receiver was off by one and buffered
+     every data packet forever (mstsc retransmitted with CWR; `recv_next`
+     accessor added so the listener could log the exact `client_seq vs expected`).
+  2. **Outbound ACKs MUST carry a populated `RDPUDP_ACK_VECTOR_HEADER`.** The
+     "send the vector empty for now" deferral was wrong for interop: mstsc
+     ignores an empty-vector ACK and retransmits forever. `ack_vector()` builds a
+     `Received` run (≤63 per element, bounded by the recv window) from
+     `snSourceAck` backward over the in-order source-packet run; threaded through
+     the pure ACK and the data-piggybacked ACKs (`encode_data` gained an
+     `ack_vector` param; `empty_ack()` removed). Selective NACK runs for
+     out-of-order gaps remain a later refinement. Verified live: mstsc's TLS
+     ClientHello (one 444-byte source packet) is delivered + acked, mstsc stops
+     retransmitting and idles on `ACK|ACK_DELAYED` keepalives, waiting for the
+     server's TLS ServerHello (M4b). 34 crate tests still green (the symmetric
+     `+1` keeps the two-instance test self-consistent).
 - **M3b (done — UDP listener, in `ironrdp-server`):** this crate became a real
   dependency of `vendor/ironrdp-server` for the first time (path dep, gated by its
   `multitransport` feature; revs already aligned so `ironrdp-core` unifies). The

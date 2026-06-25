@@ -314,3 +314,14 @@ AND released — #1276 landing is NOT sufficient.
     the correct codepath and the EUDP2 wire-format spike may be off mstsc's
     critical path for the reliable channel. The session still runs over TCP (no
     TLS/EMT tunnel or migration yet — M4).
+    **M4a (added 2026-06-25): reliable data path — verified on real mstsc.** The
+    listener now consumes the SM's `delivered` output: each `Peer` accumulates the
+    reassembled reliable byte-stream (`Peer::inbound`) and logs it (+ a TLS
+    ClientHello sniff). Getting mstsc's reliable stream to actually flow needed two
+    fixes in `ironrdp-rdpeudp` (see its CLAUDE.md M4a): the SYN consumes a sequence
+    number (first source packet = `initial_seq + 1`), and outbound ACKs must carry
+    a populated `RDPUDP_ACK_VECTOR_HEADER` (an empty vector is ignored by mstsc →
+    infinite retransmit). Result: mstsc's TLS ClientHello is delivered + acked,
+    mstsc stops retransmitting and idles on `ACK|ACK_DELAYED` keepalives, waiting
+    for our TLS ServerHello. No TLS/EMT yet (M4b/M4c); listener still not bound to
+    the per-connection cookie/MigrationState.

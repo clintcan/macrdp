@@ -64,9 +64,17 @@ impl Default for ListenerConfig {
     }
 }
 
-/// A per-peer handshake/transport session: just the reliability SM for now.
+/// A per-peer handshake/transport session: the reliability SM plus the
+/// reassembled inbound reliable byte-stream (M4a).
 struct Peer {
     sm: RdpeudpState,
+    /// The client's reliable application stream, reassembled in order from the
+    /// SM's `delivered` output. After the handshake this carries the client's
+    /// MS-RDPEMT-over-TLS bytes (its TLS ClientHello first). M4a only accumulates
+    /// + logs it; M4b feeds it into a rustls server, M4c into the EMT tunnel.
+    inbound: Vec<u8>,
+    /// Whether we've already logged the TLS ClientHello sniff (avoid log spam).
+    tls_hello_logged: bool,
 }
 
 /// A running UDP multitransport listener. The receive loop runs on a spawned
@@ -172,10 +180,13 @@ async fn run_recv_loop(socket: Arc<UdpSocket>, cfg: ListenerConfig) {
                         rto_ms: cfg.rto_ms,
                     },
                 ),
+                inbound: Vec::new(),
+                tls_hello_logged: false,
             }
         });
 
         let was_established = peer.sm.is_established();
+        let had_data = Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::DATA));
         let out = peer.sm.step(now_ms, Some(data));
         for mut dg in out.to_send {
             if is_syn_family(&dg) && dg.len() < cfg.mtu as usize {
@@ -191,6 +202,51 @@ async fn run_recv_loop(socket: Arc<UdpSocket>, cfg: ListenerConfig) {
                 %peer_addr,
                 version = ?peer.sm.negotiated_version(),
                 "RDPEUDP handshake established"
+            );
+        }
+
+        // M4a: accumulate the reassembled reliable byte-stream the SM delivered.
+        // This is the foundation the TLS server (M4b) + EMT tunnel (M4c) consume.
+        let delivered: usize = out.delivered.iter().map(Vec::len).sum();
+        if delivered > 0 {
+            for chunk in &out.delivered {
+                peer.inbound.extend_from_slice(chunk);
+            }
+            debug!(
+                %peer_addr,
+                delivered,
+                total = peer.inbound.len(),
+                "RDPEUDP reliable data delivered"
+            );
+            // Sniff for a TLS ClientHello (handshake record 0x16, version 0x03xx)
+            // — confirms the client is starting the MS-RDPEMT-over-TLS handshake
+            // and that our v1 receive path reassembled mstsc's V2 stream correctly.
+            if !peer.tls_hello_logged
+                && peer.inbound.len() >= 3
+                && peer.inbound[0] == 0x16
+                && peer.inbound[1] == 0x03
+            {
+                peer.tls_hello_logged = true;
+                debug!(
+                    %peer_addr,
+                    "RDPEUDP reliable stream carries a TLS ClientHello (MS-RDPEMT handshake starting; TLS + tunnel are M4b/M4c)"
+                );
+            }
+        } else if had_data {
+            // A DATA datagram that produced no delivery means our receive sequence
+            // didn't line up with the client's data seq — the client will keep
+            // retransmitting (CWR). Log the client's source seq vs the expected
+            // `recv_next` so the convention can be pinned against real mstsc (a
+            // gap of exactly 1 is the SYN-consumes-a-seq off-by-one; a wild value
+            // means the source-payload decode landed at the wrong offset instead).
+            let client_seq = Datagram::decode(data)
+                .ok()
+                .and_then(|dg| dg.source.map(|s| s.header.sn_source_start));
+            debug!(
+                %peer_addr,
+                ?client_seq,
+                expected = peer.sm.recv_next(),
+                "RDPEUDP DATA datagram delivered nothing (receive-sequence mismatch)"
             );
         }
     }

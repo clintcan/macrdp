@@ -12,8 +12,10 @@
 //! - Reliable, in-order, de-duplicated delivery: the receiver buffers
 //!   out-of-order datagrams and delivers contiguous runs; the sender uses the
 //!   **cumulative** ACK (`snSourceAck`) to release in-flight packets and
-//!   retransmits the unacked window on RTO. (Selective retransmit via the ACK
-//!   *vector* is a later optimization — the vector is sent empty for now.)
+//!   retransmits the unacked window on RTO. Outbound ACKs carry a populated
+//!   `RDPUDP_ACK_VECTOR_HEADER` marking the in-order run `Received` — required
+//!   for mstsc to retire datagrams (an empty vector is ignored). Selective NACK
+//!   runs for out-of-order gaps are a later refinement.
 //! - Fixed send window bounded by the peer's `uReceiveWindowSize`. No congestion
 //!   control / FEC yet.
 //!
@@ -23,7 +25,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::datagram::{Datagram, SourcePacket};
-use crate::pdu::{AckVectorHeader, SourcePayloadHeader, UdpVersion};
+use crate::pdu::{
+    AckVectorElement, AckVectorHeader, SourcePayloadHeader, UdpVersion, VectorElementState,
+};
 
 /// Which end of the connection this instance is. macrdp (the RDP server) is the
 /// passive [`Role::Server`]; [`Role::Client`] exists so two instances can be
@@ -130,7 +134,13 @@ impl RdpeudpState {
             peer_recv_window: 1,
             peer_isn: 0,
             negotiated_version: UdpVersion::V2,
-            send_next: cfg.initial_seq,
+            // The SYN consumes one sequence number (it carries `initial_seq` as its
+            // own seq), so the first *source* packet is `initial_seq + 1`. This
+            // matches real Windows: a server SYN+ACK acks `client_ISN` for the SYN
+            // alone, and the client's first data is `client_ISN + 1`. (Verified
+            // against mstsc — without the +1 the receiver is off by one and buffers
+            // every data packet forever; see `recv_next` init on the SYN below.)
+            send_next: cfg.initial_seq.wrapping_add(1),
             out_queue: VecDeque::new(),
             unacked: VecDeque::new(),
             syn_last_sent_ms: 0,
@@ -149,6 +159,13 @@ impl RdpeudpState {
     /// means the data path should use RDPEUDP2 framing after the handshake.
     pub fn negotiated_version(&self) -> UdpVersion {
         self.negotiated_version
+    }
+
+    /// The next in-order source sequence number the receiver expects. Exposed for
+    /// diagnostics (the listener logs it against an incoming data packet's seq to
+    /// pin the post-handshake sequence convention against real clients).
+    pub fn recv_next(&self) -> u32 {
+        self.recv_next
     }
 
     /// Client: emit the initial SYN. Server: no-op (it waits for the SYN).
@@ -195,7 +212,9 @@ impl RdpeudpState {
                 self.negotiated_version = ex.udp_version;
             }
             if !self.have_peer_seq {
-                self.recv_next = syn.initial_seq;
+                // The peer's SYN occupies `initial_seq`; its first source packet is
+                // `initial_seq + 1` (the SYN consumes a sequence number, like TCP).
+                self.recv_next = syn.initial_seq.wrapping_add(1);
                 self.have_peer_seq = true;
             }
             match self.role {
@@ -277,6 +296,10 @@ impl RdpeudpState {
             return;
         }
 
+        // One selective-ACK vector for every datagram emitted this pump (the
+        // receive state doesn't change while we only send), piggybacked on data
+        // and used for the trailing pure ACK.
+        let ack_vector = self.ack_vector();
         let mut sent_data = false;
 
         // Retransmit unacked packets whose RTO elapsed.
@@ -289,6 +312,7 @@ impl RdpeudpState {
                     self.cfg.recv_window,
                     entry.seq,
                     &entry.payload,
+                    ack_vector.clone(),
                 ));
                 sent_data = true;
             }
@@ -309,6 +333,7 @@ impl RdpeudpState {
                 self.cfg.recv_window,
                 seq,
                 &payload,
+                ack_vector.clone(),
             ));
             self.unacked.push_back(Unacked {
                 seq,
@@ -321,7 +346,7 @@ impl RdpeudpState {
         // Any owed ACK was piggybacked on data; otherwise send a pure ACK.
         if self.need_ack && !sent_data {
             out.to_send.push(
-                Datagram::ack(self.ack_num(), self.cfg.recv_window, empty_ack())
+                Datagram::ack(self.ack_num(), self.cfg.recv_window, ack_vector)
                     .encode()
                     .expect("encode ack"),
             );
@@ -339,6 +364,39 @@ impl RdpeudpState {
         } else {
             -1
         }
+    }
+
+    /// Build the selective-ACK vector for an outbound ACK. MS-RDPEUDP 2.2.2.7: the
+    /// first element describes the datagram at `snSourceAck` (= `recv_next - 1`)
+    /// and subsequent runs go to *decreasing* sequence numbers. We deliver strictly
+    /// in order, so the contiguous source-packet run ending at `snSourceAck` — back
+    /// to the first source packet (`peer_isn + 1`; the SYN at `peer_isn` is acked by
+    /// `snSourceAck` itself, not the source vector) — is all `Received`, emitted as
+    /// run-length elements (≤63 each), bounded by our advertised receive window.
+    ///
+    /// A real (non-empty) vector is REQUIRED for mstsc to retire the datagram —
+    /// with an empty vector mstsc ignores the ACK and retransmits forever (verified
+    /// live). Selective NACK runs (gaps in `reorder`) are a later refinement; while
+    /// the stream stays in order this exact vector is correct.
+    fn ack_vector(&self) -> AckVectorHeader {
+        if !self.have_peer_seq {
+            return AckVectorHeader { elements: vec![] };
+        }
+        let mut count = self
+            .recv_next
+            .wrapping_sub(self.peer_isn)
+            .saturating_sub(1)
+            .min(u32::from(self.cfg.recv_window));
+        let mut elements = Vec::new();
+        while count > 0 {
+            let run = count.min(63) as u8;
+            elements.push(AckVectorElement {
+                state: VectorElementState::Received,
+                run_length: run,
+            });
+            count -= u32::from(run);
+        }
+        AckVectorHeader { elements }
     }
 
     fn encode_syn(&self) -> Vec<u8> {
@@ -372,12 +430,8 @@ impl RdpeudpState {
     }
 }
 
-/// FEC header (8) + ACK vector (4, empty) + source payload header (8).
+/// FEC header (8) + ACK vector (4, min) + source payload header (8).
 const HEADERS_OVERHEAD: usize = 8 + 4 + 8;
-
-fn empty_ack() -> AckVectorHeader {
-    AckVectorHeader { elements: vec![] }
-}
 
 fn encode_data(
     recv_next: u32,
@@ -385,6 +439,7 @@ fn encode_data(
     recv_window: u16,
     seq: u32,
     payload: &[u8],
+    ack_vector: AckVectorHeader,
 ) -> Vec<u8> {
     let ack = if have_peer_seq {
         recv_next.wrapping_sub(1) as i32
@@ -394,7 +449,7 @@ fn encode_data(
     Datagram::data(
         ack,
         recv_window,
-        empty_ack(),
+        ack_vector,
         SourcePacket {
             header: SourcePayloadHeader {
                 sn_coded: seq,
