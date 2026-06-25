@@ -384,6 +384,14 @@ pub struct RdpServer {
     /// path leaves EGFX on TCP (the proven empty-Soft-Sync spike).
     #[cfg(feature = "multitransport")]
     egfx_on_udp: bool,
+    /// (M5c step 3b) Receiver for inbound migrated-channel data the UDP listener
+    /// forwards (each item is a bare DRDYNVC PDU — HigherLayerData of an inbound
+    /// `RDP_TUNNEL_DATA`, e.g. an EGFX frame ack). Created + registered (with the
+    /// matching sender in the cookie registry) per connection at the offer site;
+    /// `client_loop` drains it into the drdynvc processor. `None` when no offer is
+    /// in flight (TCP-only).
+    #[cfg(feature = "multitransport")]
+    multitransport_tunnel_inbound_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -494,6 +502,8 @@ impl RdpServer {
             multitransport_tunnel_sender: None,
             #[cfg(feature = "multitransport")]
             egfx_on_udp: false,
+            #[cfg(feature = "multitransport")]
+            multitransport_tunnel_inbound_rx: None,
         }
     }
 
@@ -715,9 +725,14 @@ impl RdpServer {
                 if let Some(prev) = self.multitransport_migration.as_ref() {
                     registry.remove(&prev.cookie);
                 }
+                // (M5c step 3b) Per-connection inbound channel: the listener
+                // forwards this tunnel's client→server channel data (bare DRDYNVC
+                // PDUs) here, keyed by cookie. `client_loop` drains the receiver.
+                let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+                self.multitransport_tunnel_inbound_rx = Some(in_rx);
                 // Keep the tunnel-bound flag: the listener flips it on a cookie
                 // match, and the EGFX dispatch path reads it to fire Soft-Sync.
-                self.udp_tunnel_bound = Some(registry.register(offer.cookie));
+                self.udp_tunnel_bound = Some(registry.register(offer.cookie, in_tx));
             }
             acceptor.set_advertise_extended_client_data(true);
             acceptor.set_multitransport_offer(Some(offer));
@@ -1233,6 +1248,10 @@ impl RdpServer {
         let mut audio_writer = writer.clone();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let audio_receiver = Arc::clone(&self.audio_receiver);
+        // (M5c step 3b) Take this connection's inbound-tunnel receiver before `self`
+        // is moved into the shared Rc; `dispatch_tunnel_inbound` drains it.
+        #[cfg(feature = "multitransport")]
+        let tunnel_inbound = self.multitransport_tunnel_inbound_rx.take();
         let s = Rc::new(Mutex::new(self));
 
         let this = Rc::clone(&s);
@@ -1422,11 +1441,29 @@ impl RdpServer {
             }
         };
 
+        // (M5c step 3b) Drain inbound migrated-channel data (EGFX over the UDP
+        // tunnel) into the drdynvc processor. Idle forever (never resolves) when
+        // there's no inbound tunnel — feature off, no migration, or the channel
+        // closed — so the other arms drive the session.
+        let this_tunnel = Rc::clone(&s);
+        let dispatch_tunnel_inbound = async move {
+            let _ = &this_tunnel;
+            #[cfg(feature = "multitransport")]
+            if let Some(mut rx) = tunnel_inbound {
+                while let Some(pdu) = rx.recv().await {
+                    let mut this = this_tunnel.lock().await;
+                    this.process_tunnel_inbound(pdu);
+                }
+            }
+            std::future::pending::<Result<RunState>>().await
+        };
+
         let state = tokio::select!(
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
             state = dispatch_audio => state,
+            state = dispatch_tunnel_inbound => state,
         );
 
         debug!("End of client loop: {state:?}");
@@ -1640,14 +1677,49 @@ impl RdpServer {
             warn!("egfx_on_udp set but no migration cookie; dropping EGFX frame");
             return Ok(());
         };
-        let chunks = ironrdp_svc::StaticVirtualChannel::chunkify(messages)
-            .map_err(|e| anyhow::anyhow!("chunkify EGFX for tunnel: {e}"))?;
-        let n = chunks.len();
-        for chunk in chunks {
-            sender.send(cookie, chunk.into_inner());
+        // The MS-RDPEMT tunnel carries the BARE DRDYNVC PDU (no static-channel
+        // CHANNEL_PDU_HEADER) — RDP_TUNNEL_DATA provides the framing, so encode
+        // each message unframed (NOT `chunkify`, which prepends CHANNEL_PDU_HEADER
+        // and would make the client misparse the EGFX stream). `encode_dvc_messages`
+        // already DVC-chunked these to fit, so one tunnel PDU per message is fine.
+        let mut n = 0usize;
+        for msg in messages {
+            let pdu = msg
+                .encode_unframed_pdu()
+                .map_err(|e| anyhow::anyhow!("encode EGFX PDU for tunnel: {e}"))?;
+            sender.send(cookie, pdu);
+            n += 1;
         }
-        trace!(chunks = n, "routed EGFX frame over the UDP tunnel");
+        trace!(pdus = n, "routed EGFX PDUs over the UDP tunnel");
         Ok(())
+    }
+
+    /// (M5c step 3b) Process one inbound migrated-channel PDU the UDP listener
+    /// forwarded: a bare DRDYNVC PDU (HigherLayerData of an inbound
+    /// `RDP_TUNNEL_DATA`, e.g. an EGFX frame acknowledgement). Feed it straight to
+    /// the drdynvc processor (the tunnel replaces the static-channel framing, so no
+    /// `CHANNEL_PDU_HEADER` to strip) and ship any reply PDUs back over the tunnel.
+    /// Errors are logged, not propagated — the optional UDP fast-path must never
+    /// tear down the TCP-authoritative session.
+    #[cfg(feature = "multitransport")]
+    fn process_tunnel_inbound(&mut self, pdu: Vec<u8>) {
+        use ironrdp_svc::SvcProcessor as _;
+        let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+            warn!("inbound tunnel data but no DRDYNVC channel; dropping");
+            return;
+        };
+        let replies = match drdynvc.process(&pdu) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "failed to process inbound tunnel DRDYNVC PDU");
+                return;
+            }
+        };
+        if !replies.is_empty() {
+            if let Err(e) = self.route_egfx_over_udp(replies) {
+                warn!(error = %e, "failed to ship tunnel reply PDUs");
+            }
+        }
     }
 
     async fn client_accepted<R, W>(

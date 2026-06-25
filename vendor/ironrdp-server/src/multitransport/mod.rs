@@ -89,8 +89,22 @@ pub fn encode_initiate_request(
 /// or replayed cookie can't open a tunnel. Cookies are one-time: the listener
 /// removes a cookie when it accepts the tunnel, and the offer path evicts the
 /// previous connection's (unconsumed) cookie before registering a new one.
+/// Per-cookie registry entry: the tunnel-bound flag plus the owning connection's
+/// inbound-tunnel-data sink.
+struct CookieEntry {
+    /// Flipped `true` when the listener binds the matching tunnel; the
+    /// offer-issuing [`RdpServer`](crate::RdpServer) reads it to fire Soft-Sync.
+    bound: Arc<AtomicBool>,
+    /// (M5c step 3b) The owning connection's inbound-tunnel-data sink. The
+    /// listener, on a successful bind, takes this sender and forwards each
+    /// inbound `RDP_TUNNEL_DATA` HigherLayerData (a bare DRDYNVC PDU — e.g. an
+    /// EGFX frame acknowledgement) to it, so the connection's drdynvc processor
+    /// sees the migrated channel's client→server traffic.
+    inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
 #[derive(Clone, Default)]
-pub struct CookieRegistry(Arc<Mutex<HashMap<[u8; 16], Arc<AtomicBool>>>>);
+pub struct CookieRegistry(Arc<Mutex<HashMap<[u8; 16], CookieEntry>>>);
 
 impl CookieRegistry {
     /// A fresh, empty registry. Create one in `main` and share it (clone) with
@@ -99,16 +113,24 @@ impl CookieRegistry {
         Self::default()
     }
 
-    /// Register an issued cookie as valid and return its **tunnel-bound flag**:
-    /// the listener sets it `true` when it binds the matching tunnel (M5c), and
-    /// the offer-issuing [`RdpServer`](crate::RdpServer) reads it to know the UDP
-    /// multitransport connection is up (the cue to send the Soft-Sync request).
-    pub fn register(&self, cookie: [u8; 16]) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
+    /// Register an issued cookie as valid, alongside the connection's inbound
+    /// sink (M5c step 3b — where the listener forwards migrated-channel client
+    /// data). Returns the **tunnel-bound flag**: the listener sets it `true`
+    /// when it binds the matching tunnel, and the offer-issuing
+    /// [`RdpServer`](crate::RdpServer) reads it to know the UDP multitransport
+    /// connection is up (the cue to send the Soft-Sync request).
+    pub fn register(&self, cookie: [u8; 16], inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> Arc<AtomicBool> {
+        let bound = Arc::new(AtomicBool::new(false));
         if let Ok(mut map) = self.0.lock() {
-            map.insert(cookie, Arc::clone(&flag));
+            map.insert(
+                cookie,
+                CookieEntry {
+                    bound: Arc::clone(&bound),
+                    inbound,
+                },
+            );
         }
-        flag
+        bound
     }
 
     /// Drop a cookie (evicted on teardown / TCP fallback).
@@ -118,22 +140,19 @@ impl CookieRegistry {
         }
     }
 
-    /// Atomically check-and-consume a cookie: returns `true` (and removes it,
-    /// **setting its tunnel-bound flag**) if it was registered. One-time use — a
-    /// retransmitted/replayed CREATEREQUEST with the same cookie won't bind a
-    /// second tunnel.
-    pub fn take(&self, cookie: &[u8; 16]) -> bool {
+    /// Atomically check-and-consume a cookie: on a match, removes it, **sets its
+    /// tunnel-bound flag**, and returns the connection's inbound sink (so the
+    /// listener can forward this tunnel's client→server channel data). Returns
+    /// `None` for an unknown cookie. One-time use — a retransmitted/replayed
+    /// CREATEREQUEST with the same cookie won't bind a second tunnel.
+    pub fn take(&self, cookie: &[u8; 16]) -> Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> {
         let removed = match self.0.lock() {
             Ok(mut map) => map.remove(cookie),
             Err(_) => None,
         };
-        match removed {
-            Some(flag) => {
-                flag.store(true, Ordering::Relaxed);
-                true
-            }
-            None => false,
-        }
+        let entry = removed?;
+        entry.bound.store(true, Ordering::Relaxed);
+        Some(entry.inbound)
     }
 }
 

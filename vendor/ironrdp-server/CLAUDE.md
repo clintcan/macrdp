@@ -475,3 +475,39 @@ AND released — #1276 landing is NOT sufficient.
     step 3b. Watch the gate/send lines plus
     `MACRDP_UDP_MIGRATE_EGFX: Soft-Sync will migrate the EGFX DVC` and (listener)
     `MS-RDPEMT tunnel PDU not handled yet … action=2`.
+    **M5c step 3b (added 2026-06-26): EGFX RENDERS over the UDP tunnel — VERIFIED
+    end-to-end on real mstsc.** Two fixes, together making H.264 video flow over
+    UDP (still behind `MACRDP_UDP_MIGRATE_EGFX`; default OFF unchanged + verified
+    no-regression):
+    1. **Outbound framing fix (the unlock).** The MS-RDPEMT tunnel carries the
+       **bare DRDYNVC PDU**, NOT a static-channel-framed one — HigherLayerData has
+       no `CHANNEL_PDU_HEADER` (confirmed empirically: inbound `action=2 len=10`
+       ⇒ 6-byte HigherLayerData, smaller than the 8-byte header; and ironrdp-svc
+       exposes `SvcMessage::encode_unframed_pdu` documented "for RDPEMT tunnel
+       data"). Step 3a wrongly used `StaticVirtualChannel::chunkify`, which prepends
+       `CHANNEL_PDU_HEADER`, so mstsc misparsed the EGFX stream → froze.
+       `route_egfx_over_udp` now encodes each message via `encode_unframed_pdu` (one
+       tunnel PDU per message; `encode_dvc_messages` already DVC-chunked them to
+       fit). This alone makes video render — macrdp's H.264 throttle is
+       `submitted − shipped` (ack-INDEPENDENT, `max_frames_in_flight = u32::MAX`),
+       so dropping inbound frame acks never stalled it; the freeze was purely the
+       garbled outbound framing.
+    2. **Inbound tunnel→drdynvc path (protocol correctness).** `CookieRegistry`
+       now stores a per-cookie inbound sink (`register(cookie, sender)`; `take`
+       returns the sink on bind). The listener's `Peer` gained `inbound_sink`, set
+       on a cookie-bound CREATEREQUEST; on inbound `RDP_TUNNEL_DATA` (action 0x2) it
+       extracts the HigherLayerData (`emt::tunnel_data_payload`) and forwards the
+       bare DRDYNVC PDU to the owning connection (instead of the old log-and-drop).
+       `RdpServer` gained `multitransport_tunnel_inbound_rx` (created at the offer
+       site alongside the cookie registration); `client_loop` adds a
+       `dispatch_tunnel_inbound` select arm that drains it into
+       `process_tunnel_inbound` → `DrdynvcServer::process` (no CHANNEL_PDU_HEADER to
+       strip — the tunnel replaced that layer), shipping any reply PDUs back over
+       the tunnel. Idle-forever (`std::future::pending`) when there's no inbound
+       tunnel, so feature-off / no-migration / soft-bound paths are unchanged.
+    **VERIFIED on real mstsc 2026-06-26:** `tunnels: [1]` accepted → EGFX H.264
+    **renders and stays live** (mouse/keyboard/window changes all update over UDP),
+    inbound `RDP_TUNNEL_DATA` now delivered+processed (the "not handled yet" lines
+    are gone), audio still on TCP (RDPSND channel 1005) throughout. This is the
+    first open-source RDP **server** serving real EGFX video over a UDP
+    multitransport tunnel. Flag-OFF (empty safe spike) re-verified no-regression.

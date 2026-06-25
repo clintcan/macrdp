@@ -49,27 +49,36 @@ mod tests {
         let cookie = [0xABu8; 16];
         let other = [0x11u8; 16];
 
-        // Unknown cookie is rejected.
-        assert!(!reg.take(&other), "unregistered cookie must not bind");
+        // Unknown cookie is rejected (no inbound sink returned).
+        assert!(
+            reg.take(&other).is_none(),
+            "unregistered cookie must not bind"
+        );
 
         // Registered cookie binds exactly once, then is consumed — and the bind
-        // flips the tunnel-bound flag the offer path keeps (M5c).
-        let flag = reg.register(cookie);
+        // flips the tunnel-bound flag the offer path keeps (M5c) and returns the
+        // connection's inbound sink (M5c step 3b).
+        let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let flag = reg.register(cookie, in_tx);
         assert!(!flag.load(Ordering::Relaxed), "flag starts unset");
-        assert!(reg.take(&cookie), "registered cookie must bind once");
+        assert!(
+            reg.take(&cookie).is_some(),
+            "registered cookie must bind once (returns its inbound sink)"
+        );
         assert!(
             flag.load(Ordering::Relaxed),
             "binding the cookie sets its tunnel-bound flag"
         );
         assert!(
-            !reg.take(&cookie),
+            reg.take(&cookie).is_none(),
             "a consumed cookie must not bind again (replay protection)"
         );
 
         // Explicit removal (teardown / eviction) also clears it.
-        reg.register(other);
+        let (in_tx2, _in_rx2) = tokio::sync::mpsc::unbounded_channel();
+        reg.register(other, in_tx2);
         reg.remove(&other);
-        assert!(!reg.take(&other), "removed cookie must not bind");
+        assert!(reg.take(&other).is_none(), "removed cookie must not bind");
     }
 
     // The Initiate Multitransport Request the server sends in M1 is the one bit

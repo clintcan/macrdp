@@ -39,7 +39,7 @@ use ironrdp_rdpeudp::state::{Config, RdpeudpState, Role};
 
 use crate::multitransport::{CookieRegistry, TunnelOutbound};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_rustls::rustls::{ServerConfig, ServerConnection};
 use tracing::{debug, trace, warn};
@@ -97,6 +97,13 @@ struct Peer {
     /// (M4c). The client retransmits the request until it sees the response, so
     /// we reply once and then ignore the retransmits.
     tunnel_created: bool,
+    /// (M5c step 3b) The owning connection's inbound-tunnel-data sink, set on a
+    /// successful cookie-bound CREATEREQUEST (`CookieRegistry::take`). Each
+    /// inbound `RDP_TUNNEL_DATA` HigherLayerData (a bare DRDYNVC PDU from the
+    /// migrated channel — e.g. an EGFX frame ack) is forwarded here to the
+    /// connection's `client_loop`. `None` on the soft-bound (no-registry) test
+    /// path — inbound channel data is then logged and dropped.
+    inbound_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 /// A running UDP multitransport listener. The receive loop runs on a spawned
@@ -247,6 +254,7 @@ fn handle_emt_tunnel(
     buf: &mut Vec<u8>,
     tunnel_created: &mut bool,
     cookie_registry: Option<&CookieRegistry>,
+    inbound: &mut Option<UnboundedSender<Vec<u8>>>,
 ) -> Option<[u8; 16]> {
     use ironrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
 
@@ -270,20 +278,24 @@ fn handle_emt_tunnel(
                             .map(|b| format!("{b:02x}"))
                             .collect::<String>();
                         // M5a: bind to a real TCP session. `take` is atomic
-                        // check-and-consume, so a cookie is one-time use.
-                        let bound = match cookie_registry {
-                            Some(reg) => reg.take(&req.security_cookie),
-                            None => true, // soft binding (test path)
+                        // check-and-consume (one-time use), and returns the
+                        // connection's inbound sink so we can forward this
+                        // tunnel's client→server channel data (M5c step 3b).
+                        let inbound_sink = match cookie_registry {
+                            Some(reg) => match reg.take(&req.security_cookie) {
+                                Some(sink) => Some(sink),
+                                None => {
+                                    warn!(
+                                        %peer_addr,
+                                        request_id = req.request_id,
+                                        %cookie,
+                                        "MS-RDPEMT tunnel CREATEREQUEST cookie not recognized — rejecting tunnel (client stays on TCP)"
+                                    );
+                                    continue;
+                                }
+                            },
+                            None => None, // soft binding (test path): accept, no forwarding
                         };
-                        if !bound {
-                            warn!(
-                                %peer_addr,
-                                request_id = req.request_id,
-                                %cookie,
-                                "MS-RDPEMT tunnel CREATEREQUEST cookie not recognized — rejecting tunnel (client stays on TCP)"
-                            );
-                            continue;
-                        }
                         debug!(
                             %peer_addr,
                             request_id = req.request_id,
@@ -293,6 +305,7 @@ fn handle_emt_tunnel(
                         let resp = TunnelCreateResponse::ok().to_vec();
                         if tls.writer().write_all(&resp).is_ok() {
                             *tunnel_created = true;
+                            *inbound = inbound_sink;
                             bound_cookie = Some(req.security_cookie);
                         } else {
                             warn!(%peer_addr, "failed to write MS-RDPEMT CREATERESPONSE into TLS");
@@ -301,15 +314,28 @@ fn handle_emt_tunnel(
                 }
                 Err(e) => warn!(%peer_addr, error = %e, "malformed MS-RDPEMT CREATEREQUEST"),
             },
+            Some(emt::action::DATA) => {
+                // (M5c step 3b) Migrated-channel client→server data (e.g. an EGFX
+                // frame ack). Forward the bare DRDYNVC PDU (HigherLayerData) to
+                // the owning connection's drdynvc processor.
+                match emt::tunnel_data_payload(&pdu) {
+                    Ok(higher) => match inbound.as_ref() {
+                        Some(sink) => {
+                            if sink.send(higher.to_vec()).is_err() {
+                                trace!(%peer_addr, "inbound tunnel sink closed; dropping channel data");
+                            }
+                        }
+                        None => debug!(
+                            %peer_addr,
+                            len = higher.len(),
+                            "inbound RDP_TUNNEL_DATA with no inbound sink (soft-bound); dropping"
+                        ),
+                    },
+                    Err(e) => warn!(%peer_addr, error = %e, "malformed inbound RDP_TUNNEL_DATA"),
+                }
+            }
             Some(other) => {
-                // RDP_TUNNEL_DATA (action 0x2) and friends carry migrated channel
-                // data — M5. Skip until then.
-                debug!(
-                    %peer_addr,
-                    action = other,
-                    len = total,
-                    "MS-RDPEMT tunnel PDU not handled yet (channel migration is M5)"
-                );
+                debug!(%peer_addr, action = other, len = total, "MS-RDPEMT tunnel PDU: unexpected action, ignoring");
             }
             None => break,
         }
@@ -423,6 +449,7 @@ async fn run_recv_loop(
                 tls_done_logged: false,
                 emt_inbound: Vec::new(),
                 tunnel_created: false,
+                inbound_sink: None,
             }
         });
 
@@ -488,6 +515,7 @@ async fn run_recv_loop(
                     tls_done_logged,
                     emt_inbound,
                     tunnel_created,
+                    inbound_sink,
                     ..
                 } = peer;
 
@@ -537,6 +565,7 @@ async fn run_recv_loop(
                         emt_inbound,
                         tunnel_created,
                         cookie_registry.as_ref(),
+                        inbound_sink,
                     ) {
                         // (M5c) Record cookie -> this peer so server-originated
                         // tunnel data (keyed by the same cookie) reaches it.
