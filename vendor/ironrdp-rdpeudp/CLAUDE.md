@@ -73,6 +73,19 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
   = NumDelayedAcks low-nibble | DelayedTimeScale high-nibble; AckTimestamp is
   24-bit LE), OverheadSize 1, DelayAckInfo 3, AckOfAcks 2, AckVector =
   BaseSeq(2)+sizeByte(1, high-bit=have-ts, low-7=coded size)+[Timestamp(4)]+vector.
-- **EUDP2 next:** wire `Eudp2Packet`/`body` into the reliability state machine
-  (`src/state.rs` — the algorithm is framing-agnostic), then M3 (UDP listener +
-  on-wire SYN+ACK). Capture: ~/Documents/Projects/mstscpcap.pcapng.
+- **EUDP2 inbound adapter (done):** `Eudp2Packet::inbound_view()` →
+  `Eudp2Inbound { cumulative_ack: Option<u16>, peer_log_window, data:
+  Option<(u16 seq, &[u8] body)> }` — the framing-neutral projection the
+  reliability layer consumes (the v1 path exposes the analogous fields on
+  `Datagram` directly). Capture-validated (`inbound_view_*` tests). The ACK
+  sub-header's AckSeq IS the cumulative ack point (the dissector tracks it as
+  `senderLow`); AckVector is selective info, exposed separately. Dummy packets
+  (type==8) project `data: None`.
+- **EUDP2 next — SM wiring deferred to M3 (on purpose):** the **encode** half +
+  feeding `inbound_view` into `RdpeudpState` needs EUDP2's **16-bit** sequence
+  space (vs v1's 32-bit; needs its own `seq_leq` half-window) AND the delayed-
+  ack-vector model — and the **encode/send** side can't be validated offline (no
+  bidirectional EUDP2 capture with known-good *server* output). Do it at M3
+  against a live V3 client (propose V3, record the client's reaction to our
+  output). Until then the SM stays v1-only (correct for the SYN handshake, which
+  is always v1). Capture: ~/Documents/Projects/mstscpcap.pcapng.

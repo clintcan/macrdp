@@ -363,6 +363,50 @@ impl<'a> Eudp2Packet<'a> {
             body,
         })
     }
+
+    /// Project this packet onto the framing-neutral fields the reliability layer
+    /// acts on — the **adapter seam** that lets a (framing-agnostic) transport
+    /// state machine consume RDP-UDP2 without knowing its wire layout. The v1
+    /// path exposes the analogous fields directly on [`crate::datagram::Datagram`]
+    /// (`fec.snd_source_ack`, `fec.recv_window`, `source`).
+    ///
+    /// This is the **decode (inbound) half** of the adapter — capture-validated
+    /// (see `inbound_view_*` tests). Wiring it into [`crate::state::RdpeudpState`]
+    /// (which then needs EUDP2's 16-bit sequence space and the symmetric *encode*
+    /// half) is deferred to the on-wire milestone, where a bidirectional V3
+    /// capture can validate what a real client accepts as our output.
+    pub fn inbound_view(&self) -> Eudp2Inbound<'a> {
+        Eudp2Inbound {
+            // ACK sub-header's AckSeq is the peer's cumulative ack point (the
+            // dissector tracks it as `senderLow`). AckVector (mutually exclusive
+            // with ACK) is *selective* info, exposed separately via `self.ack_vec`.
+            cumulative_ack: self.ack.map(|a| a.ack_seq),
+            peer_log_window: self.header.log_window,
+            // A dummy packet (`Packet_Type_Index == 8`) carries no deliverable
+            // body, so `data` is None even though the DATA flag may be set.
+            data: match &self.data {
+                Some(d) if d.channel_seq_number.is_some() => Some((d.seq_number, self.body)),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The framing-neutral, reliability-relevant projection of an inbound RDP-UDP2
+/// packet (see [`Eudp2Packet::inbound_view`]). Holds only what a transport state
+/// machine needs, lifted out of the EUDP2 wire layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eudp2Inbound<'a> {
+    /// The peer's cumulative ack (highest in-order transport sequence it has
+    /// received), if this packet carried an ACK sub-header. EUDP2 sequences are
+    /// 16-bit, so callers compare in 16-bit wrapping space.
+    pub cumulative_ack: Option<u16>,
+    /// The peer's advertised receive window as `log2(window / MTU)` — the window
+    /// is `(1 << peer_log_window)` MTUs.
+    pub peer_log_window: u8,
+    /// A deliverable data segment `(transport seq number, body)` — present iff
+    /// the packet carries a non-dummy DATA payload.
+    pub data: Option<(u16, &'a [u8])>,
 }
 
 #[cfg(test)]
@@ -517,6 +561,56 @@ mod tests {
         assert_eq!(p.overhead_size, Some(0x05));
         assert!(p.data.is_none());
         assert!(p.body.is_empty());
+    }
+
+    // The adapter seam: the framing-neutral projection the reliability layer
+    // consumes, validated against the same captured packets.
+
+    #[test]
+    fn inbound_view_of_real_data_packet() {
+        let wire = [
+            0x00, 0x14, 0xf3, 0x01, 0x14, 0x00, 0x64, 0xe0, //
+            0x64, 0x00, 0x01, 0x00, 0x16, 0x03, 0x01, 0x01,
+        ];
+        let u = unwrap_packet(&wire).unwrap();
+        let v = Eudp2Packet::parse(&u).unwrap().inbound_view();
+        // No ACK sub-header on this data packet.
+        assert_eq!(v.cumulative_ack, None);
+        assert_eq!(v.peer_log_window, 15);
+        assert_eq!(v.data, Some((0x0064, &[0x16, 0x03, 0x01, 0x01][..])));
+    }
+
+    #[test]
+    fn inbound_view_of_real_ack_packet() {
+        let wire = [
+            0x02, 0x41, 0xf0, 0x6a, 0x00, 0xc4, 0x04, 0xe0, //
+            0x00, 0x02, 0xdf, 0x73, 0x05,
+        ];
+        let u = unwrap_packet(&wire).unwrap();
+        let v = Eudp2Packet::parse(&u).unwrap().inbound_view();
+        // Cumulative ack point carried in the ACK sub-header; no data to deliver.
+        assert_eq!(v.cumulative_ack, Some(0x006a));
+        assert_eq!(v.data, None);
+    }
+
+    #[test]
+    fn inbound_view_of_dummy_packet_has_no_data() {
+        // Packet_Type_Index == 8 (dummy): DATA flag set but no body to deliver.
+        // prefix byte: type=8 -> (8<<1)=0x10, len7 -> (7<<5)=0xe0 => 0xf0.
+        let unwrapped = [
+            0xf0, 0x04, 0x00, // prefix(type=8) + flags word (DATA, logwin 0)
+            0x2a, 0x00, // DataHeader SeqNumber = 0x002a (dummy: no channel seq / body)
+        ];
+        let p = Eudp2Packet::parse(&unwrapped).unwrap();
+        assert!(p.header.prefix.is_dummy());
+        assert_eq!(
+            p.data,
+            Some(DataHeader {
+                seq_number: 0x002a,
+                channel_seq_number: None,
+            })
+        );
+        assert_eq!(p.inbound_view().data, None);
     }
 
     #[test]
