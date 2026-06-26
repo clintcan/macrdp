@@ -587,10 +587,7 @@ impl RdpServer {
     /// [`UdpMultitransportListener::bind`](crate::UdpMultitransportListener::bind).
     /// Must be called before any client connects.
     #[cfg(feature = "multitransport")]
-    pub fn set_multitransport_cookie_registry(
-        &mut self,
-        registry: Option<crate::multitransport::CookieRegistry>,
-    ) {
+    pub fn set_multitransport_cookie_registry(&mut self, registry: Option<crate::multitransport::CookieRegistry>) {
         self.multitransport_cookies = registry;
     }
 
@@ -609,10 +606,7 @@ impl RdpServer {
     /// formats (the caller passes a PCM+AAC list matching what its wave path
     /// encodes); `None` (default) leaves it unregistered.
     #[cfg(feature = "multitransport")]
-    pub fn set_multitransport_lossy_audio_formats(
-        &mut self,
-        formats: Option<Vec<ironrdp_rdpsnd::pdu::AudioFormat>>,
-    ) {
+    pub fn set_multitransport_lossy_audio_formats(&mut self, formats: Option<Vec<ironrdp_rdpsnd::pdu::AudioFormat>>) {
         self.multitransport_lossy_audio_formats = formats;
     }
 
@@ -1074,9 +1068,7 @@ impl RdpServer {
                 let mut rdpdr: Vec<ServerEvent> = Vec::new();
                 for ev in events.drain(..) {
                     match ev {
-                        ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_) => {
-                            clipboard.push(ev)
-                        }
+                        ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_) => clipboard.push(ev),
                         ServerEvent::Rdpdr(_) => rdpdr.push(ev),
                         _ => middle.push(ev),
                     }
@@ -1112,7 +1104,9 @@ impl RdpServer {
                             // hasn't overridden `set_audio_sender` — drop
                             // gracefully and warn once so the maintainer
                             // notices.
-                            warn!("Wave event on unified ServerEvent channel; backend should override set_audio_sender");
+                            warn!(
+                                "Wave event on unified ServerEvent channel; backend should override set_audio_sender"
+                            );
                             continue;
                         }
                         RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
@@ -1509,10 +1503,7 @@ impl RdpServer {
     /// Multitransport Response. M1 has no UDP transport, so this only logs the
     /// outcome and clears the in-flight request; the session stays on TCP.
     #[cfg(feature = "multitransport")]
-    fn handle_multitransport_response(
-        &mut self,
-        resp: &ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu,
-    ) {
+    fn handle_multitransport_response(&mut self, resp: &ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu) {
         match self.multitransport_migration.take() {
             Some(state) if state.request_id == resp.request_id => {
                 if resp.is_success() {
@@ -1605,7 +1596,8 @@ impl RdpServer {
         // Secondary TCP gate (a client that *does* send an Initiate Response S_OK
         // — mstsc never does). Keep it an empty spike: EGFX migration is driven by
         // the listener-bound gate (`maybe_soft_sync_on_egfx`), not this path.
-        self.send_soft_sync_request(writer, user_channel_id, Vec::new()).await?;
+        self.send_soft_sync_request(writer, user_channel_id, dvc::pdu::TUNNELTYPE_UDPFECR, Vec::new())
+            .await?;
         Ok(true)
     }
 
@@ -1616,11 +1608,7 @@ impl RdpServer {
     /// This (not a TCP Initiate Response) is the real success gate: mstsc signals
     /// multitransport success by creating the tunnel, never by a TCP response.
     #[cfg(feature = "multitransport")]
-    async fn maybe_soft_sync_on_egfx(
-        &mut self,
-        writer: &mut impl FramedWrite,
-        user_channel_id: u16,
-    ) -> Result<()> {
+    async fn maybe_soft_sync_on_egfx(&mut self, writer: &mut impl FramedWrite, user_channel_id: u16) -> Result<()> {
         let bound = self
             .udp_tunnel_bound
             .as_ref()
@@ -1628,6 +1616,34 @@ impl RdpServer {
         if !bound {
             return Ok(());
         }
+
+        // P2.4b (2b-ii): if a lossy audio DVC is registered, migrate IT onto the
+        // LOSSY tunnel (`TUNNELTYPE_UDPFECL`) — the inverse of EGFX, which (when
+        // enabled) migrates onto the RELIABLE tunnel. The lossy audio handshake
+        // can't run over TCP at all (the P2.4b-1 finding: mstsc tears the socket
+        // down), so the Soft-Sync MUST precede any audio data. Look the channel up
+        // BEFORE consuming the one-time guard, so if its DVC Create Response hasn't
+        // arrived yet we just retry on the next EGFX frame (guard intact).
+        if self.multitransport_lossy_audio_formats.is_some() {
+            let Some(audio_id) = self
+                .get_svc_processor::<dvc::DrdynvcServer>()
+                .and_then(|d| d.get_channel_id_by_name(crate::multitransport::audio_dvc::AUDIO_PLAYBACK_LOSSY_DVC))
+            else {
+                return Ok(());
+            };
+            match self.multitransport_migration.as_mut() {
+                Some(state) if !state.soft_sync_sent => state.soft_sync_sent = true,
+                _ => return Ok(()),
+            }
+            debug!(
+                audio_channel_id = audio_id,
+                "UDP lossy tunnel bound + audio DVC open — Soft-Sync migrating audio onto the LOSSY (UdpFecL) tunnel"
+            );
+            return self
+                .send_soft_sync_request(writer, user_channel_id, dvc::pdu::TUNNELTYPE_UDPFECL, vec![audio_id])
+                .await;
+        }
+
         // One-time guard (drops the &mut borrow before the get_svc_processor below).
         match self.multitransport_migration.as_mut() {
             Some(state) if !state.soft_sync_sent => state.soft_sync_sent = true,
@@ -1660,19 +1676,22 @@ impl RdpServer {
             Vec::new()
         };
         debug!("UDP tunnel bound + EGFX active — Soft-Sync gate open");
-        self.send_soft_sync_request(writer, user_channel_id, channel_ids).await
+        self.send_soft_sync_request(writer, user_channel_id, dvc::pdu::TUNNELTYPE_UDPFECR, channel_ids)
+            .await
     }
 
     /// (M5c) Send a `DYNVC_SOFT_SYNC_REQUEST` over the DRDYNVC static channel on
-    /// TCP. `channel_ids` are the DVC channels to migrate onto the reliable UDP
-    /// tunnel — **empty** is the safe spike (TCP_FLUSHED only, migrate nothing, so
-    /// everything stays on TCP); a non-empty list (the EGFX id) commits those
-    /// channels' data to the tunnel.
+    /// TCP. `tunnel_type` selects the target tunnel (`TUNNELTYPE_UDPFECR` reliable /
+    /// `TUNNELTYPE_UDPFECL` lossy); `channel_ids` are the DVC channels to migrate onto
+    /// it — **empty** is the safe spike (TCP_FLUSHED only, migrate nothing, so
+    /// everything stays on TCP); a non-empty list commits those channels' data to the
+    /// tunnel (the EGFX id for the reliable tunnel, the lossy audio DVC id for FECL).
     #[cfg(feature = "multitransport")]
     async fn send_soft_sync_request(
         &mut self,
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
+        tunnel_type: u32,
         channel_ids: Vec<u32>,
     ) -> Result<()> {
         let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
@@ -1681,17 +1700,30 @@ impl RdpServer {
         };
 
         let migrating = !channel_ids.is_empty();
-        let req = dvc::pdu::SoftSyncRequestPdu::switch_to_udpfecr(channel_ids);
+        let req = dvc::pdu::SoftSyncRequestPdu::switch_to_tunnel(tunnel_type, channel_ids);
         let pdu = dvc::pdu::DrdynvcServerPdu::SoftSyncRequest(req);
         // Soft-Sync is a top-level DRDYNVC PDU (not sub-channel DATA), so it ships
         // as a plain SvcMessage on the drdynvc static channel.
         let msg = ironrdp_svc::SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL);
         let data = server_encode_svc_messages(vec![msg], drdynvc_channel_id, user_channel_id)?;
         writer.write_all(&data).await?;
+        let tunnel_name = match tunnel_type {
+            t if t == dvc::pdu::TUNNELTYPE_UDPFECL => "lossy (UdpFecL)",
+            t if t == dvc::pdu::TUNNELTYPE_UDPFECR => "reliable (UdpFecR)",
+            _ => "unknown",
+        };
         if migrating {
-            debug!("Sent DYNVC_SOFT_SYNC_REQUEST (migrating EGFX onto the UDP tunnel)");
+            debug!(
+                tunnel_type,
+                tunnel = tunnel_name,
+                "Sent DYNVC_SOFT_SYNC_REQUEST (migrating channels onto the UDP tunnel)"
+            );
         } else {
-            debug!("Sent DYNVC_SOFT_SYNC_REQUEST (empty channel list — EGFX stays on TCP)");
+            debug!(
+                tunnel_type,
+                tunnel = tunnel_name,
+                "Sent DYNVC_SOFT_SYNC_REQUEST (empty channel list — nothing migrated, stays on TCP)"
+            );
         }
         Ok(())
     }
@@ -1996,9 +2028,9 @@ impl RdpServer {
         let control: rdp::headers::ShareControlHeader = match decode(data.user_data.as_ref()) {
             Ok(control) => control,
             Err(e) => {
-                if let Ok(resp) = decode::<ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu>(
-                    data.user_data.as_ref(),
-                ) {
+                if let Ok(resp) =
+                    decode::<ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu>(data.user_data.as_ref())
+                {
                     self.handle_multitransport_response(&resp);
                     return Ok(false);
                 }

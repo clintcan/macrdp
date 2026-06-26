@@ -566,15 +566,31 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
     that** (MS-RDPEA "Initialization Sequence"). The handler waits for Quality Mode before
     replying with Training.
 
-  **Implication for the build:** lossy audio needs the lossy DVC Soft-Synced onto the DTLS
-  tunnel up front + the handshake + AAC waves carried over the tunnel — i.e. it depends on a
-  solid lossy *data path* (P2.2/P2.3) underneath, which doesn't exist yet. And note the
-  reliable `AUDIO_PLAYBACK_DVC` path that *does* work is **not worth landing on its own**: a
+  **P2.4b-2 spike result (2026-06-27, the linchpin de-risk): mstsc ACCEPTS a *lossy*
+  Soft-Sync of the audio DVC without tearing down.** This was the open question P2.4b-1 left
+  ("does a lossy Soft-Sync itself trip mstsc, or only format-data-over-TCP?"). Built it:
+  `audio_dvc.rs::start()` now returns **no formats** for the lossy name (defer over TCP —
+  finding above), and the server Soft-Syncs the channel onto the lossy
+  (`TUNNELTYPE_UDPFECL=0x03`) tunnel via the Phase-1 Soft-Sync codec
+  (`send_soft_sync_request(.., TUNNELTYPE_UDPFECL, vec![audio_id])`, triggered off the same
+  `maybe_soft_sync_on_egfx` machinery that migrates EGFX). Verified live on mstsc:
+  `lossy audio DVC opened — deferring Server Audio Formats` → `Sent DYNVC_SOFT_SYNC_REQUEST` →
+  **`SoftSyncResponsePdu { tunnels: [3] }`** (UDPFECL accepted) → session stayed alive to a
+  graceful disconnect ~13 s later, EGFX (on TCP) acking frames the whole time. **So the #54
+  blocker was specifically format data over TCP, NOT the lossy Soft-Sync** — the migration
+  primitive is clear. (Note: this run requires `--enable-h264` because the Soft-Sync trigger
+  is driven from the EGFX dispatch arm; EGFX stayed on TCP — `MACRDP_UDP_MIGRATE_EGFX` off.)
+
+  **Implication for the build:** the migration topology is now proven end-to-end (defer +
+  lossy Soft-Sync accepted). What remains is the *data over the tunnel*: run the MS-RDPEA
+  handshake (formats → quality → training) over the lossy/DTLS tunnel for the migrated peer
+  (2b-iii), then stream AAC Wave2 over it + reconcile the drop-stale lag model (2b-iv). That
+  depends on a solid lossy *data path* (P2.2/P2.3) underneath. And note the reliable
+  `AUDIO_PLAYBACK_DVC` path that works over TCP is **not worth landing on its own**: a
   reliable tunnel HOL-blocks under loss exactly like TCP (Phase 1 soak), so reliable
-  audio-over-UDP delivers no loss-resilience over TCP audio. **Status: paused after the
-  spike.** The hard unknowns are now banked (above); the verified groundwork (`audio_dvc.rs`
-  + the handshake) is kept in-tree, gated off by default. Resume by Soft-Syncing the lossy
-  DVC onto the tunnel before the handshake, after the lossy transport SM + FEC are mature.
+  audio-over-UDP delivers no loss-resilience over TCP audio. **Status: linchpin de-risked;
+  data path next.** The verified groundwork (`audio_dvc.rs` + defer + lossy Soft-Sync) is
+  kept in-tree, gated off by default (`MACRDP_UDP_OFFER_FECL` + `MACRDP_UDP_LOSSY_AUDIO`).
 
 - **P2.5 — route audio to the lossy tunnel + reconcile the lag model.** Point the audio
   path at the lossy tunnel and reconcile with the existing audio-lag / drop-stale model

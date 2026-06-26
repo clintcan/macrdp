@@ -593,8 +593,8 @@ AND released — #1276 landing is NOT sufficient.
     bytes at the same point, before its `wants_write` drain). **Verified GREEN on
     real mstsc**: CREATEREQUEST cookie matched the issued cookie → CREATERESPONSE
     sent → tunnel established AND the client STOPPED retransmitting (the definitive
-    accept signal). Next = P2.4b (migrate the AUDIO_PLAYBACK_LOSSY_DVC audio
-    channel onto the tunnel). See feasibility doc "P2.4a".
+    accept signal). P2.4b (migrate the AUDIO_PLAYBACK_LOSSY_DVC audio channel onto
+    the tunnel) is now de-risked — see P2.4b-2 below. See feasibility doc "P2.4a".
 
     P2.4b-1 — audio output DVC handshake (2026-06-27, `multitransport/audio_dvc.rs`;
     PAUSED after the spike): a `DvcProcessor`/`DvcServerProcessor` (`AudioLossyDvc`)
@@ -621,10 +621,33 @@ AND released — #1276 landing is NOT sufficient.
     RELIABLE tunnel *after* a TCP handshake). Spec note (confirmed live): for v6+ the
     client sends Quality Mode immediately after Client Audio Formats and the server
     sends Training only after that (MS-RDPEA Initialization Sequence) — the handler
-    waits for Quality Mode. **Paused** here: the verified groundwork is kept in-tree,
-    default-off; resume once the lossy data path (P2.2/P2.3) is mature. The
-    reliable-DVC path that works is NOT worth landing on its own (a reliable tunnel
-    HOL-blocks under loss like TCP — no win). See feasibility doc "P2.4b".
+    waits for Quality Mode. The reliable-DVC path that works over TCP is NOT worth
+    landing on its own (a reliable tunnel HOL-blocks under loss like TCP — no win).
+
+    P2.4b-2 — lossy Soft-Sync of the audio DVC ACCEPTED by mstsc (2026-06-27, the
+    linchpin de-risk; `audio_dvc.rs` + `server.rs`; verified on real mstsc): the open
+    question P2.4b-1 left was whether a *lossy* Soft-Sync itself trips mstsc or only
+    format-data-over-TCP. Answer: only the latter. `AudioLossyDvc::start()` now returns
+    NO formats for the lossy name (defers the handshake — P2.4b-1 finding), and the
+    server Soft-Syncs the channel onto the lossy tunnel:
+    `send_soft_sync_request(.., dvc::pdu::TUNNELTYPE_UDPFECL, vec![audio_id])`. The
+    trigger is a new branch in `maybe_soft_sync_on_egfx` (gated on
+    `multitransport_lossy_audio_formats.is_some()`, placed after the `udp_tunnel_bound`
+    check, before the EGFX one-time guard): it resolves the lossy DVC's channel id via
+    `DrdynvcServer::get_channel_id_by_name(AUDIO_PLAYBACK_LOSSY_DVC)` (retries next frame
+    if not open yet, guard intact), claims the one-time `MigrationState::soft_sync_sent`
+    guard, and Soft-Syncs FECL. `send_soft_sync_request` gained a `tunnel_type: u32`
+    param (uses `SoftSyncRequestPdu::switch_to_tunnel`); the two pre-existing callers
+    pass `TUNNELTYPE_UDPFECR`. Live mstsc result: `lossy audio DVC opened — deferring
+    Server Audio Formats` → `Sent DYNVC_SOFT_SYNC_REQUEST` → `SoftSyncResponsePdu {
+    tunnels: [3] }` (UDPFECL accepted) → session stayed alive to a graceful disconnect,
+    EGFX (on TCP) acking the whole time. So the #54 blocker is format-data-over-TCP, NOT
+    the lossy Soft-Sync. (This run needs `--enable-h264` — the trigger rides the EGFX
+    dispatch arm; EGFX itself stays on TCP, `MACRDP_UDP_MIGRATE_EGFX` off.) **Next
+    (2b-iii):** run the MS-RDPEA handshake (formats → quality → training) over the
+    lossy/DTLS tunnel for the migrated peer, then stream AAC waves (2b-iv) + reconcile
+    the drop-stale lag model. The verified groundwork is kept in-tree, default-off
+    (`MACRDP_UDP_OFFER_FECL` + `MACRDP_UDP_LOSSY_AUDIO`). See feasibility doc "P2.4b".
 
     P2.2 step 2 — lossy flow uses lossy delivery (2026-06-27, `listener.rs`; verified
     on real mstsc). Behind the experimental env `MACRDP_UDP_LOSSY_DELIVERY` (read once

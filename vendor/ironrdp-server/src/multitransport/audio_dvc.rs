@@ -14,28 +14,36 @@
 //! version ≥ 8, and (c) AAC is the codec. So we advertise `Version::V8` and the
 //! caller passes a format list that includes AAC (`WAVE_FORMAT_AAC_MS`).
 //!
-//! **STATUS: P2.4b-1 spike, PAUSED (verified on real mstsc 2026-06-27).** Registered
-//! only when the application calls
+//! **STATUS: P2.4b-2 spike, VERIFIED on real mstsc 2026-06-27.** Registered only when
+//! the application calls
 //! [`RdpServer::set_multitransport_lossy_audio_formats`](crate::RdpServer::set_multitransport_lossy_audio_formats)
 //! (macrdp gates that behind the experimental `MACRDP_UDP_LOSSY_AUDIO` env), so the
 //! default build is byte-unchanged.
 //!
-//! **KEY FINDING — the EGFX "negotiate-on-TCP-then-Soft-Sync" pattern does NOT carry
-//! to a *lossy*-named channel.** With the literal name `AUDIO_PLAYBACK_LOSSY_DVC`,
-//! mstsc accepts the DVC Create but, on receiving Server Audio Formats over
-//! TCP/DRDYNVC, goes silent and tears down the whole TCP connection (broken pipe a
-//! few seconds later — it kills EGFX too, not just audio). The reliable name
-//! `AUDIO_PLAYBACK_DVC` (diagnostic env `MACRDP_AUDIO_DVC_RELIABLE=1`) handshakes
+//! **KEY FINDING #1 (P2.4b-1) — the EGFX "negotiate-on-TCP-then-Soft-Sync" pattern
+//! does NOT carry to a *lossy*-named channel.** With the literal name
+//! `AUDIO_PLAYBACK_LOSSY_DVC`, mstsc accepts the DVC Create but, on receiving Server
+//! Audio Formats over TCP/DRDYNVC, goes silent and tears down the whole TCP connection
+//! (broken pipe a few seconds later — it kills EGFX too, not just audio). The reliable
+//! name `AUDIO_PLAYBACK_DVC` (diagnostic env `MACRDP_AUDIO_DVC_RELIABLE=1`) handshakes
 //! perfectly over TCP (formats → client formats(AAC) → quality mode → training →
 //! confirm), audio plays, EGFX stays healthy — proving the channel *name* is the
 //! blocker, not the PDU/framing and not coexistence with static rdpsnd (dual
-//! negotiation is fine). So the **lossy** DVC must be Soft-Synced onto the lossy
-//! tunnel BEFORE any data, with the handshake over the tunnel — the opposite of EGFX
-//! (which migrates to the RELIABLE tunnel *after* a TCP handshake). That, plus routing
-//! the AAC waves over the tunnel, is deferred until the lossy data path (P2.2/P2.3) is
-//! mature; the reliable-DVC path that works isn't worth landing on its own (a reliable
-//! tunnel HOL-blocks under loss like TCP). See `docs/rdp-udp-multitransport-feasibility.md`
-//! ("P2.4b").
+//! negotiation is fine).
+//!
+//! **KEY FINDING #2 (P2.4b-2, the linchpin de-risk) — mstsc ACCEPTS a *lossy* Soft-Sync
+//! of the audio DVC without tearing down.** This handler now opens the lossy DVC and
+//! returns NO formats from `start()` (defer over TCP — finding #1), then the server
+//! Soft-Syncs the channel onto the lossy (`TUNNELTYPE_UDPFECL=0x03`) tunnel. Live mstsc
+//! result: `lossy audio DVC opened — deferring Server Audio Formats` → Soft-Sync sent →
+//! `SoftSyncResponsePdu { tunnels: [3] }` (UDPFECL accepted) → session stayed alive to a
+//! graceful disconnect. So the #54 blocker was specifically **format data over TCP**, NOT
+//! the lossy Soft-Sync itself. The path forward (the opposite of EGFX, which migrates to
+//! the RELIABLE tunnel *after* a TCP handshake): Soft-Sync the lossy DVC FIRST, then run
+//! the MS-RDPEA handshake (formats → quality → training) over the lossy tunnel (2b-iii),
+//! then stream AAC waves over it (2b-iv). The reliable-DVC path that works over TCP isn't
+//! worth landing on its own (a reliable tunnel HOL-blocks under loss like TCP). See
+//! `docs/rdp-udp-multitransport-feasibility.md` ("P2.4b").
 //!
 //! **Sequence (MS-RDPEA Initialization Sequence, confirmed live):** for v6+ the client
 //! sends a Quality Mode PDU immediately after Client Audio Formats, and the server
@@ -127,6 +135,18 @@ impl DvcProcessor for AudioLossyDvc {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // The lossy-named DVC must NOT receive format data over TCP/DRDYNVC — mstsc
+        // tears down the whole TCP socket if it does (the P2.4b-1 finding). Defer the
+        // MS-RDPEA handshake until the channel is Soft-Synced onto the lossy tunnel;
+        // the formats then ride the tunnel (2b-iii). The reliable diagnostic name
+        // (MACRDP_AUDIO_DVC_RELIABLE) keeps the proven over-TCP handshake.
+        if self.channel_name == AUDIO_PLAYBACK_LOSSY_DVC {
+            debug!(
+                channel = self.channel_name,
+                "lossy audio DVC opened — deferring Server Audio Formats until Soft-Sync onto the lossy tunnel"
+            );
+            return Ok(Vec::new());
+        }
         debug!(
             channel = self.channel_name,
             formats = self.formats.len(),
@@ -165,7 +185,10 @@ impl DvcProcessor for AudioLossyDvc {
                             "P2.4b: audio DVC client formats received — awaiting Quality Mode"
                         );
                     }
-                    None => warn!(channel = self.channel_name, "audio DVC: client accepted none of the server formats"),
+                    None => warn!(
+                        channel = self.channel_name,
+                        "audio DVC: client accepted none of the server formats"
+                    ),
                 }
                 Ok(Vec::new())
             }
