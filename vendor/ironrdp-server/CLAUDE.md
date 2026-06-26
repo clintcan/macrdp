@@ -625,3 +625,24 @@ AND released — #1276 landing is NOT sufficient.
     default-off; resume once the lossy data path (P2.2/P2.3) is mature. The
     reliable-DVC path that works is NOT worth landing on its own (a reliable tunnel
     HOL-blocks under loss like TCP — no win). See feasibility doc "P2.4b".
+
+    P2.2 step 2 — lossy flow uses lossy delivery (2026-06-27, `listener.rs`; verified
+    on real mstsc). Behind the experimental env `MACRDP_UDP_LOSSY_DELIVERY` (read once
+    at the top of `run_recv_loop`; default off), the listener classifies each flow at
+    its opening SYN — `Datagram::peek_fec_flags(data)` containing `SYN_LOSSY` ⇒ the
+    `UdpFecL` flow (the first datagram from any peer is always its SYN, so peeking at
+    `peers.entry(..).or_insert_with` time is reliable) — and builds that peer's
+    `RdpeudpState` with `DeliveryMode::Lossy` (P2.2 step 1) instead of `Reliable`. The
+    reliable (`UdpFecR`) flow is unaffected; with the env unset every peer stays
+    `Reliable` (the proven P2.1a/P2.4a path), so it's a clean A/B + instant fallback.
+    **Verified live (mstsc, env set):** lossy peer logs `RDPEUDP peer using LOSSY
+    delivery`, then the DTLS 1.2 handshake (`P2.1 GREEN`) AND the MS-RDPEMT tunnel
+    (`P2.4 GREEN`) both reach established over send-once/no-retransmit delivery —
+    DTLS's own record reordering + a clean link (one-shot flights all arrive) carry it
+    without transport retransmission. **Under-loss caveats (soak-phase, NOT yet
+    addressed):** the SM no longer resends the one-shot `CREATERESPONSE(S_OK)` / DTLS
+    server flight, and `handle_emt_tunnel`'s `tunnel_created` guard answers a repeated
+    `CREATEREQUEST` only once — so a dropped handshake datagram under real loss may
+    stall the tunnel; making the response idempotent (re-answer on retransmit in lossy
+    mode) or adding a handshake-phase retransmit is the next soak fix. See feasibility
+    doc "P2.2".

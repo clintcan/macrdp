@@ -396,12 +396,23 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   byte-identical). Lossy delivers source payloads on arrival (no reorder buffer, no
   HOL) and sends our data once (no RTO retransmit; the `unacked` push is skipped).
   Inbound is not de-duplicated in lossy mode (DTLS/audio self-dedup). Unit-tested
-  (deliver-on-arrival/no-HOL with a reliable control + send-once/no-retransmit). **Not
-  wired:** the listener still builds every peer `Reliable`, so the `UdpFecL` flow keeps
-  riding the reliable SM on a clean link. **Step 2** = switch the lossy flow to
-  `DeliveryMode::Lossy` per-flow and confirm the DTLS handshake still completes when the
-  transport stops retransmitting (DTLS retransmits its own flights) — needs a live mstsc
-  run, ideally with the netshape soak.
+  (deliver-on-arrival/no-HOL with a reliable control + send-once/no-retransmit).
+
+  **Step 2 done (2026-06-27, verified on real mstsc): the lossy flow uses lossy
+  delivery.** Behind the experimental env `MACRDP_UDP_LOSSY_DELIVERY` (default off →
+  the lossy flow keeps riding the reliable SM, a clean one-var A/B), the listener
+  classifies each flow at its opening SYN (`SYN_LOSSY` ⇒ `UdpFecL`) and builds that
+  peer's SM with `DeliveryMode::Lossy`; the reliable (`UdpFecR`) flow is never touched.
+  **Verified live:** with the env set the lossy peer logs `RDPEUDP peer using LOSSY
+  delivery`, and the **DTLS 1.2 handshake + MS-RDPEMT tunnel both reach established over
+  send-once/no-retransmit delivery** (`P2.1 GREEN` → `P2.4 GREEN`), H.264 video + audio
+  stable. DTLS's own record-layer reordering plus a clean link (everything arrives once)
+  is what carries the handshake without transport retransmission. **Known under-loss
+  caveats (soak-phase, not hit on a clean link):** the one-shot `CREATERESPONSE(S_OK)`
+  and the DTLS server flight aren't resent by the SM, and the tunnel's `tunnel_created`
+  guard answers a repeated `CREATEREQUEST` only once — so under real loss the handshake
+  may need the response re-sent idempotently (or a handshake-phase retransmit). That's
+  the next thing the netshape soak should probe.
 
 - **P2.3 — FEC encoder (optional, deferrable).** Researched: MS-RDPEUDP FEC is
   **GF(256) Reed–Solomon**, not XOR parity; each FEC packet recovers exactly **one** lost

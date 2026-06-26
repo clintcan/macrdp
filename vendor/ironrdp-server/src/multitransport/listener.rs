@@ -423,6 +423,16 @@ async fn run_recv_loop(
     let start = tokio::time::Instant::now();
     let mut buf = vec![0u8; 2048];
 
+    // (P2.2 step 2, EXPERIMENTAL) When set, a lossy (`SYN_LOSSY`) flow drives the
+    // SM in `DeliveryMode::Lossy` (deliver-on-arrival, send-once-no-retransmit)
+    // instead of the reliable policy. Default OFF — the lossy flow keeps riding the
+    // reliable SM (the proven P2.1a/P2.4a path), so this is a one-env-var A/B and a
+    // clean fallback. The reliable (`UdpFecR`) flow is never affected.
+    let lossy_delivery = std::env::var_os("MACRDP_UDP_LOSSY_DELIVERY").is_some();
+    if lossy_delivery {
+        debug!("MACRDP_UDP_LOSSY_DELIVERY set — lossy (SYN_LOSSY) flows will use DeliveryMode::Lossy");
+    }
+
     // (Soak fix) Periodic clock for the reliability state machines. The SM only
     // retransmits / drains its send window when it's pumped (step/enqueue), and
     // those are otherwise driven solely by inbound datagrams or new outbound data.
@@ -514,9 +524,23 @@ async fn run_recv_loop(
             }
         }
 
+        // (P2.2 step 2) Classify the flow at creation from its opening SYN: a
+        // `SYN_LOSSY` SYN is the `UdpFecL` flow. The first datagram from any peer is
+        // always its SYN (RDPEUDP opens with one), so peeking here is reliable. Only
+        // promotes to lossy delivery when the experimental env is set; otherwise (and
+        // for the reliable flow) it stays `Reliable`.
+        let use_lossy = lossy_delivery
+            && Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::SYN_LOSSY));
+
         let peer = peers.entry(peer_addr).or_insert_with(|| {
             session_counter = session_counter.wrapping_add(1);
             let initial_seq = cfg.server_isn_seed.wrapping_add(session_counter);
+            let mode = if use_lossy {
+                debug!(%peer_addr, "RDPEUDP peer using LOSSY delivery (SYN_LOSSY flow, MACRDP_UDP_LOSSY_DELIVERY)");
+                DeliveryMode::Lossy
+            } else {
+                DeliveryMode::Reliable
+            };
             Peer {
                 sm: RdpeudpState::new(
                     Role::Server,
@@ -525,12 +549,7 @@ async fn run_recv_loop(
                         mtu: cfg.mtu,
                         initial_seq,
                         rto_ms: cfg.rto_ms,
-                        // P2.2 step 1: the lossy delivery policy exists in the SM
-                        // (unit-tested) but is NOT wired here yet — the lossy
-                        // (UdpFecL) flow still rides the reliable SM (fine on a
-                        // clean link; the DTLS handshake relies on it). Switching
-                        // this to DeliveryMode::Lossy per-flow is step 2.
-                        mode: DeliveryMode::Reliable,
+                        mode,
                     },
                 ),
                 inbound: Vec::new(),
