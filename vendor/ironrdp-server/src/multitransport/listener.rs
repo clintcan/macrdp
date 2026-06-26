@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use ironrdp_rdpeudp::datagram::Datagram;
 use ironrdp_rdpeudp::pdu::FecFlags;
-use ironrdp_rdpeudp::state::{Config, RdpeudpState, Role};
+use ironrdp_rdpeudp::state::{Config, DeliveryMode, RdpeudpState, Role};
 
 use crate::multitransport::dtls::{DtlsConn, DtlsServerContext};
 use crate::multitransport::{CookieRegistry, TunnelOutbound};
@@ -525,6 +525,12 @@ async fn run_recv_loop(
                         mtu: cfg.mtu,
                         initial_seq,
                         rto_ms: cfg.rto_ms,
+                        // P2.2 step 1: the lossy delivery policy exists in the SM
+                        // (unit-tested) but is NOT wired here yet — the lossy
+                        // (UdpFecL) flow still rides the reliable SM (fine on a
+                        // clean link; the DTLS handshake relies on it). Switching
+                        // this to DeliveryMode::Lossy per-flow is step 2.
+                        mode: DeliveryMode::Reliable,
                     },
                 ),
                 inbound: Vec::new(),

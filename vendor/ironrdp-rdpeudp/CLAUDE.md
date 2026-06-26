@@ -35,6 +35,31 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **P2.2 step 1 — lossy delivery mode (done, 2026-06-27; SM logic only, NOT yet
+  wired):** `Config` gained `mode: DeliveryMode { Reliable, Lossy }` (default
+  `Reliable`, so every existing caller/test is byte-identical). In
+  `DeliveryMode::Lossy` the SM (a) **delivers each source payload on arrival** —
+  no reorder buffer, no in-order head-of-line block (the whole point; a packet
+  after a gap is handed up immediately) — advancing `recv_next` monotonically to
+  the highest seen seq + 1 so the cumulative ACK still reports progress (it
+  over-reports under loss, but a lossy sender never retransmits on it, so harmless);
+  and (b) **sends our own data once, never retransmits** — the send loop skips the
+  `unacked` push in lossy mode, so the RTO retransmit loop is a no-op and the window
+  check never blocks. We do NOT dedup inbound in lossy mode — the upper layer (DTLS
+  records / audio) is self-deduplicating. Unit-tested: `lossy_delivers_out_of_order_
+  on_arrival_no_hol` (fed in reverse, every packet but the first is a gap, each
+  delivered immediately; reassembly matches), a reliable control
+  (`reliable_buffers_out_of_order_head`: the same future packet is buffered →
+  nothing delivered), and `lossy_sender_sends_once_never_retransmits` (no resend on
+  RTO ever). 46 crate tests. **NOT integrated:** the listener
+  (`ironrdp-server/src/multitransport/listener.rs`) still builds every peer with
+  `DeliveryMode::Reliable` — the lossy (`UdpFecL`) flow keeps riding the reliable SM
+  (fine on a clean link; the DTLS handshake currently relies on it). Switching the
+  lossy flow to `DeliveryMode::Lossy` per-flow — and confirming the DTLS handshake
+  still completes when the transport stops retransmitting (DTLS has its own flight
+  retransmission) — is P2.2 step 2. See `docs/rdp-udp-multitransport-feasibility.md`
+  "P2.2".
+
 - **Soak observability (done, 2026-06-26):** `StepOutput` gained two diagnostic
   fields — `retransmits: usize` (in-flight data segments resent on RTO this step)
   and `syn_retransmit: bool` (client SYN resent). Set in `pump()`; the crate stays

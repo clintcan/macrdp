@@ -391,6 +391,18 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   is a second delivery policy in `state.rs`, not a new crate. Sans-I/O, unit-tested under
   injected loss/reorder/dup like the reliable machine.
 
+  **Step 1 done (2026-06-27): the lossy delivery policy, SM-only.** `Config.mode`
+  (`DeliveryMode { Reliable, Lossy }`, default `Reliable` → existing callers
+  byte-identical). Lossy delivers source payloads on arrival (no reorder buffer, no
+  HOL) and sends our data once (no RTO retransmit; the `unacked` push is skipped).
+  Inbound is not de-duplicated in lossy mode (DTLS/audio self-dedup). Unit-tested
+  (deliver-on-arrival/no-HOL with a reliable control + send-once/no-retransmit). **Not
+  wired:** the listener still builds every peer `Reliable`, so the `UdpFecL` flow keeps
+  riding the reliable SM on a clean link. **Step 2** = switch the lossy flow to
+  `DeliveryMode::Lossy` per-flow and confirm the DTLS handshake still completes when the
+  transport stops retransmitting (DTLS retransmits its own flights) — needs a live mstsc
+  run, ideally with the netshape soak.
+
 - **P2.3 — FEC encoder (optional, deferrable).** Researched: MS-RDPEUDP FEC is
   **GF(256) Reed–Solomon**, not XOR parity; each FEC packet recovers exactly **one** lost
   source packet within its range; the wire header is `RDPUDP_FEC_PAYLOAD_HEADER`

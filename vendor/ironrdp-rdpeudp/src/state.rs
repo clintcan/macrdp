@@ -40,6 +40,27 @@ pub enum Role {
     Server,
 }
 
+/// Delivery policy for the source-packet data path (MS-RDPEUDP §1.3.2).
+///
+/// The SYN/SYN+ACK handshake is identical in both modes; only how source
+/// payloads are received and sent differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeliveryMode {
+    /// `UdpFecR` — reliable, in-order, de-duplicated: out-of-order datagrams are
+    /// buffered and delivered as contiguous runs; our own data is retransmitted
+    /// on RTO until cumulatively acked. The Phase-1 default.
+    #[default]
+    Reliable,
+    /// `UdpFecL` — lossy: source payloads are **delivered on arrival** (no
+    /// in-order head-of-line blocking — *the whole point*), and our own data is
+    /// sent **once, never retransmitted**. The upper layer tolerates loss (DTLS
+    /// records are independent and self-deduplicating; audio drops a stale frame
+    /// for free), and loss *recovery* — where wanted — comes from FEC (P2.3), not
+    /// retransmission. A reliable ordered stream head-of-line-blocks on its own
+    /// loss exactly like TCP, which is why video-under-loss needs this mode.
+    Lossy,
+}
+
 /// Per-connection configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -51,6 +72,9 @@ pub struct Config {
     pub initial_seq: u32,
     /// Retransmit timeout, milliseconds.
     pub rto_ms: u64,
+    /// Reliable (`UdpFecR`) vs lossy (`UdpFecL`) delivery policy. Defaults to
+    /// [`DeliveryMode::Reliable`] so existing callers are unchanged.
+    pub mode: DeliveryMode,
 }
 
 impl Default for Config {
@@ -60,6 +84,7 @@ impl Default for Config {
             mtu: 1232,
             initial_seq: 0,
             rto_ms: 300,
+            mode: DeliveryMode::Reliable,
         }
     }
 }
@@ -272,6 +297,21 @@ impl RdpeudpState {
         }
         self.need_ack = true;
 
+        if self.cfg.mode == DeliveryMode::Lossy {
+            // Lossy: deliver on arrival, never buffer for ordering, never block on
+            // a gap (the whole point). We don't dedup here — the upper layer (DTLS)
+            // drops any duplicate/replayed record itself, and on a clean in-order
+            // link there are no duplicates. `recv_next` still advances
+            // monotonically to the highest seen seq + 1 so our cumulative ACK
+            // reports forward progress; under loss it over-reports, but a lossy
+            // sender never retransmits on that ACK, so it's harmless.
+            out.delivered.push(src.payload.clone());
+            if seq_leq(self.recv_next, seq) {
+                self.recv_next = seq.wrapping_add(1);
+            }
+            return;
+        }
+
         if seq == self.recv_next {
             out.delivered.push(src.payload.clone());
             self.recv_next = self.recv_next.wrapping_add(1);
@@ -345,11 +385,16 @@ impl RdpeudpState {
                 &payload,
                 ack_vector.clone(),
             ));
-            self.unacked.push_back(Unacked {
-                seq,
-                payload,
-                last_sent_ms: now_ms,
-            });
+            // Reliable: track for RTO retransmit until acked. Lossy: send once and
+            // forget (no retransmit) — `unacked` stays empty, so the window check
+            // above never blocks and the retransmit loop is a no-op.
+            if self.cfg.mode == DeliveryMode::Reliable {
+                self.unacked.push_back(Unacked {
+                    seq,
+                    payload,
+                    last_sent_ms: now_ms,
+                });
+            }
             sent_data = true;
         }
 
@@ -482,6 +527,7 @@ mod tests {
             mtu: 1132, // → small-ish payloads exercise fragmentation
             initial_seq,
             rto_ms: 100,
+            mode: DeliveryMode::Reliable,
         }
     }
 
@@ -570,6 +616,7 @@ mod tests {
                 mtu: 1232,
                 initial_seq: 0x61f7_b6e3,
                 rto_ms: 300,
+                mode: DeliveryMode::Reliable,
             },
         );
         let out = server.step(0, Some(&client_syn));
@@ -711,5 +758,113 @@ mod tests {
             out.retransmits, 0,
             "acked segment is no longer retransmitted"
         );
+    }
+
+    // ---- P2.2: lossy delivery mode (UdpFecL) -------------------------------
+
+    fn cfg_lossy(initial_seq: u32) -> Config {
+        Config {
+            mode: DeliveryMode::Lossy,
+            ..cfg(initial_seq)
+        }
+    }
+
+    /// Drive a lossy client↔server pair to established. The handshake itself is
+    /// mode-independent, so this mirrors [`handshook`] with the lossy config.
+    fn handshook_lossy() -> (RdpeudpState, RdpeudpState, u64) {
+        let mut client = RdpeudpState::new(Role::Client, cfg_lossy(1000));
+        let mut server = RdpeudpState::new(Role::Server, cfg_lossy(9000));
+        let mut now = 0;
+        let o = client.start(now);
+        for dg in o.to_send {
+            let so = server.step(now, Some(&dg));
+            for back in so.to_send {
+                client.step(now, Some(&back));
+            }
+        }
+        now += 1;
+        assert!(client.is_established() && server.is_established());
+        (client, server, now)
+    }
+
+    /// Capture only the source-carrying (data) datagrams from a pump's output.
+    fn data_only(to_send: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        to_send
+            .into_iter()
+            .filter(|dg| {
+                Datagram::decode(dg)
+                    .map(|d| d.source.is_some())
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Lossy mode delivers a source payload on arrival even when it's ahead of the
+    /// expected sequence — no in-order head-of-line blocking. Fed in reverse, every
+    /// packet but the first is a gap, yet each is delivered immediately.
+    #[test]
+    fn lossy_delivers_out_of_order_on_arrival_no_hol() {
+        let (mut client, mut server, now) = handshook_lossy();
+        // ~2500 bytes over a 1132-MTU link → multiple source packets.
+        let msg: Vec<u8> = b"abcdefghij".iter().copied().cycle().take(2500).collect();
+        let data = data_only(client.enqueue(now, &msg).to_send);
+        assert!(data.len() >= 2, "message must span multiple source packets");
+
+        let mut delivered: Vec<Vec<u8>> = Vec::new();
+        for (i, dg) in data.iter().rev().enumerate() {
+            let so = server.step(now, Some(dg));
+            if i == 0 {
+                // The highest-seq packet arrives first (a gap from recv_next). Lossy
+                // hands it up immediately; reliable would buffer it (see the control
+                // test below).
+                assert_eq!(
+                    so.delivered.len(),
+                    1,
+                    "lossy delivers the out-of-order head on arrival (no HOL)"
+                );
+            }
+            delivered.extend(so.delivered);
+        }
+        // Every chunk arrived (in reverse); un-reversing reconstructs the message.
+        let reassembled: Vec<u8> = delivered.iter().rev().flatten().copied().collect();
+        assert_eq!(reassembled, msg, "all payloads delivered, none dropped");
+    }
+
+    /// Control: the reliable machine buffers a future (out-of-order) source packet
+    /// instead of delivering it — the HOL behavior lossy mode deliberately avoids.
+    #[test]
+    fn reliable_buffers_out_of_order_head() {
+        let (mut client, mut server, now) = handshook();
+        let msg: Vec<u8> = b"abcdefghij".iter().copied().cycle().take(2500).collect();
+        let data = data_only(client.enqueue(now, &msg).to_send);
+        assert!(data.len() >= 2);
+        // Feed the highest-seq packet first: reliable buffers it, delivers nothing.
+        let so = server.step(now, Some(data.last().unwrap()));
+        assert!(
+            so.delivered.is_empty(),
+            "reliable buffers the future packet (HOL) until the gap fills"
+        );
+    }
+
+    /// Lossy mode sends each source packet exactly once — no RTO retransmit, ever,
+    /// even when the peer never ACKs. (Reliable would resend; see
+    /// `retransmit_counter_reports_rto_resends`.)
+    #[test]
+    fn lossy_sender_sends_once_never_retransmits() {
+        let (_client, mut server, now) = handshook_lossy();
+        let rto = server.cfg.rto_ms;
+
+        let out = server.enqueue(now, b"a lossy audio access unit");
+        assert!(!out.to_send.is_empty(), "data goes on the wire once");
+        assert_eq!(out.retransmits, 0, "first send is not a retransmit");
+
+        // No ACK ever arrives. A reliable sender would resend on RTO; lossy must not.
+        let out = server.step(now + rto, None);
+        assert_eq!(out.retransmits, 0, "lossy never retransmits");
+        assert!(out.to_send.is_empty(), "no resend on RTO in lossy mode");
+
+        let out = server.step(now + rto * 10, None);
+        assert_eq!(out.retransmits, 0);
+        assert!(out.to_send.is_empty(), "still no resend much later");
     }
 }
