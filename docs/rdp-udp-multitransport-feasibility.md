@@ -264,6 +264,140 @@ multitransport could deliver a real, user-noticeable win on a bad link. (Audio's
 drop-tolerance is the property video lacks.) Until Phase 2, audio stays on TCP with
 its existing lag model — the right call.
 
+## Phase 2 — scope (staged): lossy `UdpFecL` + DTLS + FEC + lossy audio
+
+*Scoped 2026-06-26 after the Phase-1 soak. This is a **plan**, not built. Read the
+"Audio belongs on the lossy transport" section above first — it sets the priority order
+(audio before video). Four protocol/library unknowns were researched up front; the
+findings change the shape materially and are folded in below.*
+
+### The strategic caveat — read before committing any code
+
+**The lossy transport is a *legacy* codepath, and it is not yet proven that modern
+mstsc will even use it.** Two facts:
+
+1. **RDPEUDP2 dropped lossy transport entirely.** The v2 framing (`RDPUDP2_*`) is
+   reliable-only / TLS-only. Lossy (`UdpFecL`) + DTLS + FEC live only in the older
+   **RDPEUDP v1** codepath. Modern mstsc negotiates **RDPEUDP2-reliable** for its UDP
+   flow — which is the path Phase 1 already ships and verified.
+2. **In Phase 1 we only ever *offered* `UdpFecR` (reliable).** We have never offered
+   `UdpFecL`, so we have **zero evidence** about what current mstsc does when a lossy
+   transport is on the table. It may open a lossy DTLS flow; it may decline and stay on
+   the reliable RDPEUDP2 flow it already prefers; it may ignore the offer entirely.
+
+So the entire Phase 2 lossy investment (a DTLS dependency + a lossy state machine + a
+FEC encoder + a new audio DVC) buys nothing if the client we care about won't open a
+lossy flow. **That question is cheap to answer and must be answered first.**
+
+### P2.0 — Go/No-Go spike (do this FIRST; ~1 day; gates everything else)
+
+Offer `UdpFecL` and watch a real mstsc (Win11/WiFi, the Phase-1 rig). Concretely:
+
+- Acceptor: advertise `TRANSPORT_TYPE_UDP_FECL` in the SC multitransport block and emit
+  a **second** Server Initiate Multitransport Request with
+  `RequestedProtocol::UdpFecL` (in addition to, or instead of, the existing `UdpFecR`
+  offer — try both orderings). All the offer/emit machinery already exists from M3c
+  (acceptor divergence (3)); this is a flag + a second request, not new infrastructure.
+- Listener: log, on the lossy flow, whether mstsc (a) opens a second UDP flow at all,
+  (b) sends a **DTLS ClientHello** (record type 22, version `0xFEFF` = DTLS 1.0) rather
+  than a TLS ClientHello, and (c) which RDPEUDP version it negotiates on it.
+- **No DTLS implementation needed for the spike** — we only need to *observe* the
+  ClientHello arriving (or not). A Wireshark capture is the definitive artifact, same
+  method that cracked Phase 1.
+
+**Decision gate:**
+- **mstsc opens a lossy DTLS flow → GREEN.** Proceed to P2.1. We now know the payoff is
+  reachable by the primary client.
+- **mstsc declines / stays reliable → RED.** Park Phase 2. Document that lossy UDP is
+  unreachable by modern mstsc; the only consumers would be older clients / a
+  future UDP-capable FreeRDP (which today has *no* UDP data path on either side — see
+  the Landscape section). Revisit only if a concrete client demands it.
+
+This one spike converts "should we build a multi-week lossy stack?" into an empirical
+yes/no for the cost of a flag and a capture. **Do not skip it.**
+
+### If GREEN — the staged build (mirrors Phase 1's M1→M5 discipline)
+
+Each milestone is its own gated PR, real-client-verified, feature-flagged
+(`multitransport` cargo feature already exists; reuse it), zero-cost when off.
+
+- **P2.1 — DTLS layer (the hard new dependency).** Add `boring` (or `openssl` if we
+  want to pin DTLS 1.0 explicitly — it edges ahead there; `boring` does DTLS 1.0/1.2
+  over a memory BIO via `SslMethod::dtls()` + `Ssl::setup_accept()`, no DTLS 1.3 via the
+  safe API, which is fine — mstsc speaks DTLS 1.0). Quarantine **all** of it behind one
+  maintenance-boundary file `vendor/ironrdp-server/src/multitransport/dtls.rs`, the same
+  way Phase 1's rustls layer is isolated. **Wire layering (researched):** the DTLS record
+  sits *inside* the cleartext RDPUDP framing, not around it —
+  `UDP datagram → RDPUDP header (cleartext seq/ACK/FEC) → DTLS record → RDP_TUNNEL_* (EMT)
+  → DVC data`. DTLS encrypts only the RDPUDP *payload*; the reliability header stays in
+  the clear so the state machine can ACK/retransmit without decrypting. Reuse the same
+  self-signed cert as TCP/the reliable flow. **Risk:** a second C-crypto stack in the
+  signed/notarized macOS binary — verify the build + notarization still pass (we already
+  link aws-lc-rs/ring, so the toolchain exists, but `boring` is a distinct BoringSSL
+  vendored build). Spike the mstsc DTLS-1.0 handshake interop against a capture.
+
+- **P2.2 — lossy RDPEUDP state machine.** Extend `vendor/ironrdp-rdpeudp` with a lossy
+  mode alongside the existing reliable one: source packets sent **without retransmit**,
+  loss-tolerant delivery (deliver-on-arrival, no in-order HOL block — *this is the whole
+  point*), and the lossy ACK semantics. Most PDU codecs already exist from Phase 1; this
+  is a second delivery policy in `state.rs`, not a new crate. Sans-I/O, unit-tested under
+  injected loss/reorder/dup like the reliable machine.
+
+- **P2.3 — FEC encoder (optional, deferrable).** Researched: MS-RDPEUDP FEC is
+  **GF(256) Reed–Solomon**, not XOR parity; each FEC packet recovers exactly **one** lost
+  source packet within its range; the wire header is `RDPUDP_FEC_PAYLOAD_HEADER`
+  (`snCoded`, `snSourceStart`, `uRange`, `uFecIndex`). A **send-only server needs only the
+  *encoder***, and **even that is optional** — it's a loss-recovery *optimization*, not
+  required for the lossy transport to function. So **ship lossy-without-FEC first**
+  (P2.4/P2.5 below work without it), then add the RS encoder as a measurable
+  loss-resilience improvement. This de-risks: we get a working lossy audio path before
+  taking on a Reed–Solomon implementation.
+
+- **P2.4 — lossy audio DVC (the actual payoff).** Researched and important: audio over
+  UDP is **NOT** a redirect of the static `rdpsnd` SVC. It requires a **dynamic virtual
+  channel**, `AUDIO_PLAYBACK_LOSSY_DVC` (MS-RDPEA §2.1; FreeRDP calls it
+  `RDPSND_LOSSY_DVC_CHANNEL_NAME`), migrated onto the tunnel via Soft-Sync. The good news:
+  the **PDU payloads are reusable** — the Wave2 / AAC access-unit encoders from
+  `src/audio.rs` + `src/aac.rs` are unchanged; only the channel *envelope* changes (DVC
+  instead of SVC). Windows **gates** this channel on **AAC + protocol v8 + a UDP transport
+  being present**, so `--enable-aac` becomes a prerequisite for lossy audio. Reuse the
+  Phase-1 Soft-Sync codec (`vendor/ironrdp-dvc`) to migrate the new DVC onto the lossy
+  tunnel. This is the **substantial, genuinely-new** piece of Phase 2 — a new audio
+  channel, not a wiring change.
+
+- **P2.5 — route audio to the lossy tunnel + reconcile the lag model.** Point the audio
+  path at the lossy tunnel and reconcile with the existing audio-lag / drop-stale model
+  (vendor server divergence (2)/(3)/(8)) — on a lossy transport, dropping a stale wave is
+  *correct and free* (no retransmit to cancel), which is exactly the property TCP audio
+  lacks. Verify on the netshape soak harness (`scripts/netshape.sh`) that audio stays
+  smooth on a lossy link where TCP audio desyncs — the user-noticeable win that justifies
+  the whole phase.
+
+- **P2.6 (later, maybe never) — lossy video.** H.264 over a lossy transport needs
+  loss-tolerant encoding (periodic intra-refresh / slice-based recovery) so a dropped
+  packet doesn't smear until the next IDR. Harder than audio and lower-value (the soak
+  proved reliable-video-under-loss is a dead end; lossy-video needs encoder work, not just
+  transport). Deferred; revisit only after lossy audio ships and proves the transport.
+
+### Reuse from Phase 1 (most of the infrastructure is already built)
+
+The UDP listener, cookie registry, server↔listener tunnel handoff, MS-RDPEMT tunnel
+PDUs, the Soft-Sync codec, the acceptor offer/emit machinery (M3c), the
+`ironrdp-rdpeudp` crate, and the netshape soak harness + retransmit observability **all
+carry over**. Phase 2 adds: the lossy *offer* (P2.0), one DTLS boundary file (P2.1), a
+second delivery policy in the state machine (P2.2), an optional RS encoder (P2.3), and a
+new audio DVC (P2.4) — on top of, not instead of, Phase 1.
+
+### Bottom line
+
+Phase 2 is **gated on a one-day go/no-go spike (P2.0)** because the lossy path is a
+legacy codepath and it is unproven that modern mstsc will use it at all. If it's GREEN,
+the highest-value payload is **audio** (a new `AUDIO_PLAYBACK_LOSSY_DVC`, reusing our AAC
+encoder), not video; FEC is encoder-only and even then optional; and DTLS 1.0 is the one
+hard new dependency, quarantined behind a single file. If P2.0 is RED, Phase 2 is parked
+with a clear conscience — Phase 1 (reliable EGFX over UDP, the path mstsc actually
+negotiates) stands on its own as the clean-link feature it is.
+
 ## TL;DR
 
 *Original feasibility framing (2026-06-25), kept for the record. The "don't / not
