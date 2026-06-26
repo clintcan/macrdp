@@ -76,12 +76,14 @@ verify again before acting, code moves.*
 > (default-OFF, env-gated), lossy-link video deferred to Phase 2. See "First soak
 > findings" below.
 >
-> **Possible next steps (none started):** route **audio (RDPSND)** over the tunnel
-> too; **Phase 2** = lossy `UdpFecL` + DTLS (via `boring`) + FEC — the *real*
-> loss-resilience win (only worth it if lossy-link video becomes a goal); de-vendor
-> once the IronRDP changes are upstreamed + released. Still **not** supported under
-> `--fork-workers` (the persistent UDP socket would belong to the supervisor —
-> deferred; warns + falls back to TCP).
+> **Possible next steps (none started):** **Phase 2** = lossy `UdpFecL` + DTLS (via
+> `boring`) + FEC — the *real* loss-resilience win; de-vendor once the IronRDP
+> changes are upstreamed + released. Still **not** supported under `--fork-workers`
+> (the persistent UDP socket would belong to the supervisor — deferred; warns + falls
+> back to TCP). **NB — do NOT route audio over the *reliable* tunnel** (it's a
+> downgrade; see "Audio belongs on the lossy transport, not the reliable one"
+> below). Audio over a *lossy* tunnel is a Phase-2 thing and is arguably the best
+> first payload for it — better than video.
 
 ## Landscape — UDP multitransport across open-source RDP servers
 
@@ -225,6 +227,42 @@ reliable-only multitransport.
    video becomes a goal. Note this also means the **default TCP** EGFX path has the
    same loss sensitivity (matching client resolution to avoid scaling + a capable
    client are the practical mitigations there).
+
+## Audio belongs on the lossy transport, not the reliable one
+
+A natural-looking "next step" is to also route **audio (RDPSND)** over the UDP
+tunnel. **On the reliable tunnel we have today, don't — it's a downgrade.** The
+same ordered-stream HOL blocking that limits video applies to audio, and it's
+*worse* for audio because of how macrdp already handles audio loss:
+
+- **Clean link:** no benefit — audio-over-reliable-UDP ≈ audio-over-TCP.
+- **Lossy link:** a lost audio packet stalls everything behind it until retransmit.
+  But on a live stream **late audio is worthless**, so the vendored server
+  deliberately **drops stale waves + resyncs on stall** (the audio-lag divergences
+  (2)/(3)/(8)) rather than replay them late. A reliable *ordered* tunnel can't drop
+  anything — it must deliver in order — so moving audio there **defeats the existing
+  drop-based lag model** and trades graceful degradation (audible gaps) for hard HOL
+  stalls + backlog. Strictly worse than the TCP path it would replace.
+
+**But audio over a *lossy* tunnel (Phase 2) is arguably the BEST use of UDP
+multitransport — better than video** — and the soak is exactly why. Audio is:
+
+1. **Drop-tolerant** — late packets are discarded anyway, so a lossy transport (no
+   retransmit, no HOL block) matches audio's nature exactly, sidestepping the very
+   thing that doomed reliable-UDP video.
+2. **Low-bandwidth** (~128 kbit/s AAC, ~1.4 Mbit/s PCM) — so **FEC is cheap** to add
+   (a few % overhead protects it against loss), where FEC-protecting H.264 is
+   expensive.
+3. **Latency-critical** — UDP's no-HOL-blocking helps audio directly, and the TCP
+   failure mode under loss (backlog → progressive desync; see the audio quirks) is
+   precisely what a lossy transport avoids.
+
+So the priority order for Phase 2 flips the intuition: **once the lossy `UdpFecL`
+transport + FEC exists, audio is plausibly the first channel to migrate, ahead of
+video** — reliable-video-under-loss is a dead end, but lossy-*audio* is where UDP
+multitransport could deliver a real, user-noticeable win on a bad link. (Audio's
+drop-tolerance is the property video lacks.) Until Phase 2, audio stays on TCP with
+its existing lag model — the right call.
 
 ## TL;DR
 
