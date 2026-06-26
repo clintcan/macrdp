@@ -456,7 +456,13 @@ async fn run_recv_loop(
         let was_established = peer.sm.is_established();
         let had_data = Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::DATA));
         let out = peer.sm.step(now_ms, Some(data));
+        let (retransmits, syn_retransmit) = (out.retransmits, out.syn_retransmit);
         send_datagrams(&socket, peer_addr, out.to_send, cfg.mtu).await;
+        if retransmits > 0 || syn_retransmit {
+            // The reliable transport recovered lost packets — the signal a
+            // lossy-link soak watches. Quiet (count is 0) on a clean link.
+            debug!(%peer_addr, retransmits, syn_retransmit, "RDPEUDP RTO retransmit");
+        }
 
         if !was_established && peer.sm.is_established() {
             debug!(
@@ -581,7 +587,11 @@ async fn run_recv_loop(
                 }
                 if !tls_out.is_empty() {
                     let o = sm.enqueue(now_ms, &tls_out);
+                    let (retransmits, syn_retransmit) = (o.retransmits, o.syn_retransmit);
                     send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
+                    if retransmits > 0 || syn_retransmit {
+                        debug!(%peer_addr, retransmits, syn_retransmit, "RDPEUDP RTO retransmit (outbound)");
+                    }
                 }
                 if handshake_done && !*tls_done_logged {
                     *tls_done_logged = true;

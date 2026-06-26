@@ -520,3 +520,14 @@ AND released — #1276 landing is NOT sufficient.
     / ogon / gnome-remote-desktop / Weston are TCP-only or ride FreeRDP's server
     lib. ("first" can't be proven exhaustively — phrase it "first known".)
     Flag-OFF (empty safe spike) re-verified no-regression.
+
+    **Soak observability (added 2026-06-26):** the listener now logs the reliable
+    transport's RTO retransmits — `RDPEUDP RTO retransmit` at the inbound-driven
+    `step()` site and `RDPEUDP RTO retransmit (outbound)` at the server-data
+    `enqueue()` site, gated `if retransmits > 0 || syn_retransmit` so a clean link
+    stays silent. The counts come from the new `StepOutput.{retransmits,
+    syn_retransmit}` diagnostic fields (`ironrdp-rdpeudp`; the SM stays sans-I/O —
+    it counts, the listener logs). For a lossy-link soak run with
+    `RUST_LOG=ironrdp_server::multitransport::listener=debug`; protocol + the
+    `scripts/netshape.sh` shaper are in `docs/rdp-udp-multitransport-feasibility.md`
+    ("Soak testing the UDP path under loss").

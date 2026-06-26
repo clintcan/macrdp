@@ -35,6 +35,14 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **Soak observability (done, 2026-06-26):** `StepOutput` gained two diagnostic
+  fields — `retransmits: usize` (in-flight data segments resent on RTO this step)
+  and `syn_retransmit: bool` (client SYN resent). Set in `pump()`; the crate stays
+  sans-I/O and silent — the **listener** logs them (`RDPEUDP RTO retransmit`) so a
+  lossy-link soak can confirm the recovery path actually fires. Unit-tested
+  (`retransmit_counter_reports_rto_resends`: 0 before RTO → 1 on RTO → 0 after ACK).
+  See `docs/rdp-udp-multitransport-feasibility.md` "Soak testing the UDP path under
+  loss" + `scripts/netshape.sh`.
 - **M5b-1 (done — data-path wire codecs, 2026-06-26; integration pending):** the
   pure, spec-verified codecs the EGFX-over-UDP data path needs, ahead of the
   (larger) server integration — same codecs-before-wiring pattern as M2. Two adds:

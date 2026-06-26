@@ -114,6 +114,55 @@ server-only glue (UDP listener, cookie→session binding, channel migration via
 spec walks you through — and FreeRDP never finished the *client* UDP path either,
 so there was no OSS implementation of any of it to crib from.
 
+## Soak testing the UDP path under loss
+
+EGFX-over-UDP has only been verified on a clean WiFi/LAN so far — which proves it
+*works* but not that it delivers the actual win (no head-of-line blocking on a
+lossy/high-latency link). This section is the protocol for soaking it under emulated
+loss. Loopback can't reproduce real loss, so this needs a **real client** (mstsc on
+another machine) and the Mac's built-in `pf`/`dnctl` traffic shaper.
+
+**Tooling:** `scripts/netshape.sh` shapes both directions of TCP+UDP on the macrdp
+port (default 3390) via dummynet — `sudo scripts/netshape.sh on --loss 5 --delay 100`
+to apply, `sudo scripts/netshape.sh off` to restore, `status` to inspect.
+
+**Observability:** the reliable transport's RTO retransmits are surfaced (the state
+machine is sans-I/O, so `StepOutput.retransmits` / `.syn_retransmit` are counted in
+`ironrdp-rdpeudp` and *logged by the listener*). Run the server with:
+
+```
+RUST_LOG=info,ironrdp_server::multitransport::listener=debug
+```
+
+and watch for:
+- `RDPEUDP RTO retransmit` / `RDPEUDP RTO retransmit (outbound)` — recovery firing
+  (inbound-driven vs server-data path). **Zero on a clean link**; a steady trickle
+  under loss is the system working as intended, not a fault.
+- `RDPEUDP reliable data delivered` — in-order bytes reassembled.
+- `RDPEUDP DATA datagram delivered nothing (receive-sequence mismatch)` — an
+  inbound gap (loss/reorder) the receiver is holding for.
+
+**A/B protocol — the comparison that shows the win:**
+1. Apply the same shaping for both runs, e.g. `--loss 5 --delay 100`.
+2. **Run A (EGFX on UDP):** start macrdp `--enable-udp-multitransport --enable-h264`
+   with `MACRDP_UDP_MIGRATE_EGFX=1`. Connect mstsc, drive video (scroll a page,
+   play a non-DRM clip), and type continuously.
+3. **Run B (EGFX on TCP):** same flags but **without** `MACRDP_UDP_MIGRATE_EGFX`
+   (EGFX stays on TCP — the safe spike). Same client activity.
+4. Compare: in Run B a lost segment on the shared TCP stream stalls video *and*
+   input together; Run A should keep video moving and input responsive because the
+   video channel is independent of the control TCP. Repeat across loss steps
+   (0% → 2% → 5% → 10%) and a couple of latencies (+60ms, +150ms).
+
+**What to record per cell:** subjective video smoothness + typing latency, the
+retransmit-log rate, and whether the session ever stalls/disconnects. Known thing to
+probe specifically: on a **static screen** under loss (no SCK frames flowing — see
+the flush-burst quirk) the state machine is only pumped by inbound datagrams, so if a
+trailing video segment *and* the client's follow-up ACKs are both lost, recovery can
+be delayed until the next screen change. If that shows up, the fix is a periodic
+timer tick driving `step(now, None)` in the listener — deferred until the soak proves
+it's needed.
+
 ## TL;DR
 
 *Original feasibility framing (2026-06-25), kept for the record. The "don't / not

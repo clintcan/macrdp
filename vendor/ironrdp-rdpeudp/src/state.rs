@@ -71,6 +71,14 @@ pub struct StepOutput {
     pub delivered: Vec<Vec<u8>>,
     /// Encoded datagrams to transmit.
     pub to_send: Vec<Vec<u8>>,
+    /// Diagnostics: how many in-flight **data** segments were retransmitted this
+    /// step because their RTO elapsed. The state machine is sans-I/O and silent;
+    /// the caller (the UDP listener) logs this so a lossy-link soak can confirm
+    /// the recovery path is actually firing. Zero on a clean link.
+    pub retransmits: usize,
+    /// Diagnostics: the client SYN was retransmitted this step (RTO during the
+    /// handshake). Server instances never set this (they don't send a SYN).
+    pub syn_retransmit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +298,7 @@ impl RdpeudpState {
         {
             self.syn_last_sent_ms = now_ms;
             out.to_send.push(self.encode_syn());
+            out.syn_retransmit = true;
         }
 
         if !self.is_established() {
@@ -315,6 +324,7 @@ impl RdpeudpState {
                     ack_vector.clone(),
                 ));
                 sent_data = true;
+                out.retransmits += 1;
             }
         }
 
@@ -659,5 +669,47 @@ mod tests {
             }
             assert_eq!(delivered, msg, "seed {seed}: full in-order delivery");
         }
+    }
+
+    /// The diagnostic `StepOutput.retransmits` counter increments when an
+    /// unacked data segment's RTO elapses (the signal a lossy-link soak watches),
+    /// and stays zero while the segment is still fresh / once it's acked.
+    #[test]
+    fn retransmit_counter_reports_rto_resends() {
+        let (_client, mut server, now) = handshook();
+        let rto = server.cfg.rto_ms;
+
+        // Server sends one data segment; it's now in-flight (unacked).
+        let out = server.enqueue(now, b"hello over udp");
+        assert!(!out.to_send.is_empty(), "data segment went on the wire");
+        assert_eq!(out.retransmits, 0, "first send is not a retransmit");
+
+        // Before the RTO elapses, a timer tick must NOT retransmit.
+        let out = server.step(now + rto - 1, None);
+        assert_eq!(out.retransmits, 0, "still within RTO — no resend");
+
+        // Once the RTO elapses with no ACK, the segment is retransmitted.
+        let out = server.step(now + rto, None);
+        assert_eq!(out.retransmits, 1, "RTO elapsed → exactly one resend");
+        assert!(
+            !out.to_send.is_empty(),
+            "the retransmitted datagram is emitted"
+        );
+
+        // After the peer cumulatively ACKs it, the window drains and further
+        // ticks neither resend nor count.
+        let ack = Datagram::ack(
+            server.send_next.wrapping_sub(1) as i32,
+            8,
+            server.ack_vector(),
+        )
+        .encode()
+        .expect("encode ack");
+        server.step(now + rto, Some(&ack));
+        let out = server.step(now + rto * 4, None);
+        assert_eq!(
+            out.retransmits, 0,
+            "acked segment is no longer retransmitted"
+        );
     }
 }
