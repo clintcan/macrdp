@@ -531,3 +531,19 @@ AND released — #1276 landing is NOT sufficient.
     `RUST_LOG=ironrdp_server::multitransport::listener=debug`; protocol + the
     `scripts/netshape.sh` shaper are in `docs/rdp-udp-multitransport-feasibility.md`
     ("Soak testing the UDP path under loss").
+
+    **Soak fix — periodic retransmit timer (added 2026-06-26):** `run_recv_loop`'s
+    `tokio::select!` now has a third arm, a `retransmit_tick` interval at ¼ RTO that
+    calls `pump_peers_on_timer` (`step(now, None)` on every established peer, sending
+    due retransmits / queued data / owed ACKs; logs `RDPEUDP RTO retransmit (timer)`).
+    WHY: the SM only retransmits when pumped, and pumps were driven *solely* by
+    inbound datagrams / new outbound data. The **first 5%-loss soak deadlocked** —
+    the initial EGFX burst lost segments, the screen went static (no new frames), the
+    client went quiet waiting, so nothing pumped → lost segments never resent → window
+    filled → frozen (blank). The timer pumps during silence; full screen then
+    rendered. Idle ticks emit nothing (pump only sends what's due), so a clean link is
+    unaffected. **NOTE the soak also exposed a *structural* limit this does NOT fix:**
+    the EGFX channel rides one reliable *ordered* RDPEUDP stream, which HOL-blocks on
+    its own loss like TCP — so reliable-only multitransport does not beat TCP for
+    video under loss; that needs Phase 2 (lossy `UdpFecL` + FEC). See the feasibility
+    doc "First soak findings".

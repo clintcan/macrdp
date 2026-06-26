@@ -135,9 +135,9 @@ RUST_LOG=info,ironrdp_server::multitransport::listener=debug
 ```
 
 and watch for:
-- `RDPEUDP RTO retransmit` / `RDPEUDP RTO retransmit (outbound)` — recovery firing
-  (inbound-driven vs server-data path). **Zero on a clean link**; a steady trickle
-  under loss is the system working as intended, not a fault.
+- `RDPEUDP RTO retransmit` / `… (outbound)` / `… (timer)` — recovery firing
+  (inbound-driven / server-data / periodic-timer path). **Zero on a clean link**; a
+  steady trickle under loss is the system working as intended, not a fault.
 - `RDPEUDP reliable data delivered` — in-order bytes reassembled.
 - `RDPEUDP DATA datagram delivered nothing (receive-sequence mismatch)` — an
   inbound gap (loss/reorder) the receiver is holding for.
@@ -162,6 +162,48 @@ trailing video segment *and* the client's follow-up ACKs are both lost, recovery
 be delayed until the next screen change. If that shows up, the fix is a periodic
 timer tick driving `step(now, None)` in the listener — deferred until the soak proves
 it's needed.
+
+### First soak findings (2026-06-26, mstsc, 5% loss + 100 ms/dir)
+
+Two distinct problems surfaced — the first fixed, the second a real limit of
+reliable-only multitransport.
+
+1. **Idle-retransmit deadlock — FIXED (the timer tick above, now landed).** At 5%
+   loss the *first run froze with a blank screen*: the SM was only pumped by inbound
+   datagrams / new outbound data, so the initial EGFX burst's lost segments were
+   never retransmitted, the in-flight window filled, and everything wedged (13 s of
+   inbound silence, zero retransmit logs). The deferred periodic timer (¼ RTO,
+   pumping every established peer with `step(now, None)`) was implemented in
+   response; the full screen then rendered. **So the timer is not optional — any
+   lossy link needs it.**
+
+2. **Steady-state freeze under a high-volume stream — a reliable-transport limit,
+   not a bug.** After rendering, the session still froze in steady state. Root
+   cause is structural: the EGFX channel rides **one reliable, *ordered* RDPEUDP
+   stream**, which has the *same head-of-line blocking as TCP* — a single lost video
+   segment stalls every byte behind it until it's retransmitted. Compounding it in
+   this test: (a) the client requested **1920×1080 on a 1512×982 Mac**, which forces
+   **full frames every tick, no damage rects** (the `configured size != native …
+   full frames every tick` warning) — a huge data volume that hits 5% loss
+   constantly; and (b) the H.264 encoder is throttled to `max_in_flight=2`, and its
+   credit is released by the client's **frame-acknowledge** PDUs *riding the same
+   reliable tunnel inbound* — which HOL-block under the same loss, starving the
+   encoder to a stop (observed: a flood of bare client ACKs, slow 48-byte inbound
+   frame-ack deliveries, then no new frames).
+
+   **The takeaway reframes the value prop:** reliable-only UDP multitransport
+   *isolates video from other channels' loss*, but the video stream still
+   HOL-blocks on its **own** loss — so it does **not** beat TCP for video on a lossy
+   link. The genuine loss-resilience win needs **Phase 2: the lossy `UdpFecL`
+   transport + FEC**, where video tolerates loss without retransmit-blocking. That
+   is now the clear next milestone if lossy-link video is the goal.
+
+   **Isolation experiments to run next** (cheap, pin the contribution of each
+   factor before committing to Phase 2): re-test at a **client resolution matching
+   the Mac** (kills the full-frame-every-tick volume → damage-rect updates) and at
+   **lower loss (1–2%)**; and A/B against EGFX-on-TCP (flag off) under identical
+   shaping to confirm the isolation benefit on the *other* channels even while video
+   is HOL-limited.
 
 ## TL;DR
 

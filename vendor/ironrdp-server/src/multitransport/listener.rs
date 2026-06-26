@@ -187,6 +187,32 @@ async fn send_datagrams(socket: &UdpSocket, peer_addr: SocketAddr, to_send: Vec<
     }
 }
 
+/// (Soak fix) Pump every established peer's reliability state machine on a timer
+/// tick (`step(now, None)`), shipping any due retransmits / queued data / owed ACK.
+/// This is what keeps the RTO retransmit clock running when neither inbound nor
+/// outbound traffic is flowing — without it a lossy link deadlocks (see the
+/// `retransmit_tick` rationale in `run_recv_loop`). Idle ticks emit nothing.
+async fn pump_peers_on_timer(
+    socket: &UdpSocket,
+    peers: &mut HashMap<SocketAddr, Peer>,
+    now_ms: u64,
+    mtu: u16,
+) {
+    for (addr, peer) in peers.iter_mut() {
+        if !peer.sm.is_established() {
+            continue;
+        }
+        let out = peer.sm.step(now_ms, None);
+        let (retransmits, syn_retransmit) = (out.retransmits, out.syn_retransmit);
+        if !out.to_send.is_empty() {
+            send_datagrams(socket, *addr, out.to_send, mtu).await;
+        }
+        if retransmits > 0 || syn_retransmit {
+            debug!(peer_addr = %addr, retransmits, syn_retransmit, "RDPEUDP RTO retransmit (timer)");
+        }
+    }
+}
+
 /// (M5c) Ship one server-originated HigherLayerData chunk to a bound peer: wrap it
 /// in `RDP_TUNNEL_DATA` (action 0x2), encrypt through the peer's MS-RDPEMT TLS, and
 /// send the resulting ciphertext reliably over RDPEUDP. Best-effort — an unbound
@@ -359,6 +385,21 @@ async fn run_recv_loop(
     let start = tokio::time::Instant::now();
     let mut buf = vec![0u8; 2048];
 
+    // (Soak fix) Periodic clock for the reliability state machines. The SM only
+    // retransmits / drains its send window when it's pumped (step/enqueue), and
+    // those are otherwise driven solely by inbound datagrams or new outbound data.
+    // On a lossy link that deadlocks: the initial EGFX burst loses segments, no new
+    // frames flow (static screen) and the client goes quiet waiting for the missing
+    // data, so nothing pumps → the lost segments are never resent → the in-flight
+    // window fills → frozen session (observed live at 5% loss). A timer well under
+    // the RTO pumps every peer on a `None` tick so retransmits fire on schedule even
+    // when both traffic directions are idle. Idle ticks send nothing (pump only
+    // emits due retransmits / queued data / an owed ACK), so the cost is negligible.
+    let tick_ms = (cfg.rto_ms / 4).clamp(20, 100);
+    let mut retransmit_tick = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
+    retransmit_tick
+        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         // (M5c) The recv loop is now bidirectional: it reads inbound datagrams AND
         // ships server-originated channel data (EGFX over the tunnel). When no
@@ -381,6 +422,11 @@ async fn run_recv_loop(
                     continue;
                 }
             },
+            _ = retransmit_tick.tick() => {
+                let now_ms = start.elapsed().as_millis() as u64;
+                pump_peers_on_timer(&socket, &mut peers, now_ms, cfg.mtu).await;
+                continue;
+            }
             out = outbound => {
                 let now_ms = start.elapsed().as_millis() as u64;
                 match out {
