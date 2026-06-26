@@ -401,7 +401,19 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   loss-resilience improvement. This de-risks: we get a working lossy audio path before
   taking on a Reed–Solomon implementation.
 
-- **P2.4 — lossy audio DVC (the actual payoff).** Researched and important: audio over
+- **P2.4a — MS-RDPEMT tunnel over DTLS (DONE, GREEN 2026-06-26).** The prerequisite
+  for any lossy channel: decrypt the client's DTLS application records, answer its
+  `RDP_TUNNEL_CREATEREQUEST` with a `CREATERESPONSE(S_OK)` re-encrypted through DTLS,
+  binding the tunnel to the TCP session via the same cookie registry as the reliable
+  flow. **Verified live on real mstsc:** handshake → CREATEREQUEST (cookie matched the
+  issued cookie) → CREATERESPONSE → **tunnel established, and the client stopped
+  retransmitting** (the definitive "it accepted us" signal). Implementation: added
+  `DtlsConn::recv`/`send` (post-handshake `ssl_read`/`ssl_write`) and made
+  `handle_emt_tunnel` transport-agnostic (returns the response plaintext; the caller
+  encrypts via rustls *or* DTLS) — the reliable path is unchanged. This is the gateway
+  to lossy audio (P2.4b below).
+
+- **P2.4b — lossy audio DVC (the actual payoff).** Researched and important: audio over
   UDP is **NOT** a redirect of the static `rdpsnd` SVC. It requires a **dynamic virtual
   channel**, `AUDIO_PLAYBACK_LOSSY_DVC` (MS-RDPEA §2.1; FreeRDP calls it
   `RDPSND_LOSSY_DVC_CHANNEL_NAME`), migrated onto the tunnel via Soft-Sync. The good news:

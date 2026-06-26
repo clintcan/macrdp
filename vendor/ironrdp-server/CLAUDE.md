@@ -581,3 +581,17 @@ AND released — #1276 landing is NOT sufficient.
     boring (multitransport feature always-on for macrdp); runtime DTLS path only
     runs for a lossy peer, i.e. only when `MACRDP_UDP_OFFER_FECL=1`. See the
     feasibility doc "P2.1 … Result (P2.1a)".
+
+    P2.4a — MS-RDPEMT tunnel over DTLS (2026-06-26): post-handshake, decrypt the
+    client's DTLS app records (`DtlsConn::recv` = `ssl_read`), parse the EMT PDUs,
+    answer `RDP_TUNNEL_CREATEREQUEST` with `CREATERESPONSE(S_OK)` re-encrypted
+    through DTLS (`DtlsConn::send` = `ssl_write`), binding via the same cookie
+    registry as the reliable flow. `handle_emt_tunnel` was made transport-agnostic
+    — it no longer writes into the rustls conn; it returns `EmtTunnelOutcome
+    { bound_cookie, response }` and the caller encrypts the response via rustls
+    (reliable) OR DTLS (lossy). Reliable path behavior unchanged (writes the same
+    bytes at the same point, before its `wants_write` drain). **Verified GREEN on
+    real mstsc**: CREATEREQUEST cookie matched the issued cookie → CREATERESPONSE
+    sent → tunnel established AND the client STOPPED retransmitting (the definitive
+    accept signal). Next = P2.4b (migrate the AUDIO_PLAYBACK_LOSSY_DVC audio
+    channel onto the tunnel). See feasibility doc "P2.4a".

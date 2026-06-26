@@ -209,6 +209,39 @@ impl DtlsConn {
         matches!(self.state, State::Established(_))
     }
 
+    /// (Post-handshake) Decrypt ONE inbound DTLS application datagram (pulled
+    /// from an RDPEUDP lossy payload) → plaintext (the MS-RDPEMT tunnel PDU
+    /// bytes). `Ok(None)` when the record yielded no plaintext (e.g. a
+    /// retransmit/alert consumed internally). Errors if not yet established.
+    pub fn recv(&mut self, input: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let State::Established(s) = &mut self.state else {
+            return Err(io::Error::other("DTLS not established"));
+        };
+        if !input.is_empty() {
+            s.get_mut().inbound = input.to_vec();
+        }
+        let mut buf = vec![0u8; 16 * 1024];
+        match s.ssl_read(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(buf))
+            }
+            Err(e) if e.would_block() => Ok(None),
+            Err(e) => Err(io::Error::other(format!("DTLS read: {e}"))),
+        }
+    }
+
+    /// (Post-handshake) Encrypt `plaintext` (an MS-RDPEMT tunnel PDU) → the
+    /// outbound DTLS datagram(s) to send back (wrap each in an RDPEUDP payload).
+    pub fn send(&mut self, plaintext: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+        let State::Established(s) = &mut self.state else {
+            return Err(io::Error::other("DTLS not established"));
+        };
+        s.ssl_write(plaintext)
+            .map_err(|e| io::Error::other(format!("DTLS write: {e}")))?;
+        Ok(drain_outbound(s.get_mut()))
+    }
+
     fn transport_mut(&mut self) -> Option<&mut MemTransport> {
         match &mut self.state {
             State::Handshaking(Some(mid)) => Some(mid.get_mut()),

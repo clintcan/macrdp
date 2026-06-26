@@ -294,14 +294,24 @@ async fn ship_outbound(
     }
 }
 
-/// Parse complete MS-RDPEMT tunnel PDUs from the TLS-decrypted plaintext and, on
-/// the client's `RDP_TUNNEL_CREATEREQUEST`, write a `CREATERESPONSE(S_OK)` into
-/// the TLS connection (its encrypted bytes are picked up by the caller's
-/// `write_tls` drain). Consumes parsed PDUs from the front of `buf`; leaves a
-/// partial trailing PDU buffered for the next call. The client retransmits the
-/// request until it sees the response, so we reply once (gated by
-/// `tunnel_created`) and drop the retransmits. RDP_TUNNEL_DATA (channel
-/// migration) is M5 — logged and skipped for now.
+/// What `handle_emt_tunnel` decided this call: the cookie of a tunnel bound (so
+/// the caller can map it to the peer for the server→listener handoff), and the
+/// plaintext `CREATERESPONSE` to send back (the caller encrypts + ships it
+/// through whichever transport secures this flow — rustls for reliable, DTLS for
+/// lossy). Transport-agnostic so both flows share the EMT PDU parsing.
+#[derive(Default)]
+struct EmtTunnelOutcome {
+    bound_cookie: Option<[u8; 16]>,
+    response: Option<Vec<u8>>,
+}
+
+/// Parse complete MS-RDPEMT tunnel PDUs from the *decrypted* plaintext and, on
+/// the client's `RDP_TUNNEL_CREATEREQUEST`, return a `CREATERESPONSE(S_OK)` for
+/// the caller to encrypt + send. Consumes parsed PDUs from the front of `buf`;
+/// leaves a partial trailing PDU buffered for the next call. The client
+/// retransmits the request until it sees the response, so we reply once (gated
+/// by `tunnel_created`) and drop the retransmits. RDP_TUNNEL_DATA is forwarded
+/// to the owning connection's inbound sink.
 ///
 /// `cookie_registry` (M5a) binds the tunnel to a real TCP session: when present,
 /// the CREATEREQUEST's echoed cookie must be one the server issued (and not yet
@@ -310,17 +320,14 @@ async fn ship_outbound(
 /// cookie (the soft pre-M5a behavior, used by the handshake-only test path).
 fn handle_emt_tunnel(
     peer_addr: SocketAddr,
-    tls: &mut ServerConnection,
     buf: &mut Vec<u8>,
     tunnel_created: &mut bool,
     cookie_registry: Option<&CookieRegistry>,
     inbound: &mut Option<UnboundedSender<Vec<u8>>>,
-) -> Option<[u8; 16]> {
+) -> EmtTunnelOutcome {
     use ironrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
 
-    // The cookie of a tunnel bound during this call, so the caller can map it to
-    // this peer address for the server→listener data handoff (M5c).
-    let mut bound_cookie: Option<[u8; 16]> = None;
+    let mut outcome = EmtTunnelOutcome::default();
 
     while let Some(total) = emt::peek_pdu_len(buf) {
         if buf.len() < total {
@@ -362,14 +369,10 @@ fn handle_emt_tunnel(
                             %cookie,
                             "MS-RDPEMT tunnel CREATEREQUEST bound to session — replying CREATERESPONSE(S_OK)"
                         );
-                        let resp = TunnelCreateResponse::ok().to_vec();
-                        if tls.writer().write_all(&resp).is_ok() {
-                            *tunnel_created = true;
-                            *inbound = inbound_sink;
-                            bound_cookie = Some(req.security_cookie);
-                        } else {
-                            warn!(%peer_addr, "failed to write MS-RDPEMT CREATERESPONSE into TLS");
-                        }
+                        *tunnel_created = true;
+                        *inbound = inbound_sink;
+                        outcome.bound_cookie = Some(req.security_cookie);
+                        outcome.response = Some(TunnelCreateResponse::ok().to_vec());
                     }
                 }
                 Err(e) => warn!(%peer_addr, error = %e, "malformed MS-RDPEMT CREATEREQUEST"),
@@ -401,7 +404,7 @@ fn handle_emt_tunnel(
         }
     }
 
-    bound_cookie
+    outcome
 }
 
 async fn run_recv_loop(
@@ -625,32 +628,85 @@ async fn run_recv_loop(
                         sm,
                         dtls: dtls_opt,
                         dtls_done_logged,
+                        emt_inbound,
+                        tunnel_created,
+                        inbound_sink,
                         ..
                     } = peer;
                     if let Some(conn) = dtls_opt.as_mut() {
+                        let mut dtls_err = false;
                         for chunk in &out.delivered {
-                            match conn.read_datagram(chunk) {
-                                Ok(outs) => {
-                                    // Send each DTLS datagram as its own RDPEUDP
-                                    // source payload (DTLS MTU < RDPEUDP MTU, so a
-                                    // datagram is never split across two).
-                                    for dg in outs {
-                                        let o = sm.enqueue(now_ms, &dg);
-                                        send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
+                            if conn.is_handshake_done() {
+                                // (P2.4) Post-handshake: decrypt the DTLS app record
+                                // and accumulate the MS-RDPEMT plaintext for parsing.
+                                match conn.recv(chunk) {
+                                    Ok(Some(pt)) => emt_inbound.extend_from_slice(&pt),
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(%peer_addr, error = %e, "DTLS app-record decrypt error on lossy flow");
+                                        dtls_err = true;
+                                        break;
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(%peer_addr, error = %e, "DTLS handshake error on lossy flow");
-                                    break;
+                            } else {
+                                // Handshake flights: feed one datagram, ship the
+                                // resulting datagram(s) (DTLS MTU < RDPEUDP MTU so
+                                // each is never split across two).
+                                match conn.read_datagram(chunk) {
+                                    Ok(outs) => {
+                                        for dg in outs {
+                                            let o = sm.enqueue(now_ms, &dg);
+                                            send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(%peer_addr, error = %e, "DTLS handshake error on lossy flow");
+                                        dtls_err = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        if conn.is_handshake_done() && !*dtls_done_logged {
+                        if !dtls_err && conn.is_handshake_done() && !*dtls_done_logged {
                             *dtls_done_logged = true;
                             warn!(
                                 %peer_addr,
                                 "P2.1 GREEN: DTLS 1.2 handshake COMPLETE on the LOSSY (UdpFecL) flow — MS-RDPEMT-over-DTLS reachable"
                             );
+                        }
+                        // (P2.4a) Once DTLS is established, parse any accumulated
+                        // MS-RDPEMT PDUs and answer the tunnel CREATEREQUEST —
+                        // encrypted back through DTLS. handle_emt_tunnel gates the
+                        // response on !tunnel_created, so it's sent exactly once.
+                        if !dtls_err && conn.is_handshake_done() && !emt_inbound.is_empty() {
+                            let outcome = handle_emt_tunnel(
+                                peer_addr,
+                                emt_inbound,
+                                tunnel_created,
+                                cookie_registry.as_ref(),
+                                inbound_sink,
+                            );
+                            if let Some(cookie) = outcome.bound_cookie {
+                                bound_addrs.insert(cookie, peer_addr);
+                            }
+                            if let Some(resp) = outcome.response {
+                                match conn.send(&resp) {
+                                    Ok(dgs) => {
+                                        for dg in dgs {
+                                            let o = sm.enqueue(now_ms, &dg);
+                                            send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
+                                        }
+                                        warn!(
+                                            %peer_addr,
+                                            "P2.4 GREEN: MS-RDPEMT tunnel ESTABLISHED over DTLS (lossy flow) — CREATERESPONSE(S_OK) sent"
+                                        );
+                                    }
+                                    Err(e) => warn!(
+                                        %peer_addr, error = %e,
+                                        "failed to encrypt MS-RDPEMT CREATERESPONSE through DTLS"
+                                    ),
+                                }
+                            }
                         }
                     }
                 }
@@ -720,21 +776,26 @@ async fn run_recv_loop(
                         }
                     }
 
-                    // M4c: answer the client's RDP_TUNNEL_CREATEREQUEST. Writing the
-                    // response into the TLS connection here means the wants_write
-                    // drain below picks up its encrypted bytes. M5a: bind the
-                    // tunnel to a real TCP session via the cookie registry.
-                    if let Some(cookie) = handle_emt_tunnel(
+                    // M4c: answer the client's RDP_TUNNEL_CREATEREQUEST. Write the
+                    // response into the TLS connection so the wants_write drain
+                    // below picks up its encrypted bytes. M5a: bind the tunnel to a
+                    // real TCP session via the cookie registry.
+                    let outcome = handle_emt_tunnel(
                         peer_addr,
-                        tls,
                         emt_inbound,
                         tunnel_created,
                         cookie_registry.as_ref(),
                         inbound_sink,
-                    ) {
+                    );
+                    if let Some(cookie) = outcome.bound_cookie {
                         // (M5c) Record cookie -> this peer so server-originated
                         // tunnel data (keyed by the same cookie) reaches it.
                         bound_addrs.insert(cookie, peer_addr);
+                    }
+                    if let Some(resp) = outcome.response {
+                        if tls.writer().write_all(&resp).is_err() {
+                            warn!(%peer_addr, "failed to write MS-RDPEMT CREATERESPONSE into TLS");
+                        }
                     }
 
                     while tls.wants_write() {
