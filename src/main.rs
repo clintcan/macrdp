@@ -1074,7 +1074,22 @@ fn generate_and_persist(
     Ok((vec![cert_der], key_der))
 }
 
-fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>, Arc<ServerConfig>)> {
+/// The TLS material derived from the persisted cert/key, shared across the TCP
+/// connection and the UDP multitransport flows.
+struct TlsMaterial {
+    /// rustls acceptor for the main TCP RDP connection.
+    acceptor: TlsAcceptor,
+    /// Raw `subjectPublicKey` BIT STRING for CredSSP channel binding.
+    spki_der: Vec<u8>,
+    /// rustls config reused to secure the reliable (`UdpFecR`) UDP flow.
+    config: Arc<ServerConfig>,
+    /// Cert DER, for building the lossy (`UdpFecL`) flow's DTLS context (Phase 2).
+    cert_der: Vec<u8>,
+    /// Private-key DER, same purpose as `cert_der`.
+    key_der: Vec<u8>,
+}
+
+fn make_tls_acceptor(cert_dir: &Path) -> Result<TlsMaterial> {
     let cert_path = cert_dir.join("cert.pem");
     let key_path = cert_dir.join("key.pem");
 
@@ -1104,6 +1119,11 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>, Arc<Serve
         .raw_bytes()
         .to_vec();
 
+    // Capture the cert + key DER before they're moved into the rustls config —
+    // the lossy UDP flow's DTLS server (Phase 2) is built from the same bytes.
+    let cert_der = cert_der_bytes.to_vec();
+    let key_der = key.secret_der().to_vec();
+
     let config = Arc::new(
         ServerConfig::builder()
             .with_no_client_auth()
@@ -1111,9 +1131,16 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>, Arc<Serve
             .context("build rustls ServerConfig")?,
     );
     // The same cert/config also secures the auxiliary UDP multitransport (MS-RDPEMT
-    // over TLS) — the client trusts it via the main connection's TOFU. Returned so
-    // the UDP listener can reuse it without re-loading the cert.
-    Ok((TlsAcceptor::from(Arc::clone(&config)), spki_der, config))
+    // over TLS for the reliable flow; DTLS for the lossy flow) — the client trusts
+    // it via the main connection's TOFU. Returned so the UDP listener can reuse it
+    // without re-loading the cert.
+    Ok(TlsMaterial {
+        acceptor: TlsAcceptor::from(Arc::clone(&config)),
+        spki_der,
+        config,
+        cert_der,
+        key_der,
+    })
 }
 
 /// Spawn the session-transition watcher used by `--detach-primary`
@@ -1775,7 +1802,13 @@ async fn async_main() -> Result<()> {
         Some(p) => p,
         None => default_cert_dir()?,
     };
-    let (tls, spki_der, udp_tls_config) = make_tls_acceptor(&cert_dir)?;
+    let TlsMaterial {
+        acceptor: tls,
+        spki_der,
+        config: udp_tls_config,
+        cert_der: udp_cert_der,
+        key_der: udp_key_der,
+    } = make_tls_acceptor(&cert_dir)?;
 
     // Resolve desktop dimensions + geometry. Three paths:
     //   - virtual display: width/height are already enforced as required
@@ -2132,12 +2165,27 @@ async fn async_main() -> Result<()> {
         // migrated onto the tunnel) through the sender; the listener owns the rx
         // and ships them as RDP_TUNNEL_DATA over the bound peer's UDP tunnel.
         let (tunnel_sender, tunnel_rx) = ironrdp_server::tunnel_channel();
+        // Phase 2 (P2.1a): a DTLS 1.2 server context for the LOSSY (UdpFecL) flow,
+        // built from the same cert as the TCP/reliable path. Non-fatal if it fails
+        // to build (the lossy flow then falls back to observe-only); the reliable
+        // flow is unaffected.
+        let udp_dtls_config = match ironrdp_server::DtlsServerContext::from_der(
+            &udp_cert_der,
+            &udp_key_der,
+        ) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                warn!(error = %e, "could not build DTLS server context for the lossy UDP flow; lossy stays observe-only");
+                None
+            }
+        };
         match ironrdp_server::UdpMultitransportListener::bind(
             args.bind,
             cfg,
             Some(udp_tls_config.clone()),
             Some(cookie_registry.clone()),
             Some(tunnel_rx),
+            udp_dtls_config,
         )
         .await
         {

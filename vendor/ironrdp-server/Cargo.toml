@@ -30,7 +30,7 @@ egfx = ["dep:ironrdp-egfx"]
 # the standard build is byte-identical. M1 performs the negotiation handshake;
 # M3 adds the UDP listener + RDPEUDP SYN/SYN+ACK handshake (pulls in the
 # sans-I/O ironrdp-rdpeudp crate for the wire codecs + reliability SM).
-multitransport = ["dep:ironrdp-rdpeudp", "dep:getrandom"]
+multitransport = ["dep:ironrdp-rdpeudp", "dep:getrandom", "dep:boring"]
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at any time.
@@ -64,6 +64,12 @@ ironrdp-rdpdr = "0.5" # public (vendored — server-direction RDPDR)
 # via the root patch to the same git rev.
 ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", optional = true }
 getrandom = { version = "0.2", optional = true } # multitransport: CSPRNG cookie
+# (vendored, multitransport-only, Phase 2) DTLS 1.2 server for the LOSSY
+# (`UdpFecL`) flow — sans-I/O over boring's custom-BIO `SslStream`. BoringSSL is
+# vendored + built from source (needs cmake + Go + libclang at build time;
+# GitHub-hosted CI runners ship all three). Coexists with rustls's aws-lc-rs/ring
+# via symbol prefixing. Only pulled in with the multitransport feature.
+boring = { version = "4", optional = true }
 tracing = { version = "0.1", features = ["log"] }
 x509-cert = { version = "0.2.5", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }

@@ -365,7 +365,24 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   self-signed cert as TCP/the reliable flow. **Risk:** a second C-crypto stack in the
   signed/notarized macOS binary — verify the build + notarization still pass (we already
   link aws-lc-rs/ring, so the toolchain exists, but `boring` is a distinct BoringSSL
-  vendored build). Spike the mstsc DTLS-1.0 handshake interop against a capture.
+  vendored build). Spike the mstsc DTLS handshake interop against a capture.
+
+  **Result (P2.1a, 2026-06-26): GREEN — verified live on real mstsc.** The DTLS
+  1.2 server handshake **completes** over the lossy (`UdpFecL`) RDPEUDP flow,
+  sans-I/O via `boring`'s custom-BIO `SslStream` (`multitransport/dtls.rs`),
+  driven datagram-by-datagram from the listener. Timeline from the log: client
+  DTLS 1.2 ClientHello → server flight (ServerHello/Certificate/Done) → client
+  ClientKeyExchange+ChangeCipherSpec+Finished → **handshake complete in ~13 ms /
+  ~2 RTT**, no errors. Build facts confirmed: `boring`/BoringSSL builds with the
+  local Go+cmake+libclang toolchain and coexists with rustls's aws-lc-rs; **no
+  DTLS cookie exchange needed** (BoringSSL dropped `DTLSv1_listen`); `set_mtu(1100)`
+  + `SslOptions::NO_DTLSV1` pin 1.2 (boring has no DTLS `SslVersion` constants).
+  Two follow-ups observed: (1) post-handshake the client retransmits an encrypted
+  MS-RDPEMT `CREATEREQUEST` (~5/s) we don't answer yet — that's **P2.4**
+  (EMT-over-DTLS tunnel); (2) the lossy flow is still driven through the
+  *reliable* RDPEUDP SM (fine on a clean link; proper lossy delivery is P2.2).
+  Env-gated (`MACRDP_UDP_OFFER_FECL=1`) + default-off; the reliable path is
+  byte-unchanged.
 
 - **P2.2 — lossy RDPEUDP state machine.** Extend `vendor/ironrdp-rdpeudp` with a lossy
   mode alongside the existing reliable one: source packets sent **without retransmit**,

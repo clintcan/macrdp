@@ -234,10 +234,16 @@ mod tests {
         let cfg = ListenerConfig::default();
         // No TLS config, no cookie registry, no tunnel handoff: this test only
         // exercises the SYN→SYN+ACK handshake (soft cookie binding).
-        let listener =
-            UdpMultitransportListener::bind("127.0.0.1:0".parse().unwrap(), cfg, None, None, None)
-                .await
-                .expect("bind listener");
+        let listener = UdpMultitransportListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            cfg,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bind listener");
         let server_addr = listener.local_addr();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

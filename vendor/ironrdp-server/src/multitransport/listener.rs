@@ -37,6 +37,7 @@ use ironrdp_rdpeudp::datagram::Datagram;
 use ironrdp_rdpeudp::pdu::FecFlags;
 use ironrdp_rdpeudp::state::{Config, RdpeudpState, Role};
 
+use crate::multitransport::dtls::{DtlsConn, DtlsServerContext};
 use crate::multitransport::{CookieRegistry, TunnelOutbound};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -106,9 +107,15 @@ struct Peer {
     inbound_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     /// (P2.0 spike) Set once this peer is observed sending a **DTLS** ClientHello
     /// — i.e. it opened a *lossy* (`UdpFecL`) flow. When set, we do NOT feed this
-    /// peer's bytes into rustls (DTLS records aren't TLS records and would only
-    /// produce error spam): the spike is observe-only, no DTLS is implemented.
+    /// peer's bytes into rustls (DTLS records aren't TLS records). Instead, when a
+    /// DTLS server context is configured, P2.1 drives a DTLS handshake (below).
     dtls_observed: bool,
+    /// (P2.1a) The DTLS 1.2 server handshake for a lossy peer, created lazily on
+    /// the first delivered data once `dtls_observed` and a DTLS context is set.
+    /// `None` on the reliable path or the observe-only (no-DTLS-context) path.
+    dtls: Option<DtlsConn>,
+    /// Whether we've logged DTLS-handshake completion (avoid log spam).
+    dtls_done_logged: bool,
 }
 
 /// (P2.0 spike) Scan a raw RDPEUDP datagram for a **DTLS handshake** record — the
@@ -146,12 +153,19 @@ impl UdpMultitransportListener {
     /// When set, an inbound tunnel `CREATEREQUEST` is accepted only if its echoed
     /// cookie is registered (binding the UDP flow to a real TCP session, one-time
     /// use). `None` leaves binding soft (accept any cookie — handshake-test path).
+    ///
+    /// `dtls_config` (Phase 2 / P2.1a) is the DTLS 1.2 server context used to
+    /// secure the LOSSY (`UdpFecL`) flow (built from the SAME cert as the TCP /
+    /// reliable path). When set, a peer observed sending a DTLS ClientHello (a
+    /// lossy flow) is driven through a DTLS handshake instead of rustls. `None`
+    /// leaves the lossy flow observe-only (the P2.0 spike behavior).
     pub async fn bind(
         addr: SocketAddr,
         cfg: ListenerConfig,
         tls_config: Option<Arc<ServerConfig>>,
         cookie_registry: Option<CookieRegistry>,
         tunnel_rx: Option<UnboundedReceiver<TunnelOutbound>>,
+        dtls_config: Option<DtlsServerContext>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
@@ -159,6 +173,7 @@ impl UdpMultitransportListener {
         debug!(
             %local_addr, ?cfg,
             tls = tls_config.is_some(),
+            dtls = dtls_config.is_some(),
             cookie_binding = cookie_registry.is_some(),
             tunnel_handoff = tunnel_rx.is_some(),
             "RDPEUDP multitransport listener bound"
@@ -169,6 +184,7 @@ impl UdpMultitransportListener {
             tls_config,
             cookie_registry,
             tunnel_rx,
+            dtls_config,
         ));
         Ok(Self { local_addr, task })
     }
@@ -394,6 +410,7 @@ async fn run_recv_loop(
     tls_config: Option<Arc<ServerConfig>>,
     cookie_registry: Option<CookieRegistry>,
     mut tunnel_rx: Option<UnboundedReceiver<TunnelOutbound>>,
+    dtls_config: Option<DtlsServerContext>,
 ) {
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
     // (M5c) cookie -> peer address, populated when a tunnel binds, so
@@ -515,6 +532,8 @@ async fn run_recv_loop(
                 tunnel_created: false,
                 inbound_sink: None,
                 dtls_observed: false,
+                dtls: None,
+                dtls_done_logged: false,
             }
         });
 
@@ -584,6 +603,57 @@ async fn run_recv_loop(
                     %peer_addr,
                     "RDPEUDP reliable stream carries a TLS ClientHello (MS-RDPEMT handshake starting)"
                 );
+            }
+
+            // (P2.1a) LOSSY flow: drive the DTLS 1.2 server handshake. The DTLS
+            // records ride this flow's RDPEUDP payloads, so we feed each delivered
+            // chunk (one datagram — the boundary rule in `dtls.rs`) into boring
+            // and ship the resulting datagram(s) back over RDPEUDP. Reaching
+            // "established" proves MS-RDPEMT-over-DTLS is reachable (P2.1a scope;
+            // the EMT tunnel + lossy audio DVC over it are P2.4+). Mutually
+            // exclusive with the rustls block below (that one is gated on
+            // `!dtls_observed`).
+            if peer.dtls_observed {
+                if let Some(dtls_ctx) = dtls_config.as_ref() {
+                    if peer.dtls.is_none() {
+                        match dtls_ctx.new_conn() {
+                            Ok(c) => peer.dtls = Some(c),
+                            Err(e) => warn!(%peer_addr, error = %e, "failed to create DTLS server conn"),
+                        }
+                    }
+                    let Peer {
+                        sm,
+                        dtls: dtls_opt,
+                        dtls_done_logged,
+                        ..
+                    } = peer;
+                    if let Some(conn) = dtls_opt.as_mut() {
+                        for chunk in &out.delivered {
+                            match conn.read_datagram(chunk) {
+                                Ok(outs) => {
+                                    // Send each DTLS datagram as its own RDPEUDP
+                                    // source payload (DTLS MTU < RDPEUDP MTU, so a
+                                    // datagram is never split across two).
+                                    for dg in outs {
+                                        let o = sm.enqueue(now_ms, &dg);
+                                        send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(%peer_addr, error = %e, "DTLS handshake error on lossy flow");
+                                    break;
+                                }
+                            }
+                        }
+                        if conn.is_handshake_done() && !*dtls_done_logged {
+                            *dtls_done_logged = true;
+                            warn!(
+                                %peer_addr,
+                                "P2.1 GREEN: DTLS 1.2 handshake COMPLETE on the LOSSY (UdpFecL) flow — MS-RDPEMT-over-DTLS reachable"
+                            );
+                        }
+                    }
+                }
             }
 
             // M4b/M4c: drive the MS-RDPEMT server-side TLS handshake over the

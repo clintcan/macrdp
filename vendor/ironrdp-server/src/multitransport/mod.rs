@@ -21,6 +21,7 @@
 //! `migration` submodules (the UDP transport + channel migration); the trait
 //! will gain methods accordingly.
 
+pub mod dtls;
 pub mod listener;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};

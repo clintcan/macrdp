@@ -36,6 +36,8 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 #[cfg(feature = "multitransport")]
+pub use multitransport::dtls::DtlsServerContext;
+#[cfg(feature = "multitransport")]
 pub use multitransport::listener::{ListenerConfig, UdpMultitransportListener};
 #[cfg(feature = "multitransport")]
 pub use multitransport::{CookieRegistry, MultitransportProvider, TunnelSender, encode_initiate_request, tunnel_channel};

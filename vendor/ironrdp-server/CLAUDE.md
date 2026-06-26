@@ -561,3 +561,23 @@ AND released — #1276 landing is NOT sufficient.
     session is unaffected (the lossy handshake just retries unanswered). Default
     build/offer is unchanged reliable; this is harness for the Phase 2 lossy work.
     See the feasibility doc "P2.0 — Go/No-Go spike".
+
+    P2.1a — DTLS 1.2 server handshake on the lossy flow (2026-06-26,
+    `multitransport/dtls.rs`, gated `dep:boring` under the `multitransport`
+    feature): a sans-I/O DTLS 1.2 server over boring's custom-BIO `SslStream`
+    (`DtlsServerContext::from_der` built from the same cert as the TCP/reliable
+    path; per-peer `DtlsConn::read_datagram` fed one delivered chunk = one
+    datagram at a time — the load-bearing boundary rule). The listener creates a
+    `DtlsConn` for a `dtls_observed` peer when a `DtlsServerContext` is passed to
+    `bind` (6th arg; `None` = observe-only), feeds delivered datagrams, and ships
+    the handshake flights back via the reliable SM's `enqueue`. **Verified GREEN
+    on real mstsc**: full DTLS 1.2 handshake completes in ~13 ms / ~2 RTT over the
+    lossy flow, no errors. boring config: `SslMethod::dtls()` + `set_mtu(1100)` +
+    `SslOptions::NO_DTLSV1` (boring has no DTLS `SslVersion` consts) + `set_verify(NONE)`;
+    no cookie exchange (BoringSSL dropped `DTLSv1_listen`). BoringSSL is vendored +
+    built from source (cmake+Go+libclang; coexists with rustls aws-lc-rs via symbol
+    prefixing). Scope is handshake-only — post-handshake the client retransmits an
+    encrypted EMT `CREATEREQUEST` we don't answer yet (P2.4). Default build pulls in
+    boring (multitransport feature always-on for macrdp); runtime DTLS path only
+    runs for a lossy peer, i.e. only when `MACRDP_UDP_OFFER_FECL=1`. See the
+    feasibility doc "P2.1 … Result (P2.1a)".
