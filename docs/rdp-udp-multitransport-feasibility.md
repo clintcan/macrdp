@@ -425,6 +425,47 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   tunnel. This is the **substantial, genuinely-new** piece of Phase 2 — a new audio
   channel, not a wiring change.
 
+  **P2.4b-1 spike result (2026-06-27): the DVC audio handshake works — but the EGFX
+  "negotiate-on-TCP-then-migrate" pattern does NOT carry over to a *lossy*-named channel.**
+  Verified on real mstsc. Built a `DvcProcessor` for the audio DVC
+  (`vendor/ironrdp-server/src/multitransport/audio_dvc.rs`, gated behind the experimental
+  `MACRDP_UDP_LOSSY_AUDIO` env, default off) that, on channel open, sends Server Audio
+  Formats (v8) and runs the MS-RDPEA handshake, reusing `ironrdp-rdpsnd`'s
+  `ServerAudioOutputPdu`/`ClientAudioOutputPdu` codecs verbatim (the **SNDPROLOG header is
+  kept** — byte-identical to the static path). Three concrete findings:
+  - **A channel literally named `AUDIO_PLAYBACK_LOSSY_DVC` is rejected if the server pushes
+    anything on it over TCP/DRDYNVC.** mstsc accepts the DVC Create (it can't refuse), then
+    on receiving our Server Audio Formats over TCP it goes **silent and stops reading the
+    whole TCP socket** (broken pipe ~3–4 s later — it kills EGFX/everything, not just
+    audio). So the lossy DVC must be **Soft-Synced onto the lossy tunnel *before* any data**,
+    with the handshake running over the tunnel — the opposite of EGFX, where the channel
+    negotiates over TCP and is migrated to the *reliable* tunnel afterward. (This contradicts
+    a naive reading of MS-RDPEDYC Soft-Sync — "all DVC data rides DRDYNVC until Soft-Sync
+    completes" — which is true *in general* but the `_LOSSY_`-named channel is the exception:
+    mstsc treats data on it over TCP as a violation.)
+  - **The reliable `AUDIO_PLAYBACK_DVC` name works perfectly over TCP** (diagnostic env
+    `MACRDP_AUDIO_DVC_RELIABLE=1`): Server Audio Formats → Client Audio Formats (AAC chosen)
+    → Client Quality Mode → Server Training → Client Training Confirm all round-trip, audio
+    plays, EGFX stays healthy. This is the discriminator that proved the channel *name* is
+    the blocker — not the PDU framing, and not coexistence with static rdpsnd.
+  - **Dual negotiation is fine.** Running the static `rdpsnd` SVC and the audio DVC
+    simultaneously does NOT confuse mstsc (it negotiated AAC/v8 on both with no conflict) —
+    so a server can keep static rdpsnd as the fallback while offering the DVC.
+  - **Sequence note (spec-confirmed live):** for v6+, the client sends a **Quality Mode PDU
+    immediately after Client Audio Formats**, and the server sends **Training only after
+    that** (MS-RDPEA "Initialization Sequence"). The handler waits for Quality Mode before
+    replying with Training.
+
+  **Implication for the build:** lossy audio needs the lossy DVC Soft-Synced onto the DTLS
+  tunnel up front + the handshake + AAC waves carried over the tunnel — i.e. it depends on a
+  solid lossy *data path* (P2.2/P2.3) underneath, which doesn't exist yet. And note the
+  reliable `AUDIO_PLAYBACK_DVC` path that *does* work is **not worth landing on its own**: a
+  reliable tunnel HOL-blocks under loss exactly like TCP (Phase 1 soak), so reliable
+  audio-over-UDP delivers no loss-resilience over TCP audio. **Status: paused after the
+  spike.** The hard unknowns are now banked (above); the verified groundwork (`audio_dvc.rs`
+  + the handshake) is kept in-tree, gated off by default. Resume by Soft-Syncing the lossy
+  DVC onto the tunnel before the handshake, after the lossy transport SM + FEC are mature.
+
 - **P2.5 — route audio to the lossy tunnel + reconcile the lag model.** Point the audio
   path at the lossy tunnel and reconcile with the existing audio-lag / drop-stale model
   (vendor server divergence (2)/(3)/(8)) — on a lossy transport, dropping a stale wave is

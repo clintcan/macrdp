@@ -2202,6 +2202,23 @@ async fn async_main() -> Result<()> {
                     .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
                 server.set_multitransport_cookie_registry(Some(cookie_registry));
                 server.set_multitransport_tunnel_sender(Some(tunnel_sender));
+                // (P2.4b, EXPERIMENTAL) Register the lossy-UDP audio DVC
+                // (AUDIO_PLAYBACK_LOSSY_DVC). Behind its OWN dedicated env gate
+                // (`MACRDP_UDP_LOSSY_AUDIO=1`) — NOT the lossy-offer flag — so the
+                // proven lossy transport path runs unbroken by default; this
+                // sub-step is opt-in until the handshake is verified on mstsc.
+                // Requires AAC (the lossy DVC needs version >= 8 + AAC,
+                // MS-RDPEA Appendix A note <2>). Advertises the SAME format list
+                // the static RDPSND path encodes.
+                if std::env::var_os("MACRDP_UDP_LOSSY_AUDIO").is_some() && args.enable_aac {
+                    let formats = audio::server_audio_formats(args.enable_aac, args.aac_bitrate);
+                    info!(
+                        formats = formats.len(),
+                        "P2.4b (EXPERIMENTAL, MACRDP_UDP_LOSSY_AUDIO): offering AUDIO_PLAYBACK_LOSSY_DVC \
+                         (lossy-UDP audio) — AAC negotiation over TCP"
+                    );
+                    server.set_multitransport_lossy_audio_formats(Some(formats));
+                }
                 Some(listener)
             }
             Err(e) => {

@@ -392,6 +392,12 @@ pub struct RdpServer {
     /// in flight (TCP-only).
     #[cfg(feature = "multitransport")]
     multitransport_tunnel_inbound_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// (P2.4b) Audio format list to advertise on the lossy-UDP `AUDIO_PLAYBACK_LOSSY_DVC`
+    /// dynamic channel. `Some` registers the channel (the application supplies a
+    /// PCM+AAC list matching what its wave path encodes); `None` (default) leaves
+    /// the channel unregistered. Set via `set_multitransport_lossy_audio_formats`.
+    #[cfg(feature = "multitransport")]
+    multitransport_lossy_audio_formats: Option<Vec<ironrdp_rdpsnd::pdu::AudioFormat>>,
 }
 
 #[derive(Debug)]
@@ -504,6 +510,8 @@ impl RdpServer {
             egfx_on_udp: false,
             #[cfg(feature = "multitransport")]
             multitransport_tunnel_inbound_rx: None,
+            #[cfg(feature = "multitransport")]
+            multitransport_lossy_audio_formats: None,
         }
     }
 
@@ -596,6 +604,18 @@ impl RdpServer {
         self.multitransport_tunnel_sender = sender;
     }
 
+    /// (P2.4b) Supply the audio format list for the lossy-UDP `AUDIO_PLAYBACK_LOSSY_DVC`
+    /// dynamic channel. `Some(formats)` registers the channel and advertises those
+    /// formats (the caller passes a PCM+AAC list matching what its wave path
+    /// encodes); `None` (default) leaves it unregistered.
+    #[cfg(feature = "multitransport")]
+    pub fn set_multitransport_lossy_audio_formats(
+        &mut self,
+        formats: Option<Vec<ironrdp_rdpsnd::pdu::AudioFormat>>,
+    ) {
+        self.multitransport_lossy_audio_formats = formats;
+    }
+
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
     pub fn echo_handle(&self) -> &EchoServerHandle {
         &self.echo_handle
@@ -680,6 +700,21 @@ impl RdpServer {
                     let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
                     dvc = dvc.with_dynamic_channel(gfx_server);
                 }
+            }
+            dvc
+        };
+
+        // (vendored, feature=multitransport, P2.4b) The lossy-UDP audio output DVC
+        // (`AUDIO_PLAYBACK_LOSSY_DVC`). Registered only when the application
+        // supplied a format list (macrdp does so when `--enable-aac` + the lossy
+        // UDP offer are both on). The format handshake runs over the main TCP
+        // connection first; Soft-Sync migration of the wave data onto the DTLS
+        // tunnel is a later sub-step.
+        #[cfg(feature = "multitransport")]
+        let dvc = {
+            let mut dvc = dvc;
+            if let Some(formats) = self.multitransport_lossy_audio_formats.clone() {
+                dvc = dvc.with_dynamic_channel(crate::multitransport::audio_dvc::AudioLossyDvc::new(formats));
             }
             dvc
         };

@@ -112,11 +112,7 @@ impl SoundServerFactory for MacRdpsnd {
         // AAC first so the negotiation in `start()` (first server format the
         // client also accepts) prefers it; PCM stays as the fallback for
         // clients without AAC decode.
-        let formats = if self.enable_aac {
-            vec![aac_format(self.aac_bitrate), pcm_format()]
-        } else {
-            vec![pcm_format()]
-        };
+        let formats = server_audio_formats(self.enable_aac, self.aac_bitrate);
         Box::new(MacRdpsndBackend {
             sender: self.sender.clone(),
             audio_sender: self.audio_sender.clone(),
@@ -132,6 +128,18 @@ impl SoundServerFactory for MacRdpsnd {
 
     fn set_audio_sender(&mut self, audio_sender: mpsc::Sender<AudioWave>) {
         *self.audio_sender.lock().unwrap() = Some(audio_sender);
+    }
+}
+
+/// The server audio format list, ordered by our preference (AAC ahead of PCM
+/// when `enable_aac`), exactly as `build_backend` advertises on the static
+/// RDPSND channel. Exposed so the UDP-multitransport lossy audio DVC
+/// (`AUDIO_PLAYBACK_LOSSY_DVC`) can advertise the *same* list it will encode in.
+pub fn server_audio_formats(enable_aac: bool, aac_bitrate: u32) -> Vec<AudioFormat> {
+    if enable_aac {
+        vec![aac_format(aac_bitrate), pcm_format()]
+    } else {
+        vec![pcm_format()]
     }
 }
 

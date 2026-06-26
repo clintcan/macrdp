@@ -21,6 +21,7 @@
 //! `migration` submodules (the UDP transport + channel migration); the trait
 //! will gain methods accordingly.
 
+pub mod audio_dvc;
 pub mod dtls;
 pub mod listener;
 

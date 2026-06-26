@@ -595,3 +595,33 @@ AND released — #1276 landing is NOT sufficient.
     sent → tunnel established AND the client STOPPED retransmitting (the definitive
     accept signal). Next = P2.4b (migrate the AUDIO_PLAYBACK_LOSSY_DVC audio
     channel onto the tunnel). See feasibility doc "P2.4a".
+
+    P2.4b-1 — audio output DVC handshake (2026-06-27, `multitransport/audio_dvc.rs`;
+    PAUSED after the spike): a `DvcProcessor`/`DvcServerProcessor` (`AudioLossyDvc`)
+    that, on channel open, sends Server Audio Formats (v8) and runs the MS-RDPEA
+    format/quality-mode/training handshake, reusing `ironrdp-rdpsnd`'s
+    `ServerAudioOutputPdu`/`ClientAudioOutputPdu` codecs verbatim — the SNDPROLOG
+    header is KEPT (byte-identical to the static rdpsnd path), wrapped in an
+    `OwnedAudioPdu` that delegates `Encode` (so the DRDYNVC framing length matches).
+    Registered in `attach_channels` (after the egfx block) ONLY when the application
+    calls `RdpServer::set_multitransport_lossy_audio_formats(Some(formats))` — macrdp
+    gates that behind the experimental `MACRDP_UDP_LOSSY_AUDIO` env (+ `--enable-aac`),
+    so the default build is byte-unchanged. **KEY FINDING (verified on real mstsc): the
+    EGFX "negotiate-on-TCP-then-Soft-Sync" pattern does NOT carry to a *lossy*-named
+    channel.** With the literal name `AUDIO_PLAYBACK_LOSSY_DVC`, mstsc accepts the DVC
+    Create but, on receiving Server Audio Formats over TCP/DRDYNVC, goes silent and
+    **stops reading the whole TCP socket** (broken pipe ~3–4 s later — it tears down
+    EGFX/everything, not just audio). The reliable name `AUDIO_PLAYBACK_DVC`
+    (diagnostic env `MACRDP_AUDIO_DVC_RELIABLE=1`) handshakes perfectly over TCP
+    (formats → client formats(AAC) → quality mode → training → confirm), audio plays,
+    EGFX stays healthy — the discriminator proving the channel *name* is the blocker,
+    not the PDU/framing and not coexistence with static rdpsnd (dual negotiation is
+    fine). So the lossy DVC must be **Soft-Synced onto the lossy tunnel BEFORE any
+    data**, with the handshake over the tunnel (opposite of EGFX, which migrates to the
+    RELIABLE tunnel *after* a TCP handshake). Spec note (confirmed live): for v6+ the
+    client sends Quality Mode immediately after Client Audio Formats and the server
+    sends Training only after that (MS-RDPEA Initialization Sequence) — the handler
+    waits for Quality Mode. **Paused** here: the verified groundwork is kept in-tree,
+    default-off; resume once the lossy data path (P2.2/P2.3) is mature. The
+    reliable-DVC path that works is NOT worth landing on its own (a reliable tunnel
+    HOL-blocks under loss like TCP — no win). See feasibility doc "P2.4b".
