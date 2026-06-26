@@ -731,13 +731,31 @@ impl SoftSyncRequestPdu {
     /// unset), which is the safe spike used to confirm the send path + the
     /// client's response decode without actually migrating any DVC.
     pub fn switch_to_udpfecr(channel_ids: Vec<DynamicChannelId>) -> Self {
+        Self::switch_to_tunnel(TUNNELTYPE_UDPFECR, channel_ids)
+    }
+
+    /// A request moving `channel_ids` onto the **lossy**-UDP tunnel
+    /// ([`TUNNELTYPE_UDPFECL`]) — the Phase-2 audio path (`AUDIO_PLAYBACK_LOSSY_DVC`).
+    /// Same shape as [`switch_to_udpfecr`](Self::switch_to_udpfecr); only the
+    /// `TunnelType` differs. An empty `channel_ids` is the "flush TCP, migrate
+    /// nothing" probe (no list emitted).
+    pub fn switch_to_udpfecl(channel_ids: Vec<DynamicChannelId>) -> Self {
+        Self::switch_to_tunnel(TUNNELTYPE_UDPFECL, channel_ids)
+    }
+
+    /// Build a single-tunnel Soft-Sync request. An **empty** `channel_ids` is a
+    /// valid "flush TCP, migrate nothing" probe: no channel list is emitted
+    /// (`NumberOfTunnels` = 0, `CHANNEL_LIST_PRESENT` unset) — the safe spike that
+    /// confirms the send path + the client's response decode without migrating any
+    /// DVC.
+    pub fn switch_to_tunnel(tunnel_type: u32, channel_ids: Vec<DynamicChannelId>) -> Self {
         let (flags, channel_lists) = if channel_ids.is_empty() {
             (SOFT_SYNC_TCP_FLUSHED, vec![])
         } else {
             (
                 SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT,
                 vec![SoftSyncChannelList {
-                    tunnel_type: TUNNELTYPE_UDPFECR,
+                    tunnel_type,
                     channel_ids,
                 }],
             )

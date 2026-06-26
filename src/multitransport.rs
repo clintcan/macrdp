@@ -158,6 +158,31 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
+    // P2.4b: the lossy-tunnel Soft-Sync (audio → AUDIO_PLAYBACK_LOSSY_DVC). Same
+    // shape as the reliable request, only TunnelType differs (FECL=0x03 vs FECR=0x01).
+    #[test]
+    fn soft_sync_request_udpfecl_encodes_to_exact_wire_bytes() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncRequestPdu};
+
+        let pdu =
+            DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::switch_to_udpfecl(vec![0x0009]));
+        let bytes = encode_vec(&pdu).unwrap();
+
+        #[rustfmt::skip]
+        let expected: [u8; 20] = [
+            0x80,                   // Header: Cmd=SoftSyncRequest(0x08)<<4, cbId=0, Sp=0
+            0x00,                   // Pad
+            0x12, 0x00, 0x00, 0x00, // Length = 18
+            0x03, 0x00,             // Flags = TCP_FLUSHED | CHANNEL_LIST_PRESENT
+            0x01, 0x00,             // NumberOfTunnels = 1 (u16 in the request)
+            0x03, 0x00, 0x00, 0x00, // TunnelType = TUNNELTYPE_UDPFECL
+            0x01, 0x00,             // NumberOfDVCs = 1
+            0x09, 0x00, 0x00, 0x00, // ListOfDVCIds[0] = 0x0009
+        ];
+        assert_eq!(bytes, expected);
+    }
+
     // The M5c "safe spike": an empty channel list (flush TCP, migrate nothing) —
     // no list is emitted, NumberOfTunnels = 0, CHANNEL_LIST_PRESENT unset.
     #[test]

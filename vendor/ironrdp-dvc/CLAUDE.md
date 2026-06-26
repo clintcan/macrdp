@@ -66,6 +66,11 @@ since the lib is `test = false`.
       NumberOfTunnels=0, CHANNEL_LIST_PRESENT unset), the M5c safe spike. Wired into
       `DrdynvcServerPdu::SoftSyncRequest` (Encode/name/size only — the server
       never *decodes* its own request, so no `DrdynvcServerPdu::decode` arm).
+      **P2.4b add (2026-06-27):** `switch_to_udpfecl(channel_ids)` (the lossy-audio
+      path, `TUNNELTYPE_UDPFECL`) + the shared `switch_to_tunnel(tunnel_type, …)` both
+      `switch_to_*` delegate to. Same wire shape as the reliable request, only
+      `TunnelType` differs (0x03 vs 0x01); round-trip tested in macrdp's
+      `src/multitransport.rs` (`soft_sync_request_udpfecl_encodes_to_exact_wire_bytes`).
     - `SoftSyncResponsePdu { header, tunnels: Vec<u32> }` — client→server
       DYNVC_SOFT_SYNC_RESPONSE (Header byte; Pad u8; NumberOfTunnels **u32** —
       asymmetric vs the request's u16; TunnelsToSwitch u32 each). Wired into
