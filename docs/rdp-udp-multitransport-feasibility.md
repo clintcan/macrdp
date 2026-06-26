@@ -67,12 +67,21 @@ verify again before acting, code moves.*
 > **What rides UDP today:** only **EGFX video** (when the env flag is set). Input,
 > audio (RDPSND), and clipboard still ride TCP by design for this phase.
 >
-> **Possible next steps (none started):** soak + promote the flag (eventually flip
-> the default); route **audio (RDPSND)** over the tunnel too; **Phase 2** = lossy
-> `UdpFecL` + DTLS (via `boring`) + FEC (deferred); de-vendor once the IronRDP
-> changes are upstreamed + released. Still **not** supported under `--fork-workers`
-> (the persistent UDP socket would belong to the supervisor — deferred; warns +
-> falls back to TCP).
+> **Soaked under loss (2026-06-26) — Phase 1 accepted as a clean-link feature.** A
+> lossy-link soak (mstsc, 1–5% loss) found + fixed an idle-retransmit deadlock (the
+> periodic timer, PR #46) and then **confirmed a structural limit**: reliable-only
+> multitransport does **not** beat TCP for video under loss — EGFX-on-*TCP* froze
+> under the same shaping too, because an ordered stream HOL-blocks on its own loss
+> regardless of transport. Decision: keep Phase 1 as a clean-link / low-loss feature
+> (default-OFF, env-gated), lossy-link video deferred to Phase 2. See "First soak
+> findings" below.
+>
+> **Possible next steps (none started):** route **audio (RDPSND)** over the tunnel
+> too; **Phase 2** = lossy `UdpFecL` + DTLS (via `boring`) + FEC — the *real*
+> loss-resilience win (only worth it if lossy-link video becomes a goal); de-vendor
+> once the IronRDP changes are upstreamed + released. Still **not** supported under
+> `--fork-workers` (the persistent UDP socket would belong to the supervisor —
+> deferred; warns + falls back to TCP).
 
 ## Landscape — UDP multitransport across open-source RDP servers
 
@@ -195,15 +204,27 @@ reliable-only multitransport.
    *isolates video from other channels' loss*, but the video stream still
    HOL-blocks on its **own** loss — so it does **not** beat TCP for video on a lossy
    link. The genuine loss-resilience win needs **Phase 2: the lossy `UdpFecL`
-   transport + FEC**, where video tolerates loss without retransmit-blocking. That
-   is now the clear next milestone if lossy-link video is the goal.
+   transport + FEC**, where video tolerates loss without retransmit-blocking.
 
-   **Isolation experiments to run next** (cheap, pin the contribution of each
-   factor before committing to Phase 2): re-test at a **client resolution matching
-   the Mac** (kills the full-frame-every-tick volume → damage-rect updates) and at
-   **lower loss (1–2%)**; and A/B against EGFX-on-TCP (flag off) under identical
-   shaping to confirm the isolation benefit on the *other* channels even while video
-   is HOL-limited.
+3. **CONFIRMED structural, not UDP-specific (isolation runs, 2026-06-26).** The
+   isolation A/B settled it: at **1% loss + 100 ms/dir, EGFX-on-*TCP* (flag off)
+   froze too** — partial screen then stall, the same as UDP. Since the proven TCP
+   path stalls under identical shaping, the freeze is **H.264/EGFX-under-loss
+   itself, on either transport**, not a multitransport bug. The mechanism is the
+   same on both: a 1080p H.264 keyframe is many segments, so even 1% per-segment
+   loss makes it near-certain *some* segment of a keyframe drops (`1 − 0.99^N`),
+   and an **ordered** stream (TCP or reliable-RDPEUDP alike) head-of-line-blocks
+   every byte behind it; with a ~200 ms RTT and a continuous 60 fps stream,
+   retransmit recovery can't keep pace → freeze. The UDP log shows the micro-event
+   directly: `delivered nothing (receive-sequence mismatch) expected=…424 got
+   425,426,427,428` then recovery on the client's CWR retransmit. **Decision
+   (2026-06-26): accept Phase 1 as a clean-link / low-loss feature** (it works, and
+   is verified, on a clean link; it remains default-OFF + `MACRDP_UDP_MIGRATE_EGFX`-
+   gated). Lossy-link video is explicitly **out of scope for reliable-only** and is
+   what Phase 2 (lossy `UdpFecL` + FEC) exists for — pursued only if/when lossy-link
+   video becomes a goal. Note this also means the **default TCP** EGFX path has the
+   same loss sensitivity (matching client resolution to avoid scaling + a capable
+   client are the practical mitigations there).
 
 ## TL;DR
 
