@@ -655,14 +655,25 @@ impl Sequence for Acceptor {
                 let skip_channel_join = early_capability
                     .is_some_and(|client| client.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN));
 
-                // (vendored) Advertise reliable UDP multitransport + soft-sync
-                // in `SC_MULTITRANSPORT` when the server enabled the extended
-                // client data path (which it does only when a multitransport
-                // provider is installed). Lossy (`UDP_FECL`) is a later phase.
-                let multitransport = self.advertise_extended_client_data.then_some(
-                    gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
-                        | gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
-                );
+                // (vendored) Advertise UDP multitransport + soft-sync in
+                // `SC_MULTITRANSPORT` when the server enabled the extended client
+                // data path (which it does only when a multitransport provider is
+                // installed). The advertised transport type MUST match the offer
+                // the server is about to emit (reliable `UDP_FECR` by default;
+                // lossy `UDP_FECL` for the P2.0 go/no-go spike), or the client
+                // sees an Initiate Request for a transport it wasn't told the
+                // server supports. The offer is set (in `client_accepted`) before
+                // this state, so `self.multitransport_offer` is available here.
+                let multitransport = self.advertise_extended_client_data.then(|| {
+                    let proto_flag = match self.multitransport_offer.map(|o| o.protocol) {
+                        Some(rdp::multitransport::RequestedProtocol::UdpFecL) => {
+                            gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                        }
+                        // Default / `UdpFecR` / no offer: reliable.
+                        _ => gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR,
+                    };
+                    proto_flag | gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP
+                });
 
                 // (vendored) Allocate a message channel (the next id after the
                 // virtual channels) when offering multitransport — the Initiate

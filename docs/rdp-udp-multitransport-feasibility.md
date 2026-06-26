@@ -316,15 +316,46 @@ Offer `UdpFecL` and watch a real mstsc (Win11/WiFi, the Phase-1 rig). Concretely
 This one spike converts "should we build a multi-week lossy stack?" into an empirical
 yes/no for the cost of a flag and a capture. **Do not skip it.**
 
+#### Result (2026-06-26): **GREEN** — verified live on real mstsc (Win11/WiFi)
+
+Ran with `MACRDP_UDP_OFFER_FECL=1` (the spike toggle in `src/multitransport.rs`).
+The log answered every sub-question, and decisively in favor of building Phase 2:
+
+- **mstsc advertises lossy and *prefers* UDP.** Its CS multitransport block was
+  `TRANSPORT_TYPE_UDP_FECR | TRANSPORT_TYPE_UDP_FECL | TRANSPORT_TYPE_UDP_PREFERRED |
+  SOFT_SYNC_TCP_TO_UDP` — so the "RDPEUDP2 dropped lossy, mstsc won't use it" worry was
+  unfounded for *this* mstsc build: it not only supports `UDP_FECL`, it sets
+  `UDP_PREFERRED`.
+- **It opened a lossy flow.** Once we emitted the `UdpFecL` Initiate Request, mstsc sent
+  a SYN with the **`SYN_LOSSY`** flag set (`FecFlags(SYN | SYN_LOSSY | CORRELATION_ID |
+  SYNEX)`), RDPEUDP version **V2** — the same version family as the reliable path, just
+  in lossy mode. So the lossy flow is *not* a different/older RDPEUDP; it's V2 with the
+  lossy bit.
+- **It started a DTLS handshake — DTLS 1.2, not 1.0.** The listener observed a
+  **DTLS 1.2** ClientHello (`0x16 0xFE 0xFD`), correcting the up-front research's
+  "DTLS 1.0" assumption. **This simplifies P2.1:** `boring`'s safe DTLS API covers 1.2
+  natively, so the one reason to prefer `openssl` (explicit DTLS-1.0 version pinning) is
+  moot — **`boring` is the clear choice.** (Implement 1.2; allow 1.0 fallback only if a
+  later client demands it.)
+- **Graceful throughout.** We implement no DTLS, so the handshake never completed; mstsc
+  simply retried its ClientHello periodically while the **session ran normally over TCP**
+  the entire time. Confirms the lossy offer is safe to ship behind a flag — a
+  non-responsive lossy flow costs nothing.
+
+**Verdict: proceed to P2.1 when ready.** The lossy payoff is reachable by the primary
+client. The spike code stays in-tree, env-gated and default-off (zero effect on the
+proven Phase-1 reliable path), as the harness for the P2.1+ DTLS work.
+
 ### If GREEN — the staged build (mirrors Phase 1's M1→M5 discipline)
 
 Each milestone is its own gated PR, real-client-verified, feature-flagged
 (`multitransport` cargo feature already exists; reuse it), zero-cost when off.
 
-- **P2.1 — DTLS layer (the hard new dependency).** Add `boring` (or `openssl` if we
-  want to pin DTLS 1.0 explicitly — it edges ahead there; `boring` does DTLS 1.0/1.2
-  over a memory BIO via `SslMethod::dtls()` + `Ssl::setup_accept()`, no DTLS 1.3 via the
-  safe API, which is fine — mstsc speaks DTLS 1.0). Quarantine **all** of it behind one
+- **P2.1 — DTLS layer (the hard new dependency).** Add `boring` — the P2.0 capture
+  showed mstsc offers **DTLS 1.2**, which `boring`'s safe API does natively
+  (`SslMethod::dtls()` + `Ssl::setup_accept()` over a memory BIO; no DTLS 1.3 via the
+  safe API, which is fine). The one reason to have considered `openssl` (explicit
+  DTLS-1.0 version pinning) is moot now that the client is 1.2. Quarantine **all** of it behind one
   maintenance-boundary file `vendor/ironrdp-server/src/multitransport/dtls.rs`, the same
   way Phase 1's rustls layer is isolated. **Wire layering (researched):** the DTLS record
   sits *inside* the cleartext RDPUDP framing, not around it —
@@ -390,13 +421,15 @@ new audio DVC (P2.4) — on top of, not instead of, Phase 1.
 
 ### Bottom line
 
-Phase 2 is **gated on a one-day go/no-go spike (P2.0)** because the lossy path is a
-legacy codepath and it is unproven that modern mstsc will use it at all. If it's GREEN,
-the highest-value payload is **audio** (a new `AUDIO_PLAYBACK_LOSSY_DVC`, reusing our AAC
-encoder), not video; FEC is encoder-only and even then optional; and DTLS 1.0 is the one
-hard new dependency, quarantined behind a single file. If P2.0 is RED, Phase 2 is parked
-with a clear conscience — Phase 1 (reliable EGFX over UDP, the path mstsc actually
-negotiates) stands on its own as the clean-link feature it is.
+Phase 2 was **gated on a one-day go/no-go spike (P2.0)** because the lossy path is a
+legacy codepath and it was unproven that modern mstsc would use it at all. **P2.0 ran
+GREEN (2026-06-26):** real mstsc advertises `UDP_FECL` + `UDP_PREFERRED`, opens a
+`SYN_LOSSY` flow, and starts a **DTLS 1.2** handshake — so the lossy payoff is reachable.
+Building it: the highest-value payload is **audio** (a new `AUDIO_PLAYBACK_LOSSY_DVC`,
+reusing our AAC encoder), not video; FEC is encoder-only and even then optional; and
+DTLS 1.2 via `boring` is the one hard new dependency, quarantined behind a single file.
+Phase 1 (reliable EGFX over UDP) remains the proven clean-link feature; Phase 2 lossy
+audio is the loss-resilience win, now greenlit to build when prioritized.
 
 ## TL;DR
 

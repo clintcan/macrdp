@@ -104,6 +104,24 @@ struct Peer {
     /// connection's `client_loop`. `None` on the soft-bound (no-registry) test
     /// path — inbound channel data is then logged and dropped.
     inbound_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// (P2.0 spike) Set once this peer is observed sending a **DTLS** ClientHello
+    /// — i.e. it opened a *lossy* (`UdpFecL`) flow. When set, we do NOT feed this
+    /// peer's bytes into rustls (DTLS records aren't TLS records and would only
+    /// produce error spam): the spike is observe-only, no DTLS is implemented.
+    dtls_observed: bool,
+}
+
+/// (P2.0 spike) Scan a raw RDPEUDP datagram for a **DTLS handshake** record — the
+/// signal that a client opened a *lossy* flow (vs a TLS ClientHello on a reliable
+/// flow). A DTLS record header is ContentType `0x16` (handshake) followed by the
+/// DTLS ProtocolVersion `0xFEFF` (DTLS 1.0) or `0xFEFD` (DTLS 1.2). The record
+/// sits at a header-dependent offset inside the datagram, so rather than compute
+/// it we scan for the 3-byte signature — specific enough for a diagnostic. Returns
+/// the matched version bytes for the log, if any.
+fn sniff_dtls_client_hello(datagram: &[u8]) -> Option<[u8; 2]> {
+    datagram.windows(3).find_map(|w| {
+        (w[0] == 0x16 && w[1] == 0xFE && (w[2] == 0xFF || w[2] == 0xFD)).then_some([w[1], w[2]])
+    })
 }
 
 /// A running UDP multitransport listener. The receive loop runs on a spawned
@@ -496,8 +514,30 @@ async fn run_recv_loop(
                 emt_inbound: Vec::new(),
                 tunnel_created: false,
                 inbound_sink: None,
+                dtls_observed: false,
             }
         });
+
+        // (P2.0 spike) Before anything else, sniff the raw datagram for a DTLS
+        // ClientHello. This fires on a *lossy* flow regardless of whether the
+        // reliable SM delivers the payload, so it's the most robust go/no-go
+        // signal: if this logs, modern mstsc DID open a lossy UDP flow (GREEN).
+        if !peer.dtls_observed {
+            if let Some(ver) = sniff_dtls_client_hello(data) {
+                peer.dtls_observed = true;
+                let dtls = match ver {
+                    [0xFE, 0xFF] => "DTLS 1.0",
+                    [0xFE, 0xFD] => "DTLS 1.2",
+                    _ => "DTLS",
+                };
+                warn!(
+                    %peer_addr, %dtls,
+                    "P2.0 SPIKE GREEN: client opened a LOSSY (UdpFecL) UDP flow — \
+                     it sent a {dtls} ClientHello. Lossy multitransport is reachable; \
+                     observe-only (no DTLS implemented). See feasibility doc P2.0."
+                );
+            }
+        }
 
         let was_established = peer.sm.is_established();
         let had_data = Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::DATA));
@@ -552,7 +592,10 @@ async fn run_recv_loop(
             // (M4c: answer CREATEREQUEST with CREATERESPONSE), and ship whatever
             // TLS output that produces back through the SM (reliable, fragmented
             // to the MTU). No-op when the listener has no TLS config (test path).
-            if let Some(tls_cfg) = tls_config.as_ref() {
+            // (P2.0 spike) Skipped for a peer on a lossy flow (DTLS observed):
+            // DTLS records aren't TLS records, so feeding them to rustls is pure
+            // error spam — the spike only observes that the lossy flow exists.
+            if let Some(tls_cfg) = tls_config.as_ref().filter(|_| !peer.dtls_observed) {
                 if peer.tls.is_none() {
                     match ServerConnection::new(Arc::clone(tls_cfg)) {
                         Ok(conn) => peer.tls = Some(conn),

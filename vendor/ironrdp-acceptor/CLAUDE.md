@@ -118,3 +118,13 @@ vendor dir until divergence (1) is upstreamed AND released.
       negotiates RDPEUDP **V2**, where the 16-byte security cookie is NOT in the
       SYN (the SYN `cookieHash` is V3/RDPEUDP2 only) — it rides the MS-RDPEMT
       `RDP_TUNNEL_CREATEREQUEST`, so strict cookie binding is an M4 concern.
+
+    P2.0 spike (2026-06-26): the `SC_MULTITRANSPORT` advertise at
+    `BasicSettingsSendResponse` now emits the flag MATCHING the offer's protocol
+    (`UDP_FECL` when `self.multitransport_offer.protocol == UdpFecL`, else
+    `UDP_FECR`) instead of hardcoding `UDP_FECR` — the advertised type and the
+    Initiate Request must agree. Default offer is still reliable; lossy is the
+    env-gated spike (`MACRDP_UDP_OFFER_FECL=1`). Verified GREEN on real mstsc: it
+    advertises `UDP_FECR|UDP_FECL|UDP_PREFERRED|SOFT_SYNC`, accepts the `UdpFecL`
+    Initiate Request, opens a `SYN_LOSSY` flow, and starts a **DTLS 1.2**
+    handshake. See docs/rdp-udp-multitransport-feasibility.md → "P2.0 Result".

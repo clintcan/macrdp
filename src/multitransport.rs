@@ -20,11 +20,26 @@ use ironrdp_server::MultitransportProvider;
 /// M1 provider: offer reliable UDP multitransport. Reliable (`UdpFecR`) rides
 /// the connection's existing rustls TLS, so no DTLS / new crypto dependency is
 /// needed. Lossy (`UdpFecL`, which needs DTLS) is a later milestone.
+///
+/// **P2.0 go/no-go spike:** set `MACRDP_UDP_OFFER_FECL=1` to offer **lossy**
+/// (`UdpFecL`) *instead of* reliable, then connect a real mstsc and watch the
+/// listener log. The spike answers the gating Phase-2 question — does modern
+/// mstsc open a lossy UDP flow (a DTLS ClientHello, not TLS) at all, given that
+/// RDPEUDP2 dropped lossy and mstsc prefers reliable RDPEUDP2? No DTLS is
+/// implemented; the listener only *observes* whether the client starts a DTLS
+/// handshake. Default (env unset) is unchanged Phase-1 reliable behavior. See
+/// `docs/rdp-udp-multitransport-feasibility.md` → "P2.0 — Go/No-Go spike".
 pub struct MacMultitransport;
 
 impl MultitransportProvider for MacMultitransport {
     fn requested_protocol(&self) -> RequestedProtocol {
-        RequestedProtocol::UdpFecR
+        // P2.0 spike toggle: offer lossy instead of reliable. Read per call (the
+        // provider is process-wide; this is cheap and avoids extra plumbing).
+        if std::env::var_os("MACRDP_UDP_OFFER_FECL").is_some_and(|v| v == "1") {
+            RequestedProtocol::UdpFecL
+        } else {
+            RequestedProtocol::UdpFecR
+        }
     }
 }
 

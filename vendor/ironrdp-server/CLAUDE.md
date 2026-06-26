@@ -547,3 +547,17 @@ AND released — #1276 landing is NOT sufficient.
     its own loss like TCP — so reliable-only multitransport does not beat TCP for
     video under loss; that needs Phase 2 (lossy `UdpFecL` + FEC). See the feasibility
     doc "First soak findings".
+
+    P2.0 go/no-go spike (2026-06-26, `multitransport/listener.rs`): observe-only
+    support for a LOSSY flow, to answer whether modern mstsc opens one at all
+    before committing to a DTLS+FEC build. `sniff_dtls_client_hello` scans each raw
+    datagram for a DTLS handshake record (`0x16 0xFE 0xFF`/`0xFD`); on a match the
+    peer is marked `dtls_observed`, logged at WARN ("P2.0 SPIKE GREEN …"), and the
+    rustls (TLS) feed is skipped for it (DTLS records aren't TLS — feeding them is
+    error spam; no DTLS is implemented). Paired with the env-gated `UdpFecL` offer
+    (`MACRDP_UDP_OFFER_FECL=1` in `src/multitransport.rs`) + the acceptor's
+    matching `SC_MULTITRANSPORT` advertise. **Result: GREEN on real mstsc** — it
+    opens a `SYN_LOSSY` V2 flow and sends a **DTLS 1.2** ClientHello; the TCP
+    session is unaffected (the lossy handshake just retries unanswered). Default
+    build/offer is unchanged reliable; this is harness for the Phase 2 lossy work.
+    See the feasibility doc "P2.0 — Go/No-Go spike".
