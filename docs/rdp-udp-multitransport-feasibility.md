@@ -287,6 +287,34 @@ handshake-only — once the tunnel is up, data stays send-once. (Deferred until 
 shows it's needed, per the project's "don't build it until the soak proves it" rule that
 landed the reliable-path timer tick.)
 
+### P2.2 lossy-delivery soak result (2026-06-27, mstsc, 5% loss + 100 ms/dir)
+
+First run of the lossy soak. **The lossy handshake survives loss — the send-once caveat
+did NOT bite at this level.** The log shows it directly: the client's first DTLS flight
+(190-byte ClientHello) was **delivered twice** (`delivered=190 total=190` then
+`…total=380`) — a retransmitted flight, because loss delayed our reply — and in lossy mode
+we deliver-on-arrival without dedup, DTLS dropped the replay itself, and the handshake
+still reached `P2.1 GREEN` → `P2.4 GREEN` (DTLS + MS-RDPEMT tunnel established). So DTLS's
+own flight retransmission plus our deliver-on-arrival carry the handshake even though the
+RDPEUDP SM never retransmits. The predicted `CREATERESPONSE`-lost stall did not occur at
+5% (the response got through first try); whether it bites at higher loss (10%+) is still
+open — but the idempotent-`CREATERESPONSE` fix stays **deferred** until a soak actually
+shows the stall.
+
+**The session still froze (partial screen) — but that's the TCP path, not a lossy bug.**
+`soak-lossy.sh` deliberately does **not** set `MACRDP_UDP_MIGRATE_EGFX`, and the offer is
+`UdpFecL`-only, so **nothing rides the lossy tunnel**: EGFX + audio + input all share the
+one CredSSP TCP stream, which HOL-blocks a 1080p H.264 keyframe under loss exactly as
+finding #3 documents (same structural limit, on TCP). The lossy tunnel established cleanly
+but carries no payload yet.
+
+**Takeaway:** the P2.2 lossy *transport* is validated under loss (handshake robust), but
+the soak structurally **cannot demonstrate a lossy *win* until a real payload rides the
+tunnel** — and the intended payload, **lossy audio (P2.4b), is paused** on the
+Soft-Sync-first / lossy-DVC-name finding. So lossy delivery is "built + robust" but its
+payoff is gated on P2.4b, not on more transport work. (Video-over-lossy is out of scope —
+H.264-under-loss needs intra-refresh, P2.6.)
+
 ## Audio belongs on the lossy transport, not the reliable one
 
 A natural-looking "next step" is to also route **audio (RDPSND)** over the UDP
