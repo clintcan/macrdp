@@ -16,3 +16,6 @@ Cargo.lock.bak
 
 # SwiftPM build output for the menu-bar controller (gui/)
 /gui/.build/
+
+# Soak run logs (scripts/soak-lossy.sh)
+/soak-lossy-*.log

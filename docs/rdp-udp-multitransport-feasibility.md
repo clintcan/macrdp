@@ -136,6 +136,9 @@ another machine) and the Mac's built-in `pf`/`dnctl` traffic shaper.
 **Tooling:** `scripts/netshape.sh` shapes both directions of TCP+UDP on the macrdp
 port (default 3390) via dummynet — `sudo scripts/netshape.sh on --loss 5 --delay 100`
 to apply, `sudo scripts/netshape.sh off` to restore, `status` to inspect.
+`scripts/soak-lossy.sh` is a turnkey server runner for the **lossy-delivery** soak (sets
+the lossy env gates, captures the full log, live-prints the handshake markers) — see the
+"P2.2 lossy-delivery soak (runbook)" subsection below.
 
 **Observability:** the reliable transport's RTO retransmits are surfaced (the state
 machine is sans-I/O, so `StepOutput.retransmits` / `.syn_retransmit` are counted in
@@ -227,6 +230,62 @@ reliable-only multitransport.
    video becomes a goal. Note this also means the **default TCP** EGFX path has the
    same loss sensitivity (matching client resolution to avoid scaling + a capable
    client are the practical mitigations there).
+
+### P2.2 lossy-delivery soak (runbook)
+
+The first soak (above) shaped the **reliable** EGFX-over-UDP path. This one targets the
+**lossy delivery policy** (P2.2 steps 1–2): a `SYN_LOSSY` flow driving
+`DeliveryMode::Lossy` (deliver-on-arrival, **send-once / no retransmit**). It's verified
+green on a *clean* link (DTLS handshake + MS-RDPEMT tunnel reach established); the soak
+exists to find where send-once breaks under real loss.
+
+**What it probes (the known caveats):** because the lossy SM never retransmits, a dropped
+handshake datagram isn't recovered by the transport. Specifically:
+1. the server's one-shot **`CREATERESPONSE(S_OK)`** — if it's lost, the listener's
+   `tunnel_created` guard answers a repeated `CREATEREQUEST` only once, so the tunnel may
+   never establish;
+2. the **DTLS server flight** (ServerHello/Certificate/Done) — sent once by the SM; DTLS
+   has its *own* flight retransmission (client-driven on timeout), so this *may* self-heal,
+   but that's exactly the thing to confirm.
+
+**Run it (two terminals, real mstsc on another machine):**
+```
+# 1) shape both directions of TCP+UDP on the port:
+sudo scripts/netshape.sh on --loss 5 --delay 100
+
+# 2) run the server under the lossy-delivery soak config (sets the env, captures the
+#    full log to a file, live-prints only the soak markers):
+scripts/soak-lossy.sh --enable-udp-multitransport --enable-h264 \
+    --username "$USER" --password 'PASS' --bind 0.0.0.0:3390
+
+# …connect mstsc, exercise it, then restore:
+sudo scripts/netshape.sh off
+```
+
+**Read the markers** (`soak-lossy.sh` highlights them; the full log is in the file):
+- `RDPEUDP peer using LOSSY delivery` — the lossy SM is engaged for that flow.
+- `P2.1 GREEN` (DTLS complete) → `P2.4 GREEN` (tunnel established) — **both appearing =
+  the lossy handshake survived the loss to established.** *Neither/only-one appearing,
+  with the client repeatedly sending `CREATEREQUEST`, is the stall the caveats predict.*
+- `RTO retransmit` lines should be **zero for the lossy flow** (it never retransmits); any
+  you see are the *reliable* (`UdpFecR`) flow doing its job — don't confuse them.
+
+**A/B (isolates "needs retransmission" from "loss simply too high"):** at the *same*
+shaping, run once as above (`MACRDP_UDP_LOSSY_DELIVERY=1`, the default in the script) and
+once with `MACRDP_UDP_LOSSY_DELIVERY=0 scripts/soak-lossy.sh …` (the lossy flow then rides
+the **reliable** SM, which retransmits). If the reliable control reaches `P2.4 GREEN`
+where lossy stalls, the stall is the missing handshake retransmission — not the link.
+Sweep loss `0 → 2 → 5 → 10 %` and latency `+60 / +150 ms`; record at which cell lossy
+first fails to establish and whether the reliable control still does.
+
+**If lossy stalls under loss (expected at some loss level), the fix** is handshake-phase
+robustness without giving up steady-state losslessness: make the `CREATERESPONSE`
+**idempotent** (re-answer every `CREATEREQUEST` in lossy mode instead of gating on
+`tunnel_created`), and/or drive DTLS's `handle_timeout` from the listener's existing
+retransmit tick for a lossy peer so the server re-sends its own handshake flight. Both are
+handshake-only — once the tunnel is up, data stays send-once. (Deferred until the soak
+shows it's needed, per the project's "don't build it until the soak proves it" rule that
+landed the reliable-path timer tick.)
 
 ## Audio belongs on the lossy transport, not the reliable one
 
