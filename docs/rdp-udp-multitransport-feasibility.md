@@ -690,6 +690,41 @@ redundancy** — built, see P2.3 below; else (2) accept that lossy-audio-over-ms
 (reliable = HOL-block = the very problem), so "fix ARQ" is not a lossy-audio fix — it's only relevant if a
 *reliable* tunnel payload is ever wanted.
 
+### P2.3 FEC — future revisit (needs legacy-Windows machines)
+
+The NO-GO above is structural **for modern Windows** — it's a property of the *negotiated transport
+version*, not of the link. So the one thing that could reopen FEC is a session that negotiates **RDPEUDP
+v1/v2** (`0x0001`/`0x0002`) instead of **RDPUDP2** (`0x0101`), because FEC's `RDPUDP_FEC_PAYLOAD_HEADER`
+only exists in v1/v2. The version is chosen at SYN time by capability, and modern Win10/11 both prefer
+RDPUDP2, which is why the VM capture never had a chance. **What changes the answer is the OS, not the
+hardware:** a Windows old enough to predate RDPUDP2 will fall back to RDPEUDP v1/v2.
+
+**Machines to acquire for the revisit** (this is the "appropriate machines" gap):
+- A **legacy Windows endpoint that negotiates RDPEUDP v1/v2** — roughly the RemoteFX-over-UDP era:
+  **Windows 8 / 8.1 mstsc** or **Server 2012 / 2012 R2** (as the RDP *server*). Either side being legacy
+  may be enough to drop the negotiated version below RDPUDP2; both legacy is safest. (Exact
+  version→OS mapping is unconfirmed — establish it empirically with `fec-scan.sh`, which prints the
+  negotiated `rdpudp.synex.version`.)
+- A way to **open a lossy (`SYN_LOSSY`) flow** at all — that needs UDP multitransport enabled and a
+  real-time graphics channel (RemoteFX / H.264) carried over it; confirm `syn-lossy flows > 0` in the scan
+  (the modern capture had `0`).
+- A **lossy link** (clumsy on Windows, or `netshape.sh`/a real WAN) to make the server actually emit
+  parity packets — Windows' FEC is loss-driven, so a clean link may show none even on v1/v2.
+
+**Decision procedure (unchanged capture-first gate — do NOT build an encoder before this):**
+1. Capture a legacy-Windows lossy session under induced loss.
+2. `scripts/fec-scan.sh <pcap>` — looking for `negotiated version 0x0001/0x0002` **and** `FEC packets > 0`
+   (the tool already dumps `snCoded / snSourceStart / uRange / uFecIndex` for each FEC datagram on a GO).
+3. If GO: the captured parity payloads + the source packets they cover are what let us reverse-engineer the
+   **undocumented GF(256) coefficient table** (the spec defines the header but not the matrix). Only then is
+   an encoder worth writing.
+
+**Caveat that gates the value even if GO:** FEC would help **only legacy clients** — modern mstsc/Win11
+(RDPUDP2) would still never use it. So a revisit's payoff is narrow (and the 1+1 redundancy stand-in below
+already covers the lossy-link case for *any* client without reverse-engineering anything). Weigh that before
+committing to the GF(256) work. The tooling (`fec-scan.sh`, `netshape.sh`, the capture-first methodology) is
+ready, so the revisit is "get legacy machines → capture → re-run the gate," not "start from scratch."
+
 ### P2.3 redundancy stand-in — 1+1 lossy duplicate sends (built 2026-06-27, soak pending)
 
 With real FEC ruled out, the protocol-safe redundancy is a **1+1 repetition code at the RDPEUDP
