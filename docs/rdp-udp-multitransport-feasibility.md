@@ -248,6 +248,27 @@ reliable-only multitransport.
    same loss sensitivity (matching client resolution to avoid scaling + a capable
    client are the practical mitigations there).
 
+4. **The under-loss freeze is permanent (no recovery after loss stops) — expected,
+   do NOT re-investigate (2026-06-28, mstsc, 8% loss via clumsy, reliable tunnel,
+   `MACRDP_UDP_MIGRATE_EGFX=1`).** A clean ~1-minute run then 8% drop reproduced the
+   structural HOL-block of item 3, plus a terminal state worth recording so it isn't
+   mistaken for a bug later: a loss burst lands on a ~234 KB IDR (~200+ segments);
+   the reliable SM's unacked window fills and **pegs at exactly 1024**, resending the
+   whole backlog every RTO (`RDPEUDP RTO retransmit (timer) retransmits=1024`), while
+   macrdp keeps shipping a fresh 240–270 KB periodic IDR every `--keyframe-interval`
+   (2 s) into the jammed tunnel. The client sends **CN (congestion notification)**,
+   then **stops acking entirely** and abandons the UDP tunnel (the last inbound
+   datagram precedes ~108 s of dead retransmits in the log); **audio keeps playing
+   because it rides TCP.** Because a *reliable* ordered stream cannot drop the stale
+   backlog (it would break the in-order contract) and the client never re-engages the
+   abandoned tunnel, **EGFX stays frozen even after loss stops** — there is no
+   server-side recovery path on a reliable stream. This is inherent to reliable-only
+   multitransport, not fixable in the transport; the answer is Phase 2 (lossy
+   `UdpFecL` + FEC). (Unrelated bug fixed the same day: a lock-order inversion in the
+   H.264 ship pipeline that froze EGFX on a *clean* link — see PR #78 / the
+   `ship_frames` `ctx`↔`server_handle` ordering. That one was a real deadlock; this
+   item is the expected lossy-link behavior.)
+
 ### P2.2 lossy-delivery soak (runbook)
 
 The first soak (above) shaped the **reliable** EGFX-over-UDP path. This one targets the
