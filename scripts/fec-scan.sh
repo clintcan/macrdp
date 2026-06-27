@@ -87,6 +87,20 @@ for line in lines:
         fec.append((frame, src, sport, dst, dport, sn_source_ack, uflags, payhex))
 
 print("=== RDPUDP datagrams: %d ===" % total)
+
+if total == 0:
+    print()
+    print(">>> INCONCLUSIVE: no RDP UDP datagrams in this capture.")
+    print(">>> This is NOT a NO-GO — the capture didn't contain the traffic we need.")
+    print(">>> Likely causes: empty/failed capture (e.g. `tcpdump -i any` fails on")
+    print(">>>   macOS — use the real interface), RDP ran TCP-only (the client never")
+    print(">>>   opened a UDP flow), or RDP UDP used a different port. Recapture:")
+    print(">>>   1) find your LAN interface:  ifconfig | grep -B5 'inet 192\\.168'")
+    print(">>>   2) capture broadly:  sudo tcpdump -i <iface> -w cap.pcap host <server-ip>")
+    print(">>>   3) verify it grows (ls -l cap.pcap > 24 bytes) while connected,")
+    print(">>>      then confirm UDP appears:  tshark -r cap.pcap -Y 'udp' | head")
+    sys.exit(0)
+
 print("--- uFlags histogram (count  flags  =hex) ---")
 for f in sorted(hist, key=lambda k: -hist[k]):
     print("  %6d  %-28s =0x%04x" % (hist[f], flagstr(f), f))
