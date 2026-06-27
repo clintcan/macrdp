@@ -494,18 +494,35 @@ impl Gfx {
 
     fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
-            let mut guard = self.ctx.lock().unwrap();
-            let ctx = guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
-            let surface_id = ctx
-                .surface_id
-                .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
-            let (width, height) = ctx.dims;
-            let epoch = ctx.epoch;
-            // Liveness for ack-driven IDR recovery: we're actively shipping.
-            ctx.last_ship_at = Instant::now();
-            let mut server = ctx.server_handle.lock().unwrap();
+            // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
+            // before touching `server_handle`. The inbound EGFX frame-ack path
+            // (`GfxDvcBridge::process` → `GraphicsPipelineServer::process` →
+            // `GfxHandler::on_frame_ack`) locks `server_handle` FIRST and then
+            // `ctx`. Holding `ctx` here while taking `server_handle` is the
+            // opposite order — a classic lock-order inversion that deadlocks the
+            // ship thread against an inbound ack. Over a long session the exact
+            // interleaving eventually hits and the whole pipeline freezes (idle
+            // CPU, no error, no reset — the "renders fine then freezes after a
+            // few seconds" stall, far more likely once acks ride the UDP tunnel).
+            // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
+            // lock order consistent (server_handle is never nested under ctx).
+            let (surface_id, width, height, epoch, server_handle) = {
+                let mut guard = self.ctx.lock().unwrap();
+                let ctx = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
+                let surface_id = ctx
+                    .surface_id
+                    .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
+                let (width, height) = ctx.dims;
+                let epoch = ctx.epoch;
+                // Liveness for ack-driven IDR recovery: we're actively shipping.
+                ctx.last_ship_at = Instant::now();
+                (surface_id, width, height, epoch, ctx.server_handle.clone())
+            };
+
+            // Phase 2: lock `server_handle` ALONE (ctx already released).
+            let mut server = server_handle.lock().unwrap();
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
