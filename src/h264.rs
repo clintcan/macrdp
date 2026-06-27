@@ -48,6 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -97,6 +98,11 @@ impl WireFormat {
     }
 }
 
+/// Cap on the `frame_id → LTR token` map (LTR mode). LTR frames are emitted by
+/// VideoToolbox only periodically, so this is generous; it exists purely so a
+/// client that never acks can't grow the map without bound.
+const MAX_TRACKED_LTR_TOKENS: usize = 64;
+
 /// Per-connection state, shared between the `Gfx` factory/handle (capture
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
 struct ConnectionContext {
@@ -143,6 +149,13 @@ struct ConnectionContext {
     acks_suspended: bool,
     last_ship_at: Instant,
     last_recovery_at: Instant,
+    /// LTR mode (`MACRDP_UDP_EGFX_LTR`): maps an EGFX `frame_id` (what the client
+    /// acks) → the VideoToolbox LTR token the encoder emitted for that frame.
+    /// Populated in `ship_frames` when a shipped frame carried a token; on
+    /// `on_frame_ack(frame_id)` the matching token is fed back to the encoder as
+    /// acknowledged and removed. Bounded (LTR frames are rare; pruned in
+    /// `ship_frames`). Empty on the default LTR-off path.
+    ltr_tokens: BTreeMap<u32, i64>,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -243,6 +256,16 @@ pub struct Gfx {
     recovery_enabled: bool,
     recovery_params: RecoveryParams,
     egfx_on_lossy: Arc<AtomicBool>,
+    /// Long-Term Reference recovery (`MACRDP_UDP_EGFX_LTR`). When set, the encoder
+    /// is created with LTR enabled, received frames' LTR tokens are acked back to
+    /// VT, and the ack-stall recovery action becomes a cheap `ForceLTRRefresh`
+    /// (P-frame against the last acked LTR) instead of a full IDR. Implies
+    /// `recovery_enabled` (LTR needs the same ack-stall trigger). `ltr_low_latency`
+    /// (`MACRDP_UDP_EGFX_LTR_LOWLATENCY`) additionally co-enables VT's low-latency
+    /// rate controller — a test lever for VT/HW combos that only emit LTR tokens
+    /// in that mode. Both default off → byte-identical to the pre-feature path.
+    ltr_enabled: bool,
+    ltr_low_latency: bool,
 }
 
 impl Gfx {
@@ -255,7 +278,14 @@ impl Gfx {
         egfx_on_lossy: Arc<AtomicBool>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
-        let (recovery_enabled, recovery_params) = recovery_config_from_env();
+        let (mut recovery_enabled, recovery_params) = recovery_config_from_env();
+        // LTR mode implies the ack-stall recovery trigger (it's what fires the
+        // LTR refresh). Reading it here keeps all the EGFX-on-lossy env in one place.
+        let ltr_enabled = crate::multitransport::env_truthy("MACRDP_UDP_EGFX_LTR");
+        let ltr_low_latency = crate::multitransport::env_truthy("MACRDP_UDP_EGFX_LTR_LOWLATENCY");
+        if ltr_enabled {
+            recovery_enabled = true;
+        }
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -264,8 +294,10 @@ impl Gfx {
         if recovery_enabled {
             info!(
                 ?recovery_params,
-                "EGFX ack-driven IDR recovery ENABLED (MACRDP_UDP_EGFX_ACK_RECOVERY) — \
-                 active only while EGFX is on the lossy UDP tunnel"
+                ltr_enabled,
+                ltr_low_latency,
+                "EGFX ack-driven recovery ENABLED — active only while EGFX is on the lossy UDP \
+                 tunnel; recovery action is an LTR refresh when MACRDP_UDP_EGFX_LTR is set, else IDR"
             );
         }
         Self {
@@ -280,6 +312,8 @@ impl Gfx {
             recovery_enabled,
             recovery_params,
             egfx_on_lossy,
+            ltr_enabled,
+            ltr_low_latency,
         }
     }
 
@@ -335,12 +369,26 @@ impl Gfx {
                     self.egfx_on_lossy.load(Ordering::Relaxed),
                     &self.recovery_params,
                 ) {
-                    ctx.need_keyframe = true;
                     ctx.last_recovery_at = now;
-                    info!(
-                        since_ack_ms = since_ack.as_millis() as u64,
-                        "EGFX ack-stall on lossy tunnel — forcing recovery IDR"
-                    );
+                    if self.ltr_enabled {
+                        // Cheap recovery: a P-frame against the last acked LTR (VT
+                        // falls back to an IDR itself if nothing's been acked yet).
+                        // Consumed on the next encode; persists across a dropped
+                        // capture just like need_keyframe.
+                        if let Some(enc) = ctx.encoder.as_mut() {
+                            enc.request_ltr_refresh();
+                        }
+                        info!(
+                            since_ack_ms = since_ack.as_millis() as u64,
+                            "EGFX ack-stall on lossy tunnel — forcing LTR refresh"
+                        );
+                    } else {
+                        ctx.need_keyframe = true;
+                        info!(
+                            since_ack_ms = since_ack.as_millis() as u64,
+                            "EGFX ack-stall on lossy tunnel — forcing recovery IDR"
+                        );
+                    }
                 }
             }
             // Lazy one-time setup on the first ready frame (creates the encoder
@@ -469,6 +517,8 @@ impl Gfx {
                 self.fps,
                 self.bitrate_bps,
                 self.keyframe_secs,
+                self.ltr_enabled,
+                self.ltr_low_latency,
             )?;
             // Hand VT's output channel to a dedicated ship thread (push model),
             // so encoded frames are sent the instant they're ready, off the
@@ -477,6 +527,9 @@ impl Gfx {
             let rx = encoder
                 .take_receiver()
                 .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
+            if encoder.ltr_enabled() {
+                info!("EGFX encoder created with Long-Term Reference (LTR) mode enabled");
+            }
             ctx.encoder = Some(encoder);
             // Fresh throttle counters for this connection.
             ctx.submitted.store(0, Ordering::Relaxed);
@@ -534,19 +587,22 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                match server.send_avc420_frame(surface_id, &payload, &[region], ts_ms) {
+                let shipped_id = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
+                match shipped_id {
                     Some(frame_id) if f.is_keyframe => debug!(
                         frame_id,
                         ?self.wire_format,
                         param_sets = ps_count,
                         param_bytes = ps_bytes,
                         payload_bytes = payload.len(),
+                        ltr = ?f.ltr_token,
                         "EGFX shipped keyframe (IDR)"
                     ),
                     Some(frame_id) => trace!(
                         frame_id,
                         keyframe = false,
                         payload_bytes = payload.len(),
+                        ltr = ?f.ltr_token,
                         "EGFX shipped frame"
                     ),
                     None => debug!(
@@ -555,6 +611,20 @@ impl Gfx {
                         bytes = payload.len(),
                         "send_avc420_frame returned None"
                     ),
+                }
+                // LTR mode: remember which EGFX frame_id carried which VT LTR token,
+                // so the matching client ack can acknowledge it to the encoder. Bound
+                // the map (LTR frames are rare, but never let a misbehaving peer grow
+                // it unboundedly): drop the oldest once it gets large.
+                if let (Some(frame_id), Some(token)) = (shipped_id, f.ltr_token) {
+                    ctx.ltr_tokens.insert(frame_id, token);
+                    while ctx.ltr_tokens.len() > MAX_TRACKED_LTR_TOKENS {
+                        if let Some(&oldest) = ctx.ltr_tokens.keys().next() {
+                            ctx.ltr_tokens.remove(&oldest);
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
             (server.drain_output(), egfx_channel_id)
@@ -659,6 +729,7 @@ impl GfxServerFactory for Gfx {
             acks_suspended: false,
             last_ship_at: Instant::now(),
             last_recovery_at: Instant::now(),
+            ltr_tokens: BTreeMap::new(),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -762,6 +833,15 @@ impl GraphicsPipelineHandler for GfxHandler {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
+            // LTR mode: if this acked frame was an LTR frame, tell the encoder its
+            // token is now confirmed-received so a later ForceLTRRefresh can
+            // reference it. (No-op on the default path — the map is always empty.)
+            if let Some(token) = ctx.ltr_tokens.remove(&frame_id) {
+                if let Some(enc) = ctx.encoder.as_mut() {
+                    enc.acknowledge_ltr_tokens(&[token]);
+                    trace!(frame_id, token, "EGFX LTR frame acknowledged to encoder");
+                }
+            }
         }
     }
 
