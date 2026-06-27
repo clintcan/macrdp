@@ -595,15 +595,73 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   may need the response re-sent idempotently (or a handshake-phase retransmit). That's
   the next thing the netshape soak should probe.
 
-- **P2.3 — FEC encoder (optional, deferrable).** Researched: MS-RDPEUDP FEC is
-  **GF(256) Reed–Solomon**, not XOR parity; each FEC packet recovers exactly **one** lost
-  source packet within its range; the wire header is `RDPUDP_FEC_PAYLOAD_HEADER`
-  (`snCoded`, `snSourceStart`, `uRange`, `uFecIndex`). A **send-only server needs only the
-  *encoder***, and **even that is optional** — it's a loss-recovery *optimization*, not
-  required for the lossy transport to function. So **ship lossy-without-FEC first**
-  (P2.4/P2.5 below work without it), then add the RS encoder as a measurable
-  loss-resilience improvement. This de-risks: we get a working lossy audio path before
-  taking on a Reed–Solomon implementation.
+- **P2.3 — FEC encoder — CAPTURE-BLOCKED (spec research 2026-06-27, [MS-RDPEUDP] rev 19.0).**
+  A deeper read of the spec turned the lossy-audio soak's "needs FEC" conclusion into four
+  hard blockers, so before any encoder we do a **capture-first go/no-go spike** (see the
+  "P2.3 FEC capture runbook" below):
+  1. **Receiver decode is OPTIONAL.** The spec is explicit — "the receiver … can ignore the
+     FEC Packet and not use it for any decoding operations"; **retransmission (ARQ) is the
+     actual reliability mechanism**, FEC is only an opportunistic latency-saver. So a perfect
+     encoder may be *ignored* by mstsc. (§ "UDP Data Transfer".)
+  2. **The GF(256) coefficient table is UNDOCUMENTED.** It's a Reed–Solomon / Vandermonde
+     code over GF(2^8), NOT XOR parity (spec example coefficients `[1 142 244 71 167]`), but
+     the generator polynomial, primitive element, and `uFecIndex`→coefficient-row mapping are
+     **not published**. Emitting packets a Windows receiver would decode requires
+     reverse-engineering the table **from a packet capture of a real Windows RDP *server*
+     sending FEC**. (§2.2.2.2/2.2.2.3.)
+  3. **FEC is v1/v2-only — RDPEUDP2 (v3+) has no FEC** (delay-based rate control instead), and
+     mstsc prefers v2-carrying-TLS / RDPEUDP2. So even on a lossy flow mstsc may negotiate a
+     version where FEC never applies.
+  4. **No OSS reference** — FreeRDP's prototype explicitly skipped FEC, never merged.
+
+  Wire facts (confirmed, for when/if we build it): an FEC packet is an ACK datagram with
+  `uFlags = FEC|DATA|ACK (0x1C)`, layout `RDPUDP_FEC_HEADER(8) + AckVector + RDPUDP_FEC_PAYLOAD_HEADER(12) + parity`.
+  `RDPUDP_FEC_PAYLOAD_HEADER` = `snCoded u32`, `snSourceStart u32`, `uRange u8` (covers
+  `[snSourceStart .. snSourceStart+uRange]`, ≤255), `uFecIndex u8` (selects the parity/coefficient
+  row — multiple FEC packets w/ distinct `uFecIndex` recover >1 loss; one packet = one loss),
+  `uPadding u16` (=0). Each source packet enters the FEC math prefixed with a 2-byte
+  `RDPUDP_PAYLOAD_PREFIX` (`cbPayloadSize`) and zero-padded to the longest member of the range.
+  `snCoded` advances for **every** datagram (source AND FEC); `snSourceStart` only for source.
+
+  **Decision (user, 2026-06-27): capture-first.** Build NO encoder until a capture proves
+  (a) a real Windows server actually sends FEC to a client on a lossy flow under loss, and
+  (b) yields the coefficient table. If the capture shows FEC isn't used in practice (likely,
+  given #1/#3), lossy-audio-over-mstsc has no clean FEC win and the conclusion is documented
+  as such — the retransmission-ARQ path (fix server→client RTO + the tunnel-backlog-blind lag
+  model) becomes the alternative.
+
+### P2.3 FEC capture runbook (the go/no-go spike)
+
+Goal: a `.pcap` of a **real Windows RDP server** sending RDPEUDP **FEC packets** to a client
+over a **lossy** link, to answer (a) *does it happen at all?* and (b) *what are the GF(256)
+coefficients?* Only build the encoder if (a) is yes.
+
+**Topology (use what's on hand — one Windows box + the Mac):**
+- **Server:** enable Remote Desktop on the Windows box (System → Remote Desktop). Ensure UDP
+  multitransport is on (default; GPO "Select RDP transport protocols" = Use both / leave default).
+- **Client + capture host:** the Mac, via **Microsoft Remote Desktop.app** (it can open a UDP
+  flow). Capture on the Mac with Wireshark/tcpdump on the RDP UDP flow.
+- **Loss:** `sudo scripts/netshape.sh on --loss 8 --delay 80 --port 3389` on the Mac (shape the
+  *server's* RDP port so the path is lossy → the server's RDPEUDP reacts; 8% to make FEC, if
+  used, frequent). Higher loss than the audio soak on purpose — we want to *provoke* FEC.
+- If the Mac client never triggers FEC, fall back to a **second Windows box running mstsc** to
+  the same server (Windows↔Windows is the most likely to negotiate a FEC-capable version), with
+  a lossy router/`clumsy` in between, captured on either end.
+
+**Capture + first look:**
+```
+# on the Mac, capture the UDP flow (RDP UDP rides the same 3389 by default):
+sudo tcpdump -i any -w /tmp/rdpfec.pcap 'udp and port 3389'
+# …connect MS Remote Desktop to the Windows server, exercise it ~30s under loss, stop tcpdump.
+scripts/fec-scan.sh /tmp/rdpfec.pcap     # summarizes RDPUDP flags; flags FEC datagrams
+```
+`scripts/fec-scan.sh` (added with this) tallies the RDPUDP `uFlags` per datagram and prints any
+with the **FEC bit (0x10)** set, with `snCoded`/`snSourceStart`/`uRange`/`uFecIndex` and the
+parity bytes. **Go/no-go:** any FEC datagrams at all → (a) is YES, capture-spike green, proceed
+to coefficient extraction (paste the pcap and I'll work the GF(256) table from the covered
+source packets + parity). **Zero FEC datagrams over a lossy link** (only retransmits) → (a) is
+NO: a real Windows server doesn't use FEC here either, so we don't build the encoder, and the
+ARQ-fix path is the only lever. Either outcome is a decisive result.
 
 - **P2.4a — MS-RDPEMT tunnel over DTLS (DONE, GREEN 2026-06-26).** The prerequisite
   for any lossy channel: decrypt the client's DTLS application records, answer its
