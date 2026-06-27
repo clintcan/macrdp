@@ -2190,7 +2190,7 @@ async fn async_main() -> Result<()> {
         .await
         {
             Ok(listener) => {
-                let migrate_egfx = std::env::var_os("MACRDP_UDP_MIGRATE_EGFX").is_some();
+                let migrate_egfx = multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX");
                 info!(
                     addr = %args.bind,
                     migrate_egfx,
@@ -2210,7 +2210,7 @@ async fn async_main() -> Result<()> {
                 // Requires AAC (the lossy DVC needs version >= 8 + AAC,
                 // MS-RDPEA Appendix A note <2>). Advertises the SAME format list
                 // the static RDPSND path encodes.
-                if std::env::var_os("MACRDP_UDP_LOSSY_AUDIO").is_some() && args.enable_aac {
+                if multitransport::env_truthy("MACRDP_UDP_LOSSY_AUDIO") && args.enable_aac {
                     let formats = audio::server_audio_formats(args.enable_aac, args.aac_bitrate);
                     info!(
                         formats = formats.len(),

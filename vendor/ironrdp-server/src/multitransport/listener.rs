@@ -442,7 +442,7 @@ async fn run_recv_loop(
     // instead of the reliable policy. Default OFF — the lossy flow keeps riding the
     // reliable SM (the proven P2.1a/P2.4a path), so this is a one-env-var A/B and a
     // clean fallback. The reliable (`UdpFecR`) flow is never affected.
-    let lossy_delivery = std::env::var_os("MACRDP_UDP_LOSSY_DELIVERY").is_some();
+    let lossy_delivery = super::env_truthy("MACRDP_UDP_LOSSY_DELIVERY");
     if lossy_delivery {
         debug!("MACRDP_UDP_LOSSY_DELIVERY set — lossy (SYN_LOSSY) flows will use DeliveryMode::Lossy");
     }

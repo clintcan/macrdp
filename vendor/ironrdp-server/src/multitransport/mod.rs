@@ -50,6 +50,23 @@ pub trait MultitransportProvider: Send {
     fn requested_protocol(&self) -> RequestedProtocol;
 }
 
+/// Interpret an experimental on/off environment toggle by *value*, not mere
+/// presence. Returns `true` only for a truthy value; unset, empty, and the common
+/// falsey spellings (`0`/`false`/`no`/`off`, case-insensitive, trimmed) are
+/// `false`. A bare `.is_some()` check treated `FLAG=0` as "on", which silently
+/// contaminated the lossy-soak A/B (setting `MACRDP_UDP_LOSSY_DELIVERY=0` to revert
+/// to reliable delivery left it lossy) — so all the experimental UDP toggles route
+/// through here.
+pub(crate) fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Encode a Server Initiate Multitransport Request (MS-RDPBCGR 2.2.15.1) as a
 /// `SendDataIndication` on the IO channel. The Initiate Request is a
 /// `BasicSecurityHeader`-wrapped PDU, **not** a ShareControl PDU — so this

@@ -294,7 +294,7 @@ const EGFX_DVC_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
 fn migrate_egfx_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("MACRDP_UDP_MIGRATE_EGFX").is_some())
+    *ENABLED.get_or_init(|| crate::multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX"))
 }
 
 /// (P2.4b diagnostic) EXPERIMENTAL: migrate EGFX onto the LOSSY (UdpFecL/DTLS)
@@ -309,7 +309,7 @@ fn migrate_egfx_enabled() -> bool {
 fn migrate_egfx_lossy() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("MACRDP_UDP_MIGRATE_EGFX_LOSSY").is_some())
+    *ENABLED.get_or_init(|| crate::multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX_LOSSY"))
 }
 
 pub struct RdpServer {
