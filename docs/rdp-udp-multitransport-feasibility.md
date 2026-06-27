@@ -125,6 +125,23 @@ server-only glue (UDP listener, cookie→session binding, channel migration via
 spec walks you through — and FreeRDP never finished the *client* UDP path either,
 so there was no OSS implementation of any of it to crib from.
 
+### Which clients actually take macrdp's UDP offer
+
+The UDP path only matters for clients that *open a UDP flow* in response to the
+Initiate Multitransport Request. Coverage:
+
+| Client | Opens UDP against macrdp? | Notes |
+|---|---|---|
+| **Windows mstsc** | ✅ yes | The only verified consumer of macrdp's UDP data path (EGFX over reliable RDPEUDP; lossy audio over UDPFECL). All real-client UDP verification is on mstsc. |
+| FreeRDP (`sdl-freerdp`) | ❌ no | Consumes the offer but declines UDP (`E_ABORT` / `multitransport_no_udp`) → graceful TCP fallback. |
+| **macOS Windows App / Microsoft Remote Desktop** (`com.microsoft.rdc.macos`) | ❌ no | **TCP-only against a generic RDP host.** It *has* a reliable-UDP/multitransport stack, but it's wired exclusively to **RDP Shortpath**, which is **Azure Virtual Desktop / Windows 365 / Dev Box only** (bootstraps over the AVD reverse-connect gateway + STUN/TURN, not a host's MS-RDPEMT offer; added macOS v10.9.0, Aug 2023; unchanged by the "Windows App" rename). So it never opens a UDP flow against macrdp → always TCP fallback. Confirmed via Microsoft's "Compare Remote Desktop client features" table (UDP appears only as RDP Shortpath rows, AVD pivots only). |
+
+**Consequences:** (a) the whole UDP path — and the lossy-audio / 1+1 redundancy
+work — is an **mstsc-only win** today; the Mac client and FreeRDP always run over
+TCP. (b) You **cannot** capture RDPEUDP FEC from the Mac client (no UDP on the
+wire) — the FEC-capture revisit needs a Windows **mstsc** client (against a legacy
+Windows *server* for the parity packets; see "P2.3 FEC — future revisit").
+
 ## Soak testing the UDP path under loss
 
 EGFX-over-UDP has only been verified on a clean WiFi/LAN so far — which proves it
