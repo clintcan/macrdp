@@ -705,6 +705,44 @@ redundancy** — built, see P2.3 below; else (2) accept that lossy-audio-over-ms
 (reliable = HOL-block = the very problem), so "fix ARQ" is not a lossy-audio fix — it's only relevant if a
 *reliable* tunnel payload is ever wanted.
 
+### FEC spec survey (2026-06-27) — every Microsoft media-FEC spec, and why none is reachable on the RDP path
+
+After the RDPUDP2 finding we swept the Microsoft Open Specs (+ the RFC base) for *any* FEC / parity /
+redundant-packet / loss-recovery mechanism an RDP client would decode on the **audio** or **H.264** path —
+not just the transport. The specs exist; they sort into two buckets, and **neither is usable by macrdp.**
+
+**Bucket 1 — RDP transport FEC (the one scheme already known):**
+- [MS-RDPEUDP] **v1** — `RDPUDP_FLAG_FEC` + `RDPUDP_FEC_PAYLOAD_HEADER`, GF(256), **coefficients
+  undocumented**. The only FEC any RDP client decodes.
+- [MS-RDPEUDP2] — **no FEC** (reliable-only, retransmit), spec-stated.
+- [MS-RDPEMT] — tunnel only selects reliable/lossy + TLS/DTLS; defines no FEC.
+- [MS-RDPBCGR] `UDPFECR`/`UDPFECL` — just *names* for the two RDPEUDP transport modes; the "FEC" is the
+  transport-family label, **not** a second scheme.
+
+**Bucket 2 — Microsoft media-payload FEC (all RTP, all off the RDP path):**
+- [MS-H264PF] (H.264 FEC, RFC 6190/5109 lineage) — RTP, UCC (Lync/Skype/Teams).
+- [MS-RTVPF] (RTVideo FEC, XOR) — RTP, UCC.
+- [MS-RTP] (drives audio FEC via RTCP "FEC distance"/healer signaling) — RTP, UCC.
+- [MS-RTSP] (`audio|video|application/x-wms-fec`, ≤24-source-packet XOR FEC) — RTP under Windows Media.
+- [MS-RTPRAD]/[MS-RTPRADEX] (RFC 2198 audio redundancy) — RTP, UCC.
+- RFC 5109 / RFC 2733 — the IETF base (generic XOR/parity); an **RTP payload format by construction**.
+
+**The decisive fact ruling out all of Bucket 2: RDP never carries RTP.** Every FEC-bearing media spec is in
+`office_protocols` (the UCC/RTP or Windows Media stack); **no RDP spec references RTP, RFC 5109, or any of
+these payload formats.** macrdp's media rides RDP virtual channels — H.264 over [MS-RDPEGFX] (explicitly a
+*"non-lossy dynamic virtual channel"*; its only loss handling is `RDPGFX_FRAME_ACKNOWLEDGE_PDU` flow
+control + IDR/retransmit) and audio over [MS-RDPEA]/RDPSND (lossy mode is just the `AUDIO_PLAYBACK_LOSSY_DVC`
+channel-name selector, zero payload protection). So mstsc-as-an-RDP-client has **no decoder** for any of
+these on those channels. [MS-RDPEVOR], [MS-RDPRFX], [MS-RDPNSC], [MS-RDPEGDI] likewise carry no codec-level
+FEC (all reliable-channel specs).
+
+**Conclusion:** the only client-decodable FEC on the RDP path is RDPEUDP v1's GF(256) transport FEC
+(undocumented coefficients; legacy v1/v2 only; superseded by RDPUDP2's no-FEC). There is **no** audio-payload
+FEC, **no** H.264/EGFX-payload FEC, and **no** RTP-based FEC reachable from RDP. This is exactly why the
+**1+1 transport-level redundancy** below — which needs no client FEC decoder (DTLS dedups the duplicate) — is
+the only loss-recovery lever that works for *any* current RDP client. Don't re-survey these specs; the
+result is comprehensive.
+
 ### P2.3 FEC — future revisit (needs legacy-Windows machines)
 
 The NO-GO above is structural **for modern Windows** — it's a property of the *negotiated transport
