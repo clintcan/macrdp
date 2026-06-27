@@ -87,6 +87,38 @@ echo "  negotiated version(s): ${VERSIONS:-<none>}   (0x0001/0x0002 = FEC-capabl
 echo "  data=$DATA  ack=$ACK  syn-lossy flows=$LOSSY  FEC packets=$FEC"
 echo
 
+# VALIDITY GATE (guards against a FALSE GO on mis-dissected non-RDP UDP). A genuine
+# RDPUDP SYNEX carries a version in {0x0001, 0x0002, 0x0101}. If the scanned UDP has
+# SYNEX-flagged packets but NONE carry a valid version (i.e. a scatter of garbage
+# values like 0x007e/0x18ac/0xe280), the RDPUDP dissector is mis-parsing some OTHER
+# UDP protocol — ZeroTier on 9993, QUIC, a game — and the flag/FEC counts above are
+# meaningless noise. This exact trap produced a false "204 FEC packets" GO on a
+# ZeroTier-laden capture. Refuse rather than send anyone reverse-engineering garbage.
+SYNEX="$(tshark -r "$PCAP" $DECODE -Y 'rdpudp.flags.synex==1' 2>/dev/null | grep -c . || true)"
+VALIDVER="$(tshark -r "$PCAP" $DECODE -Y 'rdpudp.flags.synex==1 && (rdpudp.synex.version==0x0001 || rdpudp.synex.version==0x0002 || rdpudp.synex.version==0x0101)' 2>/dev/null | grep -c . || true)"
+if [ "$SYNEX" -gt 0 ] && [ "$VALIDVER" -eq 0 ]; then
+    echo ">>> NOT RDPUDP (false match): $SYNEX 'SYNEX' packet(s), but NONE carry a valid"
+    echo ">>> RDPUDP version (0x0001/0x0002/0x0101) — the versions above are garbage."
+    echo ">>> The dissector is mis-parsing NON-RDP UDP (e.g. ZeroTier on 9993, QUIC, a"
+    echo ">>> game) as RDPUDP, so the flag/FEC counts are meaningless. NOT a FEC result."
+    echo ">>>   * Confirm the capture actually contains the RDP UDP session, then pass its"
+    echo ">>>     real port explicitly:  $0 $PCAP <udp_port>"
+    echo ">>>   * VirtualBox NAT (host 127.0.0.1:<port> -> guest 3389) puts RDP on the"
+    echo ">>>     LOOPBACK adapter — capture THERE, not the LAN/Ethernet adapter; or switch"
+    echo ">>>     the VM to a Bridged adapter and capture the RDP host's IP on the LAN."
+    exit 0
+fi
+
+if [ "$FEC" -gt 0 ] && [ "$VALIDVER" -eq 0 ]; then
+    # FEC flags but no RDPUDP SYN/version was captured to corroborate (e.g. capture
+    # started mid-session) — could be real, could be mis-dissection. Don't claim GO.
+    echo ">>> SUSPECT (unverified): $FEC packet(s) have the FEC flag, but no RDPUDP SYNEX"
+    echo ">>> version was captured to confirm this is really RDPUDP (the SYN handshake may"
+    echo ">>> be outside the capture window — or this isn't RDP). Re-capture from the start"
+    echo ">>> of the connection (so the SYN/SYNEX is included) before trusting a GO."
+    exit 0
+fi
+
 if [ "$FEC" -gt 0 ]; then
     echo ">>> GO: $FEC FEC datagram(s) found. Extract the coefficient table:"
     tshark -r "$PCAP" $DECODE -Y 'rdpudp.flags.fec==1' \
