@@ -297,6 +297,21 @@ fn migrate_egfx_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("MACRDP_UDP_MIGRATE_EGFX").is_some())
 }
 
+/// (P2.4b diagnostic) EXPERIMENTAL: migrate EGFX onto the LOSSY (UdpFecL/DTLS)
+/// tunnel instead of the reliable (UdpFecR/rustls) one. This is an *isolation
+/// test* for the DTLS `RDP_TUNNEL_DATA` egress path (`ship_outbound`'s DTLS
+/// branch): EGFX-over-tunnel is already proven on the reliable tunnel, so if it
+/// also renders over DTLS the framing is correct and any lossy-audio failure is
+/// purely the MS-RDPEA channel model — not our tunnel data path. Requires
+/// `MACRDP_UDP_MIGRATE_EGFX` + `MACRDP_UDP_OFFER_FECL` (so a lossy tunnel exists).
+/// Read once and cached.
+#[cfg(feature = "multitransport")]
+fn migrate_egfx_lossy() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MACRDP_UDP_MIGRATE_EGFX_LOSSY").is_some())
+}
+
 pub struct RdpServer {
     opts: RdpServerOptions,
     // FIXME: replace with a channel and poll/process the handler?
@@ -398,6 +413,20 @@ pub struct RdpServer {
     /// the channel unregistered. Set via `set_multitransport_lossy_audio_formats`.
     #[cfg(feature = "multitransport")]
     multitransport_lossy_audio_formats: Option<Vec<ironrdp_rdpsnd::pdu::AudioFormat>>,
+    /// (P2.4b dual-channel) The client-list format index negotiated on the RELIABLE
+    /// `AUDIO_PLAYBACK_DVC` over TCP, shared with the lossy wave path so the `Wave2`
+    /// PDUs it ships over the lossy/DTLS tunnel carry the right `wFormatNo`.
+    #[cfg(feature = "multitransport")]
+    lossy_audio_format: crate::multitransport::audio_dvc::NegotiatedAudioFormat,
+    /// (2b-iv-B) Per-wave `block_no` sequence for the lossy `AUDIO_PLAYBACK_LOSSY_DVC`
+    /// `Wave2` PDUs (independent of the static rdpsnd channel's own counter). Bumped
+    /// per wave shipped over the tunnel; wraps at 255.
+    #[cfg(feature = "multitransport")]
+    lossy_audio_block_no: u8,
+    /// (2b-iv-B) One-shot marker so the "now streaming audio over the lossy tunnel"
+    /// log fires exactly once at the static-rdpsnd → lossy-DVC handover (not per wave).
+    #[cfg(feature = "multitransport")]
+    lossy_audio_streaming: bool,
 }
 
 #[derive(Debug)]
@@ -512,6 +541,12 @@ impl RdpServer {
             multitransport_tunnel_inbound_rx: None,
             #[cfg(feature = "multitransport")]
             multitransport_lossy_audio_formats: None,
+            #[cfg(feature = "multitransport")]
+            lossy_audio_format: crate::multitransport::audio_dvc::NegotiatedAudioFormat::new(),
+            #[cfg(feature = "multitransport")]
+            lossy_audio_block_no: 0,
+            #[cfg(feature = "multitransport")]
+            lossy_audio_streaming: false,
         }
     }
 
@@ -698,17 +733,22 @@ impl RdpServer {
             dvc
         };
 
-        // (vendored, feature=multitransport, P2.4b) The lossy-UDP audio output DVC
-        // (`AUDIO_PLAYBACK_LOSSY_DVC`). Registered only when the application
-        // supplied a format list (macrdp does so when `--enable-aac` + the lossy
-        // UDP offer are both on). The format handshake runs over the main TCP
-        // connection first; Soft-Sync migration of the wave data onto the DTLS
-        // tunnel is a later sub-step.
+        // (vendored, feature=multitransport, P2.4b) Dual audio output DVC for lossy
+        // UDP audio. Registered only when the application supplied a format list
+        // (macrdp does so when `--enable-aac` + the lossy UDP offer are both on).
+        // mstsc tears down if it receives Server Audio Formats on the `_LOSSY_`
+        // channel (over TCP *or* the tunnel — verified), so we open BOTH: the
+        // reliable `AUDIO_PLAYBACK_DVC` runs the format/quality/training handshake
+        // over TCP and publishes the negotiated format index; the lossy
+        // `AUDIO_PLAYBACK_LOSSY_DVC` is Soft-Synced onto the lossy/DTLS tunnel and
+        // carries only Wave2 data stamped with that index.
         #[cfg(feature = "multitransport")]
         let dvc = {
+            use crate::multitransport::audio_dvc::AudioLossyDvc;
             let mut dvc = dvc;
             if let Some(formats) = self.multitransport_lossy_audio_formats.clone() {
-                dvc = dvc.with_dynamic_channel(crate::multitransport::audio_dvc::AudioLossyDvc::new(formats));
+                dvc = dvc.with_dynamic_channel(AudioLossyDvc::reliable(formats, self.lossy_audio_format.clone()));
+                dvc = dvc.with_dynamic_channel(AudioLossyDvc::lossy());
             }
             dvc
         };
@@ -1224,7 +1264,7 @@ impl RdpServer {
                         // channel. Default path is unchanged TCP.
                         #[cfg(feature = "multitransport")]
                         if self.egfx_on_udp {
-                            self.route_egfx_over_udp(messages)?;
+                            self.route_dvc_over_udp(messages)?;
                             continue;
                         }
                         let drdynvc_channel_id = self
@@ -1417,12 +1457,33 @@ impl RdpServer {
                 }
 
                 // Briefly lock Self to build the Wave PDU and look up the
-                // rdpsnd channel id. RdpsndServer::wave() bumps a private
-                // block_no and produces SVC messages — microseconds of
-                // work. Lock released before the (potentially long)
-                // socket write.
+                // channel id. RdpsndServer::wave() bumps a private block_no and
+                // produces SVC messages — microseconds of work. Lock released
+                // before the (potentially long) socket write.
+                let mut this = this.lock().await;
+
+                // (2b-iv-B) Once the lossy-audio-over-UDP path is live (reliable
+                // handshake negotiated + tunnel bound + lossy DVC open), ship the
+                // wave as a Wave2 PDU on AUDIO_PLAYBACK_LOSSY_DVC over the lossy/DTLS
+                // tunnel and SKIP the static rdpsnd write — exactly one playback path
+                // at a time (no double-play). The tunnel send is best-effort and
+                // non-blocking, so no socket-write await here.
+                #[cfg(feature = "multitransport")]
+                if let Some((format_no, lossy_id)) = this.lossy_audio_target() {
+                    let block_no = this.lossy_audio_block_no;
+                    this.lossy_audio_block_no = this.lossy_audio_block_no.wrapping_add(1);
+                    let res = this.route_lossy_audio_wave(block_no, ts, format_no, lossy_id, data);
+                    drop(this);
+                    if let Err(e) = res {
+                        warn!(error = %e, "lossy audio wave route over UDP tunnel failed");
+                    }
+                    audio_shipped_ms += wave_ms;
+                    continue;
+                }
+
+                // Static rdpsnd over TCP (default; also the pre-negotiation path
+                // before the lossy DVC is live).
                 let encoded = {
-                    let mut this = this.lock().await;
                     let Some(rdpsnd) = this.get_svc_processor::<RdpsndServer>() else {
                         warn!("No rdpsnd channel, dropping wave");
                         continue;
@@ -1440,6 +1501,7 @@ impl RdpServer {
                     };
                     server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?
                 };
+                drop(this);
 
                 audio_writer.write_all(&encoded).await?;
                 audio_shipped_ms += wave_ms;
@@ -1617,13 +1679,14 @@ impl RdpServer {
             return Ok(());
         }
 
-        // P2.4b (2b-ii): if a lossy audio DVC is registered, migrate IT onto the
-        // LOSSY tunnel (`TUNNELTYPE_UDPFECL`) — the inverse of EGFX, which (when
-        // enabled) migrates onto the RELIABLE tunnel. The lossy audio handshake
-        // can't run over TCP at all (the P2.4b-1 finding: mstsc tears the socket
-        // down), so the Soft-Sync MUST precede any audio data. Look the channel up
-        // BEFORE consuming the one-time guard, so if its DVC Create Response hasn't
-        // arrived yet we just retry on the next EGFX frame (guard intact).
+        // P2.4b (dual-channel): if the lossy audio DVCs are registered, Soft-Sync the
+        // LOSSY `AUDIO_PLAYBACK_LOSSY_DVC` onto the LOSSY tunnel (`TUNNELTYPE_UDPFECL`)
+        // — the inverse of EGFX, which migrates onto the RELIABLE tunnel. The lossy
+        // channel carries Wave2 data only; the format/quality/training handshake runs
+        // on the reliable `AUDIO_PLAYBACK_DVC` over TCP (mstsc tears the socket down if
+        // formats arrive on the lossy name — over TCP *or* the tunnel, both verified).
+        // Look the channel up BEFORE consuming the one-time guard, so if its DVC Create
+        // Response hasn't arrived yet we just retry on the next EGFX frame (guard intact).
         if self.multitransport_lossy_audio_formats.is_some() {
             let Some(audio_id) = self
                 .get_svc_processor::<dvc::DrdynvcServer>()
@@ -1637,7 +1700,8 @@ impl RdpServer {
             }
             debug!(
                 audio_channel_id = audio_id,
-                "UDP lossy tunnel bound + audio DVC open — Soft-Sync migrating audio onto the LOSSY (UdpFecL) tunnel"
+                "UDP lossy tunnel bound — Soft-Sync migrating AUDIO_PLAYBACK_LOSSY_DVC onto the LOSSY (UdpFecL) \
+                 tunnel (waves only; the format handshake runs on the reliable AUDIO_PLAYBACK_DVC over TCP)"
             );
             return self
                 .send_soft_sync_request(writer, user_channel_id, dvc::pdu::TUNNELTYPE_UDPFECL, vec![audio_id])
@@ -1675,8 +1739,16 @@ impl RdpServer {
         } else {
             Vec::new()
         };
+        // EGFX normally migrates onto the RELIABLE tunnel. The P2.4b isolation test
+        // (`MACRDP_UDP_MIGRATE_EGFX_LOSSY`) instead targets the LOSSY/DTLS tunnel to
+        // exercise the DTLS `RDP_TUNNEL_DATA` egress path with a proven payload.
+        let egfx_tunnel_type = if migrate_egfx_lossy() {
+            dvc::pdu::TUNNELTYPE_UDPFECL
+        } else {
+            dvc::pdu::TUNNELTYPE_UDPFECR
+        };
         debug!("UDP tunnel bound + EGFX active — Soft-Sync gate open");
-        self.send_soft_sync_request(writer, user_channel_id, dvc::pdu::TUNNELTYPE_UDPFECR, channel_ids)
+        self.send_soft_sync_request(writer, user_channel_id, egfx_tunnel_type, channel_ids)
             .await
     }
 
@@ -1728,37 +1800,99 @@ impl RdpServer {
         Ok(())
     }
 
-    /// (M5c) Route one EGFX frame's DVC messages over the bound UDP tunnel instead
-    /// of TCP: chunk them to SVC channel-data (`CHANNEL_PDU_HEADER` + DRDYNVC PDU,
-    /// the HigherLayerData the tunnel carries) and hand each chunk to the listener
-    /// (keyed by this connection's cookie). Best-effort — if the handoff or cookie
-    /// is missing the frame is dropped (the experimental UDP path; only reached
-    /// when `egfx_on_udp` was set under `MACRDP_UDP_MIGRATE_EGFX`).
+    /// (M5c) Route already-encoded DVC messages (EGFX frames, or the lossy audio
+    /// DVC's handshake/wave PDUs) over the bound UDP tunnel instead of TCP: hand each
+    /// to the listener (keyed by this connection's cookie), which wraps it in
+    /// `RDP_TUNNEL_DATA` and encrypts via the peer's transport (rustls for the
+    /// reliable tunnel, DTLS for the lossy one). Best-effort — if the handoff or
+    /// cookie is missing the data is dropped (the experimental UDP path; only reached
+    /// for a migrated channel: EGFX under `MACRDP_UDP_MIGRATE_EGFX`, or lossy audio
+    /// under `MACRDP_UDP_LOSSY_AUDIO`).
     #[cfg(feature = "multitransport")]
-    fn route_egfx_over_udp(&self, messages: Vec<ironrdp_svc::SvcMessage>) -> Result<()> {
+    fn route_dvc_over_udp(&self, messages: Vec<ironrdp_svc::SvcMessage>) -> Result<()> {
         let Some(sender) = self.multitransport_tunnel_sender.as_ref() else {
-            warn!("egfx_on_udp set but no tunnel sender; dropping EGFX frame");
+            warn!("migrated channel data but no tunnel sender; dropping");
             return Ok(());
         };
         let Some(cookie) = self.multitransport_migration.as_ref().map(|m| m.cookie) else {
-            warn!("egfx_on_udp set but no migration cookie; dropping EGFX frame");
+            warn!("migrated channel data but no migration cookie; dropping");
             return Ok(());
         };
         // The MS-RDPEMT tunnel carries the BARE DRDYNVC PDU (no static-channel
         // CHANNEL_PDU_HEADER) — RDP_TUNNEL_DATA provides the framing, so encode
         // each message unframed (NOT `chunkify`, which prepends CHANNEL_PDU_HEADER
-        // and would make the client misparse the EGFX stream). `encode_dvc_messages`
+        // and would make the client misparse the stream). `encode_dvc_messages`
         // already DVC-chunked these to fit, so one tunnel PDU per message is fine.
         let mut n = 0usize;
         for msg in messages {
             let pdu = msg
                 .encode_unframed_pdu()
-                .map_err(|e| anyhow::anyhow!("encode EGFX PDU for tunnel: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("encode DVC PDU for tunnel: {e}"))?;
             sender.send(cookie, pdu);
             n += 1;
         }
-        trace!(pdus = n, "routed EGFX PDUs over the UDP tunnel");
+        trace!(pdus = n, "routed DVC PDUs over the UDP tunnel");
         Ok(())
+    }
+
+    /// (2b-iv-B) Is the lossy-audio-over-UDP path live right now? Returns
+    /// `(format_no, lossy_channel_id)` only when every precondition holds, so a
+    /// `Some` result guarantees [`route_lossy_audio_wave`](Self::route_lossy_audio_wave)
+    /// can ship: the lossy audio DVCs are registered, the RELIABLE
+    /// `AUDIO_PLAYBACK_DVC` handshake has published a negotiated format index, a UDP
+    /// tunnel sender + migration cookie exist, the tunnel is bound, and the lossy
+    /// `AUDIO_PLAYBACK_LOSSY_DVC` channel is open. Until all of that is true (e.g. at
+    /// connect, before the handshake completes / the tunnel binds) audio stays on the
+    /// static rdpsnd TCP channel, so there is exactly one playback path at any time
+    /// (no double-play) with a clean handover once UDP is ready.
+    #[cfg(feature = "multitransport")]
+    fn lossy_audio_target(&mut self) -> Option<(u16, u32)> {
+        use core::sync::atomic::Ordering;
+        self.multitransport_lossy_audio_formats.as_ref()?;
+        let format_no = self.lossy_audio_format.get()?;
+        self.multitransport_tunnel_sender.as_ref()?;
+        self.multitransport_migration.as_ref()?;
+        if !self
+            .udp_tunnel_bound
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return None;
+        }
+        let lossy_id = self
+            .get_svc_processor::<dvc::DrdynvcServer>()?
+            .get_channel_id_by_name(crate::multitransport::audio_dvc::AUDIO_PLAYBACK_LOSSY_DVC)?;
+        Some((format_no, lossy_id))
+    }
+
+    /// (2b-iv-B) Ship one audio wave as a `Wave2` PDU on the lossy
+    /// `AUDIO_PLAYBACK_LOSSY_DVC` (channel 5) over the bound UDP/DTLS tunnel instead
+    /// of the static rdpsnd TCP channel. Stamps the wave with `format_no` (the index
+    /// the reliable `AUDIO_PLAYBACK_DVC` negotiated) and `block_no`, DVC-frames it for
+    /// `lossy_channel_id`, then hands it to [`route_dvc_over_udp`](Self::route_dvc_over_udp)
+    /// (which sends the bare DRDYNVC PDU as `RDP_TUNNEL_DATA`, DTLS-encrypted).
+    #[cfg(feature = "multitransport")]
+    fn route_lossy_audio_wave(
+        &mut self,
+        block_no: u8,
+        audio_timestamp: u32,
+        format_no: u16,
+        lossy_channel_id: u32,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        if !self.lossy_audio_streaming {
+            self.lossy_audio_streaming = true;
+            warn!(
+                format_no,
+                lossy_channel_id,
+                "P2.4b 2b-iv-B: streaming Wave2 audio over the LOSSY UDP/DTLS tunnel \
+                 (AUDIO_PLAYBACK_LOSSY_DVC) — static rdpsnd now silent"
+            );
+        }
+        let wave = crate::multitransport::audio_dvc::lossy_wave_dvc_message(block_no, audio_timestamp, format_no, data);
+        let msgs = dvc::encode_dvc_messages(lossy_channel_id, vec![wave], ChannelFlags::empty())
+            .map_err(|e| anyhow::anyhow!("encode lossy audio DVC wave: {e}"))?;
+        self.route_dvc_over_udp(msgs)
     }
 
     /// (M5c step 3b) Process one inbound migrated-channel PDU the UDP listener
@@ -1783,7 +1917,7 @@ impl RdpServer {
             }
         };
         if !replies.is_empty() {
-            if let Err(e) = self.route_egfx_over_udp(replies) {
+            if let Err(e) = self.route_dvc_over_udp(replies) {
                 warn!(error = %e, "failed to ship tunnel reply PDUs");
             }
         }

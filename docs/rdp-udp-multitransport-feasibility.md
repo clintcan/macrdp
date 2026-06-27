@@ -592,6 +592,41 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   data path next.** The verified groundwork (`audio_dvc.rs` + defer + lossy Soft-Sync) is
   kept in-tree, gated off by default (`MACRDP_UDP_OFFER_FECL` + `MACRDP_UDP_LOSSY_AUDIO`).
 
+  **P2.4b 2b-iv result (2026-06-27): audio RENDERS over the lossy UDP/DTLS tunnel —
+  VERIFIED end-to-end on real mstsc.** This closes the data path the 2b-ii de-risk pointed
+  to. Two sub-steps:
+  - **2b-iv-A — dual audio-DVC topology.** Rather than run the MS-RDPEA handshake over the
+    tunnel (which would need 2b-iii's tunnel-side handshake plumbing), the build uses **both**
+    audio DVCs at once: the RELIABLE `AUDIO_PLAYBACK_DVC` runs the full format/quality/training
+    handshake over TCP (the only thing mstsc tolerates — see the P2.4b-1 finding), and the LOSSY
+    `AUDIO_PLAYBACK_LOSSY_DVC` is data-only and Soft-Synced onto the UDPFECL/DTLS tunnel. The
+    lossy channel **inherits the reliable channel's negotiated `wFormatNo`** via a shared
+    `NegotiatedAudioFormat(Arc<AtomicU32>)` (reliable publishes it on TrainingConfirm; the
+    server reads it back to stamp Wave2 PDUs). This sidesteps 2b-iii entirely — the handshake
+    stays on the channel mstsc accepts it on, and only Wave2 data rides the tunnel. (A "video
+    freezes on connect" seen once here was transient mstsc state — a byte-identical retry
+    rendered fine; the documented "mstsc caches bad RDP state until reboot" behavior, not a
+    topology bug.)
+  - **2b-iv-B — AAC Wave2 over the tunnel.** `dispatch_audio` ships each wave as a `Wave2Pdu`
+    on `AUDIO_PLAYBACK_LOSSY_DVC` (bare DRDYNVC PDU → `RDP_TUNNEL_DATA`, DTLS-encrypted) once
+    all preconditions hold (reliable handshake done + tunnel bound + lossy DVC open), and
+    **skips the static rdpsnd TCP write** — exactly one playback path at a time, clean handover,
+    no double-play. **Verified live on mstsc:** reliable handshake GREEN → lossy Soft-Sync
+    accepted (`tunnels: [3]`) → one-shot marker `streaming Wave2 audio over the LOSSY UDP/DTLS
+    tunnel … static rdpsnd now silent` (format_no=0, channel 5) → **audio plays**, lossy UDP
+    flow shows continuous client ACKs (growing ACK-vector = steady Wave2 traffic acked), EGFX
+    (TCP) keeps rendering, session alive to a graceful disconnect, no teardown. **As far as is
+    known this is the first open-source RDP server streaming audio over a UDP multitransport
+    tunnel.**
+  - **Lag-model reconciliation (the P2.5 item below): no code change needed.** The tunnel
+    branch sits after the cross-batch lag model (vendor divergence (2)/(3)/(8)). The drop-stale
+    guard still rightly trims stale audio before it floods the tunnel (correct + free on a lossy
+    transport — no retransmit to cancel, exactly the property TCP audio lacks); the
+    resync-on-stall is moot but harmless (the tunnel send is non-blocking); and
+    `audio_shipped_ms += wave_ms` runs on both paths so the model stays coherent. Verified clean
+    audio in the live run. The remaining work is the loss soak (P2.2/P2.3 underneath) to prove
+    audio stays smooth where TCP audio desyncs — the user-noticeable win.
+
 - **P2.5 — route audio to the lossy tunnel + reconcile the lag model.** Point the audio
   path at the lossy tunnel and reconcile with the existing audio-lag / drop-stale model
   (vendor server divergence (2)/(3)/(8)) — on a lossy transport, dropping a stale wave is

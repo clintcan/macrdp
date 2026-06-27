@@ -271,26 +271,40 @@ async fn ship_outbound(
         trace!(%peer_addr, "tunnel data for an unknown peer; dropping");
         return;
     };
-    let Peer { sm, tls, .. } = peer;
-    let Some(tls) = tls.as_mut() else {
-        warn!(%peer_addr, "tunnel data to a peer with no TLS; dropping");
-        return;
-    };
-
     let pdu = emt::encode_tunnel_data(higher_layer);
-    if tls.writer().write_all(&pdu).is_err() {
-        warn!(%peer_addr, "failed to write RDP_TUNNEL_DATA into TLS");
-        return;
-    }
-    let mut tls_out = Vec::new();
-    while tls.wants_write() {
-        if tls.write_tls(&mut tls_out).is_err() {
-            break;
+    let Peer { sm, tls, dtls, .. } = peer;
+
+    // The flow is secured by exactly one of rustls (reliable UdpFecR) or DTLS
+    // (lossy UdpFecL). Encrypt the RDP_TUNNEL_DATA through whichever this peer
+    // holds, then ship the ciphertext reliably over the RDPEUDP SM.
+    if let Some(tls) = tls.as_mut() {
+        if tls.writer().write_all(&pdu).is_err() {
+            warn!(%peer_addr, "failed to write RDP_TUNNEL_DATA into TLS");
+            return;
         }
-    }
-    if !tls_out.is_empty() {
-        let o = sm.enqueue(now_ms, &tls_out);
-        send_datagrams(socket, peer_addr, o.to_send, mtu).await;
+        let mut tls_out = Vec::new();
+        while tls.wants_write() {
+            if tls.write_tls(&mut tls_out).is_err() {
+                break;
+            }
+        }
+        if !tls_out.is_empty() {
+            let o = sm.enqueue(now_ms, &tls_out);
+            send_datagrams(socket, peer_addr, o.to_send, mtu).await;
+        }
+    } else if let Some(dtls) = dtls.as_mut().filter(|c| c.is_handshake_done()) {
+        // P2.4b: lossy (UdpFecL) audio rides the DTLS-secured tunnel.
+        match dtls.send(&pdu) {
+            Ok(dgs) => {
+                for dg in dgs {
+                    let o = sm.enqueue(now_ms, &dg);
+                    send_datagrams(socket, peer_addr, o.to_send, mtu).await;
+                }
+            }
+            Err(e) => warn!(%peer_addr, error = %e, "failed to encrypt RDP_TUNNEL_DATA through DTLS"),
+        }
+    } else {
+        warn!(%peer_addr, "tunnel data to a peer with no TLS/DTLS (or DTLS not ready); dropping");
     }
 }
 

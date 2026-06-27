@@ -669,3 +669,61 @@ AND released — #1276 landing is NOT sufficient.
     stall the tunnel; making the response idempotent (re-answer on retransmit in lossy
     mode) or adding a handshake-phase retransmit is the next soak fix. See feasibility
     doc "P2.2".
+
+    P2.4b 2b-iv-A — dual audio-DVC topology (2026-06-27, `audio_dvc.rs` + `server.rs`;
+    verified on real mstsc). The lossy-audio design uses BOTH audio DVCs at once: the
+    RELIABLE `AUDIO_PLAYBACK_DVC` runs the full MS-RDPEA format/quality/training
+    handshake over TCP/DRDYNVC (this is what mstsc tolerates — the P2.4b-1 finding:
+    Server Audio Formats on a `_LOSSY_`-named channel makes mstsc tear down the whole
+    TCP socket), and the LOSSY `AUDIO_PLAYBACK_LOSSY_DVC` is data-only (no formats) and
+    Soft-Synced onto the UDPFECL/DTLS tunnel (P2.4b-2). The lossy channel **inherits the
+    reliable channel's negotiated format index**: `AudioLossyDvc` carries a shared
+    `NegotiatedAudioFormat(Arc<AtomicU32>)` — the reliable instance publishes the chosen
+    `wFormatNo` via `shared.set(idx)` on TrainingConfirm ("P2.4b GREEN: reliable audio
+    DVC negotiated + training confirmed over TCP"); the server reads it back through
+    `lossy_audio_format.get()`. Two constructors: `AudioLossyDvc::reliable(formats,
+    negotiated)` (defer_formats=false, sends formats, runs the handshake) and
+    `::lossy()` (defer_formats=true, `start()` returns empty). Both registered in
+    `attach_channels` when `set_multitransport_lossy_audio_formats(Some(..))` is set
+    (macrdp gates that behind `MACRDP_UDP_LOSSY_AUDIO` + `--enable-aac`, so the default
+    build is byte-unchanged). The "video freezes on connect" seen once during this work
+    was transient mstsc state (Run A, byte-identical, rendered fine next attempt — the
+    documented "mstsc caches bad RDP state until reboot" behavior), NOT a topology bug.
+
+    P2.4b 2b-iv-B — AAC Wave2 streamed over the lossy tunnel; audio RENDERS over UDP
+    (2026-06-27, `audio_dvc.rs` + `server.rs`; **VERIFIED end-to-end on real mstsc**).
+    Once 2b-iv-A's preconditions all hold, the `dispatch_audio` task ships each wave as
+    a `Wave2Pdu` on `AUDIO_PLAYBACK_LOSSY_DVC` over the bound UDP/DTLS tunnel instead of
+    the static rdpsnd TCP write — exactly one playback path at a time (no double-play).
+    Pieces:
+    - `audio_dvc::lossy_wave_dvc_message(block_no, audio_timestamp, format_no, data)`
+      builds `ServerAudioOutputPdu::Wave2(Wave2Pdu { block_no, timestamp: 0,
+      audio_timestamp, format_no, data })` wrapped in the `OwnedAudioPdu`
+      (`Encode`+`DvcEncode`) the DVC path uses.
+    - `RdpServer::lossy_audio_target() -> Option<(format_no, lossy_channel_id)>` returns
+      `Some` only when ALL hold: lossy formats registered, `lossy_audio_format.get()`
+      Some (reliable handshake done), tunnel sender + migration cookie present,
+      `udp_tunnel_bound` true, and `DrdynvcServer::get_channel_id_by_name(
+      AUDIO_PLAYBACK_LOSSY_DVC)` Some. Until then audio stays on static rdpsnd → clean
+      handover, no double-play.
+    - `RdpServer::route_lossy_audio_wave(..)` (one-shot WARN marker "P2.4b 2b-iv-B:
+      streaming Wave2 audio over the LOSSY UDP/DTLS tunnel … static rdpsnd now silent")
+      → `encode_dvc_messages(lossy_id, [wave], empty)` → `route_dvc_over_udp` (bare
+      DRDYNVC PDU as `RDP_TUNNEL_DATA`, DTLS-encrypted, shipped reliably-or-lossy over
+      the SM). New per-connection fields `lossy_audio_block_no: u8` (wrapping) +
+      `lossy_audio_streaming: bool` (one-shot marker), init 0/false in `new()`.
+    The `dispatch_audio` branch sits AFTER the cross-batch lag model (resync +
+    drop-stale): the drop-stale guard still rightly protects the tunnel from flooding
+    with stale audio (correct for any live stream), the resync-on-stall is moot but
+    harmless (the tunnel send is non-blocking), and `audio_shipped_ms += wave_ms` runs
+    on both paths so the model stays coherent — so the lag model needs no tunnel-specific
+    change (verified: clean audio in the live run). **VERIFIED on real mstsc 2026-06-27:**
+    reliable `AUDIO_PLAYBACK_DVC` handshake GREEN → lossy `AUDIO_PLAYBACK_LOSSY_DVC`
+    Soft-Synced onto UDPFECL (`SoftSyncResponsePdu { tunnels: [3] }`) → the one-shot
+    marker fired (format_no=0, lossy_channel_id=5) → **audio plays**, the lossy UDP flow
+    shows continuous client ACKs with a growing ACK-vector, EGFX (TCP) keeps acking +
+    rendering, session alive to a graceful disconnect, no teardown. As far as is known
+    this is the first open-source RDP server streaming **audio** over a UDP
+    multitransport tunnel. All gated default-off (`MACRDP_UDP_OFFER_FECL` +
+    `MACRDP_UDP_LOSSY_AUDIO`, + `--enable-aac` + `--enable-h264` since the Soft-Sync
+    trigger rides the EGFX dispatch arm). See feasibility doc "P2.4b".

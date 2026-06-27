@@ -4,10 +4,19 @@
 //!
 //! MS-RDPEA §2.1: the audio output channel is named `AUDIO_PLAYBACK_DVC` over a
 //! reliable transport and **`AUDIO_PLAYBACK_LOSSY_DVC` over an unreliable UDP
-//! transport**. The server opens it (DRDYNVC Create Request), runs the normal
-//! RDPSND format/training handshake over it (on the main TCP connection), and then
-//! — via MS-RDPEDYC Soft-Sync — migrates it onto the lossy (`UDPFECL`) tunnel, over
-//! which the Wave2 audio PDUs flow.
+//! transport**.
+//!
+//! **DUAL-CHANNEL TOPOLOGY (P2.4b-iv — corrects the earlier "handshake over the
+//! tunnel" plan).** mstsc tears the whole session down if it receives Server Audio
+//! Formats on the `_LOSSY_`-named channel — verified BOTH over TCP/DRDYNVC
+//! (P2.4b-1) AND over the migrated lossy/DTLS tunnel (P2.4b-iii). The transport is
+//! not the discriminator; the channel *name* is. So the server opens BOTH channels:
+//! the format/quality/training handshake runs on the reliable `AUDIO_PLAYBACK_DVC`
+//! over TCP, while `AUDIO_PLAYBACK_LOSSY_DVC` is Soft-Synced onto the lossy
+//! (`UDPFECL`) tunnel and carries **only `Wave2` audio data**, stamped with the
+//! format index the reliable channel negotiated (the lossy channel inherits that
+//! negotiation — it never negotiates its own). This matches how Windows' own RDP
+//! server drives lossy audio.
 //!
 //! **Gating (MS-RDPEA Appendix A note <2>):** a client uses the lossy DVC only when
 //! all of (a) a lossy UDP transport is available, (b) both ends are protocol
@@ -35,15 +44,16 @@
 //! of the audio DVC without tearing down.** This handler now opens the lossy DVC and
 //! returns NO formats from `start()` (defer over TCP — finding #1), then the server
 //! Soft-Syncs the channel onto the lossy (`TUNNELTYPE_UDPFECL=0x03`) tunnel. Live mstsc
-//! result: `lossy audio DVC opened — deferring Server Audio Formats` → Soft-Sync sent →
-//! `SoftSyncResponsePdu { tunnels: [3] }` (UDPFECL accepted) → session stayed alive to a
-//! graceful disconnect. So the #54 blocker was specifically **format data over TCP**, NOT
-//! the lossy Soft-Sync itself. The path forward (the opposite of EGFX, which migrates to
-//! the RELIABLE tunnel *after* a TCP handshake): Soft-Sync the lossy DVC FIRST, then run
-//! the MS-RDPEA handshake (formats → quality → training) over the lossy tunnel (2b-iii),
-//! then stream AAC waves over it (2b-iv). The reliable-DVC path that works over TCP isn't
-//! worth landing on its own (a reliable tunnel HOL-blocks under loss like TCP). See
-//! `docs/rdp-udp-multitransport-feasibility.md` ("P2.4b").
+//! result: `SoftSyncResponsePdu { tunnels: [3] }` (UDPFECL accepted), session stayed alive.
+//! So the lossy Soft-Sync itself is fine.
+//!
+//! **KEY FINDING #3 (P2.4b-iii) — formats over the lossy tunnel ALSO tear mstsc down.**
+//! Running the handshake over the tunnel (the earlier plan) was verified to fail with the
+//! identical 3–4 s teardown as over TCP, while an EGFX-over-DTLS isolation test rendered
+//! cleanly (so the tunnel data path is correct). Conclusion: the `_LOSSY_` channel must
+//! never carry formats at all — hence the dual-channel topology above (handshake on the
+//! reliable DVC, waves on the lossy one). See `docs/rdp-udp-multitransport-feasibility.md`
+//! ("P2.4b").
 //!
 //! **Sequence (MS-RDPEA Initialization Sequence, confirmed live):** for v6+ the client
 //! sends a Quality Mode PDU immediately after Client Audio Formats, and the server
@@ -55,11 +65,15 @@
 //! `ServerAudioOutputPdu` / `ClientAudioOutputPdu` codecs verbatim; only the channel
 //! envelope (DVC vs the static SVC) differs.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::{PduResult, decode_err};
 use ironrdp_rdpsnd::pdu::{
-    AudioFormat, ClientAudioOutputPdu, ServerAudioFormatPdu, ServerAudioOutputPdu, TrainingPdu, Version, WaveFormat,
+    AudioFormat, ClientAudioOutputPdu, ServerAudioFormatPdu, ServerAudioOutputPdu, TrainingPdu, Version, Wave2Pdu,
+    WaveFormat,
 };
 use tracing::{debug, warn};
 
@@ -67,6 +81,42 @@ use tracing::{debug, warn};
 pub const AUDIO_PLAYBACK_LOSSY_DVC: &str = "AUDIO_PLAYBACK_LOSSY_DVC";
 /// Channel name for the reliable audio output DVC (MS-RDPEA §2.1).
 pub const AUDIO_PLAYBACK_DVC: &str = "AUDIO_PLAYBACK_DVC";
+
+/// The client-list index of the audio format negotiated on the RELIABLE
+/// `AUDIO_PLAYBACK_DVC`, shared with the lossy wave path so it can stamp the
+/// `Wave2` PDUs it ships over the lossy/DTLS tunnel with the right `wFormatNo`
+/// (MS-RDPEA: the lossy channel inherits the reliable channel's format
+/// negotiation — it never negotiates its own). `u32::MAX` = not yet negotiated.
+#[derive(Clone)]
+pub struct NegotiatedAudioFormat(Arc<AtomicU32>);
+
+impl NegotiatedAudioFormat {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU32::new(u32::MAX)))
+    }
+
+    /// Publish the negotiated client-list format index (called by the reliable
+    /// handler once the client confirms training).
+    pub fn set(&self, format_no: u16) {
+        self.0.store(u32::from(format_no), Ordering::Relaxed);
+    }
+
+    /// The negotiated client-list format index, or `None` until the reliable
+    /// handshake completes. Read by the lossy wave path (2b-iv-B, not yet wired).
+    #[allow(dead_code)]
+    pub fn get(&self) -> Option<u16> {
+        match self.0.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            v => Some(v as u16),
+        }
+    }
+}
+
+impl Default for NegotiatedAudioFormat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// An owned RDPSND server PDU (Format/Training — no borrowed wave data) wrapped as
 /// a `DvcMessage`. `ironrdp_rdpsnd`'s PDUs implement `SvcEncode` (for the static
@@ -95,34 +145,77 @@ fn dvc_msg(pdu: ServerAudioOutputPdu<'static>) -> DvcMessage {
     Box::new(OwnedAudioPdu(pdu))
 }
 
-/// MS-RDPEA server handler for the audio output dynamic channel.
+/// (2b-iv-B) Build one `Wave2` audio-data DVC message for the lossy
+/// `AUDIO_PLAYBACK_LOSSY_DVC` channel: the same `Wave2Pdu` the static rdpsnd path
+/// ships (`RdpsndServer::wave`), but wrapped as a `DvcMessage` so the server can
+/// `encode_dvc_messages` it onto channel 5 and route it over the lossy/DTLS tunnel.
+/// `format_no` is the client-list index the RELIABLE `AUDIO_PLAYBACK_DVC` handshake
+/// negotiated (read from [`NegotiatedAudioFormat::get`]); `block_no` is a per-wave
+/// sequence the caller advances. `data` is the codec payload (an AAC access unit for
+/// the AAC path). MS-RDPEA v8 → `Wave2`.
+pub fn lossy_wave_dvc_message(block_no: u8, audio_timestamp: u32, format_no: u16, data: Vec<u8>) -> DvcMessage {
+    let pdu = Wave2Pdu {
+        block_no,
+        timestamp: 0,
+        audio_timestamp,
+        format_no,
+        data: data.into(),
+    };
+    dvc_msg(ServerAudioOutputPdu::Wave2(pdu))
+}
+
+/// MS-RDPEA server handler for an audio output dynamic channel.
+///
+/// **Dual-channel topology (P2.4b):** mstsc tears the session down if it receives
+/// Server Audio Formats on the `_LOSSY_`-named channel — over TCP *or* over the
+/// migrated lossy tunnel (verified). So the format/quality/training handshake runs
+/// on the RELIABLE `AUDIO_PLAYBACK_DVC` (over TCP) while `AUDIO_PLAYBACK_LOSSY_DVC`
+/// carries only `Wave2` data, Soft-Synced onto the lossy/DTLS tunnel and stamped
+/// with the format index the reliable channel negotiated. One handler type, two
+/// roles, selected at construction.
 pub struct AudioLossyDvc {
-    /// Channel name. Defaults to `AUDIO_PLAYBACK_LOSSY_DVC`; the diagnostic env
-    /// `MACRDP_AUDIO_DVC_RELIABLE=1` switches it to the reliable
-    /// `AUDIO_PLAYBACK_DVC` to test whether mstsc rejects the format handshake
-    /// specifically on a *lossy*-named channel over TCP (vs. any audio DVC).
+    /// Channel name: `AUDIO_PLAYBACK_DVC` (reliable) or `AUDIO_PLAYBACK_LOSSY_DVC`.
     channel_name: &'static str,
-    /// The server audio format list to advertise (PCM + AAC). Passed in by the
-    /// application so it matches exactly what the wave path will encode.
+    /// When `true` (the lossy channel) `start()` sends NO formats — the channel is
+    /// data-only and never negotiates (doing so tears mstsc down).
+    defer_formats: bool,
+    /// The server audio format list to advertise (PCM + AAC). Only the reliable
+    /// channel sends these; passed in so it matches what the wave path encodes.
     formats: Vec<AudioFormat>,
     /// The client-list index of the format we'll send waves in, once negotiated.
     chosen_format_no: Option<u16>,
     /// Whether the client confirmed our Training PDU (handshake complete).
     training_confirmed: bool,
+    /// Shared cell the RELIABLE handler publishes the negotiated format index to,
+    /// for the lossy wave path to read (`None` on the lossy handler).
+    negotiated: Option<NegotiatedAudioFormat>,
 }
 
 impl AudioLossyDvc {
-    pub fn new(formats: Vec<AudioFormat>) -> Self {
-        let channel_name = if std::env::var_os("MACRDP_AUDIO_DVC_RELIABLE").is_some() {
-            AUDIO_PLAYBACK_DVC
-        } else {
-            AUDIO_PLAYBACK_LOSSY_DVC
-        };
+    /// The RELIABLE `AUDIO_PLAYBACK_DVC`: runs the full MS-RDPEA handshake over its
+    /// transport (TCP) and publishes the negotiated client-list format index to
+    /// `negotiated` for the lossy wave path.
+    pub fn reliable(formats: Vec<AudioFormat>, negotiated: NegotiatedAudioFormat) -> Self {
         Self {
-            channel_name,
+            channel_name: AUDIO_PLAYBACK_DVC,
+            defer_formats: false,
             formats,
             chosen_format_no: None,
             training_confirmed: false,
+            negotiated: Some(negotiated),
+        }
+    }
+
+    /// The LOSSY `AUDIO_PLAYBACK_LOSSY_DVC`: data-only (Wave2 over the lossy/DTLS
+    /// tunnel). Never sends formats — mstsc tears the socket down if it does.
+    pub fn lossy() -> Self {
+        Self {
+            channel_name: AUDIO_PLAYBACK_LOSSY_DVC,
+            defer_formats: true,
+            formats: Vec::new(),
+            chosen_format_no: None,
+            training_confirmed: false,
+            negotiated: None,
         }
     }
 }
@@ -135,15 +228,14 @@ impl DvcProcessor for AudioLossyDvc {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        // The lossy-named DVC must NOT receive format data over TCP/DRDYNVC — mstsc
-        // tears down the whole TCP socket if it does (the P2.4b-1 finding). Defer the
-        // MS-RDPEA handshake until the channel is Soft-Synced onto the lossy tunnel;
-        // the formats then ride the tunnel (2b-iii). The reliable diagnostic name
-        // (MACRDP_AUDIO_DVC_RELIABLE) keeps the proven over-TCP handshake.
-        if self.channel_name == AUDIO_PLAYBACK_LOSSY_DVC {
+        // The lossy-named DVC must NOT receive format data — mstsc tears down the
+        // whole TCP socket if it does, over TCP *or* over the migrated tunnel
+        // (verified). It's data-only; the handshake runs on the reliable
+        // AUDIO_PLAYBACK_DVC instead, and this channel inherits its format index.
+        if self.defer_formats {
             debug!(
                 channel = self.channel_name,
-                "lossy audio DVC opened — deferring Server Audio Formats until Soft-Sync onto the lossy tunnel"
+                "lossy audio DVC opened — data-only (no format handshake; it runs on the reliable AUDIO_PLAYBACK_DVC)"
             );
             return Ok(Vec::new());
         }
@@ -204,10 +296,17 @@ impl DvcProcessor for AudioLossyDvc {
             }
             ClientAudioOutputPdu::TrainingConfirm(_) => {
                 self.training_confirmed = true;
+                // Publish the negotiated client-list format index so the lossy wave
+                // path can stamp Wave2 PDUs with it (the lossy channel inherits this
+                // reliable channel's negotiation — it never negotiates its own).
+                if let (Some(shared), Some(idx)) = (self.negotiated.as_ref(), self.chosen_format_no) {
+                    shared.set(idx);
+                }
                 warn!(
                     channel = self.channel_name,
                     chosen_wformatno = ?self.chosen_format_no,
-                    "P2.4b GREEN: audio DVC negotiated + training confirmed over TCP — ready for Soft-Sync wave migration"
+                    "P2.4b GREEN: reliable audio DVC negotiated + training confirmed over TCP — \
+                     lossy wave path can now stream Wave2 over the tunnel with this format index"
                 );
                 Ok(Vec::new())
             }
