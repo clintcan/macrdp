@@ -663,6 +663,34 @@ source packets + parity). **Zero FEC datagrams over a lossy link** (only retrans
 NO: a real Windows server doesn't use FEC here either, so we don't build the encoder, and the
 ARQ-fix path is the only lever. Either outcome is a decisive result.
 
+### P2.3 FEC capture RESULT (2026-06-27) — NO-GO (structural): modern Windows uses RDPUDP2, no FEC
+
+Captured a **real Windows RDP server** (a VirtualBox Windows VM; host `127.0.0.1:3390` NAT-forwarded to
+the guest's `3389`) ↔ **mstsc on the host**, on the host loopback. Analyzed with the rewritten
+`scripts/fec-scan.sh` driving Wireshark's RDPUDP **dissector** (authoritative — version-aware framing):
+
+- **Negotiated version = `0x0101` (RDPUDP2 / Wireshark "UDPv2")** — read from the SYNEX of both the client
+  SYN and the server SYN+ACK.
+- **`syn-lossy flows = 0`**, **`FEC packets = 0`** of 1912 RDPUDP datagrams (data=1747, ack=634).
+
+**Structural NO-GO, and the no-loss capture is sufficient to prove it.** FEC exists only in RDPEUDP
+**v1/v2**; **RDPUDP2 (0x0101) has no FEC at all** (delay-based rate control). Version negotiation is
+capability-based at SYN time — *before* any data/loss — so a lossy link would **not** downgrade to a
+FEC-capable version; it'd still be RDPUDP2, still zero FEC. A current Windows server relies on RDPUDP2
+retransmission, not FEC. **So mstsc would never decode FEC we emit — building the encoder is pointless.
+P2.3 is closed NO-GO**, confirming the spec research (blocker #3) on real Windows wire.
+
+Tooling note: the first `fec-scan.sh` hand-parsed uFlags at a fixed offset and misread RDPUDP2 data
+packets as "495 FEC datagrams" (a false GO). Rewritten to use the dissector's `rdpudp.flags.fec` +
+`rdpudp.synex.version`; it now reports the negotiated version and emits the structural NO-GO for `0x0101`.
+
+**Remaining lossy-audio levers (neither depends on RDPEUDP FEC):** (1) application-level **duplicate-AU
+redundancy** — send each AAC Wave2 PDU twice over the lossy tunnel (mstsc sees ordinary audio PDUs, no FEC
+decode; relies on it deduping by `block_no`); else (2) accept that lossy-audio-over-mstsc has no clean win
+(reliable HOL-blocks; send-once loses AUs) and document it. The ARQ path does **not** rescue *audio*
+(reliable = HOL-block = the very problem), so "fix ARQ" is not a lossy-audio fix — it's only relevant if a
+*reliable* tunnel payload is ever wanted.
+
 - **P2.4a — MS-RDPEMT tunnel over DTLS (DONE, GREEN 2026-06-26).** The prerequisite
   for any lossy channel: decrypt the client's DTLS application records, answer its
   `RDP_TUNNEL_CREATEREQUEST` with a `CREATERESPONSE(S_OK)` re-encrypted through DTLS,
