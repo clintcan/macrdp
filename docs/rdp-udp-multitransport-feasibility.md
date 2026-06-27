@@ -309,11 +309,67 @@ finding #3 documents (same structural limit, on TCP). The lossy tunnel establish
 but carries no payload yet.
 
 **Takeaway:** the P2.2 lossy *transport* is validated under loss (handshake robust), but
-the soak structurally **cannot demonstrate a lossy *win* until a real payload rides the
-tunnel** — and the intended payload, **lossy audio (P2.4b), is paused** on the
-Soft-Sync-first / lossy-DVC-name finding. So lossy delivery is "built + robust" but its
-payoff is gated on P2.4b, not on more transport work. (Video-over-lossy is out of scope —
-H.264-under-loss needs intra-refresh, P2.6.)
+this transport soak structurally **cannot demonstrate a lossy *win* until a real payload
+rides the tunnel**. That payload — **lossy audio (P2.4b 2b-iv)** — is now built and
+verified on a clean link (audio renders over the lossy DTLS tunnel; see "P2.4b 2b-iv
+result" below), so the *win* can finally be soaked: see the **lossy-audio soak (runbook)**
+next. (Video-over-lossy stays out of scope — H.264-under-loss needs intra-refresh, P2.6.)
+
+### Lossy-audio soak (runbook)
+
+This is the soak that can show the lossy **win** the P2.2 transport soak couldn't (it had
+no payload on the tunnel). It rides AAC audio on the lossy `UdpFecL`/DTLS tunnel and
+contrasts it against the same audio on TCP under identical shaping. Harness:
+`scripts/soak-lossy-audio.sh` (the audio sibling of `soak-lossy.sh`; it sets
+`MACRDP_UDP_OFFER_FECL=1` + `MACRDP_UDP_LOSSY_DELIVERY=1` + `MACRDP_UDP_LOSSY_AUDIO=1`,
+requires `--enable-aac`, and live-prints the audio-DVC + tunnel markers).
+
+**The A/B (this is the whole point — listen, don't just read logs):** play steady audio on
+the Mac (music / a YouTube tab) and listen on the client while shaping the link.
+- **CONTROL** — `MACRDP_UDP_LOSSY_AUDIO=0 scripts/soak-lossy-audio.sh …` → audio on the
+  static RDPSND **TCP** channel. Expect audible gaps / desync that worsen as `--loss`
+  climbs (the one TCP stream HOL-blocks audio behind every other channel).
+- **TREATMENT** — default (`=1`) → audio on the lossy UDP/DTLS tunnel. Expect it to stay
+  smooth where the control degraded: a lost wave is simply dropped (correct + free on a
+  live stream), no HOL stall, no growing backlog.
+
+```
+# 1) shape both directions of TCP+UDP on the port:
+sudo scripts/netshape.sh on --loss 5 --delay 100
+
+# 2a) TREATMENT — audio over the lossy tunnel (default):
+scripts/soak-lossy-audio.sh --enable-udp-multitransport --enable-aac --enable-h264 \
+    --username "$USER" --password 'PASS' --bind 0.0.0.0:3390
+
+# 2b) CONTROL — same everything, audio on TCP:
+MACRDP_UDP_LOSSY_AUDIO=0 scripts/soak-lossy-audio.sh --enable-udp-multitransport \
+    --enable-aac --enable-h264 --username "$USER" --password 'PASS' --bind 0.0.0.0:3390
+
+# …connect mstsc, play audio, listen, then restore:
+sudo scripts/netshape.sh off
+```
+
+**Read the markers** (the script highlights them; full log in the file). In treatment they
+fire roughly in this order, and all of them appearing = audio is on the tunnel:
+- `offering AUDIO_PLAYBACK_LOSSY_DVC` (gate on) → `reliable audio DVC negotiated` (AAC
+  handshake done over TCP) → `lossy audio DVC opened` → `DYNVC_SOFT_SYNC_REQUEST` +
+  `Soft-Sync Response` (mstsc accepts UDPFECL) → `P2.1 GREEN` / `P2.4 GREEN` (DTLS + tunnel
+  up under loss) → **`streaming Wave2 audio over the LOSSY UDP/DTLS tunnel`** (the payoff;
+  fires once, static rdpsnd then silent).
+- Failure tells: `lossy audio wave route over UDP tunnel failed`, `cookie not recognized`,
+  `Broken pipe` / `Connection reset`. `RTO retransmit` should be ~0 for the genuine lossy
+  flow (any value = the reliable SM is still carrying it; check `MACRDP_UDP_LOSSY_DELIVERY`).
+
+**Sweep** loss `0 → 2 → 5 → 10 %` × latency `+60 / +150 ms`, in both modes. Record the cell
+where the control becomes unacceptable and confirm the treatment is still smooth there —
+that gap is the user-noticeable result that justifies the phase. Also watch (per the P2.2
+caveat) whether, at higher loss, the lossy handshake stalls before `P2.4 GREEN` (one-shot
+`CREATERESPONSE`/DTLS flight lost); if it does, the idempotent-`CREATERESPONSE` /
+DTLS-timeout-driven-retransmit fix becomes warranted (still handshake-only — data stays
+send-once). A useful tie-breaker if the lossy handshake is the limiter: run the treatment
+with `MACRDP_UDP_LOSSY_DELIVERY=0` (audio still on the tunnel, but the flow rides the
+**reliable** SM that retransmits) — if audio is smooth there but the genuine lossy mode
+stalls to establish, the gap is purely handshake retransmission, not the steady-state path.
 
 ## Audio belongs on the lossy transport, not the reliable one
 
