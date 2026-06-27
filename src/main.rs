@@ -451,16 +451,25 @@ struct Args {
 
     /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
     /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
-    /// UDP listener on the same address/port as TCP. With the env var
-    /// MACRDP_UDP_MIGRATE_EGFX=1 the EGFX (H.264) channel is migrated onto the
-    /// reliable UDP tunnel via MS-RDPEDYC Soft-Sync (verified rendering on mstsc);
-    /// without it, EGFX stays on TCP (the proven safe spike). Input, audio (RDPSND),
-    /// and clipboard always ride TCP. The win is on lossy/high-latency links (no
-    /// head-of-line blocking), marginal on a clean LAN. Not supported under
-    /// --fork-workers (falls back to TCP). macOS-only build; see
-    /// docs/rdp-udp-multitransport-feasibility.md.
+    /// UDP listener on the same address/port as TCP. On its own, EGFX stays on TCP
+    /// (the proven safe spike) — pass --udp-migrate-egfx to actually move the
+    /// H.264 video onto the reliable UDP tunnel. Input, audio (RDPSND), and
+    /// clipboard always ride TCP. Not supported under --fork-workers (falls back to
+    /// TCP). macOS-only build; see docs/rdp-udp-multitransport-feasibility.md.
     #[arg(long)]
     enable_udp_multitransport: bool,
+
+    /// EXPERIMENTAL, opt-in (default OFF; requires --enable-udp-multitransport).
+    /// Migrate the EGFX (H.264) channel onto the reliable UDP tunnel via MS-RDPEDYC
+    /// Soft-Sync (verified rendering on mstsc). Without it, EGFX stays on TCP even
+    /// when multitransport is offered. **Caveat — clean-link feature only:** the
+    /// reliable tunnel is an ordered stream, so under packet loss it head-of-line-
+    /// blocks like TCP and, once the client abandons the tunnel, EGFX freezes with
+    /// no recovery until reconnect (audio survives on TCP). Use only on a low-loss
+    /// link. (Promoted from the MACRDP_UDP_MIGRATE_EGFX env var, which still works
+    /// as a fallback.) macOS-only build; see docs/rdp-udp-multitransport-feasibility.md.
+    #[arg(long)]
+    udp_migrate_egfx: bool,
 
     /// Don't adopt the client's requested desktop resolution. By default —
     /// when mirroring the primary display without --width/--height/--hidpi —
@@ -1385,6 +1394,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_UDP_MULTITRANSPORT", false) {
         argv.push("--enable-udp-multitransport".into());
     }
+    if on("UDP_MIGRATE_EGFX", false) {
+        argv.push("--udp-migrate-egfx".into());
+    }
     if on("FORK_WORKERS", false) {
         argv.push("--fork-workers".into());
     }
@@ -2197,16 +2209,21 @@ async fn async_main() -> Result<()> {
         .await
         {
             Ok(listener) => {
-                let migrate_egfx = multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX");
+                // EGFX migration is controlled by --udp-migrate-egfx; the legacy
+                // MACRDP_UDP_MIGRATE_EGFX env var still works as a fallback (the
+                // lossy-isolation test MACRDP_UDP_MIGRATE_EGFX_LOSSY relies on it).
+                let migrate_egfx =
+                    args.udp_migrate_egfx || multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX");
                 info!(
                     addr = %args.bind,
                     migrate_egfx,
                     "UDP multitransport listener bound — EGFX migrates to the reliable UDP tunnel \
-                     when MACRDP_UDP_MIGRATE_EGFX is set (otherwise EGFX stays on TCP); \
+                     when --udp-migrate-egfx is set (otherwise EGFX stays on TCP); \
                      input/audio/clipboard always ride TCP"
                 );
                 server
                     .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
+                server.set_migrate_egfx(migrate_egfx);
                 server.set_multitransport_cookie_registry(Some(cookie_registry));
                 server.set_multitransport_tunnel_sender(Some(tunnel_sender));
                 // Ack-driven IDR recovery (EGFX-on-lossy): hand the server the same
@@ -2370,6 +2387,7 @@ mod config_tests {
              PRIMARY_MODE=detach\n\
              FORK_WORKERS=1\n\
              ENABLE_UDP_MULTITRANSPORT=1\n\
+             UDP_MIGRATE_EGFX=1\n\
              EXTRA_FLAGS=\"--fps 30\"\n",
         );
         let args = args_from_config(&path).unwrap();
@@ -2388,6 +2406,7 @@ mod config_tests {
         assert!(!args.capture_primary);
         assert!(args.fork_workers);
         assert!(args.enable_udp_multitransport);
+        assert!(args.udp_migrate_egfx);
         // USE_KEYCHAIN defaults on (matches the old wrapper).
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
@@ -2406,6 +2425,7 @@ mod config_tests {
         assert!(!args.enable_h264);
         assert!(!args.fork_workers);
         assert!(!args.enable_udp_multitransport);
+        assert!(!args.udp_migrate_egfx);
     }
 
     #[test]

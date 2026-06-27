@@ -10,7 +10,7 @@
 # WHY this is the test that matters: in a pure-TCP session every channel (video,
 # input, audio, clipboard) multiplexes onto ONE TCP stream, so a single dropped
 # segment head-of-line-blocks *everything* until it's retransmitted. With EGFX
-# migrated onto UDP (MACRDP_UDP_MIGRATE_EGFX=1), video rides its own reliable
+# migrated onto UDP (--udp-migrate-egfx), video rides its own reliable
 # channel: loss on the control TCP no longer freezes the picture, and a lost video
 # packet only delays that packet. This script lets you see that difference.
 #

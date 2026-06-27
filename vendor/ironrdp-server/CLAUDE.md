@@ -754,3 +754,15 @@ AND released — #1276 landing is NOT sufficient.
     On the reliable tunnel / TCP the flag stays false. All `multitransport`-gated;
     feature-off and the no-migration path are byte-unchanged. See the feasibility
     doc "Ack-driven IDR recovery (EGFX-on-lossy video)".
+
+    EGFX-migration promoted from env to a flag (2026-06-28): `RdpServer` gained a
+    `migrate_egfx: bool` field (default false) + setter `set_migrate_egfx`, mirroring
+    the handle-setter pattern. At the EGFX Soft-Sync site the gate is now
+    `self.migrate_egfx || migrate_egfx_enabled()` — i.e. the macrdp `--udp-migrate-egfx`
+    flag OR the legacy `MACRDP_UDP_MIGRATE_EGFX` env var (the env fallback is kept so
+    the `MACRDP_UDP_MIGRATE_EGFX_LOSSY` isolation test, which still reads the env,
+    keeps working). The reliable-tunnel EGFX path is now reachable with just the two
+    CLI switches (`--enable-udp-multitransport --udp-migrate-egfx`); no env needed. It
+    stays a clean-link feature (reliable ordered stream HOL-blocks under loss — the
+    under-loss freeze is the documented structural limit, soak finding #4). All
+    `multitransport`-gated; feature-off byte-unchanged.

@@ -395,10 +395,17 @@ pub struct RdpServer {
     multitransport_tunnel_sender: Option<crate::multitransport::TunnelSender>,
     /// (M5c) Set once a Soft-Sync request has migrated the EGFX DVC channel to the
     /// UDP tunnel — from then on EGFX frames route over UDP, not TCP. Only ever set
-    /// when the experimental `MACRDP_UDP_MIGRATE_EGFX` env flag is on; the default
-    /// path leaves EGFX on TCP (the proven empty-Soft-Sync spike).
+    /// when EGFX migration is enabled (the `--udp-migrate-egfx` flag /
+    /// `migrate_egfx` field, or the legacy `MACRDP_UDP_MIGRATE_EGFX` env fallback);
+    /// the default path leaves EGFX on TCP (the proven empty-Soft-Sync spike).
     #[cfg(feature = "multitransport")]
     egfx_on_udp: bool,
+    /// Whether to migrate the EGFX DVC onto the reliable UDP tunnel (vs. the empty
+    /// safe spike that keeps EGFX on TCP). Set by the application from the
+    /// `--udp-migrate-egfx` flag; OR'd with the legacy `MACRDP_UDP_MIGRATE_EGFX`
+    /// env var (kept so the `..._LOSSY` isolation test still works). Default false.
+    #[cfg(feature = "multitransport")]
+    migrate_egfx: bool,
     /// Shared flag the macrdp-side EGFX/H.264 pipeline reads for ack-driven IDR
     /// recovery: set true once EGFX has been migrated onto the **lossy** tunnel
     /// (`MACRDP_UDP_MIGRATE_EGFX_LOSSY`), where a dropped frame is real loss the
@@ -547,6 +554,8 @@ impl RdpServer {
             #[cfg(feature = "multitransport")]
             egfx_on_udp: false,
             #[cfg(feature = "multitransport")]
+            migrate_egfx: false,
+            #[cfg(feature = "multitransport")]
             multitransport_tunnel_inbound_rx: None,
             #[cfg(feature = "multitransport")]
             multitransport_lossy_audio_formats: None,
@@ -653,6 +662,15 @@ impl RdpServer {
     #[cfg(feature = "multitransport")]
     pub fn set_egfx_on_lossy_handle(&mut self, handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
         self.egfx_on_lossy_handle = handle;
+    }
+
+    /// Enable migrating the EGFX DVC onto the reliable UDP tunnel (the
+    /// `--udp-migrate-egfx` flag). When `false` (default) the Soft-Sync sends an
+    /// empty channel list and EGFX stays on TCP (the proven safe spike). OR'd with
+    /// the legacy `MACRDP_UDP_MIGRATE_EGFX` env var at the Soft-Sync site.
+    #[cfg(feature = "multitransport")]
+    pub fn set_migrate_egfx(&mut self, on: bool) {
+        self.migrate_egfx = on;
     }
 
     /// (P2.4b) Supply the audio format list for the lossy-UDP `AUDIO_PLAYBACK_LOSSY_DVC`
@@ -1733,11 +1751,12 @@ impl RdpServer {
             _ => return Ok(()),
         }
 
-        // EXPERIMENTAL (`MACRDP_UDP_MIGRATE_EGFX`): name the EGFX DVC in the request
-        // so the client actually moves it onto the UDP tunnel, and flip
-        // `egfx_on_udp` so subsequent frames route over UDP. Default (flag off) is
-        // the proven safe spike — an empty channel list, EGFX stays on TCP.
-        let channel_ids = if migrate_egfx_enabled() {
+        // EXPERIMENTAL (`--udp-migrate-egfx`, or the legacy `MACRDP_UDP_MIGRATE_EGFX`
+        // env fallback): name the EGFX DVC in the request so the client actually
+        // moves it onto the UDP tunnel, and flip `egfx_on_udp` so subsequent frames
+        // route over UDP. Default (off) is the proven safe spike — an empty channel
+        // list, EGFX stays on TCP.
+        let channel_ids = if self.migrate_egfx || migrate_egfx_enabled() {
             match self
                 .get_svc_processor::<dvc::DrdynvcServer>()
                 .and_then(|d| d.get_channel_id_by_name(EGFX_DVC_CHANNEL_NAME))
@@ -1746,12 +1765,12 @@ impl RdpServer {
                     self.egfx_on_udp = true;
                     debug!(
                         gfx_channel_id = id,
-                        "MACRDP_UDP_MIGRATE_EGFX: Soft-Sync will migrate the EGFX DVC onto the UDP tunnel"
+                        "--udp-migrate-egfx: Soft-Sync will migrate the EGFX DVC onto the UDP tunnel"
                     );
                     vec![id]
                 }
                 None => {
-                    warn!("MACRDP_UDP_MIGRATE_EGFX set but EGFX DVC channel not found; sending empty Soft-Sync");
+                    warn!("--udp-migrate-egfx set but EGFX DVC channel not found; sending empty Soft-Sync");
                     Vec::new()
                 }
             }
