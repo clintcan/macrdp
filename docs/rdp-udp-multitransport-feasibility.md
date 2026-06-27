@@ -609,9 +609,11 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
      **not published**. Emitting packets a Windows receiver would decode requires
      reverse-engineering the table **from a packet capture of a real Windows RDP *server*
      sending FEC**. (§2.2.2.2/2.2.2.3.)
-  3. **FEC is v1/v2-only — RDPEUDP2 (v3+) has no FEC** (delay-based rate control instead), and
-     mstsc prefers v2-carrying-TLS / RDPEUDP2. So even on a lossy flow mstsc may negotiate a
-     version where FEC never applies.
+  3. **FEC is v1/v2-only — RDPEUDP2 (v3+) has no FEC.** [MS-RDPEUDP2] (Overview) states it
+     verbatim: RDPUDP2 "only supports 'Reliable' UDP mode ... does not support 'Best-Efforts'
+     mode or RDP-UDP-L, [so] it does not include a forward error correction (FEC) mechanism" —
+     loss is recovered by retransmission. mstsc prefers v2-carrying-TLS / RDPEUDP2, so even on a
+     lossy flow mstsc may negotiate a version where FEC never applies.
   4. **No OSS reference** — FreeRDP's prototype explicitly skipped FEC, never merged.
 
   Wire facts (confirmed, for when/if we build it): an FEC packet is an ACK datagram with
@@ -674,11 +676,24 @@ the guest's `3389`) ↔ **mstsc on the host**, on the host loopback. Analyzed wi
 - **`syn-lossy flows = 0`**, **`FEC packets = 0`** of 1912 RDPUDP datagrams (data=1747, ack=634).
 
 **Structural NO-GO, and the no-loss capture is sufficient to prove it.** FEC exists only in RDPEUDP
-**v1/v2**; **RDPUDP2 (0x0101) has no FEC at all** (delay-based rate control). Version negotiation is
-capability-based at SYN time — *before* any data/loss — so a lossy link would **not** downgrade to a
-FEC-capable version; it'd still be RDPUDP2, still zero FEC. A current Windows server relies on RDPUDP2
-retransmission, not FEC. **So mstsc would never decode FEC we emit — building the encoder is pointless.
-P2.3 is closed NO-GO**, confirming the spec research (blocker #3) on real Windows wire.
+**v1/v2** (the FEC structures — `RDPUDP_FLAG_FEC 0x0010`, `RDPUDP_FEC_PAYLOAD_HEADER` — live in
+[MS-RDPEUDP] §2.2.1/§2.2.2.2). **RDPUDP2 (`0x0101`) has no FEC at all**, and this is now *normatively
+confirmed*, not merely capture-inferred — the [MS-RDPEUDP2] Overview states it verbatim:
+
+> "the RDP-UDP2 transport only supports 'Reliable' UDP mode. In this mode, the endpoint retransmits
+> datagrams that have been lost... Because RDP-UDP2 transport does not support 'Best-Efforts' mode or
+> RDP-UDP-L, it does not include a forward error correction (FEC) mechanism."
+
+So RDPUDP2 is reliable-only: no lossy (RDP-UDP-L) mode at all, loss recovered purely by **retransmission**
+(ARQ), no FEC. Version negotiation is capability-based at SYN time — *before* any data/loss — so a lossy
+link would **not** downgrade to a FEC-capable version; it'd still be RDPUDP2, still zero FEC. **So mstsc
+would never decode FEC we emit — building the encoder is pointless. P2.3 is closed NO-GO**, confirming the
+spec research (blocker #3) on real Windows wire *and* in the RDPUDP2 spec text itself.
+
+(Aside: RDPUDP2 being reliable-only does **not** affect macrdp's lossy-audio / 1+1 work — that rides
+RDPEUDP **v2 with RDP-UDP-L**, which mstsc opens because macrdp offers `UdpFecL` and negotiates v1/v2, not
+RDPUDP2. RDPUDP2's reliable-only constraint just means modern *Windows-to-Windows* never opens that lossy
+flow; mstsc still opens one when the **server** offers it.)
 
 Tooling note: the first `fec-scan.sh` hand-parsed uFlags at a fixed offset and misread RDPUDP2 data
 packets as "495 FEC datagrams" (a false GO). Rewritten to use the dissector's `rdpudp.flags.fec` +

@@ -15,8 +15,11 @@
 #
 # Decisive fact baked into the verdict: FEC exists ONLY in RDPEUDP v1/v2. The
 # second-generation protocol **RDPUDP2 (version 0x0101, Wireshark "UDPv2")** has NO
-# FEC at all (delay-based rate control instead), and modern mstsc/Windows negotiate
-# it. So a capture that shows version 0x0101 is a structural NO-GO regardless of loss.
+# FEC at all — [MS-RDPEUDP2] (Overview) states RDPUDP2 is reliable-only ("does not
+# support 'Best-Efforts' mode or RDP-UDP-L, [so] it does not include a forward error
+# correction (FEC) mechanism"; loss is recovered by retransmission), and modern
+# mstsc/Windows negotiate it. So a capture that shows version 0x0101 is a structural
+# NO-GO regardless of loss.
 #
 #   scripts/fec-scan.sh <capture.pcap> [udp_port]
 #
