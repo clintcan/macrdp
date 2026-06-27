@@ -828,6 +828,67 @@ On an independent-loss link of rate `p`, a payload is then lost only at `p²` (5
   or does the residual `p²` loss / burst loss still stall the AAC decoder? If yes → keep it (gated); if no →
   fall back to lever (2), document lossy-audio-over-mstsc as having no clean win.
 
+### Ack-driven IDR recovery (EGFX-on-lossy video) — MVP detection spec (scoped 2026-06-27)
+
+The video analogue of the lossy-audio problem: when EGFX H.264 rides the **lossy** tunnel
+(`MACRDP_UDP_MIGRATE_EGFX_LOSSY`), a dropped frame makes every subsequent P-frame undecodable (they
+reference the lost frame) → freeze/corruption until the next periodic IDR (≤ `--keyframe-interval`, default
+2 s). RDP has **no NACK** and the EGFX decoder expects whole frames, so codec-internal concealment isn't an
+option — but RDP *does* have `RDPGFX_FRAME_ACKNOWLEDGE`, so the server can **infer** loss from ack-staleness
+and force an IDR early (≈ RTT + timeout instead of up to 2 s). This is a *partial* mitigation, not graceful
+loss-tolerance — see caveats. (The real fixes — transport FEC, or LTR+NACK — are blocked/architecturally
+hard; see "P2.3 FEC capture RESULT" and the H.264-under-loss discussion.)
+
+**Why ack-staleness infers loss.** The client only acks frames it successfully decoded+presented. A
+slow-but-healthy client either keeps acking (slowly) or suspends acks under load
+(`queueDepth == 0xFFFFFFFF`). **True loss** is the one case where we keep shipping but acks stop *entirely*
+(the client is stuck on the gap, nothing new to ack). So "actively shipping + acks went silent" ≈ loss.
+
+**MVP detection (wall-clock ack-staleness; no frame-id matching, no timer thread).**
+Per-connection state in `ConnectionContext` (`src/h264.rs`), all reset on reconnect, init to `now`:
+`last_ack_at` (set in `on_frame_ack`), `acks_suspended` (= `queueDepth == 0xFFFFFFFF`, set in
+`on_frame_ack`), `last_ship_at` (set in the ship loop), `last_recovery_at`, and `egfx_on_lossy` (a shared
+`Arc<AtomicBool>` the vendored server sets true when it migrates EGFX onto the **lossy** tunnel — mirrors
+the `udp_tunnel_bound` shared-flag pattern). The pure, unit-testable predicate (takes `Duration`s so tests
+need no real clock):
+
+```
+should_force_recovery_idr(since_ship, since_ack, since_recovery, acks_suspended, egfx_on_lossy, p) =
+       egfx_on_lossy                         // ❶ lossy tunnel only (reliable/TCP: missing ack = congestion)
+    && !acks_suspended                       // ❷ acks must be on to infer loss
+    && since_ship      <= p.active_window     // ❸ we're actively shipping frames
+    && since_ack       >= p.ack_stall         // ❹ but acks went silent → inferred loss
+    && since_recovery  >= p.min_recovery_interval  // ❺ rate-limit IDR storms
+```
+
+Checked in `submit_bgra` (runs per capture tick **and** per flush-burst re-submit — so a loss just before
+the screen goes static still heals during the flush window); on true, set the existing `need_keyframe = true`
+(one-shot, already consumed by the next encode) and `last_recovery_at = now`. No new IDR path or timer
+thread; the periodic `--keyframe-interval` IDR backstops the rare tail.
+
+MVP params (60 fps defaults, env-tunable): `ack_stall` 200 ms (`MACRDP_UDP_EGFX_ACK_STALL_MS`),
+`active_window` 500 ms (`MACRDP_UDP_EGFX_ACK_ACTIVE_MS` — covers the flush window),
+`min_recovery_interval` 1000 ms (`MACRDP_UDP_EGFX_ACK_RECOVERY_MS`). Whole feature behind
+`MACRDP_UDP_EGFX_ACK_RECOVERY` (default OFF) **and** the runtime `egfx_on_lossy` gate; feature-off keeps
+`on_frame_ack` trace-only and the path byte-identical.
+
+**Caveats (why it's a narrow, partial mitigation):** (1) lossy-EGFX-only — on TCP / the reliable tunnel a
+missing ack means congestion and an IDR would *worsen* it, so the `egfx_on_lossy` gate is load-bearing;
+(2) the recovery IDR is itself loss-vulnerable (a big frame on a lossy link), so it can fail and retrigger
+— `min_recovery_interval` bounds the storm; (3) acks ride the same lossy tunnel, so a lost ack is a
+false-positive source — the staleness *window* + rate-limit absorb the occasional one; (4) incremental over
+the periodic IDR (≤2 s → ~RTT+`ack_stall`); (5) mstsc-only. **Build status (2026-06-27):** IMPLEMENTED
+behind the env gate, default OFF. `src/h264.rs` has the pure predicate `should_force_recovery_idr` +
+`recovery_config_from_env` (7 unit tests covering each gate, threshold-inclusivity, and the lossy/reliable
+split), the `ConnectionContext` state (`last_ack_at`/`acks_suspended`/`last_ship_at`/`last_recovery_at`),
+the `on_frame_ack` + `ship_frames` stamping, and the `submit_bgra` check (logs `EGFX ack-stall on lossy
+tunnel — forcing recovery IDR`). The vendored `ironrdp-server` flips the shared `egfx_on_lossy` flag at the
+EGFX→UDPFECL Soft-Sync site (`set_egfx_on_lossy_handle`, server.rs); `main.rs` creates the `Arc<AtomicBool>`
+and wires both ends. Feature-off path is byte-identical (only cheap `Instant::now()` stamps run). **Verify
+status:** real-link soak PENDING (the user's call, like P2.3) — verify on mstsc + `MACRDP_UDP_MIGRATE_EGFX_LOSSY`
++ `MACRDP_UDP_EGFX_ACK_RECOVERY` + induced loss (A/B vs the feature off; confirm the recovery-IDR marker
+fires and recovery beats the periodic interval).
+
 - **P2.4a — MS-RDPEMT tunnel over DTLS (DONE, GREEN 2026-06-26).** The prerequisite
   for any lossy channel: decrypt the client's DTLS application records, answer its
   `RDP_TUNNEL_CREATEREQUEST` with a `CREATERESPONSE(S_OK)` re-encrypted through DTLS,

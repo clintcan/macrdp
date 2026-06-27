@@ -1989,6 +1989,12 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    // Shared flag flipped true when EGFX is Soft-Synced onto a LOSSY UDP tunnel
+    // (UDPFECL). The H.264 pipeline reads it to arm ack-driven IDR recovery; the
+    // server flips it at the migration site. Cross-platform so the UDP listener
+    // wiring below (which hands the same clone to the server) compiles on CI.
+    let egfx_on_lossy_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
@@ -2000,6 +2006,7 @@ async fn async_main() -> Result<()> {
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,
             args.h264_frames_in_flight.max(1),
+            egfx_on_lossy_flag.clone(),
         )
     });
 
@@ -2202,6 +2209,10 @@ async fn async_main() -> Result<()> {
                     .set_multitransport_provider(Some(Box::new(multitransport::MacMultitransport)));
                 server.set_multitransport_cookie_registry(Some(cookie_registry));
                 server.set_multitransport_tunnel_sender(Some(tunnel_sender));
+                // Ack-driven IDR recovery (EGFX-on-lossy): hand the server the same
+                // flag the H.264 pipeline reads. The server flips it true only when
+                // it migrates EGFX onto the LOSSY tunnel.
+                server.set_egfx_on_lossy_handle(Some(egfx_on_lossy_flag.clone()));
                 // (P2.4b, EXPERIMENTAL) Register the lossy-UDP audio DVC
                 // (AUDIO_PLAYBACK_LOSSY_DVC). Behind its OWN dedicated env gate
                 // (`MACRDP_UDP_LOSSY_AUDIO=1`) — NOT the lossy-offer flag — so the

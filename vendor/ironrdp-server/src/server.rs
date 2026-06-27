@@ -399,6 +399,13 @@ pub struct RdpServer {
     /// path leaves EGFX on TCP (the proven empty-Soft-Sync spike).
     #[cfg(feature = "multitransport")]
     egfx_on_udp: bool,
+    /// Shared flag the macrdp-side EGFX/H.264 pipeline reads for ack-driven IDR
+    /// recovery: set true once EGFX has been migrated onto the **lossy** tunnel
+    /// (`MACRDP_UDP_MIGRATE_EGFX_LOSSY`), where a dropped frame is real loss the
+    /// client can't retransmit away. On the reliable tunnel / TCP it stays false
+    /// (a missing ack there is congestion, not loss). `None` = not wired (default).
+    #[cfg(feature = "multitransport")]
+    egfx_on_lossy_handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// (M5c step 3b) Receiver for inbound migrated-channel data the UDP listener
     /// forwards (each item is a bare DRDYNVC PDU — HigherLayerData of an inbound
     /// `RDP_TUNNEL_DATA`, e.g. an EGFX frame ack). Created + registered (with the
@@ -534,6 +541,8 @@ impl RdpServer {
             #[cfg(feature = "multitransport")]
             udp_tunnel_bound: None,
             #[cfg(feature = "multitransport")]
+            egfx_on_lossy_handle: None,
+            #[cfg(feature = "multitransport")]
             multitransport_tunnel_sender: None,
             #[cfg(feature = "multitransport")]
             egfx_on_udp: false,
@@ -634,6 +643,16 @@ impl RdpServer {
     #[cfg(feature = "multitransport")]
     pub fn set_multitransport_tunnel_sender(&mut self, sender: Option<crate::multitransport::TunnelSender>) {
         self.multitransport_tunnel_sender = sender;
+    }
+
+    /// Supply the shared flag that signals "EGFX is migrated onto a **lossy** UDP
+    /// tunnel" (UDPFECL, where datagrams can actually be dropped). macrdp's H.264
+    /// pipeline reads it to arm ack-driven IDR recovery — on a reliable transport
+    /// (TCP or UDPFECR) the flag stays `false` so recovery never fires. The server
+    /// flips it `true` when it Soft-Syncs the EGFX DVC onto the lossy tunnel.
+    #[cfg(feature = "multitransport")]
+    pub fn set_egfx_on_lossy_handle(&mut self, handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+        self.egfx_on_lossy_handle = handle;
     }
 
     /// (P2.4b) Supply the audio format list for the lossy-UDP `AUDIO_PLAYBACK_LOSSY_DVC`
@@ -1747,6 +1766,16 @@ impl RdpServer {
         } else {
             dvc::pdu::TUNNELTYPE_UDPFECR
         };
+        // Signal macrdp's H.264 pipeline that EGFX is now riding a LOSSY tunnel
+        // (UDPFECL, where datagrams can be dropped) so it can arm ack-driven IDR
+        // recovery. Only when EGFX is actually migrated (non-empty channel list)
+        // AND the target is the lossy tunnel; the reliable tunnel never drops, so
+        // the flag stays false there.
+        if egfx_tunnel_type == dvc::pdu::TUNNELTYPE_UDPFECL && !channel_ids.is_empty() {
+            if let Some(handle) = &self.egfx_on_lossy_handle {
+                handle.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         debug!("UDP tunnel bound + EGFX active — Soft-Sync gate open");
         self.send_soft_sync_request(writer, user_channel_id, egfx_tunnel_type, channel_ids)
             .await

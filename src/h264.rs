@@ -48,9 +48,9 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use ironrdp_dvc::encode_dvc_messages;
@@ -134,6 +134,79 @@ struct ConnectionContext {
     /// `SharedDesktopSize` read — so a size adoption between setup and ship
     /// can't tear the region away from the surface.
     dims: (u16, u16),
+    /// Ack-driven IDR recovery state (EGFX-on-lossy). Wall-clock; per-connection
+    /// (reset on reconnect), all init to `now` so warmup doesn't false-trigger.
+    /// `last_ack_at` + `acks_suspended` set in `on_frame_ack`; `last_ship_at` set
+    /// in `ship_frames`; `last_recovery_at` set when a recovery IDR is armed in
+    /// `submit_bgra`. See [`should_force_recovery_idr`].
+    last_ack_at: Instant,
+    acks_suspended: bool,
+    last_ship_at: Instant,
+    last_recovery_at: Instant,
+}
+
+/// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
+/// [`should_force_recovery_idr`] and `docs/rdp-udp-multitransport-feasibility.md`
+/// ("Ack-driven IDR recovery").
+#[derive(Clone, Copy, Debug)]
+struct RecoveryParams {
+    /// We only treat silent acks as loss while we're *actively* shipping — if the
+    /// last ship is older than this, the screen is static and the periodic IDR
+    /// backstops. Sized to cover the flush-burst window so a loss just before the
+    /// screen goes static still heals.
+    active_window: Duration,
+    /// How long acks must stay silent (while shipping) before we infer a lost
+    /// frame. Above normal ack jitter + RTT, below the periodic keyframe interval.
+    ack_stall: Duration,
+    /// Minimum spacing between forced recovery IDRs — the IDR is large and itself
+    /// loss-vulnerable, so don't storm them if it keeps getting lost.
+    min_recovery_interval: Duration,
+}
+
+/// Decide whether to force a recovery IDR from ack-staleness. Pure (takes
+/// `Duration`s, not a clock) so it's unit-testable without timing. See the spec
+/// in `docs/rdp-udp-multitransport-feasibility.md` — each clause guards a distinct
+/// failure mode:
+/// - `egfx_on_lossy`: only on the lossy tunnel; on TCP/reliable a missing ack is
+///   congestion and an IDR would *worsen* it.
+/// - `!acks_suspended`: with acks off (`queueDepth==0xFFFFFFFF`) loss is uninferable.
+/// - `since_ship <= active_window`: only while actively shipping (else: static screen).
+/// - `since_ack >= ack_stall`: the loss signal — acks went silent.
+/// - `since_recovery >= min_recovery_interval`: rate-limit IDR storms.
+fn should_force_recovery_idr(
+    since_ship: Duration,
+    since_ack: Duration,
+    since_recovery: Duration,
+    acks_suspended: bool,
+    egfx_on_lossy: bool,
+    p: &RecoveryParams,
+) -> bool {
+    egfx_on_lossy
+        && !acks_suspended
+        && since_ship <= p.active_window
+        && since_ack >= p.ack_stall
+        && since_recovery >= p.min_recovery_interval
+}
+
+/// Read the ack-recovery config from the environment once. Returns
+/// `(enabled, params)`; disabled (default) keeps the feature off and the path
+/// byte-identical. Tunables: `MACRDP_UDP_EGFX_ACK_STALL_MS` (200),
+/// `MACRDP_UDP_EGFX_ACK_ACTIVE_MS` (500), `MACRDP_UDP_EGFX_ACK_RECOVERY_MS` (1000).
+fn recovery_config_from_env() -> (bool, RecoveryParams) {
+    let ms = |name: &str, default: u64| -> Duration {
+        let v = std::env::var(name)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(default);
+        Duration::from_millis(v)
+    };
+    let enabled = crate::multitransport::env_truthy("MACRDP_UDP_EGFX_ACK_RECOVERY");
+    let params = RecoveryParams {
+        active_window: ms("MACRDP_UDP_EGFX_ACK_ACTIVE_MS", 500),
+        ack_stall: ms("MACRDP_UDP_EGFX_ACK_STALL_MS", 200),
+        min_recovery_interval: ms("MACRDP_UDP_EGFX_ACK_RECOVERY_MS", 1000),
+    };
+    (enabled, params)
 }
 
 /// Cloneable factory + frame-submit handle. One clone is boxed into
@@ -162,6 +235,14 @@ pub struct Gfx {
     /// so encoded frames are never dropped, which would break the H.264 chain).
     max_in_flight: u32,
     wire_format: WireFormat,
+    /// Ack-driven IDR recovery (EGFX-on-lossy). `recovery_enabled` is the opt-in
+    /// env gate (`MACRDP_UDP_EGFX_ACK_RECOVERY`); `egfx_on_lossy` is the *runtime*
+    /// gate the vendored server flips true when it migrates EGFX onto the lossy
+    /// tunnel. Both must hold for `submit_bgra` to arm a recovery IDR. Default-off
+    /// → byte-identical to the pre-feature path.
+    recovery_enabled: bool,
+    recovery_params: RecoveryParams,
+    egfx_on_lossy: Arc<AtomicBool>,
 }
 
 impl Gfx {
@@ -171,13 +252,22 @@ impl Gfx {
         bitrate_bps: u32,
         keyframe_secs: f32,
         max_in_flight: u32,
+        egfx_on_lossy: Arc<AtomicBool>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
+        let (recovery_enabled, recovery_params) = recovery_config_from_env();
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
             width, height, fps, keyframe_secs, max_in_flight, "EGFX/H.264 pipeline configured"
         );
+        if recovery_enabled {
+            info!(
+                ?recovery_params,
+                "EGFX ack-driven IDR recovery ENABLED (MACRDP_UDP_EGFX_ACK_RECOVERY) — \
+                 active only while EGFX is on the lossy UDP tunnel"
+            );
+        }
         Self {
             sender: Arc::new(Mutex::new(None)),
             ctx: Arc::new(Mutex::new(None)),
@@ -187,6 +277,9 @@ impl Gfx {
             keyframe_secs,
             max_in_flight,
             wire_format,
+            recovery_enabled,
+            recovery_params,
+            egfx_on_lossy,
         }
     }
 
@@ -223,6 +316,32 @@ impl Gfx {
             // frame (the change is still on screen by then).
             if request_keyframe {
                 ctx.need_keyframe = true;
+            }
+            // Ack-driven IDR recovery (opt-in, EGFX-on-lossy only): if acks have
+            // gone silent while we're actively shipping, infer a lost frame and arm
+            // an IDR so the client recovers without waiting for the periodic
+            // keyframe. Armed BEFORE the throttle so a dropped capture still carries
+            // the IDR forward (need_keyframe persists across skips). No-op unless
+            // both the env gate and the runtime lossy-tunnel gate hold → default
+            // path unchanged.
+            if self.recovery_enabled {
+                let now = Instant::now();
+                let since_ack = now.saturating_duration_since(ctx.last_ack_at);
+                if should_force_recovery_idr(
+                    now.saturating_duration_since(ctx.last_ship_at),
+                    since_ack,
+                    now.saturating_duration_since(ctx.last_recovery_at),
+                    ctx.acks_suspended,
+                    self.egfx_on_lossy.load(Ordering::Relaxed),
+                    &self.recovery_params,
+                ) {
+                    ctx.need_keyframe = true;
+                    ctx.last_recovery_at = now;
+                    info!(
+                        since_ack_ms = since_ack.as_millis() as u64,
+                        "EGFX ack-stall on lossy tunnel — forcing recovery IDR"
+                    );
+                }
             }
             // Lazy one-time setup on the first ready frame (creates the encoder
             // and spawns the ship thread).
@@ -384,6 +503,8 @@ impl Gfx {
                 .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
             let (width, height) = ctx.dims;
             let epoch = ctx.epoch;
+            // Liveness for ack-driven IDR recovery: we're actively shipping.
+            ctx.last_ship_at = Instant::now();
             let mut server = ctx.server_handle.lock().unwrap();
             let egfx_channel_id = server
                 .channel_id()
@@ -534,6 +655,10 @@ impl GfxServerFactory for Gfx {
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
             dims: (0, 0),
+            last_ack_at: Instant::now(),
+            acks_suspended: false,
+            last_ship_at: Instant::now(),
+            last_recovery_at: Instant::now(),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -631,6 +756,13 @@ impl GraphicsPipelineHandler for GfxHandler {
 
     fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
         trace!(frame_id, queue_depth, "EGFX frame ack");
+        // Feed ack-driven IDR recovery (EGFX-on-lossy): record liveness, and note
+        // whether the client suspended acks (queueDepth == SUSPEND_FRAME_
+        // ACKNOWLEDGEMENT 0xFFFFFFFF) — with acks off, loss can't be inferred.
+        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            ctx.last_ack_at = Instant::now();
+            ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
+        }
     }
 
     /// Inbound `RDPGFX_CACHE_IMPORT_OFFER`. Behavior is UNCHANGED from the trait
@@ -741,6 +873,122 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_params() -> RecoveryParams {
+        RecoveryParams {
+            active_window: Duration::from_millis(500),
+            ack_stall: Duration::from_millis(200),
+            min_recovery_interval: Duration::from_millis(1000),
+        }
+    }
+
+    // Convenience: build a Duration in ms for the table below.
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
+    #[test]
+    fn recovery_fires_on_ack_stall_while_shipping_on_lossy() {
+        let p = recovery_params();
+        // Actively shipping (30ms), acks silent (300ms > 200), past rate-limit
+        // (5s), acks not suspended, EGFX on the lossy tunnel → force a recovery IDR.
+        assert!(should_force_recovery_idr(
+            ms(30),
+            ms(300),
+            ms(5000),
+            false,
+            true,
+            &p
+        ));
+    }
+
+    #[test]
+    fn recovery_suppressed_when_acks_suspended() {
+        let p = recovery_params();
+        // queueDepth==0xFFFFFFFF → acks_suspended: loss can't be inferred.
+        assert!(!should_force_recovery_idr(
+            ms(30),
+            ms(300),
+            ms(5000),
+            true,
+            true,
+            &p
+        ));
+    }
+
+    #[test]
+    fn recovery_never_on_reliable_or_tcp() {
+        let p = recovery_params();
+        // egfx_on_lossy=false (TCP / reliable tunnel): a missing ack is congestion,
+        // not loss — an IDR would worsen it, so never fire.
+        assert!(!should_force_recovery_idr(
+            ms(30),
+            ms(300),
+            ms(5000),
+            false,
+            false,
+            &p
+        ));
+    }
+
+    #[test]
+    fn recovery_not_when_acks_fresh() {
+        let p = recovery_params();
+        // since_ack (50ms) below ack_stall (200ms): acks still flowing, no loss.
+        assert!(!should_force_recovery_idr(
+            ms(30),
+            ms(50),
+            ms(5000),
+            false,
+            true,
+            &p
+        ));
+    }
+
+    #[test]
+    fn recovery_not_when_idle_not_shipping() {
+        let p = recovery_params();
+        // since_ship (2s) above active_window (500ms): static screen, nothing to
+        // lose — the periodic IDR backstops; don't force.
+        assert!(!should_force_recovery_idr(
+            ms(2000),
+            ms(300),
+            ms(5000),
+            false,
+            true,
+            &p
+        ));
+    }
+
+    #[test]
+    fn recovery_rate_limited() {
+        let p = recovery_params();
+        // since_recovery (200ms) below min_recovery_interval (1000ms): just forced
+        // one; don't storm IDRs even if acks are still silent.
+        assert!(!should_force_recovery_idr(
+            ms(30),
+            ms(300),
+            ms(200),
+            false,
+            true,
+            &p
+        ));
+    }
+
+    #[test]
+    fn recovery_thresholds_are_inclusive() {
+        let p = recovery_params();
+        // Exactly at the boundaries: since_ship == active_window (<=), since_ack ==
+        // ack_stall (>=), since_recovery == min_recovery_interval (>=) → fires.
+        assert!(should_force_recovery_idr(
+            ms(500),
+            ms(200),
+            ms(1000),
+            false,
+            true,
+            &p
+        ));
+    }
 
     #[test]
     fn avcc_to_annex_b_rewrites_length_prefixes() {

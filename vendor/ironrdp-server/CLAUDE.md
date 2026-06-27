@@ -743,3 +743,14 @@ AND released — #1276 landing is NOT sufficient.
     not dedup). This is the second soak A/B axis (dup vs no-dup at a fixed loss);
     `scripts/soak-lossy-audio.sh` exposes it. Verification on a real lossy link is
     pending (the spike is built + unit-tested; the soak run is the user's call).
+
+    Ack-driven IDR recovery support (2026-06-27): `RdpServer` gained
+    `egfx_on_lossy_handle: Option<Arc<AtomicBool>>` + setter
+    `set_egfx_on_lossy_handle` (mirrors the `udp_tunnel_bound` / handle-setter
+    pattern). At the EGFX Soft-Sync site, when EGFX is migrated onto the **lossy**
+    tunnel (`TUNNELTYPE_UDPFECL`, non-empty channel list) the flag is flipped true
+    so macrdp's H.264 pipeline can arm ack-driven IDR recovery (the codec-side
+    detection lives in `src/h264.rs`; the server only publishes the on-lossy state).
+    On the reliable tunnel / TCP the flag stays false. All `multitransport`-gated;
+    feature-off and the no-migration path are byte-unchanged. See the feasibility
+    doc "Ack-driven IDR recovery (EGFX-on-lossy video)".
