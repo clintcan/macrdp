@@ -41,14 +41,6 @@ pub struct EncodedFrame {
     /// SPS / PPS NAL units (raw, no length prefix and no start code).
     /// Populated only on keyframes — empty on non-keyframes.
     pub parameter_sets: Vec<Vec<u8>>,
-    /// VideoToolbox Long-Term Reference acknowledgement token, present only when
-    /// LTR is enabled (`MACRDP_UDP_EGFX_LTR`) AND this frame was coded as an LTR
-    /// frame. The pipeline records `egfx_frame_id → token` when this frame ships
-    /// and feeds the token back via [`Encoder::acknowledge_ltr_tokens`] once the
-    /// client acks that frame, so a later `ForceLTRRefresh` can recover from loss
-    /// with a P-frame against this known-good reference instead of a full IDR.
-    /// `None` on the default (LTR-off) path and on non-LTR frames.
-    pub ltr_token: Option<i64>,
 }
 
 pub struct Encoder {
@@ -75,34 +67,18 @@ pub struct Encoder {
     /// blacks there. FreeRDP honors the range flag so it stays correct either
     /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
     full_range: bool,
-    /// Long-Term Reference mode (`MACRDP_UDP_EGFX_LTR`). When true the session was
-    /// created with `EnableLTR`, output frames may carry an LTR token, and the two
-    /// pending-state fields below feed per-frame LTR options into the next encode.
-    /// When false every LTR method is a no-op and the path is byte-identical.
-    enable_ltr: bool,
-    /// LTR tokens the client has acknowledged since the last encode, to hand VT via
-    /// `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` so it may reference them.
-    /// Drained on each `encode_bgra`.
-    pending_acked_ltr: Vec<i64>,
-    /// One-shot: force the next encoded frame to be an LTR refresh (a P-frame
-    /// referencing the most recent acknowledged LTR, or an IDR if none acked yet)
-    /// via `kVTEncodeFrameOptionKey_ForceLTRRefresh`. Consumed on the next encode.
-    pending_ltr_refresh: bool,
 }
 
 impl Encoder {
     /// Create a new H.264 encoder. `bitrate_bps` is the target average
     /// bitrate; `fps` sets the frame-duration hint used by VT's rate
     /// controller. The first encoded frame will always be a keyframe.
-    #[allow(clippy::too_many_arguments)] // tightly-coupled encoder params; a struct adds no clarity
     pub fn new(
         width: u16,
         height: u16,
         fps: u32,
         bitrate_bps: u32,
         keyframe_secs: f32,
-        enable_ltr: bool,
-        ltr_low_latency: bool,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<EncodedFrame>();
         // The callback receives the raw `*mut Sender` and clones it per
@@ -121,15 +97,7 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session = ffi::create_session(
-            width,
-            height,
-            bitrate_bps,
-            keyframe_frames,
-            enable_ltr,
-            ltr_low_latency,
-            tx_ptr,
-        )?;
+        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -139,36 +107,7 @@ impl Encoder {
             next_pts: 0,
             fps,
             full_range,
-            enable_ltr,
-            pending_acked_ltr: Vec::new(),
-            pending_ltr_refresh: false,
         })
-    }
-
-    /// Whether Long-Term Reference mode is active for this encoder
-    /// (`MACRDP_UDP_EGFX_LTR`). When false the LTR methods below are no-ops.
-    pub fn ltr_enabled(&self) -> bool {
-        self.enable_ltr
-    }
-
-    /// Record LTR tokens the client has acknowledged (via `RDPGFX_FRAME_ACKNOWLEDGE`
-    /// mapped back to the token VT emitted for that frame). They're handed to VT on
-    /// the next `encode_bgra` so it may use those frames as references. No-op when
-    /// LTR is off.
-    pub fn acknowledge_ltr_tokens(&mut self, tokens: &[i64]) {
-        if self.enable_ltr {
-            self.pending_acked_ltr.extend_from_slice(tokens);
-        }
-    }
-
-    /// Request that the next encoded frame be an **LTR refresh**: a P-frame
-    /// referencing the most recently acknowledged LTR (or an IDR if none has been
-    /// acked yet — VT's documented fallback). This is the cheap loss-recovery
-    /// action that replaces a full forced IDR when LTR is on. No-op when LTR is off.
-    pub fn request_ltr_refresh(&mut self) {
-        if self.enable_ltr {
-            self.pending_ltr_refresh = true;
-        }
     }
 
     /// Take the VideoToolbox output receiver, to run it on a dedicated ship
@@ -209,10 +148,6 @@ impl Encoder {
         }
         let pts = self.next_pts;
         self.next_pts = self.next_pts.wrapping_add(1);
-        // Drain the one-shot LTR options into this encode (empty / false on the
-        // default LTR-off path → byte-identical frame properties).
-        let acked_ltr = std::mem::take(&mut self.pending_acked_ltr);
-        let force_ltr_refresh = std::mem::replace(&mut self.pending_ltr_refresh, false);
         ffi::encode_frame(
             &self.inner,
             bgra,
@@ -223,8 +158,6 @@ impl Encoder {
             self.fps,
             force_keyframe,
             self.full_range,
-            force_ltr_refresh,
-            &acked_ltr,
         )
     }
 
@@ -304,9 +237,6 @@ mod ffi {
     pub(super) const K_CM_TIME_FLAGS_VALID: u32 = 1;
 
     pub(super) const KCF_NUMBER_INT32_TYPE: i32 = 3;
-    // kCFNumberSInt64Type — for LTR acknowledgement tokens (CFNumber). Used both
-    // to build tokens we hand back to VT and to read the token VT attaches.
-    pub(super) const KCF_NUMBER_SINT64_TYPE: i32 = 4;
 
     /// Opaque stand-in for `CFDictionaryKeyCallBacks` /
     /// `CFDictionaryValueCallBacks`. We never read these structs — we
@@ -346,18 +276,6 @@ mod ffi {
             the_type: i32,
             value_ptr: *const c_void,
         ) -> CFNumberRef;
-        pub(super) fn CFNumberGetValue(
-            number: CFNumberRef,
-            the_type: i32,
-            value_ptr: *mut c_void,
-        ) -> Boolean;
-        pub(super) fn CFArrayCreate(
-            allocator: CFAllocatorRef,
-            values: *const *const c_void,
-            num_values: isize,
-            callbacks: *const c_void,
-        ) -> CFArrayRef;
-        pub(super) static kCFTypeArrayCallBacks: CFCallbacksOpaque;
 
         // Constant string handles for VT property keys + profile levels.
         // These are global symbols, dereferenced for the actual CFStringRef.
@@ -369,17 +287,6 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
-        // Long-Term Reference (LTR) keys — macOS 12+. Enabled only on the
-        // MACRDP_UDP_EGFX_LTR path; the symbols are resolved at load regardless,
-        // but they exist on every macOS macrdp targets.
-        pub(super) static kVTCompressionPropertyKey_EnableLTR: CFStringRef;
-        pub(super) static kVTEncodeFrameOptionKey_AcknowledgedLTRTokens: CFStringRef;
-        pub(super) static kVTEncodeFrameOptionKey_ForceLTRRefresh: CFStringRef;
-        pub(super) static kVTSampleAttachmentKey_RequireLTRAcknowledgementToken: CFStringRef;
-        // Low-latency rate controller — co-enabled with LTR when
-        // MACRDP_UDP_EGFX_LTR_LOWLATENCY is set (a test lever in case a given
-        // VT/HW combo only emits LTR tokens under the low-latency encoder).
-        pub(super) static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
         // space explicitly instead of leaving the decoder to guess (which is
         // why mstsc washed the image lighter while FreeRDP guessed right).
@@ -530,36 +437,13 @@ mod ffi {
     // The session itself is documented as thread-safe.
     unsafe impl Send for SessionGuard {}
 
-    #[allow(clippy::too_many_arguments)] // internal FFI session builder; grouping adds no clarity
     pub(super) fn create_session(
         width: u16,
         height: u16,
         bitrate_bps: u32,
         keyframe_frames: u32,
-        enable_ltr: bool,
-        ltr_low_latency: bool,
         tx_ctx: *mut c_void,
     ) -> Result<SessionGuard> {
-        // Optional encoder specification. Only built when LTR is requested AND the
-        // low-latency lever is on (MACRDP_UDP_EGFX_LTR_LOWLATENCY) — some VT/HW
-        // combos only emit LTR tokens under the low-latency rate controller. The
-        // default path passes a null spec (byte-identical to before).
-        let spec: CFDictionaryRef = if enable_ltr && ltr_low_latency {
-            unsafe {
-                let key = kVTVideoEncoderSpecification_EnableLowLatencyRateControl;
-                let value = kCFBooleanTrue;
-                CFDictionaryCreate(
-                    ptr::null(),
-                    &key as *const *const c_void,
-                    &value as *const *const c_void,
-                    1,
-                    &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                    &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
-                )
-            }
-        } else {
-            ptr::null()
-        };
         let mut session: VTCompressionSessionRef = ptr::null();
         let status = unsafe {
             VTCompressionSessionCreate(
@@ -567,7 +451,7 @@ mod ffi {
                 i32::from(width),
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
-                spec,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 Some(output_callback),
@@ -575,9 +459,6 @@ mod ffi {
                 &mut session,
             )
         };
-        if !spec.is_null() {
-            unsafe { CFRelease(spec) };
-        }
         if status != 0 || session.is_null() {
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
         }
@@ -648,22 +529,6 @@ mod ffi {
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
                 keyframe_frames.max(1) as i32,
             )?;
-            // Long-Term Reference (LTR) mode (MACRDP_UDP_EGFX_LTR). Best-effort: if
-            // a VT/HW combo rejects it the encoder still works (recovery just falls
-            // back to a normal IDR, since no LTR tokens are ever emitted). The
-            // default path never sets it, so it's byte-identical when off.
-            if enable_ltr {
-                let st = VTSessionSetProperty(
-                    session,
-                    kVTCompressionPropertyKey_EnableLTR,
-                    kCFBooleanTrue,
-                );
-                if st != 0 {
-                    // No tracing in this FFI module; the h264 layer logs the request
-                    // at INFO. A non-zero status here means LTR didn't take.
-                    eprintln!("warning: VT EnableLTR not accepted (OSStatus {st}); LTR inactive");
-                }
-            }
         }
 
         let prepared = unsafe { VTCompressionSessionPrepareToEncodeFrames(session) };
@@ -1090,8 +955,6 @@ mod ffi {
         fps: u32,
         force_keyframe: bool,
         full_range: bool,
-        force_ltr_refresh: bool,
-        acked_ltr_tokens: &[i64],
     ) -> Result<()> {
         // Full-range path feeds VT a `420f` (full-range NV12) buffer we fill
         // ourselves; otherwise hand VT BGRA and let it produce video-range YUV.
@@ -1191,59 +1054,19 @@ mod ffi {
                 flags: K_CM_TIME_FLAGS_VALID,
                 epoch: 0,
             };
-            // Build the per-frame options dict from up to three entries:
-            // ForceKeyFrame, ForceLTRRefresh, AcknowledgedLTRTokens. On the default
-            // path (no keyframe, LTR off) all are absent → null dict, byte-identical
-            // to before. `ltr_tokens_array` is kept alive (and released) alongside
-            // the dict because it's referenced by it.
-            let mut keys: Vec<*const c_void> = Vec::new();
-            let mut values: Vec<*const c_void> = Vec::new();
-            if force_keyframe {
-                keys.push(kVTEncodeFrameOptionKey_ForceKeyFrame);
-                values.push(kCFBooleanTrue);
-            }
-            if force_ltr_refresh {
-                keys.push(kVTEncodeFrameOptionKey_ForceLTRRefresh);
-                values.push(kCFBooleanTrue);
-            }
-            // CFArray of CFNumber(SInt64) for the acknowledged LTR tokens, if any.
-            let mut token_numbers: Vec<CFNumberRef> = Vec::new();
-            let mut ltr_tokens_array: CFArrayRef = ptr::null();
-            if !acked_ltr_tokens.is_empty() {
-                for &tok in acked_ltr_tokens {
-                    let n = CFNumberCreate(
-                        ptr::null(),
-                        KCF_NUMBER_SINT64_TYPE,
-                        &tok as *const i64 as *const c_void,
-                    );
-                    if !n.is_null() {
-                        token_numbers.push(n);
-                    }
-                }
-                if !token_numbers.is_empty() {
-                    ltr_tokens_array = CFArrayCreate(
-                        ptr::null(),
-                        token_numbers.as_ptr(),
-                        token_numbers.len() as isize,
-                        &kCFTypeArrayCallBacks as *const _ as *const c_void,
-                    );
-                    if !ltr_tokens_array.is_null() {
-                        keys.push(kVTEncodeFrameOptionKey_AcknowledgedLTRTokens);
-                        values.push(ltr_tokens_array);
-                    }
-                }
-            }
-            let frame_props: CFDictionaryRef = if keys.is_empty() {
-                ptr::null()
-            } else {
+            let frame_props: CFDictionaryRef = if force_keyframe {
+                let key = kVTEncodeFrameOptionKey_ForceKeyFrame;
+                let value = kCFBooleanTrue;
                 CFDictionaryCreate(
                     ptr::null(),
-                    keys.as_ptr(),
-                    values.as_ptr(),
-                    keys.len() as isize,
+                    &key as *const *const c_void,
+                    &value as *const *const c_void,
+                    1,
                     &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
                     &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
                 )
+            } else {
+                ptr::null()
             };
 
             let mut info_flags: VTEncodeInfoFlags = 0;
@@ -1258,14 +1081,6 @@ mod ffi {
             );
             if !frame_props.is_null() {
                 CFRelease(frame_props);
-            }
-            // The dict retained the array; the array retained each number. Release
-            // our own references now that the dict (if any) holds them.
-            if !ltr_tokens_array.is_null() {
-                CFRelease(ltr_tokens_array);
-            }
-            for n in token_numbers {
-                CFRelease(n);
             }
             if encode_status != 0 {
                 Err(anyhow!(
@@ -1338,9 +1153,6 @@ mod ffi {
         // sample-attachments array. Per Apple docs, if the attachments
         // array is missing or empty, the sample is a sync (keyframe).
         let mut is_keyframe = true;
-        // LTR acknowledgement token, present only when this sample was coded as an
-        // LTR frame (LTR mode on). Read from the same per-sample attachment dict.
-        let mut ltr_token: Option<i64> = None;
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sbuf, 0);
         if !attachments.is_null() && CFArrayGetCount(attachments) > 0 {
             let dict = CFArrayGetValueAtIndex(attachments, 0) as CFDictionaryRef;
@@ -1350,21 +1162,6 @@ mod ffi {
                     // A present "NotSync" attachment means this is a
                     // non-keyframe. (Apple's API encodes the negation.)
                     is_keyframe = not_sync != kCFBooleanTrue;
-                }
-                let tok = CFDictionaryGetValue(
-                    dict,
-                    kVTSampleAttachmentKey_RequireLTRAcknowledgementToken,
-                ) as CFNumberRef;
-                if !tok.is_null() {
-                    let mut v: i64 = 0;
-                    if CFNumberGetValue(
-                        tok,
-                        KCF_NUMBER_SINT64_TYPE,
-                        &mut v as *mut i64 as *mut c_void,
-                    ) != 0
-                    {
-                        ltr_token = Some(v);
-                    }
                 }
             }
         }
@@ -1409,7 +1206,6 @@ mod ffi {
             is_keyframe,
             pts,
             parameter_sets,
-            ltr_token,
         })
     }
 }
@@ -1717,12 +1513,12 @@ mod tests {
         // Warm up VT (first session boot is expensive; we don't want it skewing
         // the baseline).
         {
-            let mut warm = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false, false).unwrap();
+            let mut warm = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
             drive_one(&mut warm);
         }
 
         // Baseline: single session, N frames.
-        let mut e1 = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false, false).unwrap();
+        let mut e1 = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
         let t = Instant::now();
         drive_one(&mut e1);
         let t_single = t.elapsed();
@@ -1730,8 +1526,8 @@ mod tests {
         // Dual: two sessions, N frames each, submissions interleaved, then both
         // flushed. If VT parallelizes, e_b's frames overlap with e_a's flush
         // wait and the second flush returns nearly instantly.
-        let mut e_a = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false, false).unwrap();
-        let mut e_b = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false, false).unwrap();
+        let mut e_a = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+        let mut e_b = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
         let t = Instant::now();
         for i in 0..N_FRAMES {
             e_a.encode_bgra(black_box(&frame), stride, i == 0).unwrap();
@@ -1832,7 +1628,7 @@ mod tests {
             px[3] = 0xff; // A
         }
 
-        let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0, false, false)?;
+        let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0)?;
         enc.encode_bgra(&frame, stride, false)?;
         let frames = enc.flush()?;
         assert!(!frames.is_empty(), "expected at least one encoded frame");
@@ -1845,69 +1641,6 @@ mod tests {
         assert!(
             !first.parameter_sets.is_empty(),
             "keyframe should carry SPS/PPS parameter sets"
-        );
-        Ok(())
-    }
-
-    /// LTR mode (MACRDP_UDP_EGFX_LTR path) must not break basic encoding, and the
-    /// LTR control methods must be safe to call. We don't assert tokens *appear*
-    /// (whether VT emits LTR tokens depends on the encoder/HW and isn't
-    /// deterministic in a short CI run) — only that enabling LTR, acking arbitrary
-    /// tokens, and forcing an LTR refresh all keep producing valid frames.
-    #[test]
-    fn ltr_enabled_encoder_still_produces_frames() -> Result<()> {
-        let w: u16 = 320;
-        let h: u16 = 240;
-        let stride = usize::from(w) * 4;
-        let mut frame = vec![0u8; stride * usize::from(h)];
-        for (i, px) in frame.chunks_exact_mut(4).enumerate() {
-            px[0] = (i & 0xff) as u8; // B — vary so P-frames have content
-            px[1] = 0x77;
-            px[2] = 0xcc;
-            px[3] = 0xff;
-        }
-
-        let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0, true, false)?;
-        assert!(enc.ltr_enabled(), "LTR should report enabled");
-        // First frame (keyframe).
-        enc.encode_bgra(&frame, stride, false)?;
-        // Acking a token VT never issued must be a harmless no-op.
-        enc.acknowledge_ltr_tokens(&[12345]);
-        // A few more frames, then force an LTR refresh (VT falls back to IDR if no
-        // LTR has been acked — either way it must produce a frame).
-        for _ in 0..3 {
-            enc.encode_bgra(&frame, stride, false)?;
-        }
-        enc.request_ltr_refresh();
-        enc.encode_bgra(&frame, stride, false)?;
-        let frames = enc.flush()?;
-        assert!(
-            !frames.is_empty(),
-            "LTR-enabled encoder should still emit frames"
-        );
-        assert!(frames[0].is_keyframe, "first frame should be a keyframe");
-        Ok(())
-    }
-
-    /// With LTR OFF, the control methods are no-ops and tokens are never present —
-    /// the default path is unaffected.
-    #[test]
-    fn ltr_disabled_methods_are_noops() -> Result<()> {
-        let w: u16 = 320;
-        let h: u16 = 240;
-        let stride = usize::from(w) * 4;
-        let frame = vec![0x40u8; stride * usize::from(h)];
-
-        let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0, false, false)?;
-        assert!(!enc.ltr_enabled(), "LTR should report disabled");
-        enc.acknowledge_ltr_tokens(&[1, 2, 3]); // no-op
-        enc.request_ltr_refresh(); // no-op
-        enc.encode_bgra(&frame, stride, false)?;
-        let frames = enc.flush()?;
-        assert!(!frames.is_empty());
-        assert!(
-            frames.iter().all(|f| f.ltr_token.is_none()),
-            "LTR-off frames must never carry a token"
         );
         Ok(())
     }

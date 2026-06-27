@@ -885,62 +885,38 @@ the `on_frame_ack` + `ship_frames` stamping, and the `submit_bgra` check (logs `
 tunnel — forcing recovery IDR`). The vendored `ironrdp-server` flips the shared `egfx_on_lossy` flag at the
 EGFX→UDPFECL Soft-Sync site (`set_egfx_on_lossy_handle`, server.rs); `main.rs` creates the `Arc<AtomicBool>`
 and wires both ends. Feature-off path is byte-identical (only cheap `Instant::now()` stamps run). **Verify
-status:** real-link soak PENDING (the user's call, like P2.3) — verify on mstsc + `MACRDP_UDP_MIGRATE_EGFX_LOSSY`
-+ `MACRDP_UDP_EGFX_ACK_RECOVERY` + induced loss (A/B vs the feature off; confirm the recovery-IDR marker
-fires and recovery beats the periodic interval).
+status:** the recovery **trigger** was observed firing correctly on the lossy tunnel on real mstsc
+(`forcing recovery IDR` under ack-stall, with EGFX migrated onto UDPFECL); the full A/B quantification (heal
+time vs the feature off under induced loss) is still the user's call. Stays default-OFF.
 
-### LTR recovery (Long-Term Reference frames) — the cheap upgrade to the IDR recovery (implemented 2026-06-27)
+### LTR (Long-Term Reference) recovery — TRIED AND REMOVED (negative result, 2026-06-28)
 
-The ack-driven IDR recovery above heals a lost frame, but its recovery action is a **full IDR** — large,
-itself loss-vulnerable, and a bitrate spike. The standard RTC fix (WebRTC/Zoom) is **Long-Term Reference
-frames**: the encoder periodically marks frames as LTR, the receiver's per-frame ACKs tell the encoder which
-LTRs actually arrived, and on detected loss the encoder codes a **P-frame referencing the last *acknowledged*
-LTR** instead of an IDR — a fraction of the bytes, far more likely to survive the lossy link. RDP is a
-natural fit: `RDPGFX_FRAME_ACKNOWLEDGE` *is* the per-frame received-signal LTR needs, and we already track it
-(for the IDR recovery). This is a strict upgrade — same ack-stall trigger, cheaper recovery.
+Briefly shipped (PR #76) then **reverted** after live testing. The idea was the standard RTC fix — code the
+recovery frame as a P-frame against the last *acknowledged* LTR instead of a full IDR (cheaper, more
+loss-survivable). The **encoder side worked end-to-end**: VideoToolbox emitted LTR frames (`ltr=Some` on the
+wire), the `frame_id → token` map + the `RDPGFX_FRAME_ACKNOWLEDGE → acknowledge_ltr_tokens` feedback loop
+closed (`LTR frame acknowledged to encoder` fired repeatedly), and the ack-stall trigger drove
+`ForceLTRRefresh`. **But no RDP client could decode the result, so it was removed.** Two hard findings from
+real clients (2026-06-28):
 
-**Why LTR (temporal) and not spatial resilience.** On the lossy tunnel, RDPEUDP-lossy delivers a **whole-frame
-gap**, not a corrupt frame (a frame's fragments either fully reassemble or the frame is never delivered) — so
-the decoder sees a *missing* frame, never a *damaged* one. That moots every spatial H.264 tool (slices,
-data-partitioning, redundant slices, constrained-intra): they only help a decoder doing partial-frame
-concealment, which never happens here. Only **temporal** recovery (reference an older good frame, or refresh)
-addresses a missing frame. GDR / cyclic intra-refresh — the ideal "no IDR spike" tool — is **not reachable**:
-VideoToolbox exposes no public intra-refresh property (verified against the SDK headers).
+1. **VideoToolbox only emits LTR frames under the low-latency rate controller.** With the default RealTime
+   encoder, `EnableLTR` is *accepted* but VT codes **zero** LTR frames (all `ltr=None` across 86 frames) — so
+   the LTR refresh permanently degraded to an IDR (== the #75 IDR recovery, no benefit). Tokens only appeared
+   once we co-enabled `EnableLowLatencyRateControl`.
+2. **The resulting long-term-reference bitstream is rejected by RDP's AVC420 decoders.** With low-latency+LTR
+   on, a **fresh mstsc rendered cleanly for ~1 s then abruptly `Connection reset by peer`** the moment
+   LTR-*referencing* frames appeared (it tolerated LTR-*marked* frames, but `ref_pic_list_modification` to a
+   long-term index is fatal to its decoder). **FreeRDP stayed up but rendered fully blank with 0 frame acks**
+   on the same stream; the **control run (same FreeRDP, plain H.264, no LTR) rendered clean** — isolating the
+   blank to the LTR bitstream, not a FreeRDP H.264-decode gap. So both available AVC420 clients reject it.
 
-**VideoToolbox API (macOS 12+, confirmed in the SDK).** `kVTCompressionPropertyKey_EnableLTR` turns it on;
-each LTR frame emits `kVTSampleAttachmentKey_RequireLTRAcknowledgementToken` (a CFNumber); acked tokens are
-fed back via `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens`; `kVTEncodeFrameOptionKey_ForceLTRRefresh` codes
-the recovery P-frame (VT falls back to an IDR itself if no LTR has been acked yet — so a cold start is safe).
-
-**Implementation (all in macrdp — no vendor change), behind `MACRDP_UDP_EGFX_LTR` (default OFF):**
-- `src/videotoolbox.rs`: `Encoder::new` gains `enable_ltr` + `ltr_low_latency`; `create_session` sets
-  `EnableLTR` (best-effort — if a VT/HW combo rejects it, the encoder still works and recovery degrades to a
-  normal IDR) and, when `ltr_low_latency`, builds the encoder spec with
-  `EnableLowLatencyRateControl`. `EncodedFrame` gains `ltr_token: Option<i64>` read from the sample
-  attachment. New methods `acknowledge_ltr_tokens` / `request_ltr_refresh` / `ltr_enabled` feed per-frame
-  options into the next encode. Frame-properties dict generalized to carry ForceKeyFrame + ForceLTRRefresh +
-  AcknowledgedLTRTokens together (null dict on the default path → byte-identical).
-- `src/h264.rs`: `Gfx` reads `MACRDP_UDP_EGFX_LTR` (implies `recovery_enabled` — LTR needs the same ack-stall
-  trigger) + `MACRDP_UDP_EGFX_LTR_LOWLATENCY`. `ConnectionContext` gains `ltr_tokens: BTreeMap<frame_id,
-  token>` (bounded `MAX_TRACKED_LTR_TOKENS=64`): `ship_frames` records the map when a shipped frame carried a
-  token; `on_frame_ack(frame_id)` feeds the matching token back to the encoder as acknowledged. The
-  `submit_bgra` recovery action becomes `request_ltr_refresh()` when LTR is on (logs `EGFX ack-stall on lossy
-  tunnel — forcing LTR refresh`), else the existing IDR.
-- No `main.rs` change — entirely env-driven inside `h264.rs`.
-
-**Tests:** 2 new `videotoolbox` unit tests — LTR-enabled encoder still produces valid frames (ack-arbitrary +
-force-refresh are safe), and LTR-off frames never carry a token (default path unaffected). VT accepts
-`EnableLTR` and keeps encoding on the dev/CI macOS.
-
-**The make-or-break risk (must be live-tested):** whether mstsc's / FreeRDP's **AVC420** decoder correctly
-handles a P-frame that references a long-term reference (ref-pic-list modification + MMCO marking). LTR is
-standard-conformant H.264, but AVC420-over-EGFX is a constrained profile and the MS decoder *may* assume each
-P references the immediately-previous frame; if it chokes → corruption, and we revert to the IDR path. The
-`MACRDP_UDP_EGFX_LTR_LOWLATENCY` lever exists in case a given VT/HW only emits LTR tokens under the
-low-latency rate controller. **Verify status:** real-client soak PENDING (the user's call) — mstsc +
-`MACRDP_UDP_MIGRATE_EGFX_LOSSY` + `MACRDP_UDP_EGFX_LTR` + induced loss; watch for `forcing LTR refresh` +
-`EGFX LTR frame acknowledged to encoder` and confirm the picture stays clean under loss (and doesn't corrupt,
-which would mean the decoder rejects LTR refs → fall back to the IDR recovery).
+**Conclusion:** VideoToolbox H.264 LTR is not usable on the EGFX/AVC420 path — the only configuration that
+makes VT emit LTR (low-latency RC) produces a long-term-reference bitstream RDP clients can't decode. The
+recovery mechanism stays the **ack-driven IDR recovery (PR #75)**, which both clients accept (plain H.264 over
+the lossy tunnel renders stable on mstsc). **Do NOT re-attempt VT-LTR for this path** unless a future
+client/VT combination is shown to decode long-term-reference AVC420. The encoder-side LTR plumbing
+(`EncodedFrame.ltr_token`, `Encoder::{acknowledge_ltr_tokens,request_ltr_refresh}`, the low-latency encoder
+spec, the h264 token map, `MACRDP_UDP_EGFX_LTR*`) was reverted with PR #76's revert.
 
 - **P2.4a — MS-RDPEMT tunnel over DTLS (DONE, GREEN 2026-06-26).** The prerequisite
   for any lossy channel: decrypt the client's DTLS application records, answer its
