@@ -56,6 +56,16 @@
 #                               resent, so under heavy loss the tunnel may fail to
 #                               establish at all — watch for "P2.4 GREEN" / the
 #                               CREATERESPONSE marker to confirm it came up.
+#   MACRDP_UDP_LOSSY_AUDIO_DUP — 1 = 1+1 redundancy: ship each lossy source
+#                               datagram TWICE (same seq, byte-identical) so an
+#                               independent-loss link costs us only at p². mstsc's
+#                               DTLS anti-replay drops the duplicate (no double-
+#                               play). The P2.3 FEC pivot (real Reed-Solomon FEC is
+#                               structurally unavailable — modern Windows is
+#                               RDPUDP2/no-FEC). Default 0 (off). Needs LOSSY
+#                               delivery (it has no effect on the reliable SM).
+#                               This is the second A/B axis: dup vs no-dup at a
+#                               fixed loss to see if redundancy closes the gap.
 
 set -eu
 
@@ -81,6 +91,7 @@ esac
 export MACRDP_UDP_OFFER_FECL=1
 export MACRDP_UDP_LOSSY_DELIVERY="${MACRDP_UDP_LOSSY_DELIVERY:-1}"
 export MACRDP_UDP_LOSSY_AUDIO="${MACRDP_UDP_LOSSY_AUDIO:-1}"
+export MACRDP_UDP_LOSSY_AUDIO_DUP="${MACRDP_UDP_LOSSY_AUDIO_DUP:-0}"
 
 # Enough to see the audio-DVC lifecycle + the tunnel/DTLS milestones + the
 # reliability counters, without per-keystroke input spam. The audio-DVC "opened"
@@ -99,13 +110,16 @@ SOAK_LOG="${SOAK_LOG:-./soak-lossy-audio-${ts}.log}"
 #   * the failure tells (route failed / broken pipe / reset / cookie reject), and
 #   * RTO retransmits (should be ~0 for a genuine lossy flow; any value here means
 #     the reliable SM is still carrying it — check MACRDP_UDP_LOSSY_DELIVERY).
-MARKERS='offering AUDIO_PLAYBACK_LOSSY_DVC|reliable audio DVC negotiated|lossy audio DVC opened|DYNVC_SOFT_SYNC_REQUEST|Soft-Sync Response|streaming Wave2 audio over the LOSSY|lossy audio wave route over UDP tunnel failed|LOSSY delivery|SPIKE GREEN|P2\.1 GREEN|P2\.4 GREEN|CREATEREQUEST|CREATERESPONSE|cookie not recognized|RTO retransmit|Broken pipe|Connection reset|Connection error'
+MARKERS='offering AUDIO_PLAYBACK_LOSSY_DVC|reliable audio DVC negotiated|lossy audio DVC opened|DYNVC_SOFT_SYNC_REQUEST|Soft-Sync Response|streaming Wave2 audio over the LOSSY|lossy audio wave route over UDP tunnel failed|LOSSY delivery|duplicate source datagrams|SPIKE GREEN|P2\.1 GREEN|P2\.4 GREEN|CREATEREQUEST|CREATERESPONSE|cookie not recognized|RTO retransmit|Broken pipe|Connection reset|Connection error'
 
-echo "soak-lossy-audio: MACRDP_UDP_OFFER_FECL=$MACRDP_UDP_OFFER_FECL MACRDP_UDP_LOSSY_DELIVERY=$MACRDP_UDP_LOSSY_DELIVERY MACRDP_UDP_LOSSY_AUDIO=$MACRDP_UDP_LOSSY_AUDIO"
+echo "soak-lossy-audio: MACRDP_UDP_OFFER_FECL=$MACRDP_UDP_OFFER_FECL MACRDP_UDP_LOSSY_DELIVERY=$MACRDP_UDP_LOSSY_DELIVERY MACRDP_UDP_LOSSY_AUDIO=$MACRDP_UDP_LOSSY_AUDIO MACRDP_UDP_LOSSY_AUDIO_DUP=$MACRDP_UDP_LOSSY_AUDIO_DUP"
 if [ "$MACRDP_UDP_LOSSY_AUDIO" = "1" ]; then
     echo "soak-lossy-audio: mode = TREATMENT (audio over the lossy UDP/DTLS tunnel)"
 else
     echo "soak-lossy-audio: mode = CONTROL (audio on the static RDPSND TCP channel)"
+fi
+if [ "$MACRDP_UDP_LOSSY_AUDIO_DUP" = "1" ]; then
+    echo "soak-lossy-audio: redundancy = ON (1+1 duplicate source datagrams; P2.3 FEC pivot)"
 fi
 echo "soak-lossy-audio: binary=$MACRDP"
 echo "soak-lossy-audio: full log -> $SOAK_LOG (paste this if reporting)"

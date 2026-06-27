@@ -75,6 +75,18 @@ pub struct Config {
     /// Reliable (`UdpFecR`) vs lossy (`UdpFecL`) delivery policy. Defaults to
     /// [`DeliveryMode::Reliable`] so existing callers are unchanged.
     pub mode: DeliveryMode,
+    /// Lossy-only redundancy spike (P2.3 FEC pivot): emit each new source
+    /// datagram **twice** (same sequence number, same bytes) so that on an
+    /// independent-loss link of rate `p` a payload is lost only at `p²`. The
+    /// peer's RDPEUDP receiver de-duplicates by sequence number (the same
+    /// mechanism that drops a normal retransmit), so the upper layer never sees
+    /// the copy — no double-play. A poor-man's 1+1 repetition code standing in
+    /// for the structurally-unavailable Reed-Solomon FEC (modern Windows
+    /// negotiates RDPUDP2, which has no FEC — see
+    /// `docs/rdp-udp-multitransport-feasibility.md` "P2.3 FEC capture RESULT").
+    /// Ignored unless `mode == Lossy`. Default `false` (every existing caller is
+    /// byte-identical).
+    pub duplicate_lossy_sends: bool,
 }
 
 impl Default for Config {
@@ -85,6 +97,7 @@ impl Default for Config {
             initial_seq: 0,
             rto_ms: 300,
             mode: DeliveryMode::Reliable,
+            duplicate_lossy_sends: false,
         }
     }
 }
@@ -377,14 +390,22 @@ impl RdpeudpState {
             let payload: Vec<u8> = self.out_queue.drain(..take).collect();
             let seq = self.send_next;
             self.send_next = self.send_next.wrapping_add(1);
-            out.to_send.push(encode_data(
+            let datagram = encode_data(
                 self.recv_next,
                 self.have_peer_seq,
                 self.cfg.recv_window,
                 seq,
                 &payload,
                 ack_vector.clone(),
-            ));
+            );
+            // Lossy redundancy spike: ship a second identical copy (same seq) so
+            // independent loss only costs us at p². The peer de-dups by seq, so
+            // the upper layer never sees it. Reliable mode never duplicates (it
+            // has RTO retransmit instead).
+            if self.cfg.mode == DeliveryMode::Lossy && self.cfg.duplicate_lossy_sends {
+                out.to_send.push(datagram.clone());
+            }
+            out.to_send.push(datagram);
             // Reliable: track for RTO retransmit until acked. Lossy: send once and
             // forget (no retransmit) — `unacked` stays empty, so the window check
             // above never blocks and the retransmit loop is a no-op.
@@ -528,6 +549,7 @@ mod tests {
             initial_seq,
             rto_ms: 100,
             mode: DeliveryMode::Reliable,
+            duplicate_lossy_sends: false,
         }
     }
 
@@ -617,6 +639,7 @@ mod tests {
                 initial_seq: 0x61f7_b6e3,
                 rto_ms: 300,
                 mode: DeliveryMode::Reliable,
+                duplicate_lossy_sends: false,
             },
         );
         let out = server.step(0, Some(&client_syn));
@@ -866,5 +889,104 @@ mod tests {
         let out = server.step(now + rto * 10, None);
         assert_eq!(out.retransmits, 0);
         assert!(out.to_send.is_empty(), "still no resend much later");
+    }
+
+    /// Drive a lossy pair to established with `duplicate_lossy_sends` set on the
+    /// server, so its data emissions are 1+1 redundant.
+    fn handshook_lossy_dup() -> (RdpeudpState, RdpeudpState, u64) {
+        let mut client = RdpeudpState::new(Role::Client, cfg_lossy(1000));
+        let mut server = RdpeudpState::new(
+            Role::Server,
+            Config {
+                duplicate_lossy_sends: true,
+                ..cfg_lossy(9000)
+            },
+        );
+        let mut now = 0;
+        let o = client.start(now);
+        for dg in o.to_send {
+            let so = server.step(now, Some(&dg));
+            for back in so.to_send {
+                client.step(now, Some(&back));
+            }
+        }
+        now += 1;
+        assert!(client.is_established() && server.is_established());
+        (client, server, now)
+    }
+
+    /// P2.3 FEC pivot: with `duplicate_lossy_sends`, each source datagram is emitted
+    /// twice — byte-identical, same sequence number — a 1+1 repetition code so an
+    /// independent-loss link costs us only at p². De-duplication of the surviving
+    /// copy is the **upper layer's** job, not the transport's: in production the
+    /// payload is a DTLS record and mstsc's DTLS anti-replay window drops the
+    /// identical-bytes duplicate (the same self-dedup property `recv_source`'s lossy
+    /// branch relies on — see the control test `lossy_receiver_does_not_dedup`).
+    #[test]
+    fn lossy_duplicate_sends_emits_each_source_twice_byte_identical() {
+        let (_client, mut server, now) = handshook_lossy_dup();
+        // Small enough to be a single source packet, so the duplication is exact.
+        let data = data_only(server.enqueue(now, b"one aac access unit").to_send);
+        assert_eq!(
+            data.len(),
+            2,
+            "one source packet shipped as two identical copies"
+        );
+        assert_eq!(
+            data[0], data[1],
+            "the duplicate is byte-identical (same seq, same payload)"
+        );
+    }
+
+    /// Documents *why* duplication is safe only because the upper layer dedups: the
+    /// lossy receiver itself intentionally does NOT — it delivers every arrival
+    /// (no buffering/ordering is the whole point). So at the wire a duplicate seq is
+    /// delivered twice; the DTLS replay window above it drops the copy in production.
+    #[test]
+    fn lossy_receiver_does_not_dedup() {
+        let (mut client, mut recv, now) = handshook_lossy();
+        let data = data_only(client.enqueue(now, b"one aac access unit").to_send);
+        let first = recv.step(now, Some(&data[0]));
+        assert_eq!(first.delivered.len(), 1, "first copy delivers the payload");
+        let second = recv.step(now, Some(&data[0]));
+        assert_eq!(
+            second.delivered.len(),
+            1,
+            "the transport re-delivers the duplicate — dedup is the upper (DTLS) layer's job"
+        );
+    }
+
+    /// Control: without the flag a lossy sender emits each source packet once
+    /// (the default, byte-identical to every existing caller).
+    #[test]
+    fn lossy_without_duplicate_flag_sends_once() {
+        let (_client, mut server, now) = handshook_lossy();
+        let data = data_only(server.enqueue(now, b"one aac access unit").to_send);
+        assert_eq!(data.len(), 1, "no duplication when the flag is off");
+    }
+
+    /// The flag is lossy-only: a reliable sender never duplicates (it has RTO
+    /// retransmit instead), even if the flag is somehow set.
+    #[test]
+    fn reliable_ignores_duplicate_flag() {
+        let mut client = RdpeudpState::new(Role::Client, cfg(1000));
+        let mut server = RdpeudpState::new(
+            Role::Server,
+            Config {
+                duplicate_lossy_sends: true,
+                ..cfg(9000)
+            },
+        );
+        let mut now = 0;
+        let o = client.start(now);
+        for dg in o.to_send {
+            let so = server.step(now, Some(&dg));
+            for back in so.to_send {
+                client.step(now, Some(&back));
+            }
+        }
+        now += 1;
+        let data = data_only(server.enqueue(now, b"reliable payload").to_send);
+        assert_eq!(data.len(), 1, "reliable mode never duplicates");
     }
 }

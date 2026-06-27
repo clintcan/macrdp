@@ -35,6 +35,26 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **P2.3 FEC pivot — 1+1 lossy duplicate sends (done, 2026-06-27):** real
+  Reed-Solomon FEC is structurally unavailable (a real-Windows capture shows modern
+  mstsc negotiates RDPUDP2, which has no FEC — see
+  `docs/rdp-udp-multitransport-feasibility.md` "P2.3 FEC capture RESULT"). This is
+  the protocol-safe stand-in: `Config` gained `duplicate_lossy_sends: bool` (default
+  `false`, so every existing caller is byte-identical). When set **and**
+  `mode == Lossy`, `pump()` pushes each new source datagram into `to_send` **twice**
+  — byte-identical, same sequence number — a repetition code so an independent-loss
+  link of rate `p` only costs the payload at `p²`. **De-dup is the upper layer's job,
+  NOT the transport's** (the lossy receiver deliberately does not dedup — it delivers
+  every arrival): in production the payload is a DTLS record and mstsc's DTLS
+  anti-replay window drops the identical-bytes duplicate, so the upper layer (audio)
+  never double-plays. Reliable mode ignores the flag (it has RTO retransmit instead).
+  Unit-tested: `lossy_duplicate_sends_emits_each_source_twice_byte_identical` (two
+  identical copies emitted), `lossy_without_duplicate_flag_sends_once` +
+  `reliable_ignores_duplicate_flag` (controls), and `lossy_receiver_does_not_dedup`
+  (documents *why* dedup must live above the transport). 50 crate tests. Wired in the
+  listener behind `MACRDP_UDP_LOSSY_AUDIO_DUP` (lossy flow only; see ironrdp-server
+  CLAUDE.md (12) P2.3).
+
 - **P2.2 step 1 — lossy delivery mode (done, 2026-06-27; SM logic only, NOT yet
   wired):** `Config` gained `mode: DeliveryMode { Reliable, Lossy }` (default
   `Reliable`, so every existing caller/test is byte-identical). In

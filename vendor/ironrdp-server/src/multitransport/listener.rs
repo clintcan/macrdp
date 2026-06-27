@@ -447,6 +447,20 @@ async fn run_recv_loop(
         debug!("MACRDP_UDP_LOSSY_DELIVERY set — lossy (SYN_LOSSY) flows will use DeliveryMode::Lossy");
     }
 
+    // (P2.3 FEC pivot, EXPERIMENTAL) Real FEC is structurally unavailable (modern
+    // Windows negotiates RDPUDP2, which has no FEC — see the feasibility doc "P2.3
+    // FEC capture RESULT"). This is the protocol-safe stand-in: on a lossy flow,
+    // ship each source datagram twice (same seq) so an independent-loss link costs
+    // us only at p²; the peer de-dups by sequence number, so the upper layer (audio)
+    // never sees the copy. Only meaningful with MACRDP_UDP_LOSSY_DELIVERY (it needs
+    // the lossy SM); default OFF.
+    let lossy_dup = super::env_truthy("MACRDP_UDP_LOSSY_AUDIO_DUP");
+    if lossy_dup {
+        debug!(
+            "MACRDP_UDP_LOSSY_AUDIO_DUP set — lossy flows will duplicate each source datagram (1+1 redundancy)"
+        );
+    }
+
     // (Soak fix) Periodic clock for the reliability state machines. The SM only
     // retransmits / drains its send window when it's pumped (step/enqueue), and
     // those are otherwise driven solely by inbound datagrams or new outbound data.
@@ -555,6 +569,12 @@ async fn run_recv_loop(
             } else {
                 DeliveryMode::Reliable
             };
+            // 1+1 redundancy only applies to the lossy flow (the reliable SM has
+            // RTO retransmit instead and never duplicates).
+            let duplicate_lossy_sends = use_lossy && lossy_dup;
+            if duplicate_lossy_sends {
+                debug!(%peer_addr, "RDPEUDP lossy peer will duplicate source datagrams (MACRDP_UDP_LOSSY_AUDIO_DUP)");
+            }
             Peer {
                 sm: RdpeudpState::new(
                     Role::Server,
@@ -564,6 +584,7 @@ async fn run_recv_loop(
                         initial_seq,
                         rto_ms: cfg.rto_ms,
                         mode,
+                        duplicate_lossy_sends,
                     },
                 ),
                 inbound: Vec::new(),

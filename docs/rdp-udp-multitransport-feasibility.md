@@ -684,12 +684,44 @@ Tooling note: the first `fec-scan.sh` hand-parsed uFlags at a fixed offset and m
 packets as "495 FEC datagrams" (a false GO). Rewritten to use the dissector's `rdpudp.flags.fec` +
 `rdpudp.synex.version`; it now reports the negotiated version and emits the structural NO-GO for `0x0101`.
 
-**Remaining lossy-audio levers (neither depends on RDPEUDP FEC):** (1) application-level **duplicate-AU
-redundancy** — send each AAC Wave2 PDU twice over the lossy tunnel (mstsc sees ordinary audio PDUs, no FEC
-decode; relies on it deduping by `block_no`); else (2) accept that lossy-audio-over-mstsc has no clean win
+**Remaining lossy-audio levers (neither depends on RDPEUDP FEC):** (1) **1+1 transport-level
+redundancy** — built, see P2.3 below; else (2) accept that lossy-audio-over-mstsc has no clean win
 (reliable HOL-blocks; send-once loses AUs) and document it. The ARQ path does **not** rescue *audio*
 (reliable = HOL-block = the very problem), so "fix ARQ" is not a lossy-audio fix — it's only relevant if a
 *reliable* tunnel payload is ever wanted.
+
+### P2.3 redundancy stand-in — 1+1 lossy duplicate sends (built 2026-06-27, soak pending)
+
+With real FEC ruled out, the protocol-safe redundancy is a **1+1 repetition code at the RDPEUDP
+transport**: on a lossy flow, ship each source datagram **twice** — byte-identical, same sequence number.
+On an independent-loss link of rate `p`, a payload is then lost only at `p²` (5% → 0.25%).
+
+- **Why transport-level, not "send each Wave2 PDU twice" (app-level).** App-level duplication would put
+  two Wave2 PDUs with the **same `block_no`** on the wire and *rely on mstsc deduping by `block_no`* at the
+  RDPSND layer — which MS-RDPEA never specifies, so it risks **double-play**. The transport copy is instead
+  de-duplicated by **DTLS anti-replay**: the lossy tunnel is DTLS-encrypted (P2.4a), the duplicate datagram
+  carries the *identical encrypted bytes* = the same DTLS record sequence number, and mstsc's DTLS replay
+  window drops it before it ever reaches RDPSND. So the audio layer sees each AU exactly once, guaranteed
+  by a standard DTLS property rather than an unspecified client behavior. (The RDPEUDP layer itself does
+  **not** dedup in lossy mode — deliver-on-arrival is the whole point — so dedup *must* live above it; DTLS
+  is exactly that layer.)
+- **Implementation.** `ironrdp-rdpeudp` `Config` gained `duplicate_lossy_sends: bool` (default false); when
+  set and `mode == Lossy`, `pump()` emits each new source datagram twice. The listener
+  (`vendor/ironrdp-server/src/multitransport/listener.rs`) sets it on a lossy peer behind the experimental
+  env **`MACRDP_UDP_LOSSY_AUDIO_DUP`** (default OFF; needs `MACRDP_UDP_LOSSY_DELIVERY` so the flow is on the
+  lossy SM). Reliable flow + default build are byte-unchanged. Unit-tested in `ironrdp-rdpeudp` (duplicate
+  emitted byte-identical; controls for flag-off and reliable-mode; a test documenting that the receiver
+  does not dedup, i.e. why DTLS must).
+- **Cost / caveat.** Doubles the lossy flow's egress bandwidth (audio only today — AAC ~128 kbit/s, so the
+  doubling is cheap). It protects against *independent* single-packet loss; it does **not** help against a
+  burst that takes out both copies (they ship back-to-back, so a burst longer than the inter-copy gap can
+  still drop both — staggering the copies in time would harden that, deferred). It is a stand-in, not FEC:
+  no cross-packet recovery, just repetition.
+- **Status: built + unit-tested, real-link soak PENDING.** `scripts/soak-lossy-audio.sh` exposes
+  `MACRDP_UDP_LOSSY_AUDIO_DUP` as a second A/B axis (dup vs no-dup at a fixed `--loss`). The open question
+  the soak answers: does 1+1 redundancy actually close the 5%-loss audio gap on mstsc (audio stays smooth),
+  or does the residual `p²` loss / burst loss still stall the AAC decoder? If yes → keep it (gated); if no →
+  fall back to lever (2), document lossy-audio-over-mstsc as having no clean win.
 
 - **P2.4a — MS-RDPEMT tunnel over DTLS (DONE, GREEN 2026-06-26).** The prerequisite
   for any lossy channel: decrypt the client's DTLS application records, answer its

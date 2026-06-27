@@ -727,3 +727,19 @@ AND released — #1276 landing is NOT sufficient.
     multitransport tunnel. All gated default-off (`MACRDP_UDP_OFFER_FECL` +
     `MACRDP_UDP_LOSSY_AUDIO`, + `--enable-aac` + `--enable-h264` since the Soft-Sync
     trigger rides the EGFX dispatch arm). See feasibility doc "P2.4b".
+
+    P2.3 — 1+1 lossy redundancy (the FEC pivot), 2026-06-27, `listener.rs`. Real
+    Reed-Solomon FEC is structurally unavailable (a real-Windows capture proved
+    modern mstsc negotiates RDPUDP2, which has no FEC — see feasibility doc "P2.3 FEC
+    capture RESULT"). The protocol-safe stand-in: behind the experimental env
+    `MACRDP_UDP_LOSSY_AUDIO_DUP` (read once at `run_recv_loop` top, value-aware via
+    `env_truthy`; default OFF), a **lossy** peer is built with the new `RdpeudpState`
+    `Config { duplicate_lossy_sends: true }` (ironrdp-rdpeudp P2.3), so each source
+    datagram it sends ships twice (same seq, byte-identical) → an independent-loss
+    link of rate `p` drops a payload only at `p²`. Scoped to the lossy flow
+    (`use_lossy && lossy_dup`); the reliable flow and the no-env default are
+    byte-unchanged. mstsc's DTLS anti-replay drops the duplicate, so audio never
+    double-plays (dedup lives above the transport — the lossy SM intentionally does
+    not dedup). This is the second soak A/B axis (dup vs no-dup at a fixed loss);
+    `scripts/soak-lossy-audio.sh` exposes it. Verification on a real lossy link is
+    pending (the spike is built + unit-tested; the soak run is the user's call).
