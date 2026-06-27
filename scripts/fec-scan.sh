@@ -33,15 +33,25 @@ if ! command -v tshark >/dev/null 2>&1; then
 fi
 
 # Dump per-UDP-datagram: frame number, src→dst, and the raw UDP payload hex. We do
-# NOT rely on Wireshark's rdpudp dissector (field names vary by version) — we parse
-# the RDPUDP header ourselves from the payload bytes, which is version-stable.
+# NOT rely on Wireshark's rdpudp dissector for field *values* (names vary by
+# version) — we parse the RDPUDP header from the payload bytes, which is
+# version-stable. But we DO use the dissector (or, failing that, the port-3389
+# restriction) to SELECT which datagrams to parse, so unrelated UDP (ZeroTier,
+# Syncthing, QUIC, DNS, mDNS, SSDP …) isn't misread as RDPUDP — every byte triplet
+# looks like "flags" if you squint, which produces garbage histograms and false
+# FEC hits. RDP UDP multitransport rides the SAME port as the TCP listener (3389).
 #
-# tshark output goes to a temp file passed to python by path: `python3 - <<heredoc`
-# makes the heredoc python's *stdin*, so a piped `tshark | python3 -` would leave
-# sys.stdin pointing at the program text, not the data — the data would be lost.
+# Pick the narrowest filter that yields packets: Wireshark-identified `rdpudp`
+# first, else raw UDP on port 3389. If neither yields anything, the capture has no
+# RDP UDP traffic at all (wrong adapter / TCP-only session) — reported as such.
 TMPOUT="$(mktemp)"
 trap 'rm -f "$TMPOUT"' EXIT
-tshark -r "$PCAP" -Y 'udp && udp.payload' \
+
+FILTER='rdpudp'
+if [ "$(tshark -r "$PCAP" -Y 'rdpudp' 2>/dev/null | wc -l | tr -d ' ')" = "0" ]; then
+    FILTER='udp.port==3389 && udp.payload'
+fi
+tshark -r "$PCAP" -Y "$FILTER" \
     -T fields -e frame.number -e ip.src -e ip.dst -e udp.srcport -e udp.dstport -e udp.payload \
     2>/dev/null > "$TMPOUT"
 
@@ -90,15 +100,21 @@ print("=== RDPUDP datagrams: %d ===" % total)
 
 if total == 0:
     print()
-    print(">>> INCONCLUSIVE: no RDP UDP datagrams in this capture.")
-    print(">>> This is NOT a NO-GO — the capture didn't contain the traffic we need.")
-    print(">>> Likely causes: empty/failed capture (e.g. `tcpdump -i any` fails on")
-    print(">>>   macOS — use the real interface), RDP ran TCP-only (the client never")
-    print(">>>   opened a UDP flow), or RDP UDP used a different port. Recapture:")
-    print(">>>   1) find your LAN interface:  ifconfig | grep -B5 'inet 192\\.168'")
-    print(">>>   2) capture broadly:  sudo tcpdump -i <iface> -w cap.pcap host <server-ip>")
-    print(">>>   3) verify it grows (ls -l cap.pcap > 24 bytes) while connected,")
-    print(">>>      then confirm UDP appears:  tshark -r cap.pcap -Y 'udp' | head")
+    print(">>> INCONCLUSIVE: no RDP UDP datagrams (no `rdpudp` and nothing on UDP 3389).")
+    print(">>> This is NOT a NO-GO — the capture didn't contain the RDP UDP session.")
+    print(">>> Sanity-check what IS in the capture:")
+    print(">>>   tshark -r <cap> -q -z io,phs            # protocol breakdown")
+    print(">>>   tshark -r <cap> -Y 'tcp.port==3389' | head   # RDP-over-TCP present?")
+    print(">>>   tshark -r <cap> -Y 'udp.port==3389' | head   # RDP UDP present?")
+    print(">>> Likely causes:")
+    print(">>>   * WRONG ADAPTER — for a VirtualBox host<->VM RDP session the traffic")
+    print(">>>     rides the VM's virtual network (Host-Only / NAT adapter), NOT the")
+    print(">>>     physical LAN. Capture on the VirtualBox Host-Only adapter, or run")
+    print(">>>     Wireshark INSIDE the VM (the server) on its own NIC — most reliable.")
+    print(">>>   * NO UDP MULTITRANSPORT — VirtualBox NAT usually breaks RDP UDP; use")
+    print(">>>     Bridged or Host-Only so the UDP flow can establish. Confirm with the")
+    print(">>>     udp.port==3389 check above before re-running under loss.")
+    print(">>>   * TCP-ONLY session — if only tcp.port==3389 shows, UDP never came up.")
     sys.exit(0)
 
 print("--- uFlags histogram (count  flags  =hex) ---")
