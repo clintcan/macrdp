@@ -177,6 +177,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         opts.addItem(toggle(
             "Per-connection workers (reconnect fix)", key: "FORK_WORKERS", cfg: cfg,
             sel: #selector(toggleForkWorkers)))
+        // RDP UDP multitransport (experimental). Offers an auxiliary UDP transport;
+        // the sub-option moves H.264 video onto it. Mutually exclusive with
+        // per-connection workers (handled in the toggle selectors).
+        opts.addItem(toggle(
+            "UDP multitransport (experimental)", key: "ENABLE_UDP_MULTITRANSPORT", cfg: cfg,
+            sel: #selector(toggleUdpMultitransport)))
+        opts.addItem(toggle(
+            "  ↳ Move video to UDP (clean link only)", key: "UDP_MIGRATE_EGFX", cfg: cfg,
+            sel: #selector(toggleUdpMigrateEgfx)))
         opts.addItem(toggle(
             "Option+Tab switches apps", key: "ALT_TAB_SWITCH", cfg: cfg, sel: #selector(toggleAltTabSwitch)))
         // Ctrl→Cmd Windows-shortcut remap + the per-app exclude list (apps where
@@ -550,7 +559,81 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleHiDPI() { flip("HIDPI") }
     @objc func toggleUnminimize() { flip("UNMINIMIZE") }
     @objc func toggleAppSwitcherHud() { flip("APP_SWITCHER_HUD") }
-    @objc func toggleForkWorkers() { flip("FORK_WORKERS") }
+    /// Per-connection workers. Mutually exclusive with UDP multitransport (the UDP
+    /// socket must persist across reconnects, which a per-connection worker can't
+    /// own) — enabling this disables UDP multitransport + its video-migrate option.
+    @objc func toggleForkWorkers() {
+        let cfg = readConfig()
+        let enabling = cfg["FORK_WORKERS"] != "1"
+        if enabling && cfg["ENABLE_UDP_MULTITRANSPORT"] == "1" {
+            alert(style: .informational, "UDP multitransport turned off",
+                  "Per-connection workers and UDP multitransport can't run together "
+                  + "(the UDP socket must persist across reconnects, which a per-connection "
+                  + "worker can't own). UDP multitransport has been disabled.")
+            writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "0")
+            writeConfig(key: "UDP_MIGRATE_EGFX", value: "0")
+        }
+        writeConfig(key: "FORK_WORKERS", value: enabling ? "1" : "0")
+        applyIfRunning()
+    }
+
+    /// RDP UDP multitransport (MS-RDPEMT). Mutually exclusive with per-connection
+    /// workers; turning it off also clears the video-migrate sub-option (which
+    /// needs the transport).
+    @objc func toggleUdpMultitransport() {
+        let cfg = readConfig()
+        let enabling = cfg["ENABLE_UDP_MULTITRANSPORT"] != "1"
+        if enabling {
+            if cfg["FORK_WORKERS"] == "1" {
+                alert(style: .informational, "Per-connection workers turned off",
+                      "UDP multitransport and per-connection workers can't run together "
+                      + "(the UDP socket must persist across reconnects, which a per-connection "
+                      + "worker can't own). Per-connection workers have been disabled.")
+                writeConfig(key: "FORK_WORKERS", value: "0")
+            }
+            writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "1")
+        } else {
+            writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "0")
+            if cfg["UDP_MIGRATE_EGFX"] == "1" {
+                writeConfig(key: "UDP_MIGRATE_EGFX", value: "0")
+            }
+        }
+        applyIfRunning()
+    }
+
+    /// Migrate the EGFX (H.264) video channel onto the reliable UDP tunnel. Needs
+    /// UDP multitransport + H.264 (auto-enabled, disabling per-connection workers if
+    /// needed). CLEAN-LINK ONLY: under packet loss the ordered tunnel head-of-line-
+    /// blocks and the picture can freeze with no recovery until reconnect (audio
+    /// survives on TCP).
+    @objc func toggleUdpMigrateEgfx() {
+        let cfg = readConfig()
+        let enabling = cfg["UDP_MIGRATE_EGFX"] != "1"
+        if enabling {
+            var autoEnabled: [String] = []
+            if cfg["ENABLE_UDP_MULTITRANSPORT"] != "1" {
+                if cfg["FORK_WORKERS"] == "1" { writeConfig(key: "FORK_WORKERS", value: "0") }
+                writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "1")
+                autoEnabled.append("UDP multitransport")
+            }
+            if cfg["ENABLE_H264"] != "1" {
+                writeConfig(key: "ENABLE_H264", value: "1")
+                autoEnabled.append("H.264 video")
+            }
+            let extra = autoEnabled.isEmpty
+                ? "" : "\n\nAlso enabled: \(autoEnabled.joined(separator: ", "))."
+            alert(style: .warning, "Video over UDP — clean-link only",
+                  "H.264 video will ride the reliable UDP tunnel. This helps on a clean, "
+                  + "low-latency link, but under packet loss the picture can freeze with no "
+                  + "recovery until you reconnect (audio keeps playing on TCP). Use only on a "
+                  + "trusted, low-loss network." + extra)
+            writeConfig(key: "UDP_MIGRATE_EGFX", value: "1")
+        } else {
+            writeConfig(key: "UDP_MIGRATE_EGFX", value: "0")
+        }
+        applyIfRunning()
+    }
+
     @objc func toggleAltTabSwitch() { flip("ALT_TAB_SWITCH") }
     @objc func toggleDriveRedirection() { flip("ENABLE_DRIVE_REDIRECTION") }
     @objc func toggleSmartcardRedirection() { flip("ENABLE_SMARTCARD_REDIRECTION") }
