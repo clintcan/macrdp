@@ -371,6 +371,44 @@ with `MACRDP_UDP_LOSSY_DELIVERY=0` (audio still on the tunnel, but the flow ride
 **reliable** SM that retransmits) — if audio is smooth there but the genuine lossy mode
 stalls to establish, the gap is purely handshake retransmission, not the steady-state path.
 
+### Lossy-audio soak result (2026-06-27, mstsc, 5% loss + 100 ms/dir) — needs FEC
+
+First real soak of audio-over-tunnel. **Clean link: audio plays fine** (re-confirms 2b-iv-B /
+PR #61 through the harness). **At 5% loss both delivery modes fail the same way — choppy then
+silence** — which is exactly the design thesis, now demonstrated:
+
+| Link | Delivery | Result |
+|---|---|---|
+| clean | send-once (lossy) | **plays fine** |
+| 5% loss | send-once (lossy) | choppy → silence |
+| 5% loss | reliable (`MACRDP_UDP_LOSSY_DELIVERY=0`) | choppy → silence |
+
+The server side was healthy in every run (lossy DVC negotiated, Wave2 streaming over the
+tunnel, client acking, graceful disconnect — no route-fail). The two failure mechanisms:
+- **Send-once:** ~5% of AAC access units are dropped on the wire; mstsc's AAC decoder stalls on
+  the gaps. (Each lost AU ≈ 23 ms hole; ~1 in 20.)
+- **Reliable:** the tunnel send (`route_dvc_over_udp` → `TunnelSender`) is **non-blocking**, so
+  the drop-stale audio-lag model (vendor divergences (2)/(3)) is **blind to the tunnel's
+  backlog** — on TCP, `write_all` blocking is what makes `audio_shipped_ms` reflect real
+  progress; on the tunnel it races ahead and the model never drops. Audio is produced at
+  realtime, the latency-bound reliable tunnel can't drain it, the backlog grows, and audio
+  arrives later and later until it's effectively silence. (Reliable-tunnel audio HOL-blocks like
+  TCP — the very thing "Audio belongs on the lossy transport" predicts below; this is the live
+  proof.) The reliable run logged **0 RTO retransmits** over its short window — it didn't fail by
+  losing packets, it failed by backing up.
+
+**Conclusion: the lossy-audio win requires FEC (P2.3).** FEC recovers the ~5% AU loss without
+retransmit or HOL, so the AAC stream has neither gaps (the send-once killer) nor backlog (the
+reliable killer). Raw send-once + DTLS is necessary but not sufficient at 5%. **Open follow-ups
+before building full FEC:** (a) a loss-threshold sweep (`--loss 1/2/3`) to find where raw
+send-once is already acceptable — typical WiFi loss is ≪5%, so lossy audio may already deliver a
+real-world win for mild loss with FEC only needed for harsh links; (b) a cheap stepping-stone
+worth trying before a full Reed-Solomon/XOR FEC — **duplicate-AU redundancy** (send each AAC AU
+twice over the lossy tunnel): at 5% independent loss the chance both copies drop is ~0.25%, a 20×
+cut in effective AU loss, for ~2× of a ~130 kbps stream (negligible). (c) Separately, the
+**lag-model blindness to the tunnel backlog** is a real latent issue for any future
+reliable-tunnel payload, though moot for send-once (which never backlogs).
+
 ## Audio belongs on the lossy transport, not the reliable one
 
 A natural-looking "next step" is to also route **audio (RDPSND)** over the UDP
