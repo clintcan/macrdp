@@ -304,6 +304,34 @@ reliable-only multitransport.
    (A proper *capture* of real-server↔mstsc — to read the exact URCP rate-control
    signaling on the wire — is still worth doing before implementing.)
 
+   **SHIPPED 2026-06-29 — EGFX-over-UDP → TCP watchdog (the "auto-fallback band-aid",
+   built anyway because it's cheap and removes the *permanent* freeze).** While
+   rate control (above) is the real fix, it doesn't help a tunnel that has *already*
+   wedged/abandoned — that stays frozen until reconnect. The watchdog catches exactly
+   that: when EGFX is on the **reliable** UDP tunnel and frame acks go silent for
+   ~3s (`MACRDP_UDP_EGFX_WATCHDOG_MS`) while the server is still actively shipping
+   (the #89 trickle floor guarantees it ships even when ack-lag is high), it declares
+   the tunnel wedged and routes EGFX back onto **TCP** + forces an IDR (the last UDP
+   frames never arrived, so the client's reference is stale). mstsc renders EGFX on
+   TCP after a Soft-Sync — established first by a throwaway *timed* de-migration
+   ("Spike A", flip `egfx_on_udp` false → TCP, no reverse Soft-Sync needed, verified
+   live), then the full ack-stall-driven watchdog. Pure predicate
+   `should_demigrate_to_tcp` in `src/h264.rs` (8 unit tests); the server route arm
+   reads a shared `demigrate_request` flag and flips routing (one-way per connection;
+   reset on reconnect). Default-on but a strict no-op off the reliable UDP tunnel.
+   **Verified two ways on real mstsc:** (1) a deterministic clean-link injection
+   (drop acks after N s) fired at exactly `since_ack_ms=3004` and recovered; (2) a
+   genuine **clumsy UDP-only loss** wedge (UDP dropped, TCP left healthy as the
+   fallback) fired at `since_ack_ms≈7736` — *real* wedges dribble a few stray acks
+   before going fully silent, so the pure-silence trigger latches later than the
+   injection's instant silence — and EGFX recovered on the healthy TCP channel, no
+   permanent freeze. Follow-up (deferred): an **ack-lag-pegged secondary trigger**
+   (fire when shipped−acked stays pinned for N s even if odd acks trickle in) would
+   shorten the ~7–8s real-wedge recovery window toward the 3s ideal. NOTE this is
+   complementary to — not a substitute for — congestion-responsive rate control:
+   the watchdog *escapes* a dead tunnel; rate control *prevents* the wedge and also
+   helps the TCP path.
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a

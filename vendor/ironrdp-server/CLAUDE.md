@@ -852,3 +852,25 @@ AND released — #1276 landing is NOT sufficient.
     rate controller remains finding-#5 future work. All `multitransport`-gated; feature-off
     byte-unchanged. See feasibility doc "M3c reconnect state-reset" + the "Residual …
     rate-control gap" / trickle-floor note.
+    **EGFX-over-UDP → TCP watchdog (added 2026-06-29):** the reliable (UdpFecR)
+    tunnel is ordered, so under loss it head-of-line-blocks like TCP (finding #4) —
+    once the client stops acking while the server is still shipping, the tunnel is
+    wedged and queued frames never arrive → permanent freeze until reconnect. The
+    H.264 pipeline (`src/h264.rs::should_demigrate_to_tcp` / `submit_bgra`) detects
+    that wedge (reliable UDP only, `egfx_on_udp && !egfx_on_lossy`, acks silent
+    `MACRDP_UDP_EGFX_WATCHDOG_MS`≈3s while actively shipping, not suspended) and sets
+    a shared `demigrate_request: Arc<AtomicBool>` (setter
+    `set_demigrate_request_handle`, wired in `main.rs` alongside the egfx_on_udp
+    handle). The `ServerEvent::Egfx` route arm reads it: on true it flips
+    `egfx_on_udp` false (+ mirrors the egfx_on_udp handle so the H.264 #89 gate
+    releases), logs, and falls through to the TCP DRDYNVC path — the existing
+    `soft_sync_sent` guard stops any re-migration. mstsc renders EGFX on TCP after a
+    Soft-Sync (proven by the throwaway timed "Spike A", verified live 2026-06-29).
+    One-way per connection (h264 `demigrated` latch + the server resets
+    `demigrate_request` false on reconnect alongside `egfx_on_udp`). Default-on but a
+    strict no-op unless EGFX is on the reliable UDP tunnel; even a false positive only
+    routes EGFX to TCP (the proven everyday path). **Verified on real mstsc under
+    clumsy UDP-only loss** (UDP-only so TCP stays a healthy fallback): the wedge fired
+    at `since_ack_ms≈7.7s` (real wedges dribble acks before going fully silent, vs.
+    the deterministic injection's clean ~3s) and EGFX recovered on TCP — no permanent
+    freeze. A future ack-lag-pegged secondary trigger could shorten recovery.

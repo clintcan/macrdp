@@ -7,8 +7,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- (nothing in flight — EGFX-over-UDP reconnect state reset shipped as #88, and the
-  freeze-under-load fix as #89/v0.8.17)
+- [ ] **EGFX-over-UDP → TCP watchdog** (auto-recover a wedged reliable tunnel) — built
+  + verified on real mstsc (deterministic ack-drop injection AND genuine clumsy UDP-only
+  loss; recovered, no permanent freeze), branch `feat/udp-egfx-watchdog-tcp-fallback`.
+  **Awaiting CI green + squash-merge.** Was the "auto-fallback" deferred item below.
 
 ## Deferred — scoped, not started
 
@@ -58,12 +60,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
     same VT-bitrate/frame-drop/IDR-backoff levers; only the input source differs per transport.
   Bigger than FEC (dead) or auto-fallback (band-aid). Worth a real-server↔mstsc capture
   first to read the URCP signaling. See finding #5 in `docs/rdp-udp-multitransport-feasibility.md`.
-- [ ] **EGFX-over-UDP auto-fallback to TCP on tunnel abandonment** (secondary safety net,
-  below rate control). When the reliable tunnel is abandoned (window pegged / client
-  stopped acking), re-route EGFX to TCP + force an IDR instead of staying frozen. Open
-  risk: in-session fallback would be *frozen→recover* (NOT the reconnect-blank quirk —
-  that needs a new connection), but only if mstsc accepts the channel's data back on TCP
-  after Soft-Sync (no standard reverse Soft-Sync; untested). Spike against real mstsc first.
+- [ ] **EGFX-over-UDP watchdog — ack-lag-pegged secondary trigger** (refinement of the
+  shipped watchdog above). The watchdog fires on ~3s of *fully silent* acks; a real wedge
+  dribbles a few stray acks before going silent, so it latched at `since_ack_ms≈7.7s` in
+  the clumsy soak (vs. 3s ideal). Add a second trigger that fires when the frame-ack *lag*
+  (shipped−acked) stays pinned above threshold for N s even if odd acks trickle in, to
+  shorten the real-wedge recovery window. Low priority — the freeze already recovers.
 - [ ] **UDP multitransport — explicit TCP-close → listener peer-evict signal** (the
   deferred half of M3c; the *correct* fix for dead-peer reclaim). Today the listener only
   reclaims a peer via the activity-based idle-GC, whose timeout had to be raised to 60s
