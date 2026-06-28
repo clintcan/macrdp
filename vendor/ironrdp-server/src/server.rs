@@ -976,6 +976,30 @@ impl RdpServer {
 
                         self.static_channels = StaticChannelSet::new();
 
+                        // (M3c) Reset per-connection UDP-multitransport state that is
+                        // otherwise only ever SET, never cleared — so a reconnect to
+                        // this same persistent RdpServer starts clean. Critically
+                        // `egfx_on_udp`: left true from the previous connection, the
+                        // next connection routes EGFX over a UDP tunnel that its OWN
+                        // Soft-Sync hasn't bound yet → frames are dropped and the
+                        // client sees a blank/black desktop on reconnect. Resetting it
+                        // keeps EGFX on TCP until the new connection's tunnel binds and
+                        // re-fires Soft-Sync (clean migration; and a correct TCP
+                        // fallback if the new tunnel never binds). The lossy-audio
+                        // counters + the on-lossy handle must likewise restart.
+                        // (`multitransport_migration`, `udp_tunnel_bound`, and the
+                        // inbound rx ARE refreshed per connection at the offer site, so
+                        // only these only-set-never-reset flags need clearing here.)
+                        #[cfg(feature = "multitransport")]
+                        {
+                            self.egfx_on_udp = false;
+                            self.lossy_audio_block_no = 0;
+                            self.lossy_audio_streaming = false;
+                            if let Some(handle) = &self.egfx_on_lossy_handle {
+                                handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+
                         if let Some(ref mut handler) = self.connection_handler {
                             let action = handler.on_disconnected(
                                 peer,

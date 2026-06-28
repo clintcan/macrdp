@@ -616,6 +616,23 @@ async fn run_recv_loop(
         let use_lossy = lossy_delivery
             && Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::SYN_LOSSY));
 
+        // (M3c) Port reuse on reconnect: if a *new* RDPEUDP flow opens (a SYN) on
+        // the source address of an already-ESTABLISHED peer, the previous
+        // connection's client reused this addr/port (common on a fast in-process
+        // reconnect, within the 10s idle-GC window). The stale peer's SM is
+        // established and its tunnel state (`tunnel_created` + an `inbound_sink`
+        // pointing at the GONE connection's receiver) would make `handle_emt_tunnel`
+        // skip the new tunnel's CREATEREQUEST and silently drop the new connection's
+        // inbound EGFX acks → the new session wedges blank/black. Drop the stale peer
+        // (and its cookie bindings) so a fresh one is built below and the new tunnel
+        // binds cleanly. (A SYN on a still-HANDSHAKING peer is a normal SYN
+        // retransmit — `is_established()` gates that out.)
+        if is_syn_family(data) && peers.get(&peer_addr).is_some_and(|p| p.sm.is_established()) {
+            peers.remove(&peer_addr);
+            bound_addrs.retain(|_, a| *a != peer_addr);
+            debug!(%peer_addr, "RDPEUDP SYN on an established peer — replacing stale peer (port reuse / reconnect)");
+        }
+
         let peer = peers.entry(peer_addr).or_insert_with(|| {
             session_counter = session_counter.wrapping_add(1);
             let initial_seq = cfg.server_isn_seed.wrapping_add(session_counter);

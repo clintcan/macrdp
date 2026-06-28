@@ -791,3 +791,35 @@ AND released — #1276 landing is NOT sufficient.
     compound it); the robust WiFi config remains `--udp-migrate-egfx` off (EGFX on TCP).
     All `multitransport`-gated; feature-off byte-unchanged. See feasibility doc
     "M3c peer GC".
+
+    M3c reconnect state-reset — EGFX-over-UDP went blank/black on the 2nd
+    connection (2026-06-28, `server.rs` + `listener.rs`; verified on real mstsc).
+    With `--udp-migrate-egfx`, the FIRST connection rendered but a RECONNECT showed a
+    blank desktop that went black (EGFX wedged after a frame or two); plain-TCP EGFX
+    reconnect was always fine, so it was UDP-specific. TWO per-connection-state bugs on
+    the persistent server+listener, both "set once on connection 1, never reset for
+    connection 2":
+    (a) **Server (`server.rs`, the universal cause):** `egfx_on_udp` (set true at
+    Soft-Sync, checked to route EGFX over UDP) — plus `lossy_audio_block_no`,
+    `lossy_audio_streaming`, and the `egfx_on_lossy_handle` flag — were never cleared
+    between connections. So connection 2 started with `egfx_on_udp == true` and routed
+    EGFX over a UDP tunnel **its own** Soft-Sync hadn't bound yet (cookie unbound) →
+    frames dropped, and nothing went out on TCP either → blank/black. Fix: reset all of
+    these right after `self.static_channels = StaticChannelSet::new()` in the `run()`
+    accept loop (the post-connection cleanup). Now connection 2 keeps EGFX on TCP until
+    its tunnel binds and re-fires Soft-Sync (clean migration; and a correct TCP fallback
+    if the new tunnel never binds). (`multitransport_migration` / `udp_tunnel_bound` /
+    the inbound rx are already refreshed per connection at the offer site, so only these
+    only-set-never-reset flags needed clearing.)
+    (b) **Listener (`listener.rs`, the same-port case):** on a fast reconnect that
+    reused the client's UDP source addr/port (within the 10s idle-GC window), the
+    `peers.entry(addr).or_insert_with` reused the **stale** established `Peer` —
+    `tunnel_created` still true and `inbound_sink` still pointing at the gone
+    connection's receiver — so `handle_emt_tunnel` skipped the new CREATEREQUEST
+    (gated on `!tunnel_created`) and silently dropped connection 2's inbound EGFX acks.
+    Fix: before the entry, if a **SYN** arrives on an address whose existing peer is
+    already `is_established()`, it's a new flow on a reused port → remove the stale peer
+    (+ its `bound_addrs` cookie bindings) so a fresh one is built and the new tunnel
+    binds cleanly. A SYN on a still-handshaking peer is a normal SYN retransmit
+    (`is_established()` gates it out). All `multitransport`-gated; feature-off
+    byte-unchanged. See feasibility doc "M3c reconnect state-reset".

@@ -352,12 +352,49 @@ session). Logs `evicted idle UDP peer` at `ironrdp_server::multitransport=debug`
 
 This is the listener-only **backstop** half of M3c; the prompt server→listener
 "instant retire-on-disconnect" signal is still deferred (the GC is needed regardless).
-**It does NOT by itself fix the reconnect-blank** — the tunnel is TLS-encrypted so the
-pcap can't prove the leak was the *sole* cause, and the documented mstsc EGFX
-surface-retention quirk + the clean-link limit (finding #4) may compound it. The
-robust WiFi config stays `--udp-migrate-egfx` off (EGFX on TCP). Real-mstsc retest of
-the GC (watch for the eviction log ~10 s after close + UDP actually stopping) is the
-gate. See vendored server divergence (12) "M3c idle-timeout peer GC".
+The GC was **verified on real mstsc** — UDP to the closed client stops ~10 s after
+disconnect. **By itself it did NOT fix the reconnect-blank**, which turned out to be a
+*separate* per-connection-state bug (next section).
+
+### M3c reconnect state-reset — EGFX-over-UDP blank/black on the 2nd connection (fixed 2026-06-28)
+
+After the GC landed, real-mstsc retest isolated the reconnect-blank precisely: with
+`--udp-migrate-egfx`, the **first** connection rendered, but a **reconnect** showed a
+blank desktop that went black (EGFX wedged after a frame or two). Crucially, **plain
+TCP** EGFX reconnect (`--udp-migrate-egfx` off) was always clean — so it was
+UDP-specific, not the capture-primary/window-relocation gotcha and not (only) the mstsc
+surface-retention quirk (it reproduced even on a fresh mstsc process). Two
+per-connection-state bugs on the *persistent* server + listener, both "set once on
+connection 1, never reset for connection 2":
+
+1. **Server (`server.rs`, the universal cause).** `egfx_on_udp` (set true at Soft-Sync,
+   checked to route EGFX over UDP) — plus `lossy_audio_block_no`,
+   `lossy_audio_streaming`, and the `egfx_on_lossy_handle` flag — were never cleared
+   between connections (the single `RdpServer` is reused across the accept loop). So
+   connection 2 started with `egfx_on_udp == true` and routed EGFX over a UDP tunnel
+   that **its own** Soft-Sync hadn't bound yet (cookie unbound) → frames dropped, and
+   nothing on TCP either → blank/black. Fix: reset these right after
+   `self.static_channels = StaticChannelSet::new()` in `run()`. Connection 2 now keeps
+   EGFX on TCP until its tunnel binds and re-fires Soft-Sync (clean migration; correct
+   TCP fallback if the new tunnel never binds). (`multitransport_migration` /
+   `udp_tunnel_bound` / the inbound rx were already refreshed per connection at the
+   offer site — only these only-set-never-reset flags needed clearing.)
+2. **Listener (`listener.rs`, the same-port case).** On a fast reconnect that reused
+   the client's UDP source addr/port (within the 10 s idle-GC window), the
+   `peers.entry(addr).or_insert_with` reused the **stale** established `Peer` —
+   `tunnel_created` still true, `inbound_sink` still pointing at the gone connection's
+   receiver — so `handle_emt_tunnel` skipped the new CREATEREQUEST (gated on
+   `!tunnel_created`) and silently dropped connection 2's inbound EGFX acks. Fix:
+   before the entry, if a **SYN** arrives on an address whose existing peer is already
+   `is_established()`, it's a new flow on a reused port → remove the stale peer (+ its
+   `bound_addrs` bindings) so a fresh one is built and the new tunnel binds cleanly.
+   (A SYN on a still-handshaking peer is a normal SYN retransmit — `is_established()`
+   gates it out.)
+
+The robust WiFi config is still `--udp-migrate-egfx` off (the clean-link limit /
+finding #4 stands — under loss the reliable tunnel HOL-blocks regardless); this fix is
+about EGFX-over-UDP **reconnect** working at all on a clean link. See vendored server
+divergence (12) "M3c reconnect state-reset".
 
 ### P2.2 lossy-delivery soak (runbook)
 
