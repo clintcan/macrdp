@@ -96,11 +96,19 @@ things**, often conflated:
 2. **Server UDP *data path*** — the server actually binds a UDP socket, runs the
    RDPEUDP reliability handshake, secures it (TLS/DTLS), establishes the MS-RDPEMT
    tunnel, and **carries channel data over it**. This is the hard part.
-3. **Client UDP support** — a *client* that connects out over UDP. A different
-   (and easier-to-reach) codebase than the server. Notably, even FreeRDP — the
+3. **Client-side UDP data path** — the *client* counterpart of (2): it accepts
+   the server's offer, opens the UDP association, secures it, joins the EMT
+   tunnel, and carries channel data over it. A separate (and somewhat
+   easier-to-reach) codebase than the server's. Notably, even FreeRDP — the
    most complete OSS stack — has never merged this either: its client declines
    UDP with `E_ABORT`, and the RDPEUDP/RDPEUDP2 work stayed an out-of-tree
    prototype (re-verified against full git history 2026-06-26).
+
+macrdp implements (1) and (2); it is a server, not a client, so (3) is listed
+only to keep the "supports UDP" claim unambiguous and to flag the interop
+dependency — macrdp's server data path is exercised only when a client with its
+own client-side UDP data path (today, only mstsc) connects to it. See "Which
+clients actually take macrdp's UDP offer" below.
 
 | RDP **server** | Base / lang | (1) Negotiation | (2) **UDP data path** | Notes |
 |---|---|---|---|---|
