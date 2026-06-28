@@ -176,6 +176,12 @@ struct ConnectionContext {
     /// floor (`UDP_THROTTLE_FLOOR`) so the client always has trailing frames to
     /// drain its presentation buffer and the window reopens.
     last_throttle_ship: Instant,
+    /// EGFX-over-UDP → TCP watchdog latch. Set true once the watchdog has
+    /// de-migrated EGFX off a wedged RELIABLE UDP tunnel back onto TCP (see
+    /// [`should_demigrate_to_tcp`]). One-way per connection — once de-migrated we
+    /// never re-migrate to UDP in-session (no flapping); UDP is retried only on the
+    /// next connection. Reset with the fresh context on reconnect.
+    demigrated: bool,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -219,6 +225,48 @@ fn should_force_recovery_idr(
         && since_ship <= p.active_window
         && since_ack >= p.ack_stall
         && since_recovery >= p.min_recovery_interval
+}
+
+/// Decide whether to de-migrate EGFX from the RELIABLE UDP tunnel back onto TCP.
+/// Pure (Durations, not a clock) so it's unit-testable without timing.
+///
+/// The reliable (UdpFecR) tunnel is ordered, so it head-of-line-blocks under loss
+/// exactly like TCP (feasibility finding #4): once the client stops acking while
+/// we're *actively* shipping (the #89 trickle floor guarantees we keep shipping
+/// even when the ack-lag is high), the tunnel is wedged and queued frames will
+/// never arrive — the video freezes with no recovery until reconnect. The fix is
+/// to route EGFX back over TCP, which mstsc accepts post-Soft-Sync (Spike A,
+/// verified live 2026-06-29) — the caller pairs this with a forced IDR, since the
+/// last UDP frames never arrived so the client's decode reference is stale.
+///
+/// Each clause guards a distinct failure mode:
+/// - `egfx_on_udp && !egfx_on_lossy`: only on the RELIABLE UDP tunnel. The lossy
+///   tunnel uses ack-driven IDR recovery instead ([`should_force_recovery_idr`]);
+///   TCP needs nothing (socket backpressure paces it).
+/// - `!already_demigrated`: fire once per connection (one-way latch, no flapping).
+/// - `!acks_suspended`: with acks off (`queueDepth==0xFFFFFFFF`) a wedge can't be
+///   inferred from ack-staleness.
+/// - `since_ship <= active_window`: only while actively shipping (else: static
+///   screen, where silent acks are normal and the periodic IDR backstops).
+/// - `since_ack >= wedge_timeout`: the wedge signal — acks have gone fully silent
+///   long enough to rule out a transient congestion blip.
+#[allow(clippy::too_many_arguments)]
+fn should_demigrate_to_tcp(
+    since_ship: Duration,
+    since_ack: Duration,
+    acks_suspended: bool,
+    egfx_on_udp: bool,
+    egfx_on_lossy: bool,
+    already_demigrated: bool,
+    active_window: Duration,
+    wedge_timeout: Duration,
+) -> bool {
+    egfx_on_udp
+        && !egfx_on_lossy
+        && !already_demigrated
+        && !acks_suspended
+        && since_ship <= active_window
+        && since_ack >= wedge_timeout
 }
 
 /// Read the ack-recovery config from the environment once. Returns
@@ -288,9 +336,29 @@ pub struct Gfx {
     /// that a healthy high-RTT link never trips it; low enough to cap the decode
     /// backlog so video degrades to choppy-but-live instead of freezing.
     max_frame_lag: u64,
+    /// EGFX-over-UDP → TCP watchdog. On by default (disable with
+    /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
+    /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
+    /// `--udp-migrate-egfx` is in use. On a detected wedge `submit_bgra` forces an
+    /// IDR, resets the lag baseline, and sets `demigrate_request` — the cue the
+    /// vendored server reads to flip EGFX routing back to the TCP DRDYNVC channel.
+    watchdog_enabled: bool,
+    /// How long EGFX frame acks must stay fully silent (while actively shipping)
+    /// before the reliable UDP tunnel is declared wedged.
+    /// `MACRDP_UDP_EGFX_WATCHDOG_MS` (default 3000). The freeze the user sees
+    /// before auto-recovery is ~this long; long enough to rule out a transient blip.
+    watchdog_wedge_timeout: Duration,
+    /// Companion to `watchdog_wedge_timeout`: the last ship must be within this
+    /// window for the ack silence to read as a wedge (vs. a static screen).
+    /// `MACRDP_UDP_EGFX_WATCHDOG_ACTIVE_MS` (default 1000).
+    watchdog_active_window: Duration,
+    /// Shared with the vendored server: set true here on a wedge, read there to
+    /// flip `egfx_on_udp` → TCP routing; reset there on reconnect.
+    demigrate_request: Arc<AtomicBool>,
 }
 
 impl Gfx {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         desktop_size: crate::capture::SharedDesktopSize,
         fps: u32,
@@ -299,6 +367,7 @@ impl Gfx {
         max_in_flight: u32,
         egfx_on_lossy: Arc<AtomicBool>,
         egfx_on_udp: Arc<AtomicBool>,
+        demigrate_request: Arc<AtomicBool>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
@@ -307,6 +376,21 @@ impl Gfx {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(16);
+        let watchdog_enabled = match std::env::var("MACRDP_UDP_EGFX_WATCHDOG") {
+            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+            Err(_) => true, // default on (no-op unless EGFX is on the reliable UDP tunnel)
+        };
+        let watchdog_ms = |name: &str, default: u64| -> Duration {
+            Duration::from_millis(
+                std::env::var(name)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(default),
+            )
+        };
+        let watchdog_wedge_timeout = watchdog_ms("MACRDP_UDP_EGFX_WATCHDOG_MS", 3000);
+        let watchdog_active_window = watchdog_ms("MACRDP_UDP_EGFX_WATCHDOG_ACTIVE_MS", 1000);
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -333,6 +417,10 @@ impl Gfx {
             egfx_on_lossy,
             egfx_on_udp,
             max_frame_lag,
+            watchdog_enabled,
+            watchdog_wedge_timeout,
+            watchdog_active_window,
+            demigrate_request,
         }
     }
 
@@ -393,6 +481,44 @@ impl Gfx {
                     info!(
                         since_ack_ms = since_ack.as_millis() as u64,
                         "EGFX ack-stall on lossy tunnel — forcing recovery IDR"
+                    );
+                }
+            }
+            // EGFX-over-UDP → TCP watchdog (default on): the RELIABLE tunnel is
+            // ordered, so it head-of-line-blocks under loss (finding #4). If acks go
+            // fully silent while we're still actively shipping (the #89 trickle keeps
+            // frames flowing even when lag is high), the tunnel is wedged and queued
+            // frames will never arrive → the video freezes with no recovery until
+            // reconnect. Route EGFX back to TCP (mstsc renders it post-Soft-Sync —
+            // Spike A) + force an IDR (the last UDP frames never arrived, so the
+            // client's reference is stale) + reset the lag baseline so the trickle
+            // gate below doesn't drop the recovery IDR before the server flips
+            // routing. One-way per connection (the `demigrated` latch). No-op unless
+            // EGFX is on the reliable UDP tunnel → default path unchanged.
+            if self.watchdog_enabled {
+                let now = Instant::now();
+                let since_ack = now.saturating_duration_since(ctx.last_ack_at);
+                if should_demigrate_to_tcp(
+                    now.saturating_duration_since(ctx.last_ship_at),
+                    since_ack,
+                    ctx.acks_suspended,
+                    self.egfx_on_udp.load(Ordering::Relaxed),
+                    self.egfx_on_lossy.load(Ordering::Relaxed),
+                    ctx.demigrated,
+                    self.watchdog_active_window,
+                    self.watchdog_wedge_timeout,
+                ) {
+                    ctx.need_keyframe = true;
+                    ctx.last_acked_frame_id.store(
+                        ctx.last_shipped_frame_id.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    ctx.demigrated = true;
+                    self.demigrate_request.store(true, Ordering::Relaxed);
+                    warn!(
+                        since_ack_ms = since_ack.as_millis() as u64,
+                        "EGFX-over-UDP reliable tunnel wedged (acks silent while shipping) — \
+                         de-migrating to TCP + forcing IDR (one-way for this session)"
                     );
                 }
             }
@@ -794,6 +920,7 @@ impl GfxServerFactory for Gfx {
             last_acked_frame_id: Arc::new(AtomicU64::new(0)),
             egfx_acks_seen: false,
             last_throttle_ship: Instant::now(),
+            demigrated: false,
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -1132,6 +1259,135 @@ mod tests {
             false,
             true,
             &p
+        ));
+    }
+
+    // ---- EGFX-over-UDP → TCP watchdog (`should_demigrate_to_tcp`) ----
+    // Arg order: since_ship, since_ack, acks_suspended, egfx_on_udp, egfx_on_lossy,
+    // already_demigrated, active_window, wedge_timeout.
+    const WD_ACTIVE: Duration = Duration::from_millis(1000);
+    const WD_WEDGE: Duration = Duration::from_millis(3000);
+
+    #[test]
+    fn watchdog_fires_on_reliable_udp_wedge_while_shipping() {
+        // Reliable UDP (on_udp && !on_lossy), actively shipping (30ms), acks silent
+        // past the wedge timeout (4s > 3s), not suspended, not yet de-migrated → fire.
+        assert!(should_demigrate_to_tcp(
+            ms(30),
+            ms(4000),
+            false,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_never_on_tcp() {
+        // egfx_on_udp=false (plain TCP): socket backpressure paces us; nothing to do.
+        assert!(!should_demigrate_to_tcp(
+            ms(30),
+            ms(4000),
+            false,
+            false,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_never_on_lossy_tunnel() {
+        // egfx_on_lossy=true: the lossy tunnel uses ack-driven IDR recovery, not
+        // de-migration (a dropped frame there is real loss, not a wedge).
+        assert!(!should_demigrate_to_tcp(
+            ms(30),
+            ms(4000),
+            false,
+            true,
+            true,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_suppressed_when_acks_suspended() {
+        // queueDepth==0xFFFFFFFF → a wedge can't be inferred from ack-staleness.
+        assert!(!should_demigrate_to_tcp(
+            ms(30),
+            ms(4000),
+            true,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_latches_one_way() {
+        // already_demigrated=true: fire once per connection, never flap back.
+        assert!(!should_demigrate_to_tcp(
+            ms(30),
+            ms(4000),
+            false,
+            true,
+            false,
+            true,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_not_when_acks_fresh() {
+        // since_ack (500ms) below the wedge timeout (3s): acks still flowing.
+        assert!(!should_demigrate_to_tcp(
+            ms(30),
+            ms(500),
+            false,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_not_when_static_screen() {
+        // since_ship (2s) above active_window (1s): the screen went static, so silent
+        // acks are normal — not a wedge. Heals on the next activity if still wedged.
+        assert!(!should_demigrate_to_tcp(
+            ms(2000),
+            ms(4000),
+            false,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_thresholds_are_inclusive() {
+        // since_ship == active_window (<=), since_ack == wedge_timeout (>=) → fires.
+        assert!(should_demigrate_to_tcp(
+            ms(1000),
+            ms(3000),
+            false,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
         ));
     }
 

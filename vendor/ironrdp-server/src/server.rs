@@ -420,6 +420,14 @@ pub struct RdpServer {
     /// stay byte-identical). `None` = not wired (default).
     #[cfg(feature = "multitransport")]
     egfx_on_udp_handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// EGFX-over-UDP → TCP watchdog request. The macrdp H.264 pipeline sets this
+    /// true when it detects the reliable UDP tunnel has wedged (acks silent while
+    /// shipping); the EGFX route block reads it and flips `egfx_on_udp` back to
+    /// false so subsequent frames route over the TCP DRDYNVC channel (mstsc renders
+    /// EGFX on TCP post-Soft-Sync — Spike A). One-way per connection; reset to false
+    /// on reconnect so a fresh connection retries UDP. `None` = not wired (default).
+    #[cfg(feature = "multitransport")]
+    demigrate_request: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// (M5c step 3b) Receiver for inbound migrated-channel data the UDP listener
     /// forwards (each item is a bare DRDYNVC PDU — HigherLayerData of an inbound
     /// `RDP_TUNNEL_DATA`, e.g. an EGFX frame ack). Created + registered (with the
@@ -558,6 +566,8 @@ impl RdpServer {
             egfx_on_lossy_handle: None,
             egfx_on_udp_handle: None,
             #[cfg(feature = "multitransport")]
+            demigrate_request: None,
+            #[cfg(feature = "multitransport")]
             multitransport_tunnel_sender: None,
             #[cfg(feature = "multitransport")]
             egfx_on_udp: false,
@@ -679,6 +689,18 @@ impl RdpServer {
     #[cfg(feature = "multitransport")]
     pub fn set_egfx_on_udp_handle(&mut self, handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
         self.egfx_on_udp_handle = handle;
+    }
+
+    /// Wire the EGFX-over-UDP → TCP watchdog request flag. The macrdp H.264 pipeline
+    /// sets it true when the reliable UDP tunnel wedges; the EGFX route block reads
+    /// it and de-migrates EGFX back to the TCP DRDYNVC channel for the rest of the
+    /// session. Reset to false on reconnect so a fresh connection retries UDP.
+    #[cfg(feature = "multitransport")]
+    pub fn set_demigrate_request_handle(
+        &mut self,
+        handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.demigrate_request = handle;
     }
 
     /// Enable migrating the EGFX DVC onto the reliable UDP tunnel (the
@@ -1018,6 +1040,12 @@ impl RdpServer {
                             if let Some(handle) = &self.egfx_on_udp_handle {
                                 handle.store(false, std::sync::atomic::Ordering::Relaxed);
                             }
+                            // Clear the watchdog's de-migrate request so a fresh
+                            // connection retries UDP instead of instantly routing the
+                            // newly-migrated EGFX straight back to TCP.
+                            if let Some(handle) = &self.demigrate_request {
+                                handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
 
                         if let Some(ref mut handler) = self.connection_handler {
@@ -1345,8 +1373,32 @@ impl RdpServer {
                         // channel. Default path is unchanged TCP.
                         #[cfg(feature = "multitransport")]
                         if self.egfx_on_udp {
-                            self.route_dvc_over_udp(messages)?;
-                            continue;
+                            // EGFX-over-UDP → TCP watchdog: the H.264 pipeline sets
+                            // `demigrate_request` when it detects the reliable UDP
+                            // tunnel has wedged (acks silent while shipping). Flip
+                            // routing back to the TCP DRDYNVC channel for the rest of
+                            // this session and fall through to the TCP path — mstsc
+                            // renders EGFX on TCP after a Soft-Sync (Spike A). The flip
+                            // also clears the H.264 #89 backpressure gate via the
+                            // shared egfx_on_udp handle. One-way; reset on reconnect.
+                            if self
+                                .demigrate_request
+                                .as_ref()
+                                .is_some_and(|h| h.load(std::sync::atomic::Ordering::Relaxed))
+                            {
+                                self.egfx_on_udp = false;
+                                if let Some(handle) = &self.egfx_on_udp_handle {
+                                    handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                warn!(
+                                    "EGFX-over-UDP reliable tunnel wedged — watchdog de-migrating EGFX to \
+                                     TCP DRDYNVC for the rest of this session"
+                                );
+                                // fall through to the TCP DRDYNVC path below
+                            } else {
+                                self.route_dvc_over_udp(messages)?;
+                                continue;
+                            }
                         }
                         let drdynvc_channel_id = self
                             .get_channel_id_by_type::<dvc::DrdynvcServer>()
