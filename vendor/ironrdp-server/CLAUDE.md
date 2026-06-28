@@ -779,13 +779,27 @@ AND released — #1276 landing is NOT sufficient.
     (only inbound — a dead peer still *sends* outbound retransmits but receives
     nothing, so its clock stops); a new `gc_idle_peers(peers, bound_addrs, now_ms)`
     runs on the existing `retransmit_tick` (right after `pump_peers_on_timer`) and
-    evicts any peer idle > `PEER_IDLE_TIMEOUT_MS` (10s), also dropping its
+    evicts any peer idle > `PEER_IDLE_TIMEOUT_MS`, also dropping its
     `bound_addrs` cookie→addr mapping (`retain(|_, a| *a != gone)`). Activity-based, so
-    it covers graceful / abrupt / crashed disconnects uniformly; 10s is safe because a
-    live client — even idle — sends RDPEUDP keepalive/delayed-ACKs continuously
-    (~200/s in a real session). This is the listener-only backstop half of M3c; the
-    prompt server→listener "instant retire-on-disconnect" signal is still deferred (the
-    GC is needed regardless). Logs `evicted idle UDP peer` at `debug`
+    it covers graceful / abrupt / crashed disconnects uniformly.
+    **TIMEOUT CORRECTED 2026-06-29: 10s → 60s.** The original 10s rested on a wrong
+    assumption — that a live client *always* sends frequent RDPEUDP keepalive/delayed
+    ACKs (~200/s). That holds only while the picture is **active**. When the screen goes
+    idle, **mstsc drops to a ~15s UDP keepalive cadence** (verified live: inbound
+    datagrams exactly 15s apart once frame-acks stop). The 10s GC then reaped the peer
+    **between** two keepalives — killing the UDP tunnel of a fully live TCP session
+    (audio still flowing), so EGFX froze **permanently** (the client's next keepalive
+    isn't a SYN, so the peer is never recreated → needs reconnect). This was a distinct
+    bug from the load-freeze (#89): triggered by going idle ~15–60s, on mirror-primary
+    too. Fix: 60s = 4× the observed 15s keepalive, so an idle-but-live peer is never
+    reaped; a genuinely dead peer still ages out (the "UDP retransmits after disconnect"
+    leak becomes ≤60s instead of indefinite). **Verified on real mstsc**: a live peer
+    idle ~45s recovered on activity with no eviction, while the *abandoned* peer from a
+    prior reconnect was correctly reaped at idle_ms≈60042. The fully robust fix is an
+    explicit TCP-session-close → evict signal (deferred half of M3c); until then the
+    activity-based backstop must stay generous. This is the listener-only backstop half
+    of M3c; the prompt server→listener "instant retire-on-disconnect" signal is still
+    deferred (the GC is needed regardless). Logs `evicted idle UDP peer` at `debug`
     (`ironrdp_server::multitransport=debug`). Does NOT by itself fix the mstsc EGFX
     reconnect-blank (a client-side surface-retention quirk + the clean-link limit may
     compound it); the robust WiFi config remains `--udp-migrate-egfx` off (EGFX on TCP).

@@ -64,6 +64,18 @@ then delete; promote a parked item to *In flight* when work actually starts.
   risk: in-session fallback would be *frozen→recover* (NOT the reconnect-blank quirk —
   that needs a new connection), but only if mstsc accepts the channel's data back on TCP
   after Soft-Sync (no standard reverse Soft-Sync; untested). Spike against real mstsc first.
+- [ ] **UDP multitransport — explicit TCP-close → listener peer-evict signal** (the
+  deferred half of M3c; the *correct* fix for dead-peer reclaim). Today the listener only
+  reclaims a peer via the activity-based idle-GC, whose timeout had to be raised to 60s
+  (2026-06-29) because mstsc goes near-silent on the UDP flow when idle (~15s keepalive)
+  and a shorter timeout reaped *live* idle peers → permanent EGFX freeze. With a real
+  TCP-session-close signal (server marks the connection's cookie retired in the shared
+  `CookieRegistry` → listener drops that peer), a dead peer is reclaimed *immediately* on
+  disconnect and the idle-GC can be a long pure backstop (no risk of reaping a live idle
+  client regardless of its keepalive interval). Shared-state signal mirrors the existing
+  per-cookie tunnel-bound flag. See vendor `listener.rs` `PEER_IDLE_TIMEOUT_MS` + the
+  feasibility doc "M3c peer GC".
+
 - [ ] **UDP multitransport Phase 2 — lossy `UdpFecL` + DTLS + 1+1 redundancy** (FEC dropped).
   Phase 1 (reliable EGFX-over-UDP) shipped (v0.8.15, clean-link only). Phase 2 wants
   loss resilience. Status: lossy delivery mode + 1+1 duplicate-send (repetition code)

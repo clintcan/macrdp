@@ -258,11 +258,22 @@ async fn pump_peers_on_timer(
     }
 }
 
-/// (M3c) Evict a peer after this many ms with no *inbound* datagram. A live client —
-/// even an idle/quiet one — sends RDPEUDP keepalive/delayed ACKs continuously (a real
-/// session ran ~200 inbound pkts/s), so 10s is a very safe "the client is gone"
-/// threshold; a dead client sends nothing and ages out cleanly.
-const PEER_IDLE_TIMEOUT_MS: u64 = 10_000;
+/// (M3c) Evict a peer after this many ms with no *inbound* datagram.
+///
+/// CORRECTED 2026-06-29 (was 10_000): the original 10s rested on the assumption that
+/// a live client always sends frequent RDPEUDP keepalive/delayed ACKs (~200/s). That
+/// holds only while the picture is *active* — when the screen goes idle, **mstsc drops
+/// to a ~15s UDP keepalive cadence** (verified: inbound datagrams exactly 15s apart
+/// once frame-acks stop). The 10s timeout then reaped the peer *between* two keepalives
+/// — killing the UDP tunnel of a fully live TCP session (audio still flowing), so EGFX
+/// froze permanently until reconnect (the client's next keepalive isn't a SYN, so the
+/// peer is never recreated). The threshold must comfortably exceed the client's idle
+/// keepalive interval. 60s = 4× the observed 15s — still reclaims a genuinely dead peer
+/// promptly enough (the original "UDP keeps retransmitting after disconnect" leak
+/// becomes ≤60s instead of indefinite). The fully robust fix is an explicit
+/// TCP-session-close → evict signal (the deferred half of M3c); until then this
+/// activity-based backstop must be generous enough not to reap an idle-but-live client.
+const PEER_IDLE_TIMEOUT_MS: u64 = 60_000;
 
 /// (M3c) Idle-timeout garbage collection. Drop every peer whose last *inbound*
 /// datagram is older than `PEER_IDLE_TIMEOUT_MS`, along with any `bound_addrs`
