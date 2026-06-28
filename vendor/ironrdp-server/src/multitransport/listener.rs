@@ -36,6 +36,7 @@ use std::io;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ironrdp_rdpeudp::datagram::Datagram;
@@ -177,6 +178,7 @@ impl UdpMultitransportListener {
         cookie_registry: Option<CookieRegistry>,
         tunnel_rx: Option<UnboundedReceiver<TunnelOutbound>>,
         dtls_config: Option<DtlsServerContext>,
+        congestion_retransmits: Option<Arc<AtomicU64>>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
@@ -196,6 +198,7 @@ impl UdpMultitransportListener {
             cookie_registry,
             tunnel_rx,
             dtls_config,
+            congestion_retransmits,
         ));
         Ok(Self { local_addr, task })
     }
@@ -242,13 +245,15 @@ async fn pump_peers_on_timer(
     peers: &mut HashMap<SocketAddr, Peer>,
     now_ms: u64,
     mtu: u16,
-) {
+) -> usize {
+    let mut total_retransmits = 0usize;
     for (addr, peer) in peers.iter_mut() {
         if !peer.sm.is_established() {
             continue;
         }
         let out = peer.sm.step(now_ms, None);
         let (retransmits, syn_retransmit) = (out.retransmits, out.syn_retransmit);
+        total_retransmits += retransmits;
         if !out.to_send.is_empty() {
             send_datagrams(socket, *addr, out.to_send, mtu).await;
         }
@@ -256,6 +261,7 @@ async fn pump_peers_on_timer(
             debug!(peer_addr = %addr, retransmits, syn_retransmit, "RDPEUDP RTO retransmit (timer)");
         }
     }
+    total_retransmits
 }
 
 /// (M3c) Evict a peer after this many ms with no *inbound* datagram.
@@ -491,7 +497,20 @@ async fn run_recv_loop(
     cookie_registry: Option<CookieRegistry>,
     mut tunnel_rx: Option<UnboundedReceiver<TunnelOutbound>>,
     dtls_config: Option<DtlsServerContext>,
+    // Adaptive-bitrate loss signal: cumulative reliable-tunnel retransmit count the
+    // macrdp H.264 controller samples (deltas) to drive congestion-responsive
+    // bitrate. `None` = not wired (the feature off / TCP-only build).
+    congestion_retransmits: Option<Arc<AtomicU64>>,
 ) {
+    // Accumulate reliable retransmits into the shared loss-signal counter (no-op
+    // when not wired). Closure over the Option so the 3 step sites stay one-liners.
+    let bump_loss = |n: usize| {
+        if n > 0 {
+            if let Some(c) = &congestion_retransmits {
+                c.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+    };
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
     // (M5c) cookie -> peer address, populated when a tunnel binds, so
     // server-originated `TunnelOutbound` (keyed by cookie) reaches the right peer.
@@ -563,7 +582,7 @@ async fn run_recv_loop(
             },
             _ = retransmit_tick.tick() => {
                 let now_ms = start.elapsed().as_millis() as u64;
-                pump_peers_on_timer(&socket, &mut peers, now_ms, cfg.mtu).await;
+                bump_loss(pump_peers_on_timer(&socket, &mut peers, now_ms, cfg.mtu).await);
                 // (M3c) Reap peers whose client has gone away (no inbound for
                 // PEER_IDLE_TIMEOUT_MS) so the dead-peer retransmits above stop and
                 // peers/bound_addrs don't leak. Same tick — cheap, peers is small.
@@ -714,6 +733,7 @@ async fn run_recv_loop(
         let had_data = Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::DATA));
         let out = peer.sm.step(now_ms, Some(data));
         let (retransmits, syn_retransmit) = (out.retransmits, out.syn_retransmit);
+        bump_loss(retransmits);
         send_datagrams(&socket, peer_addr, out.to_send, cfg.mtu).await;
         if retransmits > 0 || syn_retransmit {
             // The reliable transport recovered lost packets — the signal a
@@ -957,6 +977,7 @@ async fn run_recv_loop(
                 if !tls_out.is_empty() {
                     let o = sm.enqueue(now_ms, &tls_out);
                     let (retransmits, syn_retransmit) = (o.retransmits, o.syn_retransmit);
+                    bump_loss(retransmits);
                     send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
                     if retransmits > 0 || syn_retransmit {
                         debug!(%peer_addr, retransmits, syn_retransmit, "RDPEUDP RTO retransmit (outbound)");

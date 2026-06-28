@@ -283,6 +283,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("bind listener");

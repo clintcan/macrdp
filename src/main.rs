@@ -471,6 +471,16 @@ struct Args {
     #[arg(long)]
     udp_migrate_egfx: bool,
 
+    /// EXPERIMENTAL, opt-in (default OFF). Congestion-responsive H.264 bitrate for
+    /// EGFX-over-UDP: when the reliable UDP tunnel shows packet loss (retransmits),
+    /// lower the VideoToolbox bitrate toward a floor (AIMD multiplicative-decrease),
+    /// and climb back toward the --bitrate ceiling when the link clears — so video
+    /// degrades to "choppy but alive" under loss instead of wedging. Only acts while
+    /// EGFX is on a UDP tunnel (no-op on TCP). Tunables: MACRDP_UDP_ADAPTIVE_FLOOR_BPS,
+    /// _INCREASE_BPS, _DECREASE, _INTERVAL_MS. macOS-only build.
+    #[arg(long)]
+    adaptive_bitrate: bool,
+
     /// Don't adopt the client's requested desktop resolution. By default —
     /// when mirroring the primary display without --width/--height/--hidpi —
     /// macrdp reads the resolution the client asked for while connecting
@@ -1397,6 +1407,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("UDP_MIGRATE_EGFX", false) {
         argv.push("--udp-migrate-egfx".into());
     }
+    if on("ADAPTIVE_BITRATE", false) {
+        argv.push("--adaptive-bitrate".into());
+    }
     if on("FORK_WORKERS", false) {
         argv.push("--fork-workers".into());
     }
@@ -2014,6 +2027,11 @@ async fn async_main() -> Result<()> {
     // reliable UDP tunnel wedges (acks silent while shipping); the server reads it to
     // flip EGFX routing back to TCP. Reset on reconnect (server side).
     let egfx_demigrate_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Adaptive-bitrate loss signal: cumulative reliable-tunnel retransmit count the
+    // UDP listener bumps and the H.264 controller samples (deltas) to drive
+    // congestion-responsive bitrate. Cross-platform so the listener wiring compiles
+    // on CI; only read on the macOS H.264 path.
+    let congestion_retransmits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
@@ -2029,6 +2047,8 @@ async fn async_main() -> Result<()> {
             egfx_on_lossy_flag.clone(),
             egfx_on_udp_flag.clone(),
             egfx_demigrate_flag.clone(),
+            args.adaptive_bitrate,
+            congestion_retransmits.clone(),
         )
     });
 
@@ -2215,6 +2235,7 @@ async fn async_main() -> Result<()> {
             Some(cookie_registry.clone()),
             Some(tunnel_rx),
             udp_dtls_config,
+            Some(congestion_retransmits.clone()),
         )
         .await
         {

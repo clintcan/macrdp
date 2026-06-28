@@ -182,6 +182,15 @@ struct ConnectionContext {
     /// never re-migrate to UDP in-session (no flapping); UDP is retried only on the
     /// next connection. Reset with the fresh context on reconnect.
     demigrated: bool,
+    /// Adaptive-bitrate (congestion-responsive rate control) per-connection state.
+    /// `adaptive_target_bps` is the controller's current target (starts at the
+    /// configured `--bitrate` ceiling); `adaptive_last_control` rate-limits the AIMD
+    /// step to one per `Gfx::adaptive_interval`; `adaptive_last_retransmits` is the
+    /// last sampled value of the shared cumulative-retransmit loss counter, so the
+    /// controller works on per-interval deltas. See [`Gfx::adaptive_bitrate_step`].
+    adaptive_target_bps: u32,
+    adaptive_last_control: Instant,
+    adaptive_last_retransmits: u64,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -267,6 +276,27 @@ fn should_demigrate_to_tcp(
         && !acks_suspended
         && since_ship <= active_window
         && since_ack >= wedge_timeout
+}
+
+/// Pure AIMD step for congestion-responsive bitrate (P1). Given the current target,
+/// the reliable-tunnel loss delta observed this control interval, and the bounds/
+/// params, return the new target bitrate. **Multiplicative-decrease** on any loss
+/// (back off fast, clamp to `floor_bps`); **additive-increase** when clean (climb
+/// slowly, clamp to `ceiling_bps`). Pure (no clock/state) so it's unit-testable.
+/// See [`Gfx::adaptive_bitrate_step`].
+fn aimd_bitrate(
+    current: u32,
+    loss_delta: u64,
+    floor_bps: u32,
+    ceiling_bps: u32,
+    increase_bps: u32,
+    decrease: f32,
+) -> u32 {
+    if loss_delta > 0 {
+        (((current as f32) * decrease) as u32).max(floor_bps)
+    } else {
+        current.saturating_add(increase_bps).min(ceiling_bps)
+    }
 }
 
 /// Read the ack-recovery config from the environment once. Returns
@@ -355,6 +385,22 @@ pub struct Gfx {
     /// Shared with the vendored server: set true here on a wedge, read there to
     /// flip `egfx_on_udp` → TCP routing; reset there on reconnect.
     demigrate_request: Arc<AtomicBool>,
+    /// Adaptive bitrate (congestion-responsive rate control, P1). On by
+    /// `--adaptive-bitrate` (or `MACRDP_UDP_ADAPTIVE_BITRATE`); only acts while EGFX
+    /// is on a UDP tunnel, so it's a no-op on TCP. The controller (AIMD) reads the
+    /// shared `congestion_retransmits` loss counter the UDP listener bumps and live-
+    /// adjusts the VideoToolbox bitrate within `[adaptive_floor_bps, bitrate_bps]`:
+    /// multiplicative-decrease `adaptive_decrease` per interval with loss, additive-
+    /// increase `adaptive_increase_bps` per interval when clean. `bitrate_bps` (the
+    /// `--bitrate` value) is the ceiling. See [`Gfx::adaptive_bitrate_step`].
+    adaptive_enabled: bool,
+    adaptive_floor_bps: u32,
+    adaptive_increase_bps: u32,
+    adaptive_decrease: f32,
+    adaptive_interval: Duration,
+    /// Cumulative reliable-tunnel retransmit count, bumped by the UDP listener and
+    /// sampled (as deltas) by the controller. Shared `Arc` like the egfx flags.
+    congestion_retransmits: Arc<AtomicU64>,
 }
 
 impl Gfx {
@@ -368,6 +414,8 @@ impl Gfx {
         egfx_on_lossy: Arc<AtomicBool>,
         egfx_on_udp: Arc<AtomicBool>,
         demigrate_request: Arc<AtomicBool>,
+        adaptive_bitrate: bool,
+        congestion_retransmits: Arc<AtomicU64>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
@@ -391,6 +439,36 @@ impl Gfx {
         };
         let watchdog_wedge_timeout = watchdog_ms("MACRDP_UDP_EGFX_WATCHDOG_MS", 3000);
         let watchdog_active_window = watchdog_ms("MACRDP_UDP_EGFX_WATCHDOG_ACTIVE_MS", 1000);
+        // Adaptive bitrate (P1). Enabled by the --adaptive-bitrate flag OR the env
+        // fallback; the controller still only acts while EGFX is on a UDP tunnel.
+        let adaptive_enabled =
+            adaptive_bitrate || crate::multitransport::env_truthy("MACRDP_UDP_ADAPTIVE_BITRATE");
+        let env_u32 = |name: &str, default: u32| -> u32 {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(default)
+        };
+        // Floor: don't drop below this (degrade to "choppy but alive", not dead).
+        // Default = 1/8 of the ceiling, clamped to ≥500 kbps and ≤ the ceiling.
+        let adaptive_floor_bps = env_u32(
+            "MACRDP_UDP_ADAPTIVE_FLOOR_BPS",
+            (bitrate_bps / 8).max(500_000),
+        )
+        .min(bitrate_bps.max(1));
+        // Additive-increase step per interval: ~1/16 of the ceiling (≈16 clean
+        // intervals to climb the full range). Multiplicative-decrease factor on loss.
+        let adaptive_increase_bps = env_u32(
+            "MACRDP_UDP_ADAPTIVE_INCREASE_BPS",
+            (bitrate_bps / 16).max(250_000),
+        );
+        let adaptive_decrease = std::env::var("MACRDP_UDP_ADAPTIVE_DECREASE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|&f| f > 0.0 && f < 1.0)
+            .unwrap_or(0.7);
+        let adaptive_interval = watchdog_ms("MACRDP_UDP_ADAPTIVE_INTERVAL_MS", 300);
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -401,6 +479,17 @@ impl Gfx {
                 ?recovery_params,
                 "EGFX ack-driven IDR recovery ENABLED (MACRDP_UDP_EGFX_ACK_RECOVERY) — \
                  active only while EGFX is on the lossy UDP tunnel"
+            );
+        }
+        if adaptive_enabled {
+            info!(
+                ceiling_bps = bitrate_bps,
+                floor_bps = adaptive_floor_bps,
+                increase_bps = adaptive_increase_bps,
+                decrease = adaptive_decrease,
+                interval_ms = adaptive_interval.as_millis() as u64,
+                "EGFX adaptive bitrate ENABLED (--adaptive-bitrate) — congestion-responsive \
+                 rate control, active only while EGFX is on a UDP tunnel"
             );
         }
         Self {
@@ -421,6 +510,12 @@ impl Gfx {
             watchdog_wedge_timeout,
             watchdog_active_window,
             demigrate_request,
+            adaptive_enabled,
+            adaptive_floor_bps,
+            adaptive_increase_bps,
+            adaptive_decrease,
+            adaptive_interval,
+            congestion_retransmits,
         }
     }
 
@@ -600,13 +695,65 @@ impl Gfx {
             let Some(ctx) = guard.as_mut() else {
                 return Ok(true);
             };
+            // Congestion-responsive bitrate (P1): compute the new target (mutates
+            // ctx adaptive state) BEFORE borrowing the encoder, then apply it live.
+            // No-op unless adaptive is enabled AND EGFX is on a UDP tunnel.
+            let new_bitrate = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
                 return Ok(true);
             };
+            if let Some(bps) = new_bitrate {
+                if let Err(e) = encoder.set_bitrate(bps) {
+                    trace!(error = ?e, bps, "adaptive set_bitrate failed");
+                }
+            }
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
+    }
+
+    /// Congestion-responsive bitrate controller (P1, AIMD). Called once per capture
+    /// from `submit_bgra` while holding the ctx lock; rate-limited to one step per
+    /// `adaptive_interval`. Reads the shared cumulative-retransmit loss counter the
+    /// UDP listener bumps and, per interval: **multiplicative-decrease** the target
+    /// toward `adaptive_floor_bps` if any loss occurred, else **additive-increase**
+    /// toward the `bitrate_bps` ceiling. Returns `Some(bps)` when the target changed
+    /// (the caller live-sets it on the VT session). No-op (returns `None`) unless
+    /// the feature is enabled and EGFX is on a UDP tunnel — so TCP stays byte-identical.
+    fn adaptive_bitrate_step(&self, ctx: &mut ConnectionContext) -> Option<u32> {
+        if !self.adaptive_enabled || !self.egfx_on_udp.load(Ordering::Relaxed) {
+            return None;
+        }
+        let now = Instant::now();
+        if now.duration_since(ctx.adaptive_last_control) < self.adaptive_interval {
+            return None;
+        }
+        ctx.adaptive_last_control = now;
+        let cur = self.congestion_retransmits.load(Ordering::Relaxed);
+        let delta = cur.saturating_sub(ctx.adaptive_last_retransmits);
+        ctx.adaptive_last_retransmits = cur;
+        let new_target = aimd_bitrate(
+            ctx.adaptive_target_bps,
+            delta,
+            self.adaptive_floor_bps,
+            self.bitrate_bps.max(1),
+            self.adaptive_increase_bps,
+            self.adaptive_decrease,
+        );
+        if new_target != ctx.adaptive_target_bps {
+            let prev = ctx.adaptive_target_bps;
+            ctx.adaptive_target_bps = new_target;
+            debug!(
+                loss_delta = delta,
+                prev_bps = prev,
+                new_bps = new_target,
+                "EGFX adaptive bitrate adjusted"
+            );
+            Some(new_target)
+        } else {
+            None
+        }
     }
 
     /// Ship loop for the push pipeline: owns VideoToolbox's output receiver and
@@ -921,6 +1068,9 @@ impl GfxServerFactory for Gfx {
             egfx_acks_seen: false,
             last_throttle_ship: Instant::now(),
             demigrated: false,
+            adaptive_target_bps: self.bitrate_bps,
+            adaptive_last_control: Instant::now(),
+            adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -1389,6 +1539,62 @@ mod tests {
             WD_ACTIVE,
             WD_WEDGE
         ));
+    }
+
+    // ---- adaptive bitrate AIMD (`aimd_bitrate`) ----
+    // (current, loss_delta, floor, ceiling, increase, decrease)
+    #[test]
+    fn aimd_decreases_multiplicatively_on_loss() {
+        // 10 Mbps, loss this interval, 0.7 factor → 7 Mbps (above the 1 Mbps floor).
+        assert_eq!(
+            aimd_bitrate(10_000_000, 3, 1_000_000, 10_000_000, 500_000, 0.7),
+            7_000_000
+        );
+    }
+
+    #[test]
+    fn aimd_decrease_clamps_to_floor() {
+        // Already near the floor; a further cut can't go below it.
+        assert_eq!(
+            aimd_bitrate(1_200_000, 5, 1_000_000, 10_000_000, 500_000, 0.7),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn aimd_increases_additively_when_clean() {
+        // No loss → climb by the step.
+        assert_eq!(
+            aimd_bitrate(5_000_000, 0, 1_000_000, 10_000_000, 500_000, 0.7),
+            5_500_000
+        );
+    }
+
+    #[test]
+    fn aimd_increase_clamps_to_ceiling() {
+        // Near the ceiling; the additive step can't exceed it.
+        assert_eq!(
+            aimd_bitrate(9_800_000, 0, 1_000_000, 10_000_000, 500_000, 0.7),
+            10_000_000
+        );
+    }
+
+    #[test]
+    fn aimd_at_ceiling_clean_is_stable() {
+        // At the ceiling on a clean interval → unchanged (caller treats == as no-op).
+        assert_eq!(
+            aimd_bitrate(10_000_000, 0, 1_000_000, 10_000_000, 500_000, 0.7),
+            10_000_000
+        );
+    }
+
+    #[test]
+    fn aimd_at_floor_with_loss_is_stable() {
+        // At the floor under continued loss → stays at the floor (choppy-but-alive).
+        assert_eq!(
+            aimd_bitrate(1_000_000, 9, 1_000_000, 10_000_000, 500_000, 0.7),
+            1_000_000
+        );
     }
 
     #[test]

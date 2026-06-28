@@ -118,6 +118,14 @@ impl Encoder {
         self.rx.take()
     }
 
+    /// Live-update the target average bitrate (bps) on the running session, for
+    /// congestion-responsive rate control (`h264.rs`'s adaptive-bitrate
+    /// controller). No encoder rebuild, so the H.264 reference chain is preserved.
+    pub fn set_bitrate(&self, bitrate_bps: u32) -> Result<()> {
+        // SAFETY: `self.inner.session` is valid for the lifetime of the Encoder.
+        unsafe { ffi::set_average_bitrate(self.inner.session, bitrate_bps) }
+    }
+
     /// Submit a BGRA frame for encoding. `stride` is in bytes per row
     /// of the source buffer — VideoToolbox is told the source pixel
     /// format is `kCVPixelFormatType_32BGRA`, so each pixel is 4 bytes
@@ -536,6 +544,22 @@ mod ffi {
             bail!("VTCompressionSessionPrepareToEncodeFrames failed: OSStatus {prepared}");
         }
         Ok(guard)
+    }
+
+    /// Live-update the target average bitrate on a running session — for
+    /// congestion-responsive rate control. `kVTCompressionPropertyKey_AverageBitRate`
+    /// is settable mid-session; VT's rate controller adapts within a frame or two,
+    /// so we can lower it under loss and climb back when the link clears without
+    /// rebuilding the encoder (which would force an IDR + lose the reference chain).
+    pub(super) unsafe fn set_average_bitrate(
+        session: VTCompressionSessionRef,
+        bitrate_bps: u32,
+    ) -> Result<()> {
+        set_i32(
+            session,
+            kVTCompressionPropertyKey_AverageBitRate,
+            bitrate_bps.max(1) as i32,
+        )
     }
 
     unsafe fn set_bool(
