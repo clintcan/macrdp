@@ -71,6 +71,14 @@ use tracing::{debug, info, trace, warn};
 
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
+/// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
+/// backpressure gate while the client's frame-ack lag is over the threshold.
+/// ~10 fps: enough trailing frames for mstsc to keep presenting + acking (so
+/// the window reopens and lag recovers) while still throttling well below the
+/// full 60 fps so the client's decode queue drains net. See the gate in
+/// `submit_bgra` and `ConnectionContext::last_throttle_ship`.
+const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
+
 /// How the H.264 NAL units are framed inside the AVC420 wire payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireFormat {
@@ -143,6 +151,31 @@ struct ConnectionContext {
     acks_suspended: bool,
     last_ship_at: Instant,
     last_recovery_at: Instant,
+    /// EGFX-on-UDP frame-ack backpressure. `last_shipped_frame_id` is the id of
+    /// the most recent frame handed to `send_avc420_frame` (bumped by the ship
+    /// thread); `last_acked_frame_id` is the most recent frame the client
+    /// reported *decoded* via RDPGFX_FRAME_ACKNOWLEDGE (bumped in `on_frame_ack`).
+    /// Their difference is the client's decode backlog. On TCP the socket's own
+    /// backpressure paces the server to the client; on the UDP tunnel nothing
+    /// does, so without this the server floods frames and the client's decode
+    /// queue runs away → frozen video. `submit_bgra` drops captures (to latest)
+    /// when the lag exceeds the threshold — but only once `egfx_acks_seen` (avoid
+    /// a cold-start false drop before the first ack) and only while EGFX is on the
+    /// UDP tunnel (`Gfx::egfx_on_udp`) and acks aren't suspended. `Arc` so the
+    /// ship thread can bump `last_shipped_frame_id` without taking the ctx lock
+    /// (the ship-path lock-order invariant: never hold ctx under server_handle).
+    last_shipped_frame_id: Arc<AtomicU64>,
+    last_acked_frame_id: Arc<AtomicU64>,
+    egfx_acks_seen: bool,
+    /// When the EGFX-on-UDP backpressure gate last let a "trickle" frame
+    /// through while lag was over the threshold. The gate drops MOST captures
+    /// when the client is behind, but NOT all of them: mstsc only *presents*
+    /// (and thus frame-acks) an H.264 frame once a couple more arrive behind
+    /// it, so dropping to zero starves that — the acks never advance, lag never
+    /// recovers, and video freezes permanently. This timestamp paces a low-rate
+    /// floor (`UDP_THROTTLE_FLOOR`) so the client always has trailing frames to
+    /// drain its presentation buffer and the window reopens.
+    last_throttle_ship: Instant,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -243,6 +276,18 @@ pub struct Gfx {
     recovery_enabled: bool,
     recovery_params: RecoveryParams,
     egfx_on_lossy: Arc<AtomicBool>,
+    /// Runtime gate the vendored server flips true when EGFX is migrated onto the
+    /// UDP multitransport tunnel (reliable OR lossy). Enables the frame-ack-lag
+    /// backpressure in `submit_bgra` — only on the UDP tunnel, since the TCP path
+    /// is paced by socket backpressure and must stay byte-identical (never-drop
+    /// push model). Stays false on TCP → the gate is a no-op there.
+    egfx_on_udp: Arc<AtomicBool>,
+    /// Max EGFX frame-ack lag (shipped − decoded, in frames) tolerated on the UDP
+    /// tunnel before `submit_bgra` drops captures to let the client catch up.
+    /// `MACRDP_UDP_EGFX_MAX_FRAME_LAG` (default 16 ≈ 266 ms at 60 fps). High enough
+    /// that a healthy high-RTT link never trips it; low enough to cap the decode
+    /// backlog so video degrades to choppy-but-live instead of freezing.
+    max_frame_lag: u64,
 }
 
 impl Gfx {
@@ -253,9 +298,15 @@ impl Gfx {
         keyframe_secs: f32,
         max_in_flight: u32,
         egfx_on_lossy: Arc<AtomicBool>,
+        egfx_on_udp: Arc<AtomicBool>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
+        let max_frame_lag = std::env::var("MACRDP_UDP_EGFX_MAX_FRAME_LAG")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(16);
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -280,6 +331,8 @@ impl Gfx {
             recovery_enabled,
             recovery_params,
             egfx_on_lossy,
+            egfx_on_udp,
+            max_frame_lag,
         }
     }
 
@@ -365,6 +418,51 @@ impl Gfx {
                     "EGFX pipeline full; dropping capture to latest"
                 );
                 return Ok(true); // still the active path; just dropped this frame
+            }
+            // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
+            // socket backpressure to pace us to the client (unlike TCP), so without
+            // this the server floods frames and the client's DECODE queue runs away
+            // → frozen video while audio (on TCP) keeps playing. When the client's
+            // decode backlog (shipped − decoded, from FrameAcknowledge) exceeds the
+            // threshold, drop this capture so the client catches up — video degrades
+            // to choppy-but-live instead of freezing. Gated to the UDP tunnel
+            // (TCP push path stays byte-identical), to acks actually flowing (a
+            // suspended-ack client falls back to the submitted−shipped throttle
+            // above), and to having seen ≥1 ack (no cold-start false drop). Dropping
+            // before encode keeps the H.264 reference chain valid.
+            if self.egfx_on_udp.load(Ordering::Relaxed) && ctx.egfx_acks_seen && !ctx.acks_suspended
+            {
+                let lag = ctx
+                    .last_shipped_frame_id
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
+                if lag > self.max_frame_lag {
+                    // Client is behind. Drop MOST captures so it catches up — but
+                    // keep a low-rate trickle, never zero: mstsc only presents (and
+                    // thus frame-acks) an H.264 frame once a couple more arrive
+                    // behind it, so dropping to zero means it never acks the
+                    // in-flight frames, `lag` never falls back under the threshold,
+                    // and the video freezes PERMANENTLY (recovers only on
+                    // reconnect). The trickle keeps trailing frames flowing so the
+                    // presentation buffer drains and the window reopens. Dropping
+                    // before encode keeps the H.264 reference chain valid (the
+                    // encoder never sees the dropped frames, so the next encoded
+                    // frame is a valid P-frame from the client's last reference).
+                    let now = Instant::now();
+                    if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
+                        trace!(
+                            lag,
+                            "EGFX-on-UDP lag high; dropping capture (trickle floor)"
+                        );
+                        return Ok(true);
+                    }
+                    ctx.last_throttle_ship = now;
+                    trace!(
+                        lag,
+                        "EGFX-on-UDP lag high; letting a trickle frame through to drain client buffer"
+                    );
+                    // fall through: ship this one to keep the client presenting/acking
+                }
             }
             std::mem::replace(&mut ctx.need_keyframe, false)
         };
@@ -506,7 +604,7 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle) = {
+            let (surface_id, width, height, epoch, server_handle, last_shipped) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -518,7 +616,17 @@ impl Gfx {
                 let epoch = ctx.epoch;
                 // Liveness for ack-driven IDR recovery: we're actively shipping.
                 ctx.last_ship_at = Instant::now();
-                (surface_id, width, height, epoch, ctx.server_handle.clone())
+                // Clone the shipped-frame-id gauge so we can bump it in Phase 2
+                // (under server_handle) WITHOUT re-taking the ctx lock — preserving
+                // the never-hold-ctx-under-server_handle invariant.
+                (
+                    surface_id,
+                    width,
+                    height,
+                    epoch,
+                    ctx.server_handle.clone(),
+                    ctx.last_shipped_frame_id.clone(),
+                )
             };
 
             // Phase 2: lock `server_handle` ALONE (ctx already released).
@@ -551,7 +659,13 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                match server.send_avc420_frame(surface_id, &payload, &[region], ts_ms) {
+                let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
+                // Record the newest shipped frame id for the UDP frame-ack-lag
+                // backpressure gate (`submit_bgra`). Monotonic per connection.
+                if let Some(frame_id) = sent {
+                    last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+                }
+                match sent {
                     Some(frame_id) if f.is_keyframe => debug!(
                         frame_id,
                         ?self.wire_format,
@@ -676,6 +790,10 @@ impl GfxServerFactory for Gfx {
             acks_suspended: false,
             last_ship_at: Instant::now(),
             last_recovery_at: Instant::now(),
+            last_shipped_frame_id: Arc::new(AtomicU64::new(0)),
+            last_acked_frame_id: Arc::new(AtomicU64::new(0)),
+            egfx_acks_seen: false,
+            last_throttle_ship: Instant::now(),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -779,6 +897,16 @@ impl GraphicsPipelineHandler for GfxHandler {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
+            // Record decode progress for the UDP frame-ack-lag backpressure gate.
+            // The client sends FrameAcknowledge after it DECODES a frame, so this
+            // is the floor of its decode backlog. Only advance on a real ack (not
+            // the suspend sentinel), and mark that we've seen at least one ack so
+            // `submit_bgra` doesn't false-drop during cold start.
+            if !ctx.acks_suspended {
+                ctx.last_acked_frame_id
+                    .store(u64::from(frame_id), Ordering::Relaxed);
+                ctx.egfx_acks_seen = true;
+            }
         }
     }
 

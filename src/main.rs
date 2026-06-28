@@ -2006,6 +2006,10 @@ async fn async_main() -> Result<()> {
     // server flips it at the migration site. Cross-platform so the UDP listener
     // wiring below (which hands the same clone to the server) compiles on CI.
     let egfx_on_lossy_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Companion flag: EGFX migrated onto ANY UDP tunnel (reliable or lossy). The
+    // H.264 pipeline reads it to enable frame-ack-lag backpressure (the UDP tunnel
+    // has no socket pacing); the server flips it at the same migration site.
+    let egfx_on_udp_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
@@ -2019,6 +2023,7 @@ async fn async_main() -> Result<()> {
             args.keyframe_interval,
             args.h264_frames_in_flight.max(1),
             egfx_on_lossy_flag.clone(),
+            egfx_on_udp_flag.clone(),
         )
     });
 
@@ -2230,6 +2235,10 @@ async fn async_main() -> Result<()> {
                 // flag the H.264 pipeline reads. The server flips it true only when
                 // it migrates EGFX onto the LOSSY tunnel.
                 server.set_egfx_on_lossy_handle(Some(egfx_on_lossy_flag.clone()));
+                // Frame-ack-lag backpressure: the server flips this true whenever it
+                // migrates EGFX onto a UDP tunnel (reliable or lossy), and the H.264
+                // pipeline drops captures when the client's decode backlog runs away.
+                server.set_egfx_on_udp_handle(Some(egfx_on_udp_flag.clone()));
                 // (P2.4b, EXPERIMENTAL) Register the lossy-UDP audio DVC
                 // (AUDIO_PLAYBACK_LOSSY_DVC). Behind its OWN dedicated env gate
                 // (`MACRDP_UDP_LOSSY_AUDIO=1`) — NOT the lossy-offer flag — so the

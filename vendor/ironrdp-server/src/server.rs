@@ -413,6 +413,13 @@ pub struct RdpServer {
     /// (a missing ack there is congestion, not loss). `None` = not wired (default).
     #[cfg(feature = "multitransport")]
     egfx_on_lossy_handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Shared flag the macrdp-side EGFX/H.264 pipeline reads to enable frame-ack-lag
+    /// backpressure: set true once EGFX is migrated onto **any** UDP tunnel
+    /// (reliable or lossy), where there's no socket backpressure to pace the server
+    /// to the client. On TCP it stays false (the socket paces it; the push path must
+    /// stay byte-identical). `None` = not wired (default).
+    #[cfg(feature = "multitransport")]
+    egfx_on_udp_handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// (M5c step 3b) Receiver for inbound migrated-channel data the UDP listener
     /// forwards (each item is a bare DRDYNVC PDU — HigherLayerData of an inbound
     /// `RDP_TUNNEL_DATA`, e.g. an EGFX frame ack). Created + registered (with the
@@ -549,6 +556,7 @@ impl RdpServer {
             udp_tunnel_bound: None,
             #[cfg(feature = "multitransport")]
             egfx_on_lossy_handle: None,
+            egfx_on_udp_handle: None,
             #[cfg(feature = "multitransport")]
             multitransport_tunnel_sender: None,
             #[cfg(feature = "multitransport")]
@@ -662,6 +670,15 @@ impl RdpServer {
     #[cfg(feature = "multitransport")]
     pub fn set_egfx_on_lossy_handle(&mut self, handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
         self.egfx_on_lossy_handle = handle;
+    }
+
+    /// Wire the EGFX-on-UDP flag (frame-ack-lag backpressure). The server flips it
+    /// `true` whenever it Soft-Syncs the EGFX DVC onto a UDP tunnel (reliable or
+    /// lossy) and back to `false` on connection teardown; the macrdp H.264 pipeline
+    /// reads it to enable capture-dropping when the client's decode backlog grows.
+    #[cfg(feature = "multitransport")]
+    pub fn set_egfx_on_udp_handle(&mut self, handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+        self.egfx_on_udp_handle = handle;
     }
 
     /// Enable migrating the EGFX DVC onto the reliable UDP tunnel (the
@@ -996,6 +1013,9 @@ impl RdpServer {
                             self.lossy_audio_block_no = 0;
                             self.lossy_audio_streaming = false;
                             if let Some(handle) = &self.egfx_on_lossy_handle {
+                                handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some(handle) = &self.egfx_on_udp_handle {
                                 handle.store(false, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
@@ -1787,6 +1807,11 @@ impl RdpServer {
             {
                 Some(id) => {
                     self.egfx_on_udp = true;
+                    // Tell the H.264 pipeline EGFX is now on the UDP tunnel so it
+                    // enables frame-ack-lag backpressure (no socket pacing here).
+                    if let Some(handle) = &self.egfx_on_udp_handle {
+                        handle.store(true, Ordering::Relaxed);
+                    }
                     debug!(
                         gfx_channel_id = id,
                         "--udp-migrate-egfx: Soft-Sync will migrate the EGFX DVC onto the UDP tunnel"

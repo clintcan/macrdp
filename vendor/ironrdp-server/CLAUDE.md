@@ -822,11 +822,19 @@ AND released — #1276 landing is NOT sufficient.
     (+ its `bound_addrs` cookie bindings) so a fresh one is built and the new tunnel
     binds cleanly. A SYN on a still-handshaking peer is a normal SYN retransmit
     (`is_established()` gates it out). **Verified on real mstsc** — multi-cycle reconnect
-    now renders and stays responsive. **Residual (NOT this fix):** reconnect still freezes
-    *intermittently* under stress because the EGFX path never throttles on the client's
-    `queueDepth` (`GfxHandler::on_frame_ack` only records timing) → the client's frame
-    queue can run away (peak ~352k) → frozen display + RDPEUDP ACK storm. That's the
-    rate-control gap (finding #5), tracked separately; the earlier "mstsc
-    surface-retention quirk" guess was disproven (it reproduced on a fresh mstsc process).
-    All `multitransport`-gated; feature-off byte-unchanged. See feasibility doc
-    "M3c reconnect state-reset".
+    now renders and stays responsive. **Residual (the EGFX-over-UDP freeze under load /
+    on reconnect) — FIXED 2026-06-28 in `macrdp` (`src/h264.rs`), not this crate:** the
+    EGFX path never throttled on the client's `queueDepth`, so under a high-volume stream
+    (or a backed-up reconnect) the client's frame queue ran away (peak ~352k) → frozen
+    display + RDPEUDP ACK storm (input still reached the Mac over TCP, so it only *looked*
+    dead). The fix is a frame-ack-lag backpressure gate in `submit_bgra` **with a trickle
+    floor** — dropping most captures when the client is behind but never to zero, because
+    mstsc only presents/acks an H.264 frame once trailing frames arrive (dropping to zero
+    latches the freeze permanently). Verified on real mstsc under the headless
+    `--capture-primary` + held-Cmd+Tab repro. The earlier "mstsc surface-retention quirk"
+    guess was disproven (it reproduced on a fresh mstsc process); and the `egfx-ship`
+    thread parked in `_dispatch_semaphore_wait_slow` during the freeze is a red herring —
+    that's just Rust's `std::sync::mpsc::recv` idling on macOS. A fuller continuous
+    rate controller remains finding-#5 future work. All `multitransport`-gated; feature-off
+    byte-unchanged. See feasibility doc "M3c reconnect state-reset" + the "Residual …
+    rate-control gap" / trickle-floor note.

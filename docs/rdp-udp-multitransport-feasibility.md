@@ -417,12 +417,40 @@ ACKs — the client falls hopelessly behind and the display freezes on a stale f
 unreliable freeze *predictor* (huge in both healthy and frozen states) but the
 **runaway** is the failure mode. This is the same **"server ignores client
 congestion/queue feedback"** gap captured in finding #5 / the rate-control TODO — it
-bites hardest on reconnect, where the client starts more backed-up. The real fix is
-**queue_depth-aware throttling / frame dropping** (a focused piece of the finding-#5
-rate-control work), ideally informed by a real-Windows-server capture first, since the
-raw `queueDepth` units are oddly large and a naive threshold would mis-fire. Everyday
-robust config stays `--udp-migrate-egfx` off (and `--fork-workers` gives clean
-in-process reconnect on the TCP path; it's mutually exclusive with UDP multitransport).
+bites hardest on reconnect, where the client starts more backed-up.
+
+**FIXED 2026-06-28 — frame-ack-lag backpressure with a TRICKLE FLOOR (the first
+focused piece of the finding-#5 rate-control work; verified on real mstsc under the
+exact repro that froze: headless `--virtual-display --capture-primary`, YouTube +
+rapidly held Cmd+Tab).** `src/h264.rs`'s `submit_bgra` now, on the UDP tunnel only,
+tracks per-frame lag = `last_shipped_frame_id − last_acked_frame_id` (the EGFX
+FrameAcknowledge id, recorded in `on_frame_ack`) and, when it exceeds
+`MACRDP_UDP_EGFX_MAX_FRAME_LAG` (default 16), **drops most captures so the client
+catches up** — capping the queue runaway. The load-bearing subtlety (and the bug in
+the first cut): it must **NOT drop to zero**. mstsc only *presents* — and therefore
+*frame-acks* — an H.264 frame once a couple more arrive behind it (the same
+presentation-buffer behaviour the `--flush-frames` burst feeds). With zero trailing
+frames the client never acks the in-flight ones, `lag` stays pinned one over the
+threshold, every capture is dropped, and the video **freezes permanently** (recovers
+only on reconnect — exactly the reported symptom). The fix keeps a low-rate **trickle**
+(`UDP_THROTTLE_FLOOR`, ~10 fps) flowing while lag is high, so the client keeps
+presenting + acking and the window reopens; dropping *before* encode keeps the H.264
+reference chain valid (the next encoded frame is a P-frame from the client's last
+reference). Net: under load the video degrades to **choppy-but-live** instead of
+freezing.
+
+*(Diagnostic dead-end, recorded so it isn't re-chased: a `sample` of the frozen
+process shows the `egfx-ship` thread parked in `_dispatch_semaphore_wait_slow` — this
+is NOT a stall. Rust's `std::sync::mpsc` implements its blocking `recv()` via a
+libdispatch semaphore on macOS, so an idle ship thread waiting for the next encoded
+frame looks exactly like that. The freeze was upstream of it — the capture-side gate
+dropping every frame so nothing was ever encoded.)*
+
+A fuller rate controller (continuous queue_depth-aware pacing, ideally informed by a
+real-Windows-server capture since the raw `queueDepth` units are oddly large) remains
+finding-#5 future work. Everyday robust config stays `--udp-migrate-egfx` off (and
+`--fork-workers` gives clean in-process reconnect on the TCP path; it's mutually
+exclusive with UDP multitransport).
 
 ### P2.2 lossy-delivery soak (runbook)
 
