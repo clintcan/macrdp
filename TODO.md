@@ -16,9 +16,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
   routed EGFX over an unbound UDP tunnel → frames dropped → blank (fix: reset in the
   `run()` accept loop); (b) listener reused a stale established `Peer` on a same-port
   reconnect → new tunnel never bound, acks dropped (fix: replace the peer when a SYN
-  arrives on an already-established addr). **Verify:** `UDP_MIGRATE_EGFX=1`, connect →
-  disconnect → reconnect mstsc; EGFX should render on reconnect like the first connect.
-  Follows the merged idle-GC (#87). See feasibility doc "M3c reconnect state-reset".
+  arrives on an already-established addr). **Server fix confirmed in the debug log**
+  (conn-2 EGFX pipeline byte-identical to conn-1: surface created+mapped, 3 IDRs
+  shipped, mstsc ACKing over the tunnel). Residual stale-frame on an **in-process**
+  reconnect is the documented mstsc surface-id-0 retention quirk (client-side; reached
+  over UDP exactly as over TCP; the `--fork-workers` cure can't combine with UDP).
+  **Verify the server fix via a FRESH mstsc process** (quit + reopen the app) over UDP
+  → should render cleanly. Follows the merged idle-GC (#87). See feasibility doc
+  "M3c reconnect state-reset".
 
 ## Deferred — scoped, not started
 

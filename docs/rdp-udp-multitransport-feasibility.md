@@ -396,6 +396,26 @@ finding #4 stands — under loss the reliable tunnel HOL-blocks regardless); thi
 about EGFX-over-UDP **reconnect** working at all on a clean link. See vendored server
 divergence (12) "M3c reconnect state-reset".
 
+**What it leaves: the documented mstsc surface-retention quirk, now reached over UDP.**
+After the state-reset fix, a real-mstsc retest (debug log) showed connection 2's EGFX
+pipeline is byte-identical to connection 1's — encoder init, **surface created+mapped,
+3 IDR keyframes shipped** — and **mstsc ACKs the frames over the UDP tunnel** (inbound
+`ACK | DATA` datagrams). So the server ships correctly on reconnect. But every
+per-connection `GraphicsPipelineServer` resets `next_surface_id` to **0**, and on an
+**in-process** reconnect (mstsc.exe kept running, only the connection reopened) mstsc
+**retains surface id 0** and no-ops the `CreateSurface` for an id it already holds → the
+new frames decode into the **stale** surface → the client shows "the last frame before
+the previous disconnect," frozen (input rides TCP and still reaches the Mac — it's the
+*video* that's frozen on the retained surface, so it only *looks* unresponsive). This is
+exactly the **documented mstsc EGFX reconnect-blank quirk** (`known-quirks.md`), now
+reached over UDP identically to TCP — a **client** limitation, not a server bug. The
+normal cure is process-freshness (`--fork-workers`), which is **mutually exclusive with
+UDP multitransport** (the persistent UDP socket can't be owned by a per-connection
+worker) — so EGFX-over-UDP can't use it. Recovery is the same as the TCP case: **fully
+close + reopen mstsc** (a fresh *process* has no retained surface 0 and renders cleanly
+on reconnect — which is also the clean way to verify this server fix). Everyday robust
+config stays `--udp-migrate-egfx` off.
+
 ### P2.2 lossy-delivery soak (runbook)
 
 The first soak (above) shaped the **reliable** EGFX-over-UDP path. This one targets the
