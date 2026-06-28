@@ -325,6 +325,40 @@ reliable-only multitransport.
    Research "URCP: Universal Rate Control Protocol for Real-Time Communication";
    RDP Shortpath docs.)
 
+### M3c peer GC — the listener leaked dead peers (fixed 2026-06-28)
+
+A separate, transport-level correctness bug surfaced from a real mstsc pcap
+(EGFX-over-UDP, `--udp-migrate-egfx`, WiFi): on **reconnect the video went blank**,
+and the user noticed **"the UDP connection continues even after I close the client"**
+(recovery needed a server restart). The pcap confirmed it: after the client's TCP
+session RST'd, the server kept shipping UDP (EGFX retransmits) to the gone client for
+the rest of the capture (~10 s / 32 packets and still going).
+
+Root cause: the listener's `peers: HashMap<SocketAddr, Peer>` was inserted-but-never
+removed — the module doc literally said *"never garbage-collected … GC + idle timeout
+come with M3c"*, and M3c's GC half was never built. So a client whose RDP/TCP session
+went away kept its peer entry forever, and `pump_peers_on_timer` kept RTO-retransmitting
+unacked EGFX to it; over a long-running server dead peers also accumulate unbounded.
+
+Fix (`vendor/ironrdp-server/src/multitransport/listener.rs`, idle-timeout GC):
+`Peer` gained `last_seen_ms`, bumped on **every inbound datagram** (only inbound — a
+dead peer still *sends* outbound retransmits but receives nothing, so its clock
+stops); `gc_idle_peers` runs on the existing `retransmit_tick` (right after
+`pump_peers_on_timer`) and evicts any peer idle > 10 s (`PEER_IDLE_TIMEOUT_MS`),
+dropping its `bound_addrs` cookie→addr mapping too. Activity-based, so it covers
+graceful / abrupt / crashed disconnects uniformly; 10 s is safe because a live client
+— even idle — sends RDPEUDP keepalive/delayed-ACKs continuously (~200/s in a real
+session). Logs `evicted idle UDP peer` at `ironrdp_server::multitransport=debug`.
+
+This is the listener-only **backstop** half of M3c; the prompt server→listener
+"instant retire-on-disconnect" signal is still deferred (the GC is needed regardless).
+**It does NOT by itself fix the reconnect-blank** — the tunnel is TLS-encrypted so the
+pcap can't prove the leak was the *sole* cause, and the documented mstsc EGFX
+surface-retention quirk + the clean-link limit (finding #4) may compound it. The
+robust WiFi config stays `--udp-migrate-egfx` off (EGFX on TCP). Real-mstsc retest of
+the GC (watch for the eviction log ~10 s after close + UDP actually stopping) is the
+gate. See vendored server divergence (12) "M3c idle-timeout peer GC".
+
 ### P2.2 lossy-delivery soak (runbook)
 
 The first soak (above) shaped the **reliable** EGFX-over-UDP path. This one targets the

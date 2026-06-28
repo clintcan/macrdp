@@ -7,7 +7,18 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-_(nothing in flight — see Deferred/Parked below)_
+- [ ] **UDP multitransport peer leak — idle-timeout GC** (branch `fix/udp-peer-idle-gc`;
+  built + clippy/fmt green; **awaiting real-mstsc verification before merge**). Listener
+  `peers` map was inserted-but-never-removed (M3c GC never built), so a dead client kept
+  RTO-retransmitting unacked EGFX for the process lifetime — the user's "UDP doesn't close
+  on disconnect" + blank-on-reconnect pcap. Fix: `Peer.last_seen_ms` bumped on inbound,
+  `gc_idle_peers` evicts peers idle >10s (+ their `bound_addrs`) on the existing tick.
+  **Verify:** temporarily `UDP_MIGRATE_EGFX=1`, run with
+  `RUST_LOG=info,ironrdp_server::multitransport=debug`, connect+close mstsc, confirm an
+  `evicted idle UDP peer` log ~10s later and UDP to the old client stops; then reconnect a
+  fresh mstsc to see if the blank improves (if not → mstsc surface quirk / clean-link
+  limit, answer stays `--udp-migrate-egfx` off). Listener-only backstop; the prompt
+  server→listener instant-retire signal is still deferred. See feasibility doc "M3c peer GC".
 
 ## Deferred — scoped, not started
 

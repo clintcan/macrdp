@@ -19,8 +19,13 @@
 //!   first macrdp↔client capture (our own cookie + the client's resulting hash),
 //!   which is what's needed to derive/verify the exact hash formula; strict
 //!   binding to a specific TCP session lands in M3c.
-//! - Peers are demuxed by source address and never garbage-collected (one client
-//!   in the M3b path); GC + idle timeout come with M3c.
+//! - Peers are demuxed by source address and **idle-timeout garbage-collected**
+//!   (M3c): a peer with no *inbound* datagram for `PEER_IDLE_TIMEOUT_MS` is evicted
+//!   by `gc_idle_peers` (its `peers` entry + any `bound_addrs` cookie→addr mapping),
+//!   so a dead RDP session's reliability SM stops RTO-retransmitting to a gone client
+//!   and the maps don't leak for the process lifetime. The prompt server→listener
+//!   "instant retire-on-disconnect" signal is the still-deferred other half of M3c
+//!   (the idle GC is the needed backstop regardless).
 //!
 //! Cross-platform (pure tokio/std networking), so Linux CI exercises it too — see
 //! the loopback integration test in the macrdp crate (the vendored server is
@@ -116,6 +121,12 @@ struct Peer {
     dtls: Option<DtlsConn>,
     /// Whether we've logged DTLS-handshake completion (avoid log spam).
     dtls_done_logged: bool,
+    /// (M3c) Wall-clock ms (listener `start.elapsed()`) of the last *inbound*
+    /// datagram from this peer. Drives `gc_idle_peers`: a dead client (its RDP/TCP
+    /// session gone) stops acking, so this stops advancing while the reliability SM
+    /// would otherwise RTO-retransmit unacked data to it forever and the
+    /// `peers`/`bound_addrs` entries would leak for the process lifetime.
+    last_seen_ms: u64,
 }
 
 /// (P2.0 spike) Scan a raw RDPEUDP datagram for a **DTLS handshake** record — the
@@ -244,6 +255,47 @@ async fn pump_peers_on_timer(
         if retransmits > 0 || syn_retransmit {
             debug!(peer_addr = %addr, retransmits, syn_retransmit, "RDPEUDP RTO retransmit (timer)");
         }
+    }
+}
+
+/// (M3c) Evict a peer after this many ms with no *inbound* datagram. A live client —
+/// even an idle/quiet one — sends RDPEUDP keepalive/delayed ACKs continuously (a real
+/// session ran ~200 inbound pkts/s), so 10s is a very safe "the client is gone"
+/// threshold; a dead client sends nothing and ages out cleanly.
+const PEER_IDLE_TIMEOUT_MS: u64 = 10_000;
+
+/// (M3c) Idle-timeout garbage collection. Drop every peer whose last *inbound*
+/// datagram is older than `PEER_IDLE_TIMEOUT_MS`, along with any `bound_addrs`
+/// cookie→addr mapping pointing at it. Without this, peers inserted by
+/// `run_recv_loop` are never removed: a client whose RDP/TCP session has gone away
+/// stops acking but the reliability SM keeps RTO-retransmitting unacked EGFX to it
+/// forever (`pump_peers_on_timer`), and over a long-running server dead peers
+/// accumulate unbounded. Activity-based, so it covers graceful, abrupt, and crashed
+/// disconnects uniformly. O(peers) on each `retransmit_tick`; peers is a handful.
+fn gc_idle_peers(
+    peers: &mut HashMap<SocketAddr, Peer>,
+    bound_addrs: &mut HashMap<[u8; 16], SocketAddr>,
+    now_ms: u64,
+) {
+    let gone: Vec<SocketAddr> = peers
+        .iter()
+        .filter(|(_, p)| now_ms.saturating_sub(p.last_seen_ms) > PEER_IDLE_TIMEOUT_MS)
+        .map(|(addr, _)| *addr)
+        .collect();
+    for addr in gone {
+        let idle_ms = peers
+            .remove(&addr)
+            .map(|p| now_ms.saturating_sub(p.last_seen_ms))
+            .unwrap_or(0);
+        // Drop any cookie→addr bindings for the evicted peer so a stale cookie can't
+        // route server tunnel data to it (or to a later peer that reuses the addr).
+        bound_addrs.retain(|_, a| *a != addr);
+        debug!(
+            peer_addr = %addr,
+            idle_ms,
+            timeout_ms = PEER_IDLE_TIMEOUT_MS,
+            "evicted idle UDP peer (no inbound; reliability retransmits stop, state reclaimed)"
+        );
     }
 }
 
@@ -501,6 +553,10 @@ async fn run_recv_loop(
             _ = retransmit_tick.tick() => {
                 let now_ms = start.elapsed().as_millis() as u64;
                 pump_peers_on_timer(&socket, &mut peers, now_ms, cfg.mtu).await;
+                // (M3c) Reap peers whose client has gone away (no inbound for
+                // PEER_IDLE_TIMEOUT_MS) so the dead-peer retransmits above stop and
+                // peers/bound_addrs don't leak. Same tick — cheap, peers is small.
+                gc_idle_peers(&mut peers, &mut bound_addrs, now_ms);
                 continue;
             }
             out = outbound => {
@@ -597,8 +653,13 @@ async fn run_recv_loop(
                 dtls_observed: false,
                 dtls: None,
                 dtls_done_logged: false,
+                last_seen_ms: now_ms,
             }
         });
+        // (M3c) Any inbound datagram is liveness for the idle-GC clock. A dead client
+        // still emits outbound retransmits but receives nothing, so only *inbound*
+        // bumps this — its `last_seen_ms` then stops advancing and it ages out.
+        peer.last_seen_ms = now_ms;
 
         // (P2.0 spike) Before anything else, sniff the raw datagram for a DTLS
         // ClientHello. This fires on a *lossy* flow regardless of whether the

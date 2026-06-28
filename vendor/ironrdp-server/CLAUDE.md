@@ -766,3 +766,28 @@ AND released — #1276 landing is NOT sufficient.
     stays a clean-link feature (reliable ordered stream HOL-blocks under loss — the
     under-loss freeze is the documented structural limit, soak finding #4). All
     `multitransport`-gated; feature-off byte-unchanged.
+
+    M3c idle-timeout peer GC (2026-06-28, `listener.rs`). The listener's
+    `peers: HashMap<SocketAddr, Peer>` was inserted-but-never-removed ("GC + idle
+    timeout come with M3c" — never built), so a client whose RDP/TCP session went away
+    kept its peer entry forever and `pump_peers_on_timer` kept RTO-retransmitting
+    unacked EGFX to it. Reproduced from a real mstsc pcap (EGFX-over-UDP reconnect):
+    after the client's TCP RST the server shipped UDP retransmits to the gone client
+    for the rest of the capture (~10s/32 pkts and still going), and recovery needed a
+    server restart — the user's "the UDP connection doesn't close on disconnect"
+    report. Fix: `Peer` gained `last_seen_ms`, bumped on **every inbound datagram**
+    (only inbound — a dead peer still *sends* outbound retransmits but receives
+    nothing, so its clock stops); a new `gc_idle_peers(peers, bound_addrs, now_ms)`
+    runs on the existing `retransmit_tick` (right after `pump_peers_on_timer`) and
+    evicts any peer idle > `PEER_IDLE_TIMEOUT_MS` (10s), also dropping its
+    `bound_addrs` cookie→addr mapping (`retain(|_, a| *a != gone)`). Activity-based, so
+    it covers graceful / abrupt / crashed disconnects uniformly; 10s is safe because a
+    live client — even idle — sends RDPEUDP keepalive/delayed-ACKs continuously
+    (~200/s in a real session). This is the listener-only backstop half of M3c; the
+    prompt server→listener "instant retire-on-disconnect" signal is still deferred (the
+    GC is needed regardless). Logs `evicted idle UDP peer` at `debug`
+    (`ironrdp_server::multitransport=debug`). Does NOT by itself fix the mstsc EGFX
+    reconnect-blank (a client-side surface-retention quirk + the clean-link limit may
+    compound it); the robust WiFi config remains `--udp-migrate-egfx` off (EGFX on TCP).
+    All `multitransport`-gated; feature-off byte-unchanged. See feasibility doc
+    "M3c peer GC".
