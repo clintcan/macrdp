@@ -989,4 +989,270 @@ mod tests {
         let data = data_only(server.enqueue(now, b"reliable payload").to_send);
         assert_eq!(data.len(), 1, "reliable mode never duplicates");
     }
+
+    // ------------------------------------------------------------------------
+    // Property tests (proptest): randomized adversarial scheduling + shrinking.
+    //
+    // The hand-written `delivers_under_loss_reorder_dup` above samples four
+    // fixed LCG seeds. These instead draw the whole parameter space — loss rate,
+    // reorder depth, duplication, receive window, message size, and (crucially)
+    // initial sequence numbers near the u32 wrap — and SHRINK any failure to a
+    // minimal counterexample. They also assert two invariants the fixed-seed
+    // test never checks: reliable delivery is an in-order prefix at EVERY step
+    // (not just at the end), and the in-flight window never exceeds the peer's
+    // advertised receive window.
+    // ------------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Seeded LCG → a u32 stream (same generator family as the fixed-seed sim).
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    /// Drive a reliable client→server transfer of `msg` over a link that drops
+    /// (`loss_permille`), occasionally duplicates, and delays up to `reorder_max`
+    /// ticks, scheduled by `seed`. Returns `Ok(())` iff every invariant held and
+    /// the whole message was delivered in order; `Err(reason)` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn run_reliable_sim(
+        msg: &[u8],
+        client_isn: u32,
+        server_isn: u32,
+        recv_window: u16,
+        rto_ms: u64,
+        loss_permille: u32,
+        reorder_max: u64,
+        seed: u64,
+    ) -> Result<(), String> {
+        let mk = |isn| Config {
+            recv_window,
+            mtu: 1132,
+            initial_seq: isn,
+            rto_ms,
+            mode: DeliveryMode::Reliable,
+            duplicate_lossy_sends: false,
+        };
+        let mut client = RdpeudpState::new(Role::Client, mk(client_isn));
+        let mut server = RdpeudpState::new(Role::Server, mk(server_isn));
+
+        let mut now = 0u64;
+        // Handshake on a clean link (handshake-under-loss is a separate concern).
+        let o = client.start(now);
+        for dg in o.to_send {
+            let so = server.step(now, Some(&dg));
+            for back in so.to_send {
+                client.step(now, Some(&back));
+            }
+        }
+        now += 1;
+        if !(client.is_established() && server.is_established()) {
+            return Err("handshake did not establish".into());
+        }
+
+        let window_ok = |c: &RdpeudpState| -> Result<(), String> {
+            if c.unacked.len() > c.peer_recv_window as usize {
+                Err(format!(
+                    "send window overflow: unacked {} > peer_recv_window {}",
+                    c.unacked.len(),
+                    c.peer_recv_window
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let mut rng = seed | 1;
+        // In-flight datagrams as (deliver_at_tick, bytes).
+        let mut c2s: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut s2c: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        let first = client.enqueue(now, msg);
+        window_ok(&client)?;
+        for dg in first.to_send {
+            c2s.push((now, dg));
+        }
+
+        let mut delivered: Vec<u8> = Vec::new();
+        let budget = 300_000usize;
+        for _ in 0..budget {
+            if delivered.len() >= msg.len() && c2s.is_empty() && s2c.is_empty() {
+                break;
+            }
+
+            // client → server
+            let (due, held): (Vec<_>, Vec<_>) = c2s.into_iter().partition(|(t, _)| *t <= now);
+            c2s = held;
+            for (_, dg) in due {
+                if u64::from(lcg(&mut rng)) % 1000 < u64::from(loss_permille) {
+                    continue;
+                }
+                let times = if lcg(&mut rng) % 1000 < 50 { 2 } else { 1 };
+                for _ in 0..times {
+                    let so = server.step(now, Some(&dg));
+                    for p in so.delivered {
+                        delivered.extend_from_slice(&p);
+                        // INVARIANT: reliable is in-order + exactly-once, so the
+                        // delivered byte-stream is always a prefix of msg.
+                        if !msg.starts_with(&delivered) {
+                            return Err(format!(
+                                "out-of-order/duplicate/corrupt delivery at len {}",
+                                delivered.len()
+                            ));
+                        }
+                    }
+                    for back in so.to_send {
+                        let delay = u64::from(lcg(&mut rng)) % (reorder_max + 1);
+                        s2c.push((now + delay, back));
+                    }
+                }
+            }
+
+            // server → client (acks)
+            let (due, held): (Vec<_>, Vec<_>) = s2c.into_iter().partition(|(t, _)| *t <= now);
+            s2c = held;
+            for (_, dg) in due {
+                if u64::from(lcg(&mut rng)) % 1000 < u64::from(loss_permille) {
+                    continue;
+                }
+                let co = client.step(now, Some(&dg));
+                window_ok(&client)?;
+                for back in co.to_send {
+                    let delay = u64::from(lcg(&mut rng)) % (reorder_max + 1);
+                    c2s.push((now + delay, back));
+                }
+            }
+
+            now += 1;
+            // Periodic timer tick: fires RTO retransmits + drains any window that
+            // re-opened as acks arrived.
+            if now.is_multiple_of(50) {
+                let ct = client.step(now, None);
+                window_ok(&client)?;
+                for dg in ct.to_send {
+                    c2s.push((now, dg));
+                }
+                for dg in server.step(now, None).to_send {
+                    s2c.push((now, dg));
+                }
+            }
+        }
+
+        if delivered != msg {
+            return Err(format!(
+                "did not converge: delivered {} of {} bytes",
+                delivered.len(),
+                msg.len()
+            ));
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// Reliable transfer survives random loss/reorder/dup AND keeps both
+        /// invariants (in-order prefix at every step; window never exceeds the
+        /// peer's advertised window), across the full sequence-number space.
+        #[test]
+        fn prop_reliable_in_order_under_adversary(
+            msg in proptest::collection::vec(any::<u8>(), 0..6000),
+            client_isn in prop_oneof![Just(u32::MAX - 3), Just(u32::MAX), 0u32..16, any::<u32>()],
+            server_isn in any::<u32>(),
+            recv_window in 1u16..=16,
+            rto_ms in 40u64..=300,
+            loss_permille in 0u32..=250,
+            reorder_max in 0u64..=3,
+            seed in any::<u64>(),
+        ) {
+            match run_reliable_sim(
+                &msg, client_isn, server_isn, recv_window, rto_ms, loss_permille, reorder_max, seed,
+            ) {
+                Ok(()) => {}
+                Err(e) => prop_assert!(false, "{e}"),
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// Lossy mode delivers every payload in order on a clean link and NEVER
+        /// retransmits (no `unacked`, so the RTO loop is always a no-op).
+        #[test]
+        fn prop_lossy_clean_link_delivers_in_order_never_retransmits(
+            msg in proptest::collection::vec(any::<u8>(), 1..4000),
+            recv_window in 1u16..=16,
+        ) {
+            let mk = |isn| Config {
+                recv_window,
+                mtu: 1132,
+                initial_seq: isn,
+                rto_ms: 50,
+                mode: DeliveryMode::Lossy,
+                duplicate_lossy_sends: false,
+            };
+            let mut client = RdpeudpState::new(Role::Client, mk(1000));
+            let mut server = RdpeudpState::new(Role::Server, mk(9000));
+            let mut now = 0u64;
+            let o = client.start(now);
+            for dg in o.to_send {
+                let so = server.step(now, Some(&dg));
+                for back in so.to_send {
+                    client.step(now, Some(&back));
+                }
+            }
+            now += 1;
+            prop_assert!(client.is_established() && server.is_established());
+
+            let out = client.enqueue(now, &msg);
+            let mut retransmits = out.retransmits;
+            let mut delivered: Vec<u8> = Vec::new();
+            let mut wire = out.to_send;
+            for _ in 0..4000 {
+                if wire.is_empty() {
+                    break;
+                }
+                let mut next = Vec::new();
+                for dg in wire.drain(..) {
+                    let so = server.step(now, Some(&dg));
+                    retransmits += so.retransmits;
+                    for p in so.delivered {
+                        delivered.extend_from_slice(&p);
+                    }
+                    for back in so.to_send {
+                        let co = client.step(now, Some(&back));
+                        retransmits += co.retransmits;
+                        next.extend(co.to_send);
+                    }
+                }
+                now += 1;
+                wire = next;
+            }
+            prop_assert_eq!(retransmits, 0, "lossy mode must never retransmit");
+            prop_assert_eq!(delivered, msg, "clean lossy link delivers every payload in order");
+        }
+    }
+
+    /// Deterministic boundary: ISN near u32::MAX so `send_next` wraps past 0
+    /// mid-transfer (~8 source packets), exercising `seq_leq`'s wrap logic in
+    /// both `process_ack` and source reassembly on a clean link.
+    #[test]
+    fn delivers_across_seq_wraparound() {
+        let msg: Vec<u8> = (0..8000u32).map(|i| (i % 251) as u8).collect();
+        let res = run_reliable_sim(
+            &msg,
+            u32::MAX - 2, // SYN at MAX-2 → first data MAX-1, then MAX, 0, 1, ...
+            0x1234,
+            8,
+            100,
+            0, // no loss — isolate the wrap arithmetic
+            0,
+            1,
+        );
+        assert!(res.is_ok(), "{}", res.err().unwrap());
+    }
 }

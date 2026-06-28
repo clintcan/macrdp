@@ -35,6 +35,24 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
 
 ## Milestone status
 
+- **Property tests (done, 2026-06-28):** `proptest` (a `[dev-dependencies]` — only
+  pulled by the standalone test build, so the macrdp build graph is unchanged) drives
+  three randomized properties in `state.rs`'s `mod tests`, complementing the
+  hand-written four-seed `delivers_under_loss_reorder_dup` sim. They draw the whole
+  parameter space (loss 0–25 %, reorder 0–3 ticks, dup, recv window 1–16, msg ≤6 KB,
+  and **ISNs near the u32 wrap**) and SHRINK any failure: (1)
+  `prop_reliable_in_order_under_adversary` asserts two invariants the fixed-seed sim
+  never checked — reliable delivery is an in-order **prefix of the message at EVERY
+  step** (not just at the end), and the in-flight window **never exceeds the peer's
+  advertised recv window** (`unacked.len() <= peer_recv_window`, checked after every
+  client pump) — plus eventual full convergence; (2)
+  `prop_lossy_clean_link_delivers_in_order_never_retransmits` (lossy `retransmits==0`
+  always, clean link delivers all in order); (3) `delivers_across_seq_wraparound`
+  (deterministic boundary: ISN `u32::MAX-2`, ~8 packets so `send_next` wraps past 0).
+  **Why proptest, not loom:** this crate is sans-I/O (no atomics/locks/threads), so
+  loom has nothing to model; the real coverage gap was randomized scheduling +
+  invariant assertions, which proptest provides. 53 crate tests.
+
 - **P2.3 FEC pivot — 1+1 lossy duplicate sends (done, 2026-06-27):** real
   Reed-Solomon FEC is structurally unavailable (a real-Windows capture shows modern
   mstsc negotiates RDPUDP2, which has no FEC — see

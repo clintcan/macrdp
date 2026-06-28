@@ -9,6 +9,12 @@ publish = false
 [lib]
 doctest = false
 
+[dev-dependencies]
+# Property-based testing of the reliability state machine: randomized adversarial
+# scheduling (loss / reorder / dup / window / sequence-wraparound) with shrinking,
+# complementing the hand-written fixed-seed simulation in `state.rs`.
+proptest = "1"
+
 [dependencies]
 # Resolved to the same git-pinned IronRDP rev as the rest of macrdp: in the
 # macrdp build, the ROOT Cargo.toml's [patch.crates-io] redirects this; built
