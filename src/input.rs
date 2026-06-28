@@ -1744,31 +1744,43 @@ mod macos {
     /// released, and lazily from cycle_apps when the grace timeout
     /// has elapsed.
     fn commit_cycle_session() {
-        let cursor_pid = {
+        // Take the session out under the CYCLE_SESSION lock, then DROP the lock
+        // (it's confined to this block) before any HUD / AX / mru /
+        // LAST_FOCUS_BUNDLE work below — those acquire OTHER mutexes, and holding
+        // CYCLE_SESSION across them would nest locks (the same lock-order hazard
+        // removed from h264 `ship_frames`: LAST_FOCUS_BUNDLE is written cross-
+        // thread by the focus observer / click hit-test). Nothing below needs the
+        // session map locked, only the taken session's data. The session is
+        // already `take()`n, so a racing cycle_apps just starts a fresh one — the
+        // correct outcome after a commit.
+        let session = {
             let mut guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
-            let Some(session) = guard.take() else { return };
-            // A session existed → tear down the on-screen HUD (best-effort).
-            if super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::switcher_hud::hide();
+            match guard.take() {
+                Some(s) => s,
+                None => return,
             }
-            if let Some((bundle, _, _)) = session
-                .snapshot
-                .iter()
-                .find(|(_, _, p)| *p == session.cursor_pid)
-            {
-                promote_bundle_to_front(bundle);
-                // Record the landed app as the current focus for the Ctrl→Cmd
-                // remap. Its `frontmost_is_excluded` reads LAST_FOCUS_BUNDLE
-                // first, and our own Cmd+Tab/Option+Tab AX activation doesn't
-                // reliably post an NSWorkspace activation — so without this,
-                // cycling from an excluded app (terminal/VSCode) to a normal one
-                // left the remap suppressed until the user clicked the new app.
-                if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
-                    *g = Some(bundle.clone());
-                }
-            }
-            session.cursor_pid
         };
+        // A session existed → tear down the on-screen HUD (best-effort).
+        if super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::switcher_hud::hide();
+        }
+        if let Some((bundle, _, _)) = session
+            .snapshot
+            .iter()
+            .find(|(_, _, p)| *p == session.cursor_pid)
+        {
+            promote_bundle_to_front(bundle);
+            // Record the landed app as the current focus for the Ctrl→Cmd
+            // remap. Its `frontmost_is_excluded` reads LAST_FOCUS_BUNDLE
+            // first, and our own Cmd+Tab/Option+Tab AX activation doesn't
+            // reliably post an NSWorkspace activation — so without this,
+            // cycling from an excluded app (terminal/VSCode) to a normal one
+            // left the remap suppressed until the user clicked the new app.
+            if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
+                *g = Some(bundle.clone());
+            }
+        }
+        let cursor_pid = session.cursor_pid;
         // On commit (Cmd release), re-assert the landed app and, if it has no
         // window (e.g. Notes/Calendar/Mail with their window closed), reopen it so
         // it surfaces — both gated to commit so apps merely cycled *through* aren't
