@@ -1,6 +1,6 @@
 [package]
 name = "macrdp"
-version = "0.8.17"
+version = "0.8.18"
 edition = "2021"
 description = "Native RDP server for macOS"
 license = "MIT OR Apache-2.0"
