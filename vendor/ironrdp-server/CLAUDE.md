@@ -821,5 +821,12 @@ AND released — #1276 landing is NOT sufficient.
     already `is_established()`, it's a new flow on a reused port → remove the stale peer
     (+ its `bound_addrs` cookie bindings) so a fresh one is built and the new tunnel
     binds cleanly. A SYN on a still-handshaking peer is a normal SYN retransmit
-    (`is_established()` gates it out). All `multitransport`-gated; feature-off
-    byte-unchanged. See feasibility doc "M3c reconnect state-reset".
+    (`is_established()` gates it out). **Verified on real mstsc** — multi-cycle reconnect
+    now renders and stays responsive. **Residual (NOT this fix):** reconnect still freezes
+    *intermittently* under stress because the EGFX path never throttles on the client's
+    `queueDepth` (`GfxHandler::on_frame_ack` only records timing) → the client's frame
+    queue can run away (peak ~352k) → frozen display + RDPEUDP ACK storm. That's the
+    rate-control gap (finding #5), tracked separately; the earlier "mstsc
+    surface-retention quirk" guess was disproven (it reproduced on a fresh mstsc process).
+    All `multitransport`-gated; feature-off byte-unchanged. See feasibility doc
+    "M3c reconnect state-reset".
