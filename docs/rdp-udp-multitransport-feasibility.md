@@ -332,6 +332,24 @@ reliable-only multitransport.
    the watchdog *escapes* a dead tunnel; rate control *prevents* the wedge and also
    helps the TCP path.
 
+   **SHIPPED 2026-06-29 — rate control P1: adaptive bitrate (`--adaptive-bitrate`).**
+   The first piece of the congestion-responsive controller. Loss signal: the UDP
+   listener accumulates reliable-tunnel **retransmits** into a shared counter
+   (`Arc<AtomicU64>`, threaded through `bind`/`run_recv_loop`); the H.264 controller
+   (`src/h264.rs::adaptive_bitrate_step`, pure `aimd_bitrate`, unit-tested) samples
+   the per-interval delta and runs **AIMD**: multiplicative-decrease the VideoToolbox
+   target toward a floor on any loss, additive-increase toward the `--bitrate` ceiling
+   when clean. Lever: `Encoder::set_bitrate` live-sets `AverageBitRate` on the running
+   VT session (no rebuild → reference chain intact). Opt-in, EGFX-over-UDP only (no-op
+   on TCP). **Verified on real mstsc under clumsy UDP-only loss: at 8% the bitrate
+   dropped and video stayed alive with NO wedge** (the controller kept the tunnel under
+   its window — the win); at sustained 12% it still wedged → watchdog → TCP. Uses the
+   retransmit signal only; CN/RTT/window and the levers below are P2/P3. **Follow-up
+   found in the same test:** under *sustained* heavy loss, ~60s after a watchdog
+   de-migration mstsc resets the session (its multitransport dead-tunnel timeout on the
+   now-silent UDP tunnel) — fix is to keepalive or cleanly close the abandoned tunnel
+   on de-migrate (TODO).
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a

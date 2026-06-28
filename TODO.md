@@ -7,13 +7,31 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- (nothing in flight — EGFX-over-UDP → TCP watchdog shipped as #93, verified on real
-  mstsc under clumsy UDP-only loss)
+- [ ] **Congestion-responsive rate control — P1: adaptive bitrate** (`--adaptive-bitrate`).
+  Built + verified on real mstsc under clumsy UDP-only loss: at 8% the bitrate dropped
+  (AIMD on the reliable-tunnel retransmit signal) and video **stayed alive with no wedge**;
+  at sustained 12% it still wedged → watchdog → TCP (the backstop). Branch
+  `feat/udp-adaptive-bitrate`. **Awaiting CI + merge.** P2/P3 (IDR-backoff, frame-drop
+  integration, TCP adapter, real-server capture tuning) remain in the item below.
+
+- [ ] **Watchdog follow-up: keep the de-migrated UDP tunnel from timing out.** Found
+  2026-06-29 during P1 testing: under *sustained* heavy loss the watchdog de-migrates EGFX
+  to TCP (video keeps running), but ~60s later **mstsc resets the whole session**
+  (`Connection reset by peer`) — its multitransport dead-tunnel timeout, since the UDP
+  tunnel it Soft-Synced EGFX onto goes silent after de-migration. Fix: after de-migration,
+  either send RDPEUDP **keepalives** on the abandoned tunnel so mstsc doesn't time out, or
+  cleanly **close** the multitransport tunnel so mstsc stops expecting it. Must distinguish
+  "de-migrated, client still here" from "client gone" (interacts with the 60s idle-GC).
+  Still strictly better than the pre-watchdog permanent freeze; only bites under sustained
+  loss. See the `feat/udp-adaptive-bitrate` test log (wedge 23:44:49 → reset 23:45:50).
 
 ## Deferred — scoped, not started
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
-  video-under-loss work — helps BOTH the default TCP path and UDP). **Concrete
+  video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)
+  SHIPPING — see In-flight above;** the remaining P2/P3 sub-pieces (IDR-backoff under the
+  controller, frame-drop integration, the TCP-path adapter, and tuning the control law
+  against a real-Windows-server capture) are below. **Concrete
   manifestation found 2026-06-28:** EGFX-over-UDP reconnect freezes *intermittently*
   because the server never throttles on the client's EGFX `queueDepth` —
   `GfxHandler::on_frame_ack` only records ack timing, so macrdp ships at full rate while

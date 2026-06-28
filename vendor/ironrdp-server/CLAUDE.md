@@ -874,3 +874,14 @@ AND released — #1276 landing is NOT sufficient.
     at `since_ack_ms≈7.7s` (real wedges dribble acks before going fully silent, vs.
     the deterministic injection's clean ~3s) and EGFX recovered on TCP — no permanent
     freeze. A future ack-lag-pegged secondary trigger could shorten recovery.
+    **Adaptive-bitrate loss signal (added 2026-06-29):** the UDP listener
+    (`multitransport/listener.rs`) accumulates reliable-tunnel **retransmits** into a
+    shared `Arc<AtomicU64>` so macrdp's H.264 controller can do congestion-responsive
+    bitrate (AIMD). Threaded as a new last param through
+    `UdpMultitransportListener::bind` → `run_recv_loop` alongside the existing tls/dtls
+    Arcs (NOT in `ListenerConfig`, which stays `Copy`), bumped at all three `sm.step()`
+    retransmit sites via a `bump_loss` closure + `pump_peers_on_timer`'s return value.
+    `None` = not wired. See `src/h264.rs::adaptive_bitrate_step` + feasibility doc
+    "rate control P1". **Watchdog follow-up (TODO):** under sustained loss mstsc resets
+    ~60s after a de-migration (its multitransport dead-tunnel timeout on the now-silent
+    UDP tunnel) — keepalive or cleanly close the abandoned tunnel on de-migrate.
