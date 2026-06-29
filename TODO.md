@@ -30,11 +30,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   with `--bitrate 8` on a pure-TCP session, clean connect via the cold-start guard, gentle
   8M↔5.6M sawtooth backoff/recovery under 5% TCP drop — see the feasibility doc "P3" note;
   ack-lag on TCP is a real but spiky/lower-amplitude signal, tuned via a ¾·max_frame_lag
-  threshold). Remaining sub-pieces: **P2b** frame-drop / fps reduction when bitrate is at
-  the floor; a **stronger TCP signal** (`TCP_CONNECTION_INFO` RTT+retransmits / write-
-  backpressure — less spiky than ack-lag, would let EWMA smoothing be dropped); the
-  CN/RTT/window signals; **EWMA smoothing/hysteresis** on the controller (deferred polish
-  to reduce the residual dip + catch-up speed-up); and tuning the control law against a
+  threshold). **EWMA smoothing + hysteresis + 3-zone hold SHIPPED 2026-06-29** (verified
+  mstsc: per-spike sawtooth → one gentle step-and-recover per episode; A/V more in sync,
+  catch-up speed-up cut, "video sometimes stops" gone — see feasibility doc). Remaining
+  sub-pieces: **P2b** frame-drop / fps reduction when bitrate is at the floor; a **stronger
+  TCP signal** (`TCP_CONNECTION_INFO` RTT+retransmits / write-backpressure — less spiky
+  than ack-lag); the CN/RTT/window signals; and tuning the control law against a
   real-Windows-server capture. **Concrete
   manifestation found 2026-06-28:** EGFX-over-UDP reconnect freezes *intermittently*
   because the server never throttles on the client's EGFX `queueDepth` —
@@ -85,12 +86,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
   sync primitive** (RDPSND + EGFX are independent channels, no shared clock/PTS) → true
   lip-sync is impossible, only *reduce* drift. The P3 adaptive video catches up (speeds/
   slows) while fixed-rate audio can't, which makes the drift visible. Two partial levers,
-  both deferred: **A** — EWMA/hysteresis smoothing of the video controller (recommended
-  first; fixes the cause — video timing swings — with no audio-quality cost; also smooths
-  the residual P3 dip/catch-up); **B** — tighten the audio-lag resync (vendored
-  `dispatch_audio`, ~300 ms threshold tuned for resize-freezes, not slow drift) to keep
-  audio live, at the cost of choppier audio. Try A first. Detail: `project_av_sync_under_drops`
-  memory + the rate-control "Design shape" above.
+  two levers: **A** — EWMA/hysteresis smoothing of the video controller (**DONE
+  2026-06-29**, shipped with the rate-control EWMA work above; user confirmed "audio more
+  in sync" + less catch-up speed-up); **B** (remaining) — tighten the audio-lag resync
+  (vendored `dispatch_audio`, ~300 ms threshold tuned for resize-freezes, not slow drift)
+  to keep audio live, at the cost of choppier audio. Lever A substantially improved it;
+  B only if the residual drift/skips still bother in daily use. Detail:
+  `project_av_sync_under_drops` memory.
 - [ ] **EGFX-over-UDP watchdog — ack-lag-pegged secondary trigger** (refinement of the
   shipped watchdog above). The watchdog fires on ~3s of *fully silent* acks; a real wedge
   dribbles a few stray acks before going silent, so it latched at `since_ack_ms≈7.7s` in

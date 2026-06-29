@@ -413,6 +413,29 @@ reliable-only multitransport.
    refinements (CN/RTT/window signals; `TCP_CONNECTION_INFO` for a stronger, less spiky
    TCP signal; frame-drop P2b) remain.
 
+   **SHIPPED 2026-06-29 — EWMA smoothing + hysteresis + 3-zone hold.** The deferred
+   polish, built after the user reported A/V drift + a catch-up speed-up under loss (the
+   raw ack-lag is spiky — TCP bursts 0↔40 even at moderate loss — so a naive per-interval
+   threshold pumped the bitrate, and the video then sped up to catch up while fixed-rate
+   audio couldn't, drifting). Three parts, all pure + unit-tested: (1) **EWMA** the
+   ack-lag (`α` default 0.3, `MACRDP_ADAPTIVE_EWMA_ALPHA`), fed only real samples (skipped
+   during warmup/ack-suspend so the startup backlog can't pre-load it), so single bursts
+   don't trip a back-off — only sustained high lag does. (2) **Hysteresis**
+   (`congested_hysteresis`): enter at the high mark, stay until below half it — no
+   flip-flop straddling one threshold; a retransmit still forces congested. (3)
+   **3-zone hold** (`rate_action`): decrease above high, **hold** while the EWMA decays
+   through the [low, high] band, increase once cleared — without the hold, a single spike
+   kept decreasing every interval as the EWMA decayed back through the band, cratering the
+   bitrate toward the floor ("video sometimes stops"); now a single spike = one step down
+   then a plateau, while *sustained* congestion still rides to the floor. **Verified on
+   real mstsc** (pure-TCP, `--bitrate 8`, 5 % clumsy drop): per-spike sawtooth → one gentle
+   step-and-recover per genuine episode (dips bottomed at ~2.7–3.9 M vs the pre-hold
+   1.0–1.9 M), **A/V noticeably more in sync, the catch-up speed-up cut, and "video
+   sometimes stops" gone**. Applies to both transports. **Residual:** audio still *skips*
+   under sustained drop (5 % loss hits RDPSND directly + the audio-lag model drops stale
+   waves to keep sync — the skip is the cost of the better sync; lever B / audio-resync
+   tuning, deferred — see the `project_av_sync_under_drops` note).
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a
