@@ -1035,6 +1035,12 @@ mod macos {
                     let resume_keyframe = if self.was_suppressed {
                         self.was_suppressed = false;
                         tracing::debug!("client un-suppress edge — forcing IDR on next encode");
+                        // If EGFX is on the reliable UDP tunnel, mstsc's surface
+                        // won't survive the minimize/restore — switch back to TCP
+                        // BEFORE shipping the restore frame into the now-stale
+                        // tunnel (no-op on TCP/lossy/default; see
+                        // `Gfx::demigrate_on_resume`).
+                        gfx.demigrate_on_resume();
                         true
                     } else {
                         false

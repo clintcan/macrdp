@@ -722,6 +722,47 @@ impl Gfx {
         }
     }
 
+    /// Proactively de-migrate EGFX off the reliable UDP tunnel back onto TCP when
+    /// the client comes out of a minimize (SuppressOutput → restore).
+    ///
+    /// Once the EGFX channel has been Soft-Sync-migrated onto the reliable UDP
+    /// tunnel, mstsc's surface does NOT survive a minimize/restore: on restore the
+    /// picture freezes and the watchdog's *reactive* de-migrate (3–6 s later, after
+    /// we've already shipped frames into the now-stale tunnel) is too late to heal
+    /// it — recovery needs a fresh mstsc. The fix is to switch the transport back to
+    /// TCP on the un-suppress edge, BEFORE shipping a single frame back into the
+    /// post-minimize tunnel, so the forced restore-IDR lands over TCP (which mstsc
+    /// renders cleanly across minimize, exactly like an EGFX-on-TCP-from-start
+    /// session). One-way per connection (the `demigrated` latch), and a no-op unless
+    /// EGFX is currently on the reliable UDP tunnel → the TCP/default path and the
+    /// lossy path are byte-unchanged.
+    pub fn demigrate_on_resume(&self) {
+        let on_reliable_udp =
+            self.egfx_on_udp.load(Ordering::Relaxed) && !self.egfx_on_lossy.load(Ordering::Relaxed);
+        if !on_reliable_udp {
+            return; // not on the reliable UDP tunnel → nothing to switch
+        }
+        let mut guard = self.ctx.lock().unwrap();
+        let Some(ctx) = guard.as_mut() else {
+            return;
+        };
+        if ctx.demigrated {
+            return; // already on TCP for this session
+        }
+        ctx.need_keyframe = true;
+        ctx.last_acked_frame_id.store(
+            ctx.last_shipped_frame_id.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        ctx.demigrated = true;
+        self.demigrate_request.store(true, Ordering::Relaxed);
+        warn!(
+            "client resumed from minimize while EGFX was on the reliable UDP tunnel — \
+             proactively de-migrating to TCP (one-way for this session) so the restore \
+             IDR lands over TCP instead of a stale tunnel"
+        );
+    }
+
     /// Feed one full-frame BGRA buffer. Never blocks on the encoder.
     ///
     /// `request_keyframe` asks for the next encoded frame to be a forced IDR —
