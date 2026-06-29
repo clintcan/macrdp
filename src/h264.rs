@@ -830,13 +830,14 @@ impl Gfx {
             IdrBackoff::Stretch => {
                 ctx.idr_backed_off = true;
                 actions.keyframe_frames = Some(self.stretched_keyframe_frames);
-                debug!("EGFX IDR backoff: suppressing periodic keyframe under congestion");
+                // info (not debug): fires at most once per congestion episode.
+                info!("EGFX IDR backoff: suppressing periodic keyframe under congestion");
             }
             IdrBackoff::Restore => {
                 ctx.idr_backed_off = false;
                 actions.keyframe_frames = Some(self.normal_keyframe_frames);
                 ctx.need_keyframe = true; // one clean recovery IDR now the link is clear
-                debug!(
+                info!(
                     "EGFX IDR backoff: link recovered — restoring periodic keyframe + forcing recovery IDR"
                 );
             }
