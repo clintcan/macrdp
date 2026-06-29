@@ -191,6 +191,10 @@ struct ConnectionContext {
     adaptive_target_bps: u32,
     adaptive_last_control: Instant,
     adaptive_last_retransmits: u64,
+    /// P2a IDR-backoff state: true while the periodic keyframe is suppressed
+    /// (stretched) because the tunnel is congested. Restored (+ one recovery IDR)
+    /// when the link fully recovers. See [`idr_backoff_decision`].
+    idr_backed_off: bool,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -299,6 +303,46 @@ fn aimd_bitrate(
     }
 }
 
+/// What the IDR-backoff sub-controller (P2a) should do this interval. A periodic
+/// keyframe is a big intra frame — the worst thing to inject into a congested,
+/// backed-up tunnel — so under congestion we **stretch** the keyframe interval
+/// (effectively suppressing the periodic IDR) and **restore** it (plus force one
+/// clean recovery IDR) once the link has fully recovered. Safe on the RELIABLE
+/// tunnel: reliable delivery means there's no loss-corruption to heal, so the
+/// periodic IDR is only a decode-glitch safety net we can defer until clear.
+#[derive(Debug, PartialEq, Eq)]
+enum IdrBackoff {
+    /// Loss started and we're not yet backed off → suppress the periodic IDR.
+    Stretch,
+    /// Fully recovered (clean + back at the bitrate ceiling) while backed off →
+    /// restore the normal interval and force one recovery IDR.
+    Restore,
+    /// No change this interval.
+    Hold,
+}
+
+/// Pure IDR-backoff decision (P2a). `loss` = any reliable retransmit this interval;
+/// `new_target`/`ceiling` are the post-AIMD bitrate and its ceiling; `backed_off`
+/// is the current state. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+fn idr_backoff_decision(loss: bool, new_target: u32, ceiling: u32, backed_off: bool) -> IdrBackoff {
+    if loss && !backed_off {
+        IdrBackoff::Stretch
+    } else if !loss && new_target >= ceiling && backed_off {
+        IdrBackoff::Restore
+    } else {
+        IdrBackoff::Hold
+    }
+}
+
+/// Encoder adjustments the adaptive controller wants applied this frame: the P1
+/// bitrate and the P2a keyframe interval. `None` fields = no change. The controller
+/// also sets `ctx.need_keyframe` directly when forcing a recovery IDR.
+#[derive(Default)]
+struct AdaptiveActions {
+    bitrate_bps: Option<u32>,
+    keyframe_frames: Option<u32>,
+}
+
 /// Read the ack-recovery config from the environment once. Returns
 /// `(enabled, params)`; disabled (default) keeps the feature off and the path
 /// byte-identical. Tunables: `MACRDP_UDP_EGFX_ACK_STALL_MS` (200),
@@ -398,6 +442,11 @@ pub struct Gfx {
     adaptive_increase_bps: u32,
     adaptive_decrease: f32,
     adaptive_interval: Duration,
+    /// P2a IDR backoff: the normal periodic-keyframe interval (frames, from
+    /// `--keyframe-interval`) restored on recovery, and the stretched value used to
+    /// suppress the periodic IDR under congestion.
+    normal_keyframe_frames: u32,
+    stretched_keyframe_frames: u32,
     /// Cumulative reliable-tunnel retransmit count, bumped by the UDP listener and
     /// sampled (as deltas) by the controller. Shared `Arc` like the egfx flags.
     congestion_retransmits: Arc<AtomicU64>,
@@ -469,6 +518,13 @@ impl Gfx {
             .filter(|&f| f > 0.0 && f < 1.0)
             .unwrap_or(0.7);
         let adaptive_interval = watchdog_ms("MACRDP_UDP_ADAPTIVE_INTERVAL_MS", 300);
+        // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
+        // derivation as Encoder::new), and a stretched value (~10 min) that
+        // effectively suppresses the periodic IDR for the duration of a congestion
+        // episode without a hard "never" (VT still honors forced keyframes).
+        let normal_keyframe_frames =
+            (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
+        let stretched_keyframe_frames = fps.saturating_mul(600).max(normal_keyframe_frames + 1);
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -488,8 +544,10 @@ impl Gfx {
                 increase_bps = adaptive_increase_bps,
                 decrease = adaptive_decrease,
                 interval_ms = adaptive_interval.as_millis() as u64,
-                "EGFX adaptive bitrate ENABLED (--adaptive-bitrate) — congestion-responsive \
-                 rate control, active only while EGFX is on a UDP tunnel"
+                normal_keyframe_frames,
+                stretched_keyframe_frames,
+                "EGFX adaptive bitrate + IDR backoff ENABLED (--adaptive-bitrate) — \
+                 congestion-responsive rate control, active only while EGFX is on a UDP tunnel"
             );
         }
         Self {
@@ -515,6 +573,8 @@ impl Gfx {
             adaptive_increase_bps,
             adaptive_decrease,
             adaptive_interval,
+            normal_keyframe_frames,
+            stretched_keyframe_frames,
             congestion_retransmits,
         }
     }
@@ -695,16 +755,22 @@ impl Gfx {
             let Some(ctx) = guard.as_mut() else {
                 return Ok(true);
             };
-            // Congestion-responsive bitrate (P1): compute the new target (mutates
-            // ctx adaptive state) BEFORE borrowing the encoder, then apply it live.
-            // No-op unless adaptive is enabled AND EGFX is on a UDP tunnel.
-            let new_bitrate = self.adaptive_bitrate_step(ctx);
+            // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
+            // the adjustments (mutates ctx adaptive state, may set need_keyframe)
+            // BEFORE borrowing the encoder, then apply them live. No-op unless
+            // adaptive is enabled AND EGFX is on a UDP tunnel.
+            let adaptive = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
                 return Ok(true);
             };
-            if let Some(bps) = new_bitrate {
+            if let Some(bps) = adaptive.bitrate_bps {
                 if let Err(e) = encoder.set_bitrate(bps) {
                     trace!(error = ?e, bps, "adaptive set_bitrate failed");
+                }
+            }
+            if let Some(frames) = adaptive.keyframe_frames {
+                if let Err(e) = encoder.set_keyframe_interval(frames) {
+                    trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
                 }
             }
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
@@ -713,31 +779,38 @@ impl Gfx {
         Ok(true)
     }
 
-    /// Congestion-responsive bitrate controller (P1, AIMD). Called once per capture
-    /// from `submit_bgra` while holding the ctx lock; rate-limited to one step per
-    /// `adaptive_interval`. Reads the shared cumulative-retransmit loss counter the
-    /// UDP listener bumps and, per interval: **multiplicative-decrease** the target
-    /// toward `adaptive_floor_bps` if any loss occurred, else **additive-increase**
-    /// toward the `bitrate_bps` ceiling. Returns `Some(bps)` when the target changed
-    /// (the caller live-sets it on the VT session). No-op (returns `None`) unless
-    /// the feature is enabled and EGFX is on a UDP tunnel — so TCP stays byte-identical.
-    fn adaptive_bitrate_step(&self, ctx: &mut ConnectionContext) -> Option<u32> {
+    /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
+    /// once per capture from `submit_bgra` while holding the ctx lock; rate-limited to
+    /// one step per `adaptive_interval`. Reads the shared cumulative-retransmit loss
+    /// counter the UDP listener bumps and, per interval:
+    /// - **bitrate:** multiplicative-decrease toward `adaptive_floor_bps` on any loss,
+    ///   else additive-increase toward the `bitrate_bps` ceiling;
+    /// - **IDR backoff:** stretch the periodic keyframe interval (suppress the
+    ///   periodic IDR) when congestion starts, restore it + force one recovery IDR
+    ///   when the link is fully recovered (clean + back at the ceiling).
+    ///
+    /// Returns the encoder adjustments to apply this frame; may also set
+    /// `ctx.need_keyframe`. A no-op (`AdaptiveActions::default()`) unless the feature
+    /// is enabled and EGFX is on a UDP tunnel — so the TCP path stays byte-identical.
+    fn adaptive_bitrate_step(&self, ctx: &mut ConnectionContext) -> AdaptiveActions {
+        let mut actions = AdaptiveActions::default();
         if !self.adaptive_enabled || !self.egfx_on_udp.load(Ordering::Relaxed) {
-            return None;
+            return actions;
         }
         let now = Instant::now();
         if now.duration_since(ctx.adaptive_last_control) < self.adaptive_interval {
-            return None;
+            return actions;
         }
         ctx.adaptive_last_control = now;
         let cur = self.congestion_retransmits.load(Ordering::Relaxed);
         let delta = cur.saturating_sub(ctx.adaptive_last_retransmits);
         ctx.adaptive_last_retransmits = cur;
+        let ceiling = self.bitrate_bps.max(1);
         let new_target = aimd_bitrate(
             ctx.adaptive_target_bps,
             delta,
             self.adaptive_floor_bps,
-            self.bitrate_bps.max(1),
+            ceiling,
             self.adaptive_increase_bps,
             self.adaptive_decrease,
         );
@@ -750,10 +823,26 @@ impl Gfx {
                 new_bps = new_target,
                 "EGFX adaptive bitrate adjusted"
             );
-            Some(new_target)
-        } else {
-            None
+            actions.bitrate_bps = Some(new_target);
         }
+        // P2a IDR backoff: don't inject a big periodic keyframe into a congested tunnel.
+        match idr_backoff_decision(delta > 0, new_target, ceiling, ctx.idr_backed_off) {
+            IdrBackoff::Stretch => {
+                ctx.idr_backed_off = true;
+                actions.keyframe_frames = Some(self.stretched_keyframe_frames);
+                debug!("EGFX IDR backoff: suppressing periodic keyframe under congestion");
+            }
+            IdrBackoff::Restore => {
+                ctx.idr_backed_off = false;
+                actions.keyframe_frames = Some(self.normal_keyframe_frames);
+                ctx.need_keyframe = true; // one clean recovery IDR now the link is clear
+                debug!(
+                    "EGFX IDR backoff: link recovered — restoring periodic keyframe + forcing recovery IDR"
+                );
+            }
+            IdrBackoff::Hold => {}
+        }
+        actions
     }
 
     /// Ship loop for the push pipeline: owns VideoToolbox's output receiver and
@@ -1071,6 +1160,7 @@ impl GfxServerFactory for Gfx {
             adaptive_target_bps: self.bitrate_bps,
             adaptive_last_control: Instant::now(),
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
+            idr_backed_off: false,
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -1594,6 +1684,54 @@ mod tests {
         assert_eq!(
             aimd_bitrate(1_000_000, 9, 1_000_000, 10_000_000, 500_000, 0.7),
             1_000_000
+        );
+    }
+
+    // ---- IDR backoff (`idr_backoff_decision`) ----
+    // (loss, new_target, ceiling, backed_off)
+    #[test]
+    fn idr_stretches_when_congestion_starts() {
+        // Loss begins, not yet backed off → suppress the periodic IDR.
+        assert_eq!(
+            idr_backoff_decision(true, 7_000_000, 10_000_000, false),
+            IdrBackoff::Stretch
+        );
+    }
+
+    #[test]
+    fn idr_holds_while_already_backed_off_under_loss() {
+        // Still losing, already suppressed → nothing to change.
+        assert_eq!(
+            idr_backoff_decision(true, 5_000_000, 10_000_000, true),
+            IdrBackoff::Hold
+        );
+    }
+
+    #[test]
+    fn idr_holds_during_clean_climbback_below_ceiling() {
+        // Recovering (no loss) but not yet at the ceiling → keep suppressed (don't
+        // inject a keyframe mid-recovery).
+        assert_eq!(
+            idr_backoff_decision(false, 8_000_000, 10_000_000, true),
+            IdrBackoff::Hold
+        );
+    }
+
+    #[test]
+    fn idr_restores_on_full_recovery() {
+        // Clean AND back at the ceiling while backed off → restore + recovery IDR.
+        assert_eq!(
+            idr_backoff_decision(false, 10_000_000, 10_000_000, true),
+            IdrBackoff::Restore
+        );
+    }
+
+    #[test]
+    fn idr_no_op_when_never_backed_off() {
+        // Clean at ceiling but never suppressed → nothing to do.
+        assert_eq!(
+            idr_backoff_decision(false, 10_000_000, 10_000_000, false),
+            IdrBackoff::Hold
         );
     }
 

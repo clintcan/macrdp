@@ -126,6 +126,14 @@ impl Encoder {
         unsafe { ffi::set_average_bitrate(self.inner.session, bitrate_bps) }
     }
 
+    /// Live-update the periodic keyframe (IDR) interval (in frames), for
+    /// congestion-responsive IDR backoff (`h264.rs`). Stretch it under congestion to
+    /// suppress the periodic IDR; restore on recovery. No encoder rebuild.
+    pub fn set_keyframe_interval(&self, keyframe_frames: u32) -> Result<()> {
+        // SAFETY: `self.inner.session` is valid for the lifetime of the Encoder.
+        unsafe { ffi::set_max_keyframe_interval(self.inner.session, keyframe_frames) }
+    }
+
     /// Submit a BGRA frame for encoding. `stride` is in bytes per row
     /// of the source buffer — VideoToolbox is told the source pixel
     /// format is `kCVPixelFormatType_32BGRA`, so each pixel is 4 bytes
@@ -559,6 +567,23 @@ mod ffi {
             session,
             kVTCompressionPropertyKey_AverageBitRate,
             bitrate_bps.max(1) as i32,
+        )
+    }
+
+    /// Live-update the periodic keyframe (IDR) interval, in frames, on a running
+    /// session — for congestion-responsive IDR backoff. Settable mid-session: under
+    /// congestion we stretch it (effectively suppressing the periodic IDR, since a
+    /// big intra frame is the worst thing to inject into a backed-up tunnel) and
+    /// restore it on recovery. *Forced* keyframes (first frame, recovery) are
+    /// independent — they go through `encode_bgra(force_keyframe=true)`.
+    pub(super) unsafe fn set_max_keyframe_interval(
+        session: VTCompressionSessionRef,
+        keyframe_frames: u32,
+    ) -> Result<()> {
+        set_i32(
+            session,
+            kVTCompressionPropertyKey_MaxKeyFrameInterval,
+            keyframe_frames.max(1) as i32,
         )
     }
 
