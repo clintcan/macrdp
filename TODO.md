@@ -168,12 +168,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
   change. Open design question: true-monitors vs one-big-desktop vs phased. (PAUSED, no code.)
   Also listed as Tier 3 in the production-readiness roadmap below.
 
-- [ ] **Production-readiness roadmap** (scoped 2026-06-29, not started). What would lift
+- [ ] **Production-readiness roadmap** (scoped 2026-06-29, in progress). What would lift
   macrdp from "polished v0 daily-driver for trusted LANs" to "reliable, secure, unattended
   single-session server for a LAN/VPN." Full prioritized plan in
-  `docs/production-readiness-roadmap.md`. Recommended starting trio: (1) real
-  operator-supplied TLS certs, (2) auth rate-limit + audit log, (3) a 48–72 h soak to shake
-  out leaks/drift. Hard ceiling (NO-GO): multi-user concurrent GUI sessions (macOS limit).
+  `docs/production-readiness-roadmap.md`. Recommended starting trio status: (1) real
+  operator-supplied TLS certs (`--cert`/`--key`) **DONE 2026-06-30 #104**; (2) auth
+  rate-limit + lockout + audit log (`src/auth_guard.rs`) **DONE 2026-06-30 #105**; (3) a
+  48–72 h **soak to shake out leaks/drift — NEXT (Tier 2.4, not started)**. Also done:
+  log rotation + startup reaper (Tier 2.5, #103). Still open beyond the soak: Tier 2.5
+  hung-but-alive health-check/bounce; Tier 3 polish. Hard ceiling (NO-GO): multi-user
+  concurrent GUI sessions (macOS limit).
 
 ## Parked — scoped, low priority
 

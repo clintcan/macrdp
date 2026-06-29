@@ -209,12 +209,29 @@ MACRDP_GUARD_MIN_SESSION_SECS=10  # a connection shorter than this counts as a f
 MACRDP_GUARD_COOLDOWN_BASE_SECS=30  # first lockout length (doubles per extra failure)
 MACRDP_GUARD_COOLDOWN_MAX_SECS=900  # lockout escalation cap (15 min)
 ```
-The lockout is **heuristic** (an errored or very-short connection counts as a
-failure; a clean, long-lived session resets that IP's counter), so a single benign
-disconnect — e.g. mstsc's first-connect cert-prompt "Broken pipe" — never locks you
-out. Audit lines are tagged `macrdp::audit`:
-`grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows `event="accept|reject|disconnect"`
-with the source IP and (for rejects) the reason and retry-after.
+The lockout **escalates and auto-expires** — duration `COOLDOWN_BASE << (failures −
+threshold)`, capped at `COOLDOWN_MAX`. With the defaults it triggers at the 5th
+consecutive failure and doubles from 30 s as the IP keeps failing past each cooldown:
+
+| Consecutive failures | Lockout |
+|---|---|
+| 5 (threshold) | 30 s |
+| 6 | 60 s |
+| 7 | 120 s |
+| 8 | 240 s |
+| 9 | 480 s |
+| 10+ | 900 s (capped) |
+
+There is **no manual unlock** — each cooldown auto-expires, then the next attempt is
+allowed through. Escalation requires *actually failing again after* each cooldown
+clears (while locked out, attempts are rejected pre-handshake and don't count as new
+failures), and **any clean, long-lived session resets the IP to 0**. The lockout is
+**heuristic** (an errored or very-short connection counts as a failure; a clean
+session resets), so a single benign disconnect — e.g. mstsc's first-connect
+cert-prompt "Broken pipe" — never locks you out. Audit lines are tagged
+`macrdp::audit`: `grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows
+`event="accept|reject|disconnect"` with the source IP and (for rejects) the reason
+and retry-after.
 
 Testing against the server:
 ```bash
