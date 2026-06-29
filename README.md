@@ -17,14 +17,14 @@ v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.19](https:/
 Short version: **a polished v0 daily-driver for trusted LANs — not an enterprise RDP server.** Use it to reach your own Mac over a network you control; don't put it on a public IP or treat it as multi-user/critical infrastructure.
 
 **What's solid (verified on real mstsc / Microsoft Remote Desktop / FreeRDP):**
-- Real auth — TLS + NLA/CredSSP against the macOS account via PAM, password from the Keychain. TLS can use a real CA / ACME / Let's Encrypt cert (`--cert`/`--key`), or the self-signed default.
+- Real auth — TLS + NLA/CredSSP against the macOS account via PAM, password from the Keychain. TLS can use a real CA / ACME / Let's Encrypt cert (`--cert`/`--key`), or the self-signed default. Per-IP connection **rate-limiting + lockout + an audit log** sit in front of the auth gate (on by default, loopback-exempt).
 - The full daily workflow — display, keyboard/mouse (incl. non-US layouts, Cmd+Tab, optional Ctrl→Cmd), clipboard text/images/files both ways, system audio, drive + smart-card redirection, headless virtual displays.
 - H.264/EGFX with **congestion-responsive rate control** — under packet loss it degrades gracefully (bitrate backs off → fps sheds at the floor → stays choppy-but-in-sync) instead of freezing, and audio can ride a loss-resilient lossy-UDP path.
 - Deployable — signed + notarized `.app`, a LaunchAgent, and a menu-bar GUI controller; TCC grants survive rebuilds.
-- Tested — 120 unit tests + a regression harness, run in CI on every push.
+- Tested — 130+ unit tests + a regression harness, run in CI on every push.
 
 **Known limitations — read before relying on it:**
-- **Trusted-LAN scope is load-bearing.** TLS now supports a real CA / ACME cert (`--cert`/`--key`) — lifting the self-signed-only caveat — but the rest isn't hardened for internet exposure or hostile networks (no auth rate-limiting/audit log yet). Even with a real cert, **put internet-facing RDP behind a VPN or an RD Gateway** — that's the production answer for any RDP server, not just this one.
+- **Trusted-LAN scope is load-bearing.** TLS supports a real CA / ACME cert (`--cert`/`--key`) and there's now per-IP connection rate-limiting + lockout + an audit log — but it still isn't hardened for full internet exposure or hostile networks. Even with all that, **put internet-facing RDP behind a VPN or an RD Gateway** — that's the production answer for any RDP server, not just this one.
 - **Single session, single user.** No multi-monitor (client-side multi-display) and no printer redirection.
 - **Some content can't be captured, by OS design** — DRM video (Netflix etc.) and password-manager vault windows render blank; macOS excludes protected content from screen capture and that can't (and shouldn't) be overridden.
 - **Synthetic input can't reach secure contexts** — the login window, lock screen, and secure-input password fields are OS-blocked.
@@ -32,7 +32,7 @@ Short version: **a polished v0 daily-driver for trusted LANs — not an enterpri
 - **The UDP multitransport / lossy-audio paths are EXPERIMENTAL** (opt-in, default OFF) — robust in testing but newer and less soaked than the TCP core, which remains the default everything rides on.
 - **It's a solo v0** built on vendored [IronRDP](https://github.com/Devolutions/IronRDP) forks — no commercial support or SLA.
 
-If your use case is "remote into my own Mac over my LAN/VPN," it's in good shape. If it's unattended production, untrusted networks, or multi-user, it isn't there yet — see [`docs/production-readiness-roadmap.md`](docs/production-readiness-roadmap.md) for what would close that gap (real TLS certs ✓ done; auth hardening + a multi-day soak still open) and what can't be (multi-user GUI sessions, on macOS).
+If your use case is "remote into my own Mac over my LAN/VPN," it's in good shape. If it's unattended production, untrusted networks, or multi-user, it isn't there yet — see [`docs/production-readiness-roadmap.md`](docs/production-readiness-roadmap.md) for what would close that gap (real TLS certs ✓ done; auth hardening ✓ done; a multi-day soak still open) and what can't be (multi-user GUI sessions, on macOS).
 
 ## Quick start
 

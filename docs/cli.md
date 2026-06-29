@@ -192,6 +192,30 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Config key: LOG_DIR.
 ```
 
+Auth hardening (env-only, **on by default**). macrdp rate-limits and briefly
+(escalating) locks out source IPs that hammer the port with connection attempts,
+in front of the existing NLA/CredSSP gate, and writes a per-connection audit line.
+**Loopback (`127.0.0.1`/`::1`) is always exempt** — these only bite when `--bind`
+exposes the server to other hosts, and you can't lock yourself out locally. The
+defaults are conservative; tune or disable via env (settable through `config.env`
+— see the matching keys there — or the LaunchAgent plist `EnvironmentVariables`):
+```
+MACRDP_CONN_GUARD=1               # master switch (0/off = disable rate-limit + lockout)
+MACRDP_AUDIT_LOG=1                # connection audit log (independent of the guard)
+MACRDP_GUARD_RL_MAX=10            # max attempts per window per IP (0 = no rate-limit)
+MACRDP_GUARD_RL_WINDOW_SECS=60    # rate-limit sliding window
+MACRDP_GUARD_FAIL_THRESHOLD=5     # consecutive failures before lockout (0 = no lockout)
+MACRDP_GUARD_MIN_SESSION_SECS=10  # a connection shorter than this counts as a failure
+MACRDP_GUARD_COOLDOWN_BASE_SECS=30  # first lockout length (doubles per extra failure)
+MACRDP_GUARD_COOLDOWN_MAX_SECS=900  # lockout escalation cap (15 min)
+```
+The lockout is **heuristic** (an errored or very-short connection counts as a
+failure; a clean, long-lived session resets that IP's counter), so a single benign
+disconnect — e.g. mstsc's first-connect cert-prompt "Broken pipe" — never locks you
+out. Audit lines are tagged `macrdp::audit`:
+`grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows `event="accept|reject|disconnect"`
+with the source IP and (for rejects) the reason and retry-after.
+
 Testing against the server:
 ```bash
 # FreeRDP — easiest to script and get verbose logs from.

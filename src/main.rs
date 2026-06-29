@@ -11,6 +11,7 @@
 mod aac;
 mod audio;
 mod auth;
+mod auth_guard;
 mod avc444;
 mod capture;
 mod clipboard;
@@ -793,7 +794,22 @@ async fn run_fork_supervisor(
     // after fixing the worker to process::exit — a fast reconnect could still
     // overlap the new worker's capture with the dying worker's not-yet-released
     // SCStream.
-    let mut prev_worker: Option<std::process::Child> = None;
+    // Tuple carries the peer IP + spawn instant alongside the child so, when this
+    // worker is drained on the NEXT accept, the auth guard can classify its outcome
+    // (exit code + session duration) and record it against the right IP.
+    let mut prev_worker: Option<(std::process::Child, std::net::IpAddr, std::time::Instant)> = None;
+
+    // Auth hardening (Tier 1.2): the fork-workers supervisor owns its own accept
+    // loop (it never builds an RdpServer), so it drives the shared AuthGuardCore
+    // directly — pre-spawn rate-limit/lockout + per-IP outcome recording on worker
+    // drain. `None` when MACRDP_CONN_GUARD is off. Loopback is exempt in the core.
+    let mut guard = auth_guard::AuthGuardCore::from_env();
+    // "Long-lived session" bar for the supervisor's outcome heuristic; falls back
+    // to the documented default when the guard is disabled but audit is still on.
+    let min_session = guard
+        .as_ref()
+        .map(|g| g.min_session())
+        .unwrap_or_else(|| std::time::Duration::from_secs(10));
 
     // SCK capture-slot settle, env-overridable for hardware-in-the-loop tuning.
     let sck_settle = std::env::var(WORKER_SCK_SETTLE_ENV)
@@ -831,31 +847,36 @@ async fn run_fork_supervisor(
             }
         };
 
-        // Engage headless blanking on the first connection (continuous).
-        if !headless_engaged && blank != BlankMode::None {
-            headless_engaged = true;
-            if let Some(id) = vd_id {
-                engage_headless_blank(
-                    blank,
-                    id,
-                    detach_slot.clone(),
-                    capture_slot.clone(),
-                    primary_slot.clone(),
-                );
-            }
-        }
-
-        // Drain the previous worker before this connection captures.
-        if let Some(prev) = prev_worker.take() {
+        // Drain the previous worker FIRST (before the rate-limit gate) so its
+        // outcome is recorded and its capture slot is freed regardless of whether
+        // THIS connection is accepted.
+        if let Some((prev, prev_ip, started)) = prev_worker.take() {
             let prev_pid = prev.id();
+            let dur = started.elapsed();
             let waited = tokio::time::timeout(
                 WORKER_WAIT_TIMEOUT,
                 tokio::task::spawn_blocking(move || {
                     let mut prev = prev;
-                    let _ = prev.wait();
+                    prev.wait()
                 }),
             )
             .await;
+            // Classify the finished worker for the guard's lockout heuristic. The
+            // worker exits 0 on a clean connection end / 1 on error (see the worker
+            // branch's process::exit). Clean + long-lived ⇒ success; nonzero or
+            // short ⇒ failure; a wait/join error ⇒ don't penalize; a >timeout
+            // still-alive worker is clearly a long-lived session ⇒ success.
+            let outcome = match &waited {
+                Ok(Ok(Ok(status))) => {
+                    if status.success() && dur >= min_session {
+                        auth_guard::Outcome::Success
+                    } else {
+                        auth_guard::Outcome::Failure
+                    }
+                }
+                Ok(_) => auth_guard::Outcome::Success,
+                Err(_) => auth_guard::Outcome::Success,
+            };
             if waited.is_err() {
                 // Timed out: the old connection is still alive. The detached
                 // spawn_blocking keeps running and reaps it; proceed anyway so a
@@ -870,9 +891,44 @@ async fn run_fork_supervisor(
                     "previous worker exited; capture slot freed"
                 );
             }
+            if let Some(g) = guard.as_mut() {
+                g.record_outcome(std::time::Instant::now(), prev_ip, outcome);
+            }
+            auth_guard::audit_disconnect(prev_ip, dur, outcome);
             // Let SCK's daemon release the capture slot before the next SCStream.
             tokio::time::sleep(sck_settle).await;
         }
+
+        // Rate-limit / lockout gate (pre-handshake, before spawning a worker).
+        // Loopback is exempt inside the core. audit_accept/_reject self-gate on
+        // MACRDP_AUDIT_LOG, so they run even when the guard itself is disabled.
+        match guard.as_mut() {
+            Some(g) => match g.decide(std::time::Instant::now(), peer.ip()) {
+                auth_guard::Decision::Accept => auth_guard::audit_accept(peer.ip(), peer.port()),
+                reject => {
+                    auth_guard::audit_reject(peer.ip(), reject);
+                    drop(stream);
+                    continue;
+                }
+            },
+            None => auth_guard::audit_accept(peer.ip(), peer.port()),
+        }
+
+        // Engage headless blanking on the first ACCEPTED connection (continuous) —
+        // after the gate so a rejected port-scan doesn't blank the panel.
+        if !headless_engaged && blank != BlankMode::None {
+            headless_engaged = true;
+            if let Some(id) = vd_id {
+                engage_headless_blank(
+                    blank,
+                    id,
+                    detach_slot.clone(),
+                    capture_slot.clone(),
+                    primary_slot.clone(),
+                );
+            }
+        }
+
         // Take ownership of the raw fd and stop tokio/std from closing it; the
         // child inherits it across fork, and we close the parent's copy after
         // spawn. `into_std` then `into_raw_fd` detaches it from Rust's RAII.
@@ -916,10 +972,11 @@ async fn run_fork_supervisor(
                     fd,
                     "spawned worker process for connection"
                 );
-                // Hold the child so the NEXT accept waits for it to exit before
-                // spawning (the serialization above) — that wait is also what
-                // reaps it, so it never becomes a lingering zombie.
-                prev_worker = Some(child);
+                // Hold the child (+ peer IP and spawn instant) so the NEXT accept
+                // waits for it to exit before spawning (the serialization above) —
+                // that wait is also what reaps it (never a lingering zombie) and
+                // what feeds the auth guard this worker's outcome.
+                prev_worker = Some((child, peer.ip(), std::time::Instant::now()));
             }
             Err(e) => error!(error = ?e, "failed to spawn worker process"),
         }
@@ -1565,6 +1622,30 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(path.clone());
         }
     }
+    // Auth-guard tunables are env-only (read at startup by auth_guard::*_from_env).
+    // Bridge the friendly config.env keys to their MACRDP_* env vars here so
+    // menu-bar / LaunchAgent users can tune them via config.env without editing
+    // the plist's EnvironmentVariables. Unset keys keep the on-by-default defaults.
+    for (cfg_key, env_var) in [
+        ("CONN_GUARD", "MACRDP_CONN_GUARD"),
+        ("AUDIT_LOG", "MACRDP_AUDIT_LOG"),
+        ("GUARD_RL_MAX", "MACRDP_GUARD_RL_MAX"),
+        ("GUARD_RL_WINDOW_SECS", "MACRDP_GUARD_RL_WINDOW_SECS"),
+        ("GUARD_FAIL_THRESHOLD", "MACRDP_GUARD_FAIL_THRESHOLD"),
+        ("GUARD_MIN_SESSION_SECS", "MACRDP_GUARD_MIN_SESSION_SECS"),
+        (
+            "GUARD_COOLDOWN_BASE_SECS",
+            "MACRDP_GUARD_COOLDOWN_BASE_SECS",
+        ),
+        ("GUARD_COOLDOWN_MAX_SECS", "MACRDP_GUARD_COOLDOWN_MAX_SECS"),
+    ] {
+        if let Some(val) = cfg.get(cfg_key) {
+            if !val.is_empty() {
+                std::env::set_var(env_var, val);
+            }
+        }
+    }
+
     // EXTRA_FLAGS: space-separated escape hatch, appended verbatim.
     if let Some(extra) = cfg.get("EXTRA_FLAGS") {
         for tok in extra.split_whitespace() {
@@ -2301,6 +2382,17 @@ async fn async_main() -> Result<()> {
             None
         };
 
+    // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
+    // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
+    // (MACRDP_CONN_GUARD=0 disables). A fork *worker* bypasses the accept loop
+    // (run_connection directly), so its handler is never consulted — pass None to
+    // avoid dead weight; the supervisor drives the same core in its own loop.
+    let conn_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> = if worker_fd.is_none() {
+        auth_guard::AuthGuardHandler::from_env()
+    } else {
+        None
+    };
+
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
         .with_hybrid(tls, spki_der)
@@ -2311,6 +2403,7 @@ async fn async_main() -> Result<()> {
         .with_rdpdr_factory(rdpdr_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
+        .with_connection_handler(conn_handler)
         .build();
 
     // Hand the shared suppress flag to the server so its per-connection

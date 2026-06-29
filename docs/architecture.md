@@ -3,6 +3,19 @@
 ```
 src/main.rs       CLI, TCC preflight, TLS cert mgmt, RdpServer assembly
 src/auth.rs       Startup PAM auth against the macOS account (libpam FFI)
+src/auth_guard.rs Connection-level auth hardening (Tier 1.2): per-source-IP
+                  rate-limiting + escalating auto-expiring lockout + a greppable
+                  `macrdp::audit` log, in front of the NLA/CredSSP gate. Pure,
+                  platform-independent AuthGuardCore (decide/record_outcome, time
+                  passed in for deterministic tests) + the ConnectionHandler
+                  adapter (AuthGuardHandler) for the single-process path; the
+                  --fork-workers supervisor (main.rs) drives the SAME core in its
+                  own accept loop (classifying each worker by exit code + duration).
+                  On by default, loopback-exempt, env-tunable (MACRDP_CONN_GUARD /
+                  MACRDP_GUARD_* / MACRDP_AUDIT_LOG), zero vendored divergence
+                  (reuses ironrdp-server's existing ConnectionHandler seam).
+                  Lockout is heuristic (errored/short ⇒ failure, clean long
+                  session resets) so a benign disconnect never locks anyone out.
 src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
 src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by

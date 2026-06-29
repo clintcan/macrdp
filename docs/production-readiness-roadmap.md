@@ -28,9 +28,17 @@ are scope limits, not gaps to close.
    Support/macrdp` remains the zero-config default. (Dropping `cert.pem`/`key.pem` into
    the cert dir also still works.) Not done here: ACME auto-renewal (operator tooling's
    job — replace the file + restart) and hot reload (a cert change needs a restart).
-2. **Auth hardening.** NLA/CredSSP is already the pre-auth gate (good). Add:
-   connection **rate-limiting**, **failed-attempt backoff/lockout**, and an **auth audit
-   log** (who connected, from where, when, success/fail). Moderate effort, real value.
+2. **Auth hardening — DONE (2026-06-30).** In front of the NLA/CredSSP pre-auth gate,
+   macrdp now does per-source-IP connection **rate-limiting** + escalating auto-expiring
+   **failed-attempt lockout** + a greppable **auth audit log** (`macrdp::audit` lines:
+   who connected, from where, accept/reject/disconnect + outcome). On by default with
+   conservative tunable thresholds (env / `config.env`); **loopback is exempt** so you
+   can't self-lock. Lives in `src/auth_guard.rs` (a pure, unit-tested decision core) wired
+   through the existing `ConnectionHandler` seam (single-process) and the `--fork-workers`
+   supervisor loop — **zero vendored divergence**. The lockout is deliberately **heuristic**
+   (errored/very-short ⇒ failure; clean long session resets), so a benign disconnect never
+   locks anyone out. Not done here: precise CredSSP-failure classification (would need a
+   vendored signal — intentionally avoided).
 3. **Document the posture honestly.** Even hardened, internet-facing RDP is a bad idea
    for *any* server — the production answer is "behind a VPN or an RD Gateway." Make that
    explicit alongside Tier 1.1.
@@ -85,9 +93,10 @@ Don't chase these — they're scope limits, not bugs:
 
 If picking a starting batch, do these three:
 
-1. **Real TLS certs** (Tier 1.1) — cleanest, highest-trust, lowest-risk; natural first step.
-2. **Auth rate-limit + audit log** (Tier 1.2).
-3. **A 48–72 h soak to shake out leaks/drift** (Tier 2.4).
+1. **Real TLS certs** (Tier 1.1) — **DONE (2026-06-30).**
+2. **Auth rate-limit + lockout + audit log** (Tier 1.2) — **DONE (2026-06-30).**
+3. **A 48–72 h soak to shake out leaks/drift** (Tier 2.4) — next.
 
 That trio takes it from "daily-driver I babysit" to "I can deploy this and walk away on a
-network I control." Everything else is incremental.
+network I control." With 1.1 + 1.2 landed, the remaining high-value item is the soak (2.4);
+everything else is incremental.
