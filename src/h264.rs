@@ -219,6 +219,11 @@ struct ConnectionContext {
     /// Hysteresis state: whether the controller is currently in a congestion episode
     /// (enters when the EWMA lag clears the high mark, exits below the low mark).
     adaptive_congested: bool,
+    /// P2b: when the last capture was let through under the frame-rate floor (the
+    /// fps cap that engages once bitrate is at the floor and the link is still
+    /// congested). Throttles let-throughs to `Gfx::adaptive_min_fps_interval`, like
+    /// `last_throttle_ship` does for the EGFX-on-UDP trickle. See [`frame_drop_at_floor`].
+    last_floor_fps_pass: Instant,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -439,6 +444,30 @@ fn rate_action(
     }
 }
 
+/// P2b — pure decision: should this capture be DROPPED to enforce a frame-rate floor?
+///
+/// Engages only once the bitrate controller has already cut the encoder to its floor
+/// (`at_floor`) AND the link is still `congested` — i.e. lowering quality can no longer
+/// help, so the next lever is shedding *frames* (fewer frames → fewer packets → less
+/// load). It caps the effective frame rate to a floor by dropping any capture that
+/// arrives within `min_interval` of the last one we let through (`since_last_pass`).
+///
+/// It never drops to zero: a capture is let through once `min_interval` has elapsed, so
+/// the client always keeps receiving trailing frames to present/ack (the same reason the
+/// EGFX-on-UDP trickle floor never zeroes — dropping to zero pins the lag and freezes the
+/// picture). Works on BOTH transports; on TCP it's the only fps lever (there's no UDP
+/// frame-ack backpressure gate). When the link recovers (`congested` clears or the
+/// controller climbs off the floor) it stops dropping and the full capture rate resumes.
+/// Unit-tested. See [`Gfx::submit_bgra`].
+fn frame_drop_at_floor(
+    at_floor: bool,
+    congested: bool,
+    since_last_pass: Duration,
+    min_interval: Duration,
+) -> bool {
+    at_floor && congested && since_last_pass < min_interval
+}
+
 /// Encoder adjustments the adaptive controller wants applied this frame: the P1
 /// bitrate and the P2a keyframe interval. `None` fields = no change. The controller
 /// also sets `ctx.need_keyframe` directly when forcing a recovery IDR.
@@ -589,6 +618,12 @@ pub struct Gfx {
     /// Cumulative reliable-tunnel retransmit count, bumped by the UDP listener and
     /// sampled (as deltas) by the controller. Shared `Arc` like the egfx flags.
     congestion_retransmits: Arc<AtomicU64>,
+    /// P2b: minimum spacing between captures once the frame-rate floor engages (bitrate
+    /// at the floor AND still congested) — i.e. `1 / floor-fps`. When P2b is active,
+    /// captures arriving sooner than this are dropped, capping the effective frame rate
+    /// so a congested link sheds packet load that bitrate cuts alone can't. Default 10
+    /// fps (100 ms); `MACRDP_ADAPTIVE_FLOOR_FPS` overrides. See [`frame_drop_at_floor`].
+    adaptive_min_fps_interval: Duration,
 }
 
 impl Gfx {
@@ -686,6 +721,12 @@ impl Gfx {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(2);
+        // P2b frame-rate floor: once bitrate is pinned at the floor and the link is
+        // still congested, cap the effective fps to this (drop captures arriving sooner
+        // than 1/fps). Default 10 fps — matches the EGFX-on-UDP trickle floor and stays
+        // well above "must keep presenting." `MACRDP_ADAPTIVE_FLOOR_FPS` overrides.
+        let adaptive_floor_fps = env_u32("MACRDP_ADAPTIVE_FLOOR_FPS", 10).max(1);
+        let adaptive_min_fps_interval = Duration::from_millis(1000 / u64::from(adaptive_floor_fps));
         // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
         // derivation as Encoder::new), and a stretched value (~10 min) that
         // effectively suppresses the periodic IDR for the duration of a congestion
@@ -717,7 +758,8 @@ impl Gfx {
                 ewma_alpha = adaptive_ewma_alpha,
                 normal_keyframe_frames,
                 stretched_keyframe_frames,
-                "EGFX adaptive bitrate + IDR backoff ENABLED (--adaptive-bitrate) — \
+                floor_fps = adaptive_floor_fps,
+                "EGFX adaptive bitrate + IDR backoff + frame-rate floor ENABLED (--adaptive-bitrate) — \
                  congestion-responsive rate control on both the UDP tunnel and the TCP path"
             );
         }
@@ -751,6 +793,7 @@ impl Gfx {
             normal_keyframe_frames,
             stretched_keyframe_frames,
             congestion_retransmits,
+            adaptive_min_fps_interval,
         }
     }
 
@@ -897,6 +940,38 @@ impl Gfx {
             // and spawns the ship thread).
             if ctx.surface_id.is_none() || ctx.encoder.is_none() {
                 self.setup_locked(ctx)?;
+            }
+            // P2b frame-rate floor: once the adaptive controller has cut the bitrate to
+            // its floor AND the link is still congested, lowering quality can't help —
+            // so shed FRAMES. Cap the effective fps (drop captures arriving within
+            // `adaptive_min_fps_interval`), cutting packet load on BOTH transports — it's
+            // the only fps lever on TCP, which has no UDP frame-ack backpressure gate.
+            // Never zero: one capture per interval gets through so the client keeps
+            // trailing frames to present/ack. The controller state read here was set by
+            // the previous interval's adaptive_bitrate_step (runs after submit) — fine,
+            // congestion persists for seconds. need_keyframe persists across the drop
+            // (consumed below), so an armed IDR lands on the next let-through. Dropping
+            // before encode keeps the H.264 reference chain valid. No-op unless
+            // --adaptive-bitrate AND the controller is actually at the floor under
+            // congestion → default path unchanged.
+            if self.adaptive_enabled {
+                let at_floor = ctx.adaptive_target_bps <= self.adaptive_floor_bps;
+                let now = Instant::now();
+                if frame_drop_at_floor(
+                    at_floor,
+                    ctx.adaptive_congested,
+                    now.duration_since(ctx.last_floor_fps_pass),
+                    self.adaptive_min_fps_interval,
+                ) {
+                    trace!(
+                        "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
+                    );
+                    return Ok(true);
+                }
+                if at_floor && ctx.adaptive_congested {
+                    ctx.last_floor_fps_pass = now;
+                    debug!("EGFX frame-rate floor active — capping fps (let a capture through)");
+                }
             }
             // Drop-to-latest throttle: if too many frames are still in the
             // VT/ship pipeline, skip this capture entirely. This bounds latency
@@ -1493,6 +1568,7 @@ impl GfxServerFactory for Gfx {
             adaptive_warmup_until: None,
             adaptive_lag_ewma: 0.0,
             adaptive_congested: false,
+            last_floor_fps_pass: Instant::now(),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -2184,6 +2260,48 @@ mod tests {
             rate_action(1.0, 8.0, lossy, true, true),
             RateAction::Decrease
         );
+    }
+
+    // ---- P2b: frame_drop_at_floor ----
+
+    #[test]
+    fn frame_drop_at_floor_only_when_at_floor_and_congested() {
+        let min = Duration::from_millis(100);
+        let soon = Duration::from_millis(10); // inside the min-fps spacing
+                                              // Both conditions + too-soon → drop.
+        assert!(frame_drop_at_floor(true, true, soon, min));
+        // Not at floor → never drops (bitrate cuts are still the right lever).
+        assert!(!frame_drop_at_floor(false, true, soon, min));
+        // Not congested → never drops (link is fine).
+        assert!(!frame_drop_at_floor(true, false, soon, min));
+        // Neither → never drops.
+        assert!(!frame_drop_at_floor(false, false, soon, min));
+    }
+
+    #[test]
+    fn frame_drop_at_floor_respects_min_fps_spacing() {
+        let min = Duration::from_millis(100);
+        // A capture that arrives after the spacing elapsed is let through (never zero).
+        assert!(!frame_drop_at_floor(
+            true,
+            true,
+            Duration::from_millis(100),
+            min
+        ));
+        assert!(!frame_drop_at_floor(
+            true,
+            true,
+            Duration::from_millis(250),
+            min
+        ));
+        // One arriving sooner is dropped — capping the effective fps.
+        assert!(frame_drop_at_floor(
+            true,
+            true,
+            Duration::from_millis(99),
+            min
+        ));
+        assert!(frame_drop_at_floor(true, true, Duration::ZERO, min));
     }
 
     #[test]
