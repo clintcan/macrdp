@@ -334,6 +334,25 @@ fn idr_backoff_decision(loss: bool, new_target: u32, ceiling: u32, backed_off: b
     }
 }
 
+/// Pure congestion test for the adaptive controller. Congested when the client's
+/// frame-ack lag (`ack_lag` = shipped − acked) exceeds `lag_threshold` with acks
+/// flowing, OR any reliable retransmit happened this interval (`retransmit_delta`).
+/// Ack-lag is the FAST signal — it rises the moment the client stops acking, ~2 s
+/// before the watchdog's ack-silence trigger, whereas `retransmit_delta` only climbs
+/// after an RTO (~one RTT late, so it can't lead the watchdog on its own). With acks
+/// suspended (`queueDepth==0xFFFFFFFF`) or not yet seen, lag is uninferable so only
+/// the retransmit signal counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+fn controller_congested(
+    ack_lag: u64,
+    lag_threshold: u64,
+    retransmit_delta: u64,
+    acks_seen: bool,
+    acks_suspended: bool,
+) -> bool {
+    let lag_congested = acks_seen && !acks_suspended && ack_lag > lag_threshold;
+    lag_congested || retransmit_delta > 0
+}
+
 /// Encoder adjustments the adaptive controller wants applied this frame: the P1
 /// bitrate and the P2a keyframe interval. `None` fields = no change. The controller
 /// also sets `ctx.need_keyframe` directly when forcing a recovery IDR.
@@ -431,17 +450,26 @@ pub struct Gfx {
     demigrate_request: Arc<AtomicBool>,
     /// Adaptive bitrate (congestion-responsive rate control, P1). On by
     /// `--adaptive-bitrate` (or `MACRDP_UDP_ADAPTIVE_BITRATE`); only acts while EGFX
-    /// is on a UDP tunnel, so it's a no-op on TCP. The controller (AIMD) reads the
-    /// shared `congestion_retransmits` loss counter the UDP listener bumps and live-
-    /// adjusts the VideoToolbox bitrate within `[adaptive_floor_bps, bitrate_bps]`:
-    /// multiplicative-decrease `adaptive_decrease` per interval with loss, additive-
-    /// increase `adaptive_increase_bps` per interval when clean. `bitrate_bps` (the
-    /// `--bitrate` value) is the ceiling. See [`Gfx::adaptive_bitrate_step`].
+    /// is on a UDP tunnel, so it's a no-op on TCP. The controller (AIMD) detects
+    /// congestion primarily from the client's **frame-ack lag** (`shipped − acked` >
+    /// `adaptive_lag_threshold`) — the FAST signal that rises the moment the client
+    /// stops acking, ~2 s before the watchdog's ack-silence trigger — and secondarily
+    /// from the shared `congestion_retransmits` counter (a late RTO-based signal). It
+    /// live-adjusts the VideoToolbox bitrate within `[adaptive_floor_bps, bitrate_bps]`:
+    /// multiplicative-decrease `adaptive_decrease` per interval with congestion,
+    /// additive-increase `adaptive_increase_bps` per interval when clean. `bitrate_bps`
+    /// (the `--bitrate` value) is the ceiling. See [`Gfx::adaptive_bitrate_step`].
     adaptive_enabled: bool,
     adaptive_floor_bps: u32,
     adaptive_increase_bps: u32,
     adaptive_decrease: f32,
     adaptive_interval: Duration,
+    /// Frame-ack lag (shipped − acked, in frames) above which the controller treats
+    /// the link as congested — the fast pre-watchdog signal. Below `max_frame_lag`
+    /// (the frame-DROP threshold) so the controller leads the backpressure gate, and
+    /// well above mstsc's healthy presentation jitter (~0–2). Default `max_frame_lag
+    /// / 2`; `MACRDP_UDP_ADAPTIVE_LAG_THRESHOLD` overrides.
+    adaptive_lag_threshold: u64,
     /// P2a IDR backoff: the normal periodic-keyframe interval (frames, from
     /// `--keyframe-interval`) restored on recovery, and the stretched value used to
     /// suppress the periodic IDR under congestion.
@@ -518,6 +546,13 @@ impl Gfx {
             .filter(|&f| f > 0.0 && f < 1.0)
             .unwrap_or(0.7);
         let adaptive_interval = watchdog_ms("MACRDP_UDP_ADAPTIVE_INTERVAL_MS", 300);
+        // Congestion lag threshold: react below the frame-DROP point (max_frame_lag)
+        // so the controller leads the backpressure gate, and above healthy jitter.
+        let adaptive_lag_threshold = std::env::var("MACRDP_UDP_ADAPTIVE_LAG_THRESHOLD")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or((max_frame_lag / 2).max(4));
         // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
         // derivation as Encoder::new), and a stretched value (~10 min) that
         // effectively suppresses the periodic IDR for the duration of a congestion
@@ -544,6 +579,7 @@ impl Gfx {
                 increase_bps = adaptive_increase_bps,
                 decrease = adaptive_decrease,
                 interval_ms = adaptive_interval.as_millis() as u64,
+                lag_threshold = adaptive_lag_threshold,
                 normal_keyframe_frames,
                 stretched_keyframe_frames,
                 "EGFX adaptive bitrate + IDR backoff ENABLED (--adaptive-bitrate) — \
@@ -573,6 +609,7 @@ impl Gfx {
             adaptive_increase_bps,
             adaptive_decrease,
             adaptive_interval,
+            adaptive_lag_threshold,
             normal_keyframe_frames,
             stretched_keyframe_frames,
             congestion_retransmits,
@@ -781,8 +818,9 @@ impl Gfx {
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
     /// once per capture from `submit_bgra` while holding the ctx lock; rate-limited to
-    /// one step per `adaptive_interval`. Reads the shared cumulative-retransmit loss
-    /// counter the UDP listener bumps and, per interval:
+    /// one step per `adaptive_interval`. Detects congestion from the client's frame-ack
+    /// lag (fast, leads the watchdog) and the shared retransmit counter (late), and
+    /// per interval:
     /// - **bitrate:** multiplicative-decrease toward `adaptive_floor_bps` on any loss,
     ///   else additive-increase toward the `bitrate_bps` ceiling;
     /// - **IDR backoff:** stretch the periodic keyframe interval (suppress the
@@ -794,7 +832,23 @@ impl Gfx {
     /// is enabled and EGFX is on a UDP tunnel — so the TCP path stays byte-identical.
     fn adaptive_bitrate_step(&self, ctx: &mut ConnectionContext) -> AdaptiveActions {
         let mut actions = AdaptiveActions::default();
-        if !self.adaptive_enabled || !self.egfx_on_udp.load(Ordering::Relaxed) {
+        if !self.adaptive_enabled {
+            return actions;
+        }
+        if !self.egfx_on_udp.load(Ordering::Relaxed) {
+            // EGFX is on TCP (never migrated, or the watchdog de-migrated). If we'd
+            // stretched the keyframe interval on the UDP tunnel, restore the normal
+            // periodic IDR for the TCP path (one-shot) — otherwise the encoder keeps
+            // the ~10 min stretched interval and the TCP session has no periodic
+            // keyframe to heal a decode glitch. The watchdog already forced one IDR
+            // at de-migration, so no extra recovery IDR is needed here.
+            if ctx.idr_backed_off {
+                ctx.idr_backed_off = false;
+                actions.keyframe_frames = Some(self.normal_keyframe_frames);
+                info!(
+                    "EGFX IDR backoff: EGFX left the UDP tunnel — restoring normal periodic keyframe"
+                );
+            }
             return actions;
         }
         let now = Instant::now();
@@ -803,12 +857,28 @@ impl Gfx {
         }
         ctx.adaptive_last_control = now;
         let cur = self.congestion_retransmits.load(Ordering::Relaxed);
-        let delta = cur.saturating_sub(ctx.adaptive_last_retransmits);
+        let retransmit_delta = cur.saturating_sub(ctx.adaptive_last_retransmits);
         ctx.adaptive_last_retransmits = cur;
+        // Fast congestion signal: the client's frame-ack lag (shipped − acked). It
+        // rises the instant the client stops acking — ~2 s before the watchdog's
+        // 3 s ack-silence trigger — so the controller can back off in time, unlike
+        // the retransmit counter which only climbs after an RTO (the watchdog beats
+        // it every time on a lossy link). See [`controller_congested`].
+        let ack_lag = ctx
+            .last_shipped_frame_id
+            .load(Ordering::Relaxed)
+            .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
+        let congested = controller_congested(
+            ack_lag,
+            self.adaptive_lag_threshold,
+            retransmit_delta,
+            ctx.egfx_acks_seen,
+            ctx.acks_suspended,
+        );
         let ceiling = self.bitrate_bps.max(1);
         let new_target = aimd_bitrate(
             ctx.adaptive_target_bps,
-            delta,
+            u64::from(congested), // 0/1: AIMD only cares whether there was loss this interval
             self.adaptive_floor_bps,
             ceiling,
             self.adaptive_increase_bps,
@@ -818,7 +888,9 @@ impl Gfx {
             let prev = ctx.adaptive_target_bps;
             ctx.adaptive_target_bps = new_target;
             debug!(
-                loss_delta = delta,
+                ack_lag,
+                retransmit_delta,
+                congested,
                 prev_bps = prev,
                 new_bps = new_target,
                 "EGFX adaptive bitrate adjusted"
@@ -826,7 +898,7 @@ impl Gfx {
             actions.bitrate_bps = Some(new_target);
         }
         // P2a IDR backoff: don't inject a big periodic keyframe into a congested tunnel.
-        match idr_backoff_decision(delta > 0, new_target, ceiling, ctx.idr_backed_off) {
+        match idr_backoff_decision(congested, new_target, ceiling, ctx.idr_backed_off) {
             IdrBackoff::Stretch => {
                 ctx.idr_backed_off = true;
                 actions.keyframe_frames = Some(self.stretched_keyframe_frames);
@@ -1734,6 +1806,36 @@ mod tests {
             idr_backoff_decision(false, 10_000_000, 10_000_000, false),
             IdrBackoff::Hold
         );
+    }
+
+    #[test]
+    fn congested_when_ack_lag_exceeds_threshold() {
+        // Fast signal: lag past threshold with acks flowing → congested, no
+        // retransmit needed (this is the pre-watchdog head-start).
+        assert!(controller_congested(10, 8, 0, true, false));
+    }
+
+    #[test]
+    fn not_congested_when_ack_lag_within_threshold() {
+        // Healthy presentation jitter (lag ≤ threshold), no retransmits → clean.
+        assert!(!controller_congested(2, 8, 0, true, false));
+        assert!(!controller_congested(8, 8, 0, true, false)); // exactly at = not over
+    }
+
+    #[test]
+    fn ack_lag_ignored_when_acks_suspended_or_unseen() {
+        // Lag is uninferable with acks suspended or not yet seen — fall back to the
+        // retransmit signal only, so a huge stale lag doesn't false-trigger.
+        assert!(!controller_congested(10_000, 8, 0, true, true)); // suspended
+        assert!(!controller_congested(10_000, 8, 0, false, false)); // cold start
+    }
+
+    #[test]
+    fn congested_on_retransmit_even_when_lag_low() {
+        // Late signal still counts: a retransmit with low lag → congested.
+        assert!(controller_congested(0, 8, 1, true, false));
+        // And even when acks are suspended (retransmit is acks-independent).
+        assert!(controller_congested(0, 8, 1, true, true));
     }
 
     #[test]
