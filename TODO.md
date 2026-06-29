@@ -25,14 +25,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
   video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)
-  SHIPPED as #94; P2a (IDR backoff + ack-lag signal switch) SHIPPED 2026-06-29**
-  (verified on real mstsc: controller now fires ~2.6s before the watchdog and the live
-  keyframe-interval changes don't break the stream — see the feasibility doc "P2a" note;
-  scope caveat: doesn't *save* the tunnel above the moderate-loss regime, the ordered
-  stream HOL-blocks at any bitrate). The remaining P2/P3 sub-pieces (**P2b** frame-drop /
-  fps reduction when bitrate is at the floor, the **P3** TCP-path adapter reading
-  backpressure + `TCP_CONNECTION_INFO`, the CN/RTT/window signals, and tuning the control
-  law against a real-Windows-server capture) are below. **Concrete
+  SHIPPED as #94; P2a (IDR backoff + ack-lag signal switch) SHIPPED 2026-06-29;
+  P3 (controller runs on the TCP path too) SHIPPED 2026-06-29** (verified on real mstsc:
+  with `--bitrate 8` on a pure-TCP session, clean connect via the cold-start guard, gentle
+  8M↔5.6M sawtooth backoff/recovery under 5% TCP drop — see the feasibility doc "P3" note;
+  ack-lag on TCP is a real but spiky/lower-amplitude signal, tuned via a ¾·max_frame_lag
+  threshold). Remaining sub-pieces: **P2b** frame-drop / fps reduction when bitrate is at
+  the floor; a **stronger TCP signal** (`TCP_CONNECTION_INFO` RTT+retransmits / write-
+  backpressure — less spiky than ack-lag, would let EWMA smoothing be dropped); the
+  CN/RTT/window signals; **EWMA smoothing/hysteresis** on the controller (deferred polish
+  to reduce the residual dip + catch-up speed-up); and tuning the control law against a
+  real-Windows-server capture. **Concrete
   manifestation found 2026-06-28:** EGFX-over-UDP reconnect freezes *intermittently*
   because the server never throttles on the client's EGFX `queueDepth` —
   `GfxHandler::on_frame_ack` only records ack timing, so macrdp ships at full rate while

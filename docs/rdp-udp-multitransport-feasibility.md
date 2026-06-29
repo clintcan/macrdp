@@ -384,6 +384,35 @@ reliable-only multitransport.
    watchdog→TCP backstop covers the rest. Remaining: CN/RTT/window signals, frame-drop
    (P2b), the TCP-path adapter (P3).
 
+   **SHIPPED 2026-06-29 — rate control P3: the controller runs on the TCP path too.**
+   The same AIMD + ack-lag signal, now active while EGFX is on TCP (not just the UDP
+   tunnel) — so a user can set a high ceiling (`--bitrate 8`) and have it back off only
+   when the link struggles, climbing back when clear, on the path every client uses.
+   Key realization: the `shipped − acked` ack-lag signal works on TCP because EGFX
+   `FrameAcknowledge` flows on the TCP DRDYNVC channel AND the `ServerEvent` ship
+   channel is **unbounded** (`shipped` advances immediately; socket backpressure lives
+   inside the vendored server), so the lag reflects the real encoder→socket→client
+   backlog. **Characterized on real mstsc under clumsy TCP loss** (this took correcting
+   a test error — clumsy was first run with a *UDP* filter on a pure-TCP session, which
+   dropped nothing): healthy ack-lag is 0–4; under 5 % TCP drop it climbs to **~40 in
+   bursts** — a real but *spiky, lower-amplitude* signal vs UDP's 25–33 sustained (TCP's
+   own reliability + flow control smooth loss out). Tuning that matters: a transport-
+   specific threshold — default **¾·`max_frame_lag` (=12)**, `MACRDP_TCP_ADAPTIVE_LAG_THRESHOLD`
+   — catches genuine spikes (14–40) while ignoring the 0–12 jitter. At the UDP default
+   (16) it missed real congestion; at a diagnostic 2 it pumped the bitrate 1.3 M↔8 M
+   (visibly). At 12 it's an infrequent, gentle **8 M↔5.6 M** sawtooth on real spikes,
+   verified smoother on screen. Plus a **cold-start guard** (`ADAPTIVE_WARMUP`, 2 s):
+   ignore the ack-lag signal for 2 s after the first ack so the connect-time startup
+   backlog (`ack_lag`~25 before the client starts acking) doesn't dip the bitrate at
+   session open — verified to give a clean connect. **IDR backoff stays UDP-only** (on
+   reliable TCP the periodic keyframe is cheap decode-glitch insurance, not worth the
+   false-suppress risk). The UDP→TCP de-migrate snaps to the ceiling once (instant
+   recovery) then the TCP controller manages from there. **Residual** (accepted): a
+   slight dip + brief catch-up speed-up on a congestion spike — inherent to rate-adaptive
+   video draining its buffer; EWMA smoothing/hysteresis is deferred polish. The next
+   refinements (CN/RTT/window signals; `TCP_CONNECTION_INFO` for a stronger, less spiky
+   TCP signal; frame-drop P2b) remain.
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a
