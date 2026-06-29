@@ -358,26 +358,37 @@ fn idr_backoff_decision(loss: bool, new_target: u32, ceiling: u32, backed_off: b
     }
 }
 
+/// Whether the reliable-tunnel retransmits observed this control interval count as
+/// loss, given the per-interval `tolerance`. The tunnel retransmits on *any* packet
+/// loss and a wireless link (WiFi) has near-continuous low-level loss, so a single
+/// retransmit must NOT read as congestion — only `retransmit_delta > tolerance` does.
+/// `tolerance == 0` restores the old "any retransmit = loss" behaviour. Pure +
+/// unit-tested. See [`Gfx::adaptive_bitrate_step`] and the `adaptive_retx_tolerance` field.
+fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
+    retransmit_delta > tolerance
+}
+
 /// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
 /// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
 /// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
 /// 0↔40 even at moderate loss, which a naive threshold turns into visible bitrate
 /// pumping). **Hysteresis:** enter congestion when `ewma_lag` crosses `high`, then stay
 /// congested until it falls below `low` (`low < high`) — so the bitrate doesn't
-/// flip-flop while the signal straddles one threshold. A reliable retransmit this
-/// interval (`retransmit_delta`, UDP) forces congested immediately (a definite loss, no
-/// smoothing). With acks unusable (suspended / not yet seen / cold-start warmup), the
-/// lag is uninferable so only the retransmit signal counts. Unit-tested. See
-/// [`Gfx::adaptive_bitrate_step`].
+/// flip-flop while the signal straddles one threshold. `retransmit_lossy` (UDP — the
+/// caller has already applied the per-interval retransmit *tolerance*, so this is
+/// "loss above the wireless background", not "any retransmit") forces congested
+/// immediately (a definite loss, no smoothing). With acks unusable (suspended / not yet
+/// seen / cold-start warmup), the lag is uninferable so only the retransmit signal
+/// counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
 fn congested_hysteresis(
     ewma_lag: f64,
     high: f64,
     low: f64,
-    retransmit_delta: u64,
+    retransmit_lossy: bool,
     acks_usable: bool,
     currently_congested: bool,
 ) -> bool {
-    if retransmit_delta > 0 {
+    if retransmit_lossy {
         return true;
     }
     if !acks_usable {
@@ -406,7 +417,8 @@ enum RateAction {
 
 /// Pure 3-zone bitrate action on the smoothed signal (AIMD with a hold band).
 /// `congested` is the hysteresis state from [`congested_hysteresis`] this interval.
-/// Decrease while genuinely congested (lag above `high`, or a retransmit); hold while
+/// Decrease while genuinely congested (lag above `high`, or retransmits above the
+/// tolerance); hold while
 /// the episode is still latched but the smoothed lag is decaying back through the band;
 /// increase once cleared. So a single spike = one step down then a plateau, while
 /// *sustained* congestion (lag stays above `high`) keeps decreasing toward the floor.
@@ -414,11 +426,11 @@ enum RateAction {
 fn rate_action(
     ewma_lag: f64,
     high: f64,
-    retransmit_delta: u64,
+    retransmit_lossy: bool,
     acks_usable: bool,
     congested: bool,
 ) -> RateAction {
-    if retransmit_delta > 0 || (acks_usable && ewma_lag > high) {
+    if retransmit_lossy || (acks_usable && ewma_lag > high) {
         RateAction::Decrease
     } else if !congested {
         RateAction::Increase
@@ -557,6 +569,18 @@ pub struct Gfx {
     /// smoothing (slower reaction). Default 0.3; `MACRDP_ADAPTIVE_EWMA_ALPHA` overrides.
     /// The hysteresis exit threshold is half the (transport) entry threshold.
     adaptive_ewma_alpha: f64,
+    /// Retransmit tolerance (per control interval) for the UDP loss signal. The
+    /// reliable tunnel retransmits on *any* packet loss, and a wireless link (WiFi)
+    /// has near-continuous low-level loss, so treating a single retransmit as
+    /// congestion made the controller ratchet the bitrate down with no recovery
+    /// (decrease on any retransmit; increase only on a *zero*-retransmit interval,
+    /// which WiFi rarely gives). Instead, only `retransmit_delta > tolerance` in an
+    /// interval counts as loss — so sporadic single retransmits are ignored and the
+    /// bitrate can still climb under low background loss, while *sustained* loss
+    /// (delta above the tolerance every interval) still backs off. Default 2;
+    /// `MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE` overrides (0 = the old "any retransmit"
+    /// behaviour). Only the UDP path produces retransmits, so this never affects TCP.
+    adaptive_retx_tolerance: u64,
     /// P2a IDR backoff: the normal periodic-keyframe interval (frames, from
     /// `--keyframe-interval`) restored on recovery, and the stretched value used to
     /// suppress the periodic IDR under congestion.
@@ -655,6 +679,13 @@ impl Gfx {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&a| a > 0.0 && a <= 1.0)
             .unwrap_or(0.3);
+        // Retransmit tolerance per control interval for the UDP loss signal (0 = the
+        // old "any retransmit = loss" behaviour). Default 2 so sporadic single
+        // wireless retransmits don't ratchet the bitrate down on WiFi. See the field.
+        let adaptive_retx_tolerance = std::env::var("MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(2);
         // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
         // derivation as Encoder::new), and a stretched value (~10 min) that
         // effectively suppresses the periodic IDR for the duration of a congestion
@@ -716,6 +747,7 @@ impl Gfx {
             adaptive_lag_threshold,
             adaptive_tcp_lag_threshold,
             adaptive_ewma_alpha,
+            adaptive_retx_tolerance,
             normal_keyframe_frames,
             stretched_keyframe_frames,
             congestion_retransmits,
@@ -1033,6 +1065,12 @@ impl Gfx {
         let cur = self.congestion_retransmits.load(Ordering::Relaxed);
         let retransmit_delta = cur.saturating_sub(ctx.adaptive_last_retransmits);
         ctx.adaptive_last_retransmits = cur;
+        // Apply the per-interval retransmit tolerance: a wireless link retransmits
+        // continuously at a low rate, so only loss *above* the tolerance counts as
+        // congestion. Without this, any single retransmit forced a multiplicative
+        // decrease while an increase needed a zero-retransmit interval (rare on WiFi)
+        // → the bitrate ratcheted down with no recovery.
+        let retransmit_lossy = retransmit_is_lossy(retransmit_delta, self.adaptive_retx_tolerance);
         // Congestion signal: the client's frame-ack lag (shipped − acked). On UDP it
         // rises ~2 s before the watchdog's ack-silence trigger (the retransmit counter
         // only climbs after an RTO, too late); on TCP it reflects the encoder→socket→
@@ -1060,7 +1098,7 @@ impl Gfx {
             ctx.adaptive_lag_ewma,
             high,
             high * 0.5, // exit threshold (hysteresis low mark)
-            retransmit_delta,
+            retransmit_lossy,
             acks_usable,
             ctx.adaptive_congested,
         );
@@ -1072,7 +1110,7 @@ impl Gfx {
         let action = rate_action(
             ctx.adaptive_lag_ewma,
             high,
-            retransmit_delta,
+            retransmit_lossy,
             acks_usable,
             congested,
         );
@@ -2029,74 +2067,122 @@ mod tests {
         );
     }
 
-    // congested_hysteresis(ewma_lag, high, low, retransmit_delta, acks_usable, currently)
+    // retransmit_is_lossy(retransmit_delta, tolerance)
+    #[test]
+    fn retransmit_tolerance_ignores_sporadic_wireless_loss() {
+        // Default tolerance 2: up to 2 retransmits/interval is background wireless loss,
+        // NOT congestion — so a sporadic single/double retransmit no longer ratchets the
+        // bitrate down, and the controller can still climb under it.
+        assert!(!retransmit_is_lossy(0, 2));
+        assert!(!retransmit_is_lossy(1, 2));
+        assert!(!retransmit_is_lossy(2, 2)); // at tolerance → still tolerated
+        assert!(retransmit_is_lossy(3, 2)); // above tolerance → real loss → back off
+                                            // tolerance 0 restores the old "any retransmit = loss" behaviour.
+        assert!(!retransmit_is_lossy(0, 0));
+        assert!(retransmit_is_lossy(1, 0));
+    }
+
+    // congested_hysteresis(ewma_lag, high, low, retransmit_lossy, acks_usable, currently)
     #[test]
     fn hysteresis_enters_only_above_high() {
         // Not yet congested: enter only once the smoothed lag clears the HIGH mark.
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, 0, true, false)); // below high
-        assert!(!congested_hysteresis(12.0, 12.0, 6.0, 0, true, false)); // exactly at
-        assert!(congested_hysteresis(13.0, 12.0, 6.0, 0, true, false)); // above high
+        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // below high
+        assert!(!congested_hysteresis(12.0, 12.0, 6.0, false, true, false)); // exactly at
+        assert!(congested_hysteresis(13.0, 12.0, 6.0, false, true, false)); // above high
     }
 
     #[test]
     fn hysteresis_stays_until_below_low() {
         // Already congested: stay through the (low, high] band, exit at or below low.
-        assert!(congested_hysteresis(9.0, 12.0, 6.0, 0, true, true)); // in the band → stay
-        assert!(congested_hysteresis(7.0, 12.0, 6.0, 0, true, true)); // just above low → stay
-        assert!(!congested_hysteresis(6.0, 12.0, 6.0, 0, true, true)); // at low → exit
-        assert!(!congested_hysteresis(5.0, 12.0, 6.0, 0, true, true)); // below low → exit
+        assert!(congested_hysteresis(9.0, 12.0, 6.0, false, true, true)); // in the band → stay
+        assert!(congested_hysteresis(7.0, 12.0, 6.0, false, true, true)); // just above low → stay
+        assert!(!congested_hysteresis(6.0, 12.0, 6.0, false, true, true)); // at low → exit
+        assert!(!congested_hysteresis(5.0, 12.0, 6.0, false, true, true)); // below low → exit
     }
 
     #[test]
     fn hysteresis_retransmit_forces_congested() {
-        // A reliable retransmit is a definite loss → congested regardless of lag/acks.
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, 1, true, false));
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, 1, false, false)); // even acks-unusable
+        // Loss above the tolerance is a definite loss → congested regardless of lag/acks.
+        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, true, false));
+        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, false, false)); // even acks-unusable
     }
 
     #[test]
     fn hysteresis_ignores_lag_when_acks_unusable() {
         // Acks suspended / cold-start: lag uninferable → not congested (no retransmit),
         // and a stale-high EWMA can't keep an episode latched.
-        assert!(!congested_hysteresis(10_000.0, 12.0, 6.0, 0, false, false));
-        assert!(!congested_hysteresis(10_000.0, 12.0, 6.0, 0, false, true));
+        assert!(!congested_hysteresis(
+            10_000.0, 12.0, 6.0, false, false, false
+        ));
+        assert!(!congested_hysteresis(
+            10_000.0, 12.0, 6.0, false, false, true
+        ));
     }
 
     #[test]
     fn hysteresis_transport_specific_high() {
         // Same smoothed lag enters congestion at the UDP high (8) but not the TCP high
         // (12) — TCP's send buffer adds baseline depth, so it needs a higher mark.
-        assert!(congested_hysteresis(10.0, 8.0, 4.0, 0, true, false)); // UDP
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, 0, true, false)); // TCP
+        assert!(congested_hysteresis(10.0, 8.0, 4.0, false, true, false)); // UDP
+        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // TCP
     }
 
-    // rate_action(ewma_lag, high, retransmit_delta, acks_usable, congested)
+    // rate_action(ewma_lag, high, retransmit_lossy, acks_usable, congested)
     #[test]
     fn rate_action_decreases_above_high_or_on_retransmit() {
-        assert_eq!(rate_action(13.0, 12.0, 0, true, true), RateAction::Decrease); // lag>high
-        assert_eq!(rate_action(0.0, 12.0, 1, true, true), RateAction::Decrease); // retransmit
         assert_eq!(
-            rate_action(0.0, 12.0, 1, false, false),
+            rate_action(13.0, 12.0, false, true, true),
             RateAction::Decrease
-        ); // retransmit, acks unusable
+        ); // lag>high
+        assert_eq!(
+            rate_action(0.0, 12.0, true, true, true),
+            RateAction::Decrease
+        ); // loss>tolerance
+        assert_eq!(
+            rate_action(0.0, 12.0, true, false, false),
+            RateAction::Decrease
+        ); // loss>tolerance, acks unusable
     }
 
     #[test]
     fn rate_action_holds_in_band_while_congested() {
         // Latched congested but the smoothed lag has decayed below high (decaying through
         // the band) → hold, don't keep cratering. This is the "single spike" fix.
-        assert_eq!(rate_action(9.0, 12.0, 0, true, true), RateAction::Hold);
+        assert_eq!(rate_action(9.0, 12.0, false, true, true), RateAction::Hold);
     }
 
     #[test]
     fn rate_action_increases_when_cleared() {
         // Not congested (cleared below low) → climb back toward the ceiling.
-        assert_eq!(rate_action(2.0, 12.0, 0, true, false), RateAction::Increase);
+        assert_eq!(
+            rate_action(2.0, 12.0, false, true, false),
+            RateAction::Increase
+        );
         // Acks unusable (warmup/suspend) with no retransmit → not congested → increase
         // (target is already at ceiling at connect, so this is a clamp-no-op there).
         assert_eq!(
-            rate_action(99.0, 12.0, 0, false, false),
+            rate_action(99.0, 12.0, false, false, false),
             RateAction::Increase
+        );
+    }
+
+    #[test]
+    fn rate_action_climbs_under_tolerated_wireless_loss() {
+        // The WiFi-ratchet fix end-to-end: low background loss (delta=1) is below the
+        // default tolerance → retransmit_lossy=false → with a low smoothed lag the
+        // controller still INCREASES instead of being pinned in decrease.
+        let lossy = retransmit_is_lossy(1, 2);
+        assert!(!lossy);
+        assert_eq!(
+            rate_action(1.0, 8.0, lossy, true, false),
+            RateAction::Increase
+        );
+        // But sustained loss (delta=5) crosses the tolerance → back off.
+        let lossy = retransmit_is_lossy(5, 2);
+        assert!(lossy);
+        assert_eq!(
+            rate_action(1.0, 8.0, lossy, true, true),
+            RateAction::Decrease
         );
     }
 
