@@ -350,6 +350,40 @@ reliable-only multitransport.
    now-silent UDP tunnel) — fix is to keepalive or cleanly close the abandoned tunnel
    on de-migrate (TODO).
 
+   **SHIPPED 2026-06-29 — rate control P2a: IDR backoff + the ack-lag signal switch.**
+   Two changes that ship together. (1) **IDR backoff** (`idr_backoff_decision`, pure +
+   unit-tested): a ~240 KB periodic keyframe is the worst thing to inject into a
+   congested ordered tunnel (it's what wedges it), so on congestion the controller
+   stretches `MaxKeyFrameInterval` to ~10 min (`Encoder::set_keyframe_interval`,
+   live-settable, no rebuild) — suppressing the periodic IDR — and restores it +
+   forces one recovery IDR on full recovery. Safe on the reliable tunnel: reliable
+   delivery means there's no loss-corruption to heal, so the periodic IDR is only a
+   decode-glitch safety net that's deferrable while congested. (2) **THE FIX that made
+   P1 *and* P2a actually fire on a lossy link:** the original retransmit-counter signal
+   only climbs after an RTO (~one RTT), which is **strictly slower than the watchdog's
+   3 s ack-silence trigger** — so on every lossy session the watchdog de-migrated to
+   TCP (`egfx_on_udp→false`) *before* the first retransmit, and the controller shut off
+   having never seen loss (observed live: watchdog at T+11.2 s, first retransmit
+   +292 ms *after* it; zero bitrate adjustments all session). Switched the primary
+   congestion signal to the client's **frame-ack lag** (`shipped − acked`, the same
+   fast signal the watchdog + backpressure gate already compute) — it rises the instant
+   the client stops acking, so the controller now reacts **~2.6 s before** the watchdog.
+   Pure `controller_congested` (lag > threshold with acks flowing, OR a retransmit) +
+   4 unit tests; retransmit delta kept as a secondary late signal. Also restores the
+   normal keyframe interval when EGFX leaves the UDP tunnel (watchdog de-migrate) while
+   backed off, so the TCP path doesn't inherit the 10 min stretched interval.
+   **Verified on real mstsc under clumsy UDP loss:** clean baseline held 11 s at the
+   3 Mbps ceiling with no false positives; on loss the controller rode 3 M → 500 k floor
+   in ~1.7 s, suppressed the keyframe, and the live `MaxKeyFrameInterval` changes did
+   **not** break the stream; video recovered cleanly on the TCP de-migrate.
+   **Important scope finding:** on a link *this* lossy (clumsy + WiFi baseline) the
+   tunnel still wedged even at the 500 k floor — a reliable **ordered** stream HOL-blocks
+   on a single unrecovered packet regardless of bitrate (finding #3/#4), so no bitrate
+   is low enough; the controller's win is real only in the **moderate**-loss regime
+   (keeps the tunnel under the wedge threshold, as P1 showed at 8 %), and the
+   watchdog→TCP backstop covers the rest. Remaining: CN/RTT/window signals, frame-drop
+   (P2b), the TCP-path adapter (P3).
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a

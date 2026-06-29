@@ -25,9 +25,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
   video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)
-  SHIPPED as #94;** the remaining P2/P3 sub-pieces (IDR-backoff under the
-  controller, frame-drop integration, the TCP-path adapter, and tuning the control law
-  against a real-Windows-server capture) are below. **Concrete
+  SHIPPED as #94; P2a (IDR backoff + ack-lag signal switch) SHIPPED 2026-06-29**
+  (verified on real mstsc: controller now fires ~2.6s before the watchdog and the live
+  keyframe-interval changes don't break the stream — see the feasibility doc "P2a" note;
+  scope caveat: doesn't *save* the tunnel above the moderate-loss regime, the ordered
+  stream HOL-blocks at any bitrate). The remaining P2/P3 sub-pieces (**P2b** frame-drop /
+  fps reduction when bitrate is at the floor, the **P3** TCP-path adapter reading
+  backpressure + `TCP_CONNECTION_INFO`, the CN/RTT/window signals, and tuning the control
+  law against a real-Windows-server capture) are below. **Concrete
   manifestation found 2026-06-28:** EGFX-over-UDP reconnect freezes *intermittently*
   because the server never throttles on the client's EGFX `queueDepth` —
   `GfxHandler::on_frame_ack` only records ack timing, so macrdp ships at full rate while
