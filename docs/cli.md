@@ -171,6 +171,16 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   nicety, while --fork-workers fixes the real mstsc pain).
                           #   macOS-only. See the H.264 reconnect-blank quirk note.
 --cert-dir PATH           # default ~/Library/Application Support/macrdp
+--cert PATH               # Operator-supplied TLS certificate (PEM; leaf first,
+                          #   then any intermediate chain). Serve a real CA / ACME
+                          #   / Let's Encrypt cert instead of the self-signed
+                          #   default. MUST be given with --key. When set, macrdp
+                          #   uses exactly these files and NEVER falls back to
+                          #   self-signed — a missing/unreadable file is a hard
+                          #   error. A cert change needs a restart (launchctl
+                          #   kickstart -k). Config keys: TLS_CERT / TLS_KEY.
+--key PATH                # Private key (PEM) for --cert. Must be chmod 600 and
+                          #   readable by the macrdp user. Required with --cert.
 --log-dir PATH            # Directory for the rotating log file (macrdp.log). If
                           #   unset: a rotating file in ~/Library/Logs when running
                           #   HEADLESS (stdout is not a TTY, e.g. under the

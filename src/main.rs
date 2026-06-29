@@ -236,6 +236,20 @@ struct Args {
     #[arg(long)]
     cert_dir: Option<PathBuf>,
 
+    /// Operator-supplied TLS certificate (PEM; leaf first, then any chain).
+    /// Use this to serve a real CA / ACME / Let's Encrypt cert instead of the
+    /// self-signed default. Must be given together with --key; when set, macrdp
+    /// uses exactly these files and NEVER falls back to self-signed (a missing
+    /// file is a hard error). Default (neither flag): auto self-signed in
+    /// --cert-dir. A cert change needs a restart.
+    #[arg(long)]
+    cert: Option<PathBuf>,
+
+    /// Operator-supplied TLS private key (PEM) for --cert. Must be chmod 600 and
+    /// readable by the macrdp user. Required together with --cert.
+    #[arg(long)]
+    key: Option<PathBuf>,
+
     /// Directory for the rotating log file (`macrdp.log`, size-bounded via
     /// MACRDP_LOG_MAX_BYTES / MACRDP_LOG_MAX_FILES). If unset, logs go to a
     /// rotating file in ~/Library/Logs when running headless (stdout is not a
@@ -1132,16 +1146,86 @@ struct TlsMaterial {
     key_der: Vec<u8>,
 }
 
-fn make_tls_acceptor(cert_dir: &Path) -> Result<TlsMaterial> {
-    let cert_path = cert_dir.join("cert.pem");
-    let key_path = cert_dir.join("key.pem");
+/// Expiry classification for an operator-supplied cert. Pure (testable) split
+/// from the logging in [`warn_if_expiring`].
+#[derive(Debug, PartialEq, Eq)]
+enum CertExpiry {
+    Expired,
+    /// Within the warn window; carries days remaining.
+    Soon(u64),
+    Ok,
+}
 
-    let (certs, key) = if cert_path.exists() && key_path.exists() {
-        info!(dir = %cert_dir.display(), "loading persisted TLS cert");
-        load_pem_cert_and_key(&cert_path, &key_path)?
-    } else {
-        info!(dir = %cert_dir.display(), "generating new self-signed TLS cert");
-        generate_and_persist(cert_dir, &cert_path, &key_path)?
+fn classify_expiry(
+    not_after: std::time::SystemTime,
+    now: std::time::SystemTime,
+    warn_days: u64,
+) -> CertExpiry {
+    match not_after.duration_since(now) {
+        Err(_) => CertExpiry::Expired,
+        Ok(remaining) => {
+            let days = remaining.as_secs() / 86_400;
+            if days <= warn_days {
+                CertExpiry::Soon(days)
+            } else {
+                CertExpiry::Ok
+            }
+        }
+    }
+}
+
+/// Warn (never refuse) if an operator's leaf cert is expired or near expiry.
+/// Refusing would risk locking an operator out of their own box over a stale
+/// cert; a loud warning is the right call. Best-effort: a parse failure is
+/// silently skipped (the cert already loaded into rustls, so it's structurally
+/// fine; only the validity read is advisory).
+fn warn_if_expiring(certs: &[CertificateDer<'static>]) {
+    let Some(leaf) = certs.first() else { return };
+    let Ok(parsed) = Certificate::from_der(leaf.as_ref()) else {
+        return;
+    };
+    let not_after = parsed.tbs_certificate.validity.not_after.to_system_time();
+    match classify_expiry(not_after, std::time::SystemTime::now(), 14) {
+        CertExpiry::Expired => warn!(
+            "operator TLS certificate has EXPIRED — clients will reject it; renew it and restart macrdp"
+        ),
+        CertExpiry::Soon(days) => warn!(
+            days_left = days,
+            "operator TLS certificate expires soon — renew before it lapses"
+        ),
+        CertExpiry::Ok => {}
+    }
+}
+
+/// Build the TLS material. With `cert`/`key` set (operator-supplied), load
+/// exactly those files — a missing/unreadable/bad-permission file is a hard
+/// error, NEVER a silent self-signed fallback. With neither set, use the
+/// self-signed default in `cert_dir` (load if present, else generate+persist).
+/// Callers must validate the both-or-neither invariant first.
+fn make_tls_acceptor(
+    cert_dir: &Path,
+    cert: Option<&Path>,
+    key: Option<&Path>,
+) -> Result<TlsMaterial> {
+    let (certs, key) = match (cert, key) {
+        (Some(c), Some(k)) => {
+            info!(cert = %c.display(), key = %k.display(), "loading operator-supplied TLS cert");
+            let loaded = load_pem_cert_and_key(c, k)?;
+            warn_if_expiring(&loaded.0);
+            loaded
+        }
+        (None, None) => {
+            let cert_path = cert_dir.join("cert.pem");
+            let key_path = cert_dir.join("key.pem");
+            if cert_path.exists() && key_path.exists() {
+                info!(dir = %cert_dir.display(), "loading persisted TLS cert");
+                load_pem_cert_and_key(&cert_path, &key_path)?
+            } else {
+                info!(dir = %cert_dir.display(), "generating new self-signed TLS cert");
+                generate_and_persist(cert_dir, &cert_path, &key_path)?
+            }
+        }
+        _ => anyhow::bail!("--cert and --key must be supplied together (or neither)"),
     };
 
     // CredSSP's public-key channel-binding hashes the raw `subjectPublicKey`
@@ -1467,6 +1551,18 @@ fn args_from_config(path: &Path) -> Result<Args> {
         if !dir.is_empty() {
             argv.push("--log-dir".into());
             argv.push(dir.clone());
+        }
+    }
+    if let Some(path) = cfg.get("TLS_CERT") {
+        if !path.is_empty() {
+            argv.push("--cert".into());
+            argv.push(path.clone());
+        }
+    }
+    if let Some(path) = cfg.get("TLS_KEY") {
+        if !path.is_empty() {
+            argv.push("--key".into());
+            argv.push(path.clone());
         }
     }
     // EXTRA_FLAGS: space-separated escape hatch, appended verbatim.
@@ -1873,13 +1969,20 @@ async fn async_main() -> Result<()> {
         Some(p) => p,
         None => default_cert_dir()?,
     };
+    // Operator-supplied cert/key are all-or-nothing: one without the other is a
+    // config error (we won't guess the missing half or silently self-sign).
+    if args.cert.is_some() != args.key.is_some() {
+        return Err(anyhow!(
+            "--cert and --key must be supplied together (or neither, for the self-signed default)"
+        ));
+    }
     let TlsMaterial {
         acceptor: tls,
         spki_der,
         config: udp_tls_config,
         cert_der: udp_cert_der,
         key_der: udp_key_der,
-    } = make_tls_acceptor(&cert_dir)?;
+    } = make_tls_acceptor(&cert_dir, args.cert.as_deref(), args.key.as_deref())?;
 
     // Resolve desktop dimensions + geometry. Three paths:
     //   - virtual display: width/height are already enforced as required
@@ -2567,5 +2670,126 @@ mod config_tests {
 
         assert!(args.detach_primary);
         assert!(!args.capture_primary);
+    }
+
+    #[test]
+    fn config_maps_tls_cert_and_key() {
+        let path = write_temp(
+            "tls",
+            "TLS_CERT=/etc/ssl/macrdp.pem\nTLS_KEY=/etc/ssl/macrdp.key\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert_eq!(args.cert.as_deref(), Some(Path::new("/etc/ssl/macrdp.pem")));
+        assert_eq!(args.key.as_deref(), Some(Path::new("/etc/ssl/macrdp.key")));
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "macrdp-tlstest-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a fresh self-signed cert+key as operator-style PEM files (key 0600,
+    /// as `load_pem_cert_and_key` requires). Returns (cert_path, key_path).
+    fn write_operator_pem(dir: &Path) -> (PathBuf, PathBuf) {
+        let ck = rcgen::generate_simple_self_signed(vec!["macrdp.example".to_string()])
+            .expect("gen cert");
+        let cert_path = dir.join("operator-cert.pem");
+        let key_path = dir.join("operator-key.pem");
+        fs::write(&cert_path, ck.cert.pem()).unwrap();
+        fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn classify_expiry_covers_expired_soon_ok() {
+        let now = SystemTime::now();
+        assert_eq!(
+            classify_expiry(now - Duration::from_secs(60), now, 14),
+            CertExpiry::Expired
+        );
+        assert_eq!(
+            classify_expiry(now + Duration::from_secs(3 * 86_400), now, 14),
+            CertExpiry::Soon(3)
+        );
+        assert_eq!(
+            classify_expiry(now + Duration::from_secs(60 * 86_400), now, 14),
+            CertExpiry::Ok
+        );
+    }
+
+    #[test]
+    fn operator_cert_loads_without_self_signing() {
+        let store = unique_dir("op");
+        let (cert, key) = write_operator_pem(&store);
+        // cert_dir is a DIFFERENT, empty dir — proving we don't touch it.
+        let cert_dir = unique_dir("op-certdir");
+
+        let mat = make_tls_acceptor(&cert_dir, Some(&cert), Some(&key)).expect("operator load");
+        assert!(
+            !mat.spki_der.is_empty(),
+            "SPKI must be extracted for CredSSP"
+        );
+        assert!(!mat.cert_der.is_empty() && !mat.key_der.is_empty());
+        // No self-signed material written into cert_dir.
+        assert!(!cert_dir.join("cert.pem").exists());
+        assert!(!cert_dir.join("key.pem").exists());
+
+        fs::remove_dir_all(&store).ok();
+        fs::remove_dir_all(&cert_dir).ok();
+    }
+
+    #[test]
+    fn operator_missing_file_is_hard_error_not_self_sign() {
+        let cert_dir = unique_dir("op-missing");
+        let missing_cert = cert_dir.join("nope-cert.pem");
+        let missing_key = cert_dir.join("nope-key.pem");
+        let res = make_tls_acceptor(&cert_dir, Some(&missing_cert), Some(&missing_key));
+        assert!(
+            res.is_err(),
+            "a missing operator cert must error, never self-sign"
+        );
+        // And it must NOT have generated a fallback self-signed cert.
+        assert!(!cert_dir.join("cert.pem").exists());
+        fs::remove_dir_all(&cert_dir).ok();
+    }
+
+    #[test]
+    fn operator_cert_without_key_is_error() {
+        let store = unique_dir("op-onearg");
+        let (cert, _key) = write_operator_pem(&store);
+        let cert_dir = unique_dir("op-onearg-certdir");
+        // Only --cert, no --key: make_tls_acceptor rejects (defensive; async_main
+        // also validates before calling).
+        let res = make_tls_acceptor(&cert_dir, Some(&cert), None);
+        assert!(res.is_err());
+        fs::remove_dir_all(&store).ok();
+        fs::remove_dir_all(&cert_dir).ok();
+    }
+
+    #[test]
+    fn default_path_still_generates_self_signed() {
+        let cert_dir = unique_dir("default");
+        let mat = make_tls_acceptor(&cert_dir, None, None).expect("default self-signed");
+        assert!(!mat.spki_der.is_empty());
+        // Default path persists into cert_dir for stable TOFU.
+        assert!(cert_dir.join("cert.pem").exists());
+        assert!(cert_dir.join("key.pem").exists());
+        fs::remove_dir_all(&cert_dir).ok();
     }
 }

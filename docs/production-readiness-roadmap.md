@@ -19,14 +19,15 @@ are scope limits, not gaps to close.
 
 ## Tier 1 — Security (lifts the "trusted-LAN only" caveat)
 
-1. **Real TLS certificates.** *(highest trust payoff / low effort — recommended first.)*
-   Today the cert is self-signed with trust-on-first-use (`~/Library/Application
-   Support/macrdp/{cert,key}.pem`, generated on first run) — the single biggest reason
-   the project is scoped to trusted LANs. Let the operator supply a real cert/key
-   (their CA, or ACME / Let's Encrypt). The cert-loading plumbing already exists in
-   `src/main.rs::make_tls_acceptor`; this is mostly a `--cert`/`--key` flag (or honoring
-   operator-provided files in the cert dir) + docs. Keep self-signed as the zero-config
-   default.
+1. **Real TLS certificates — DONE (2026-06-30).** The operator can now supply a real
+   CA / ACME / Let's Encrypt cert/key via `--cert`/`--key` (or `TLS_CERT`/`TLS_KEY` in
+   config.env), so clients can verify the server's identity instead of relying on
+   trust-on-first-use. When set, macrdp uses exactly those files and **never** silently
+   falls back to self-signed (a missing/bad file is a hard error), and it warns at
+   startup if the cert is expired / within 14 days. Self-signed in `~/Library/Application
+   Support/macrdp` remains the zero-config default. (Dropping `cert.pem`/`key.pem` into
+   the cert dir also still works.) Not done here: ACME auto-renewal (operator tooling's
+   job — replace the file + restart) and hot reload (a cert change needs a restart).
 2. **Auth hardening.** NLA/CredSSP is already the pre-auth gate (good). Add:
    connection **rate-limiting**, **failed-attempt backoff/lockout**, and an **auth audit
    log** (who connected, from where, when, success/fail). Moderate effort, real value.
