@@ -836,17 +836,29 @@ impl Gfx {
             return actions;
         }
         if !self.egfx_on_udp.load(Ordering::Relaxed) {
-            // EGFX is on TCP (never migrated, or the watchdog de-migrated). If we'd
-            // stretched the keyframe interval on the UDP tunnel, restore the normal
-            // periodic IDR for the TCP path (one-shot) — otherwise the encoder keeps
-            // the ~10 min stretched interval and the TCP session has no periodic
-            // keyframe to heal a decode glitch. The watchdog already forced one IDR
-            // at de-migration, so no extra recovery IDR is needed here.
+            // EGFX is on TCP (never migrated, or the watchdog de-migrated). TCP is
+            // paced by socket backpressure and never HOL-freezes on loss (it just
+            // slows), so the UDP-side backoff doesn't apply here — restore the FULL
+            // configured bitrate and the normal keyframe interval (one-shot). Without
+            // this the TCP session is stuck at whatever reduced bitrate the UDP
+            // controller had ramped down to (e.g. the floor) with nothing to climb it
+            // back, since the adaptive controller only runs while EGFX is on the UDP
+            // tunnel. (Dynamic rate control ON the TCP path — read backpressure /
+            // TCP_CONNECTION_INFO — is P3.) The watchdog already forced one IDR at
+            // de-migration, so no extra recovery IDR is needed here.
+            let ceiling = self.bitrate_bps.max(1);
+            if ctx.adaptive_target_bps < ceiling {
+                ctx.adaptive_target_bps = ceiling;
+                actions.bitrate_bps = Some(ceiling);
+            }
             if ctx.idr_backed_off {
                 ctx.idr_backed_off = false;
                 actions.keyframe_frames = Some(self.normal_keyframe_frames);
+            }
+            if actions.bitrate_bps.is_some() || actions.keyframe_frames.is_some() {
                 info!(
-                    "EGFX IDR backoff: EGFX left the UDP tunnel — restoring normal periodic keyframe"
+                    ceiling_bps = ceiling,
+                    "EGFX left the UDP tunnel — restoring full bitrate + normal keyframe for the TCP path"
                 );
             }
             return actions;
