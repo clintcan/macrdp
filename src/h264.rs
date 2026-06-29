@@ -213,6 +213,12 @@ struct ConnectionContext {
     /// signal is ignored (the connect-time startup backlog isn't congestion).
     /// `None` until the first ack. See [`Gfx::adaptive_bitrate_step`].
     adaptive_warmup_until: Option<Instant>,
+    /// EWMA of the ack-lag signal (only updated while acks are usable, so the
+    /// connect-time backlog never enters it). Fed to [`congested_hysteresis`].
+    adaptive_lag_ewma: f64,
+    /// Hysteresis state: whether the controller is currently in a congestion episode
+    /// (enters when the EWMA lag clears the high mark, exits below the low mark).
+    adaptive_congested: bool,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -352,23 +358,73 @@ fn idr_backoff_decision(loss: bool, new_target: u32, ceiling: u32, backed_off: b
     }
 }
 
-/// Pure congestion test for the adaptive controller. Congested when the client's
-/// frame-ack lag (`ack_lag` = shipped − acked) exceeds `lag_threshold` with acks
-/// flowing, OR any reliable retransmit happened this interval (`retransmit_delta`).
-/// Ack-lag is the FAST signal — it rises the moment the client stops acking, ~2 s
-/// before the watchdog's ack-silence trigger, whereas `retransmit_delta` only climbs
-/// after an RTO (~one RTT late, so it can't lead the watchdog on its own). With acks
-/// suspended (`queueDepth==0xFFFFFFFF`) or not yet seen, lag is uninferable so only
-/// the retransmit signal counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
-fn controller_congested(
-    ack_lag: u64,
-    lag_threshold: u64,
+/// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
+/// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
+/// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
+/// 0↔40 even at moderate loss, which a naive threshold turns into visible bitrate
+/// pumping). **Hysteresis:** enter congestion when `ewma_lag` crosses `high`, then stay
+/// congested until it falls below `low` (`low < high`) — so the bitrate doesn't
+/// flip-flop while the signal straddles one threshold. A reliable retransmit this
+/// interval (`retransmit_delta`, UDP) forces congested immediately (a definite loss, no
+/// smoothing). With acks unusable (suspended / not yet seen / cold-start warmup), the
+/// lag is uninferable so only the retransmit signal counts. Unit-tested. See
+/// [`Gfx::adaptive_bitrate_step`].
+fn congested_hysteresis(
+    ewma_lag: f64,
+    high: f64,
+    low: f64,
     retransmit_delta: u64,
-    acks_seen: bool,
-    acks_suspended: bool,
+    acks_usable: bool,
+    currently_congested: bool,
 ) -> bool {
-    let lag_congested = acks_seen && !acks_suspended && ack_lag > lag_threshold;
-    lag_congested || retransmit_delta > 0
+    if retransmit_delta > 0 {
+        return true;
+    }
+    if !acks_usable {
+        return false;
+    }
+    if currently_congested {
+        ewma_lag > low // stay congested until the smoothed lag drops below the low mark
+    } else {
+        ewma_lag > high // only enter once the smoothed lag clears the high mark
+    }
+}
+
+/// What the controller does to the bitrate this interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateAction {
+    /// Smoothed lag is above the high mark (or a retransmit) — multiplicative-decrease.
+    Decrease,
+    /// In the hysteresis band (congested, lag decaying between low and high) — hold the
+    /// current bitrate. Stops a single spike from cratering the bitrate as the EWMA
+    /// decays back through the band (it would otherwise decrease every interval → the
+    /// "video sometimes stops" deep dips).
+    Hold,
+    /// Cleared (below the low mark / not in an episode) — additive-increase toward ceiling.
+    Increase,
+}
+
+/// Pure 3-zone bitrate action on the smoothed signal (AIMD with a hold band).
+/// `congested` is the hysteresis state from [`congested_hysteresis`] this interval.
+/// Decrease while genuinely congested (lag above `high`, or a retransmit); hold while
+/// the episode is still latched but the smoothed lag is decaying back through the band;
+/// increase once cleared. So a single spike = one step down then a plateau, while
+/// *sustained* congestion (lag stays above `high`) keeps decreasing toward the floor.
+/// Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+fn rate_action(
+    ewma_lag: f64,
+    high: f64,
+    retransmit_delta: u64,
+    acks_usable: bool,
+    congested: bool,
+) -> RateAction {
+    if retransmit_delta > 0 || (acks_usable && ewma_lag > high) {
+        RateAction::Decrease
+    } else if !congested {
+        RateAction::Increase
+    } else {
+        RateAction::Hold
+    }
 }
 
 /// Encoder adjustments the adaptive controller wants applied this frame: the P1
@@ -496,6 +552,11 @@ pub struct Gfx {
     /// `MACRDP_TCP_ADAPTIVE_LAG_THRESHOLD` overrides. Only consulted while EGFX is
     /// on TCP and `--adaptive-bitrate` is set.
     adaptive_tcp_lag_threshold: u64,
+    /// EWMA weight on each new ack-lag sample in (0,1]: `ewma = α·sample + (1−α)·ewma`.
+    /// Smooths the spiky raw lag so single bursts don't pump the bitrate; lower = more
+    /// smoothing (slower reaction). Default 0.3; `MACRDP_ADAPTIVE_EWMA_ALPHA` overrides.
+    /// The hysteresis exit threshold is half the (transport) entry threshold.
+    adaptive_ewma_alpha: f64,
     /// P2a IDR backoff: the normal periodic-keyframe interval (frames, from
     /// `--keyframe-interval`) restored on recovery, and the stretched value used to
     /// suppress the periodic IDR under congestion.
@@ -588,6 +649,12 @@ impl Gfx {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
             .unwrap_or((max_frame_lag * 3 / 4).max(6));
+        // EWMA smoothing weight for the ack-lag signal (clamped to (0,1]); default 0.3.
+        let adaptive_ewma_alpha = std::env::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|&a| a > 0.0 && a <= 1.0)
+            .unwrap_or(0.3);
         // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
         // derivation as Encoder::new), and a stretched value (~10 min) that
         // effectively suppresses the periodic IDR for the duration of a congestion
@@ -616,6 +683,7 @@ impl Gfx {
                 interval_ms = adaptive_interval.as_millis() as u64,
                 lag_threshold = adaptive_lag_threshold,
                 tcp_lag_threshold = adaptive_tcp_lag_threshold,
+                ewma_alpha = adaptive_ewma_alpha,
                 normal_keyframe_frames,
                 stretched_keyframe_frames,
                 "EGFX adaptive bitrate + IDR backoff ENABLED (--adaptive-bitrate) — \
@@ -647,6 +715,7 @@ impl Gfx {
             adaptive_interval,
             adaptive_lag_threshold,
             adaptive_tcp_lag_threshold,
+            adaptive_ewma_alpha,
             normal_keyframe_frames,
             stretched_keyframe_frames,
             congestion_retransmits,
@@ -910,6 +979,9 @@ impl Gfx {
                     "EGFX left the UDP tunnel — restoring full bitrate + normal keyframe for the TCP path"
                 );
             }
+            // Stale UDP-side smoothing state doesn't apply to the fresh TCP path.
+            ctx.adaptive_lag_ewma = 0.0;
+            ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
 
@@ -923,40 +995,74 @@ impl Gfx {
         // Congestion signal: the client's frame-ack lag (shipped − acked). On UDP it
         // rises ~2 s before the watchdog's ack-silence trigger (the retransmit counter
         // only climbs after an RTO, too late); on TCP it reflects the encoder→socket→
-        // client backlog growing under congestion. Threshold is transport-specific —
-        // TCP's send buffer adds baseline depth. See [`controller_congested`].
+        // client backlog growing under congestion. The raw lag is spiky (TCP bursts
+        // 0↔40 even at moderate loss), so smooth it with an EWMA and decide via
+        // hysteresis — otherwise single spikes pump the bitrate. Threshold is
+        // transport-specific (TCP's send buffer adds baseline depth); exit at half it.
         let ack_lag = ctx
             .last_shipped_frame_id
             .load(Ordering::Relaxed)
             .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
-        let lag_threshold = if on_udp {
+        let acks_usable = ctx.egfx_acks_seen && !ctx.acks_suspended && !in_warmup;
+        // Only fold real samples into the EWMA — during warmup/suspend the lag is the
+        // startup backlog, not congestion, and must not pre-load the average.
+        if acks_usable {
+            ctx.adaptive_lag_ewma = self.adaptive_ewma_alpha * ack_lag as f64
+                + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_lag_ewma;
+        }
+        let high = if on_udp {
             self.adaptive_lag_threshold
         } else {
             self.adaptive_tcp_lag_threshold
-        };
-        let congested = controller_congested(
-            ack_lag,
-            lag_threshold,
+        } as f64;
+        let congested = congested_hysteresis(
+            ctx.adaptive_lag_ewma,
+            high,
+            high * 0.5, // exit threshold (hysteresis low mark)
             retransmit_delta,
-            ctx.egfx_acks_seen && !in_warmup, // ignore the lag signal during cold-start
-            ctx.acks_suspended,
+            acks_usable,
+            ctx.adaptive_congested,
         );
-        let new_target = aimd_bitrate(
-            ctx.adaptive_target_bps,
-            u64::from(congested), // 0/1: AIMD only cares whether there was loss this interval
-            self.adaptive_floor_bps,
-            ceiling,
-            self.adaptive_increase_bps,
-            self.adaptive_decrease,
+        ctx.adaptive_congested = congested;
+        // 3-zone action: decrease above the high mark, hold while the EWMA decays
+        // through the band (so a single spike doesn't crater the bitrate), increase
+        // once cleared. aimd_bitrate does the decrease/increase math (1 = decrease,
+        // 0 = increase); Hold leaves the target untouched.
+        let action = rate_action(
+            ctx.adaptive_lag_ewma,
+            high,
+            retransmit_delta,
+            acks_usable,
+            congested,
         );
+        let new_target = match action {
+            RateAction::Hold => ctx.adaptive_target_bps,
+            RateAction::Decrease => aimd_bitrate(
+                ctx.adaptive_target_bps,
+                1,
+                self.adaptive_floor_bps,
+                ceiling,
+                self.adaptive_increase_bps,
+                self.adaptive_decrease,
+            ),
+            RateAction::Increase => aimd_bitrate(
+                ctx.adaptive_target_bps,
+                0,
+                self.adaptive_floor_bps,
+                ceiling,
+                self.adaptive_increase_bps,
+                self.adaptive_decrease,
+            ),
+        };
         if new_target != ctx.adaptive_target_bps {
             let prev = ctx.adaptive_target_bps;
             ctx.adaptive_target_bps = new_target;
             debug!(
                 transport = if on_udp { "udp" } else { "tcp" },
                 ack_lag,
+                ewma_lag = ctx.adaptive_lag_ewma,
                 retransmit_delta,
-                congested,
+                ?action,
                 prev_bps = prev,
                 new_bps = new_target,
                 "EGFX adaptive bitrate adjusted"
@@ -1306,6 +1412,8 @@ impl GfxServerFactory for Gfx {
             idr_backed_off: false,
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
+            adaptive_lag_ewma: 0.0,
+            adaptive_congested: false,
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -1880,44 +1988,75 @@ mod tests {
         );
     }
 
+    // congested_hysteresis(ewma_lag, high, low, retransmit_delta, acks_usable, currently)
     #[test]
-    fn congested_when_ack_lag_exceeds_threshold() {
-        // Fast signal: lag past threshold with acks flowing → congested, no
-        // retransmit needed (this is the pre-watchdog head-start).
-        assert!(controller_congested(10, 8, 0, true, false));
+    fn hysteresis_enters_only_above_high() {
+        // Not yet congested: enter only once the smoothed lag clears the HIGH mark.
+        assert!(!congested_hysteresis(10.0, 12.0, 6.0, 0, true, false)); // below high
+        assert!(!congested_hysteresis(12.0, 12.0, 6.0, 0, true, false)); // exactly at
+        assert!(congested_hysteresis(13.0, 12.0, 6.0, 0, true, false)); // above high
     }
 
     #[test]
-    fn not_congested_when_ack_lag_within_threshold() {
-        // Healthy presentation jitter (lag ≤ threshold), no retransmits → clean.
-        assert!(!controller_congested(2, 8, 0, true, false));
-        assert!(!controller_congested(8, 8, 0, true, false)); // exactly at = not over
+    fn hysteresis_stays_until_below_low() {
+        // Already congested: stay through the (low, high] band, exit at or below low.
+        assert!(congested_hysteresis(9.0, 12.0, 6.0, 0, true, true)); // in the band → stay
+        assert!(congested_hysteresis(7.0, 12.0, 6.0, 0, true, true)); // just above low → stay
+        assert!(!congested_hysteresis(6.0, 12.0, 6.0, 0, true, true)); // at low → exit
+        assert!(!congested_hysteresis(5.0, 12.0, 6.0, 0, true, true)); // below low → exit
     }
 
     #[test]
-    fn ack_lag_ignored_when_acks_suspended_or_unseen() {
-        // Lag is uninferable with acks suspended or not yet seen — fall back to the
-        // retransmit signal only, so a huge stale lag doesn't false-trigger.
-        assert!(!controller_congested(10_000, 8, 0, true, true)); // suspended
-        assert!(!controller_congested(10_000, 8, 0, false, false)); // cold start
+    fn hysteresis_retransmit_forces_congested() {
+        // A reliable retransmit is a definite loss → congested regardless of lag/acks.
+        assert!(congested_hysteresis(0.0, 12.0, 6.0, 1, true, false));
+        assert!(congested_hysteresis(0.0, 12.0, 6.0, 1, false, false)); // even acks-unusable
     }
 
     #[test]
-    fn congested_on_retransmit_even_when_lag_low() {
-        // Late signal still counts: a retransmit with low lag → congested.
-        assert!(controller_congested(0, 8, 1, true, false));
-        // And even when acks are suspended (retransmit is acks-independent).
-        assert!(controller_congested(0, 8, 1, true, true));
+    fn hysteresis_ignores_lag_when_acks_unusable() {
+        // Acks suspended / cold-start: lag uninferable → not congested (no retransmit),
+        // and a stale-high EWMA can't keep an episode latched.
+        assert!(!congested_hysteresis(10_000.0, 12.0, 6.0, 0, false, false));
+        assert!(!congested_hysteresis(10_000.0, 12.0, 6.0, 0, false, true));
     }
 
     #[test]
-    fn transport_specific_lag_threshold(/* P3 */) {
-        // The same ack-lag reads as congested on UDP (lower threshold) but clean on
-        // TCP (higher threshold, since TCP's send buffer adds baseline depth). No
-        // retransmits on TCP, so the lag is the only signal.
-        let ack_lag = 12;
-        assert!(controller_congested(ack_lag, 8, 0, true, false)); // UDP threshold 8
-        assert!(!controller_congested(ack_lag, 16, 0, true, false)); // TCP threshold 16
+    fn hysteresis_transport_specific_high() {
+        // Same smoothed lag enters congestion at the UDP high (8) but not the TCP high
+        // (12) — TCP's send buffer adds baseline depth, so it needs a higher mark.
+        assert!(congested_hysteresis(10.0, 8.0, 4.0, 0, true, false)); // UDP
+        assert!(!congested_hysteresis(10.0, 12.0, 6.0, 0, true, false)); // TCP
+    }
+
+    // rate_action(ewma_lag, high, retransmit_delta, acks_usable, congested)
+    #[test]
+    fn rate_action_decreases_above_high_or_on_retransmit() {
+        assert_eq!(rate_action(13.0, 12.0, 0, true, true), RateAction::Decrease); // lag>high
+        assert_eq!(rate_action(0.0, 12.0, 1, true, true), RateAction::Decrease); // retransmit
+        assert_eq!(
+            rate_action(0.0, 12.0, 1, false, false),
+            RateAction::Decrease
+        ); // retransmit, acks unusable
+    }
+
+    #[test]
+    fn rate_action_holds_in_band_while_congested() {
+        // Latched congested but the smoothed lag has decayed below high (decaying through
+        // the band) → hold, don't keep cratering. This is the "single spike" fix.
+        assert_eq!(rate_action(9.0, 12.0, 0, true, true), RateAction::Hold);
+    }
+
+    #[test]
+    fn rate_action_increases_when_cleared() {
+        // Not congested (cleared below low) → climb back toward the ceiling.
+        assert_eq!(rate_action(2.0, 12.0, 0, true, false), RateAction::Increase);
+        // Acks unusable (warmup/suspend) with no retransmit → not congested → increase
+        // (target is already at ceiling at connect, so this is a clamp-no-op there).
+        assert_eq!(
+            rate_action(99.0, 12.0, 0, false, false),
+            RateAction::Increase
+        );
     }
 
     #[test]
