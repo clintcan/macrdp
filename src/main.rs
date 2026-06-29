@@ -481,6 +481,21 @@ struct Args {
     #[arg(long)]
     adaptive_bitrate: bool,
 
+    /// EXPERIMENTAL, opt-in (default OFF; implies --enable-udp-multitransport,
+    /// requires --enable-aac and --enable-h264). Stream RDPSND audio over a LOSSY
+    /// UDP/DTLS tunnel with 1+1 redundancy instead of TCP — the loss-resilient audio
+    /// path. The MS-RDPEA format handshake runs on a reliable DVC over TCP; AAC Wave2
+    /// data is Soft-Synced onto a lossy (UdpFecL) RDPEUDP flow (deliver-on-arrival, no
+    /// retransmit) and each datagram is sent TWICE (the client's DTLS anti-replay
+    /// dedups, so audio never double-plays), so an independent-loss link of rate p
+    /// drops a payload only at p² — verified smooth on real mstsc at 5/10/15% loss
+    /// where the single-send path glitches. Collapses the
+    /// MACRDP_UDP_{OFFER_FECL,LOSSY_DELIVERY,LOSSY_AUDIO,LOSSY_AUDIO_DUP} env gates
+    /// (which still work as a fallback). macOS-only build; see
+    /// docs/rdp-udp-multitransport-feasibility.md.
+    #[arg(long)]
+    enable_lossy_audio: bool,
+
     /// Don't adopt the client's requested desktop resolution. By default —
     /// when mirroring the primary display without --width/--height/--hidpi —
     /// macrdp reads the resolution the client asked for while connecting
@@ -1410,6 +1425,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ADAPTIVE_BITRATE", false) {
         argv.push("--adaptive-bitrate".into());
     }
+    if on("ENABLE_LOSSY_AUDIO", false) {
+        argv.push("--enable-lossy-audio".into());
+    }
     if on("FORK_WORKERS", false) {
         argv.push("--fork-workers".into());
     }
@@ -2195,7 +2213,32 @@ async fn async_main() -> Result<()> {
     // the session over TCP. Single-process path only — under --fork-workers the
     // persistent UDP socket would have to live in the supervisor (deferred; we
     // warn above and fall back to TCP). worker_fd.is_some() ⇒ a fork worker.
-    let _udp_listener = if args.enable_udp_multitransport && worker_fd.is_none() {
+    //
+    // `--enable-lossy-audio` is the one-switch promotion of the verified lossy-audio
+    // path: it bridges the three expert env gates the vendored listener + provider
+    // read (offer the lossy UdpFecL transport, use lossy deliver-on-arrival delivery,
+    // and 1+1 duplicate sends), and implies the UDP listener below. The macrdp-side
+    // `MACRDP_UDP_LOSSY_AUDIO` gate is OR'd directly at the registration site. Setting
+    // env here (single-threaded, before the listener task spawns + before any
+    // connection reads the provider) is the minimal bridge — no vendored signature
+    // change. The env gates still work standalone as a fallback.
+    if args.enable_lossy_audio {
+        std::env::set_var("MACRDP_UDP_OFFER_FECL", "1");
+        std::env::set_var("MACRDP_UDP_LOSSY_DELIVERY", "1");
+        std::env::set_var("MACRDP_UDP_LOSSY_AUDIO_DUP", "1");
+        if !args.enable_aac || !args.enable_h264 {
+            warn!(
+                enable_aac = args.enable_aac,
+                enable_h264 = args.enable_h264,
+                "--enable-lossy-audio needs --enable-aac (MS-RDPEA requires AAC for the lossy DVC) \
+                 AND --enable-h264 (the lossy-audio Soft-Sync rides the EGFX dispatch path); without \
+                 both, audio stays on TCP"
+            );
+        }
+    }
+    let _udp_listener = if (args.enable_udp_multitransport || args.enable_lossy_audio)
+        && worker_fd.is_none()
+    {
         // The server ISN isn't client-validated; seed it from the clock to avoid a
         // new RNG dependency (the security-relevant value is the cookie, not this).
         let isn_seed = std::time::SystemTime::now()
@@ -2269,20 +2312,20 @@ async fn async_main() -> Result<()> {
                 // the reliable UDP tunnel wedges; the server reads it to de-migrate
                 // EGFX back to TCP (mstsc renders it post-Soft-Sync). Reset on reconnect.
                 server.set_demigrate_request_handle(Some(egfx_demigrate_flag.clone()));
-                // (P2.4b, EXPERIMENTAL) Register the lossy-UDP audio DVC
-                // (AUDIO_PLAYBACK_LOSSY_DVC). Behind its OWN dedicated env gate
-                // (`MACRDP_UDP_LOSSY_AUDIO=1`) — NOT the lossy-offer flag — so the
-                // proven lossy transport path runs unbroken by default; this
-                // sub-step is opt-in until the handshake is verified on mstsc.
-                // Requires AAC (the lossy DVC needs version >= 8 + AAC,
-                // MS-RDPEA Appendix A note <2>). Advertises the SAME format list
-                // the static RDPSND path encodes.
-                if multitransport::env_truthy("MACRDP_UDP_LOSSY_AUDIO") && args.enable_aac {
+                // (P2.4b) Register the lossy-UDP audio DVC (AUDIO_PLAYBACK_LOSSY_DVC),
+                // driven by `--enable-lossy-audio` (or the legacy `MACRDP_UDP_LOSSY_AUDIO`
+                // env fallback). Requires AAC (the lossy DVC needs version >= 8 + AAC,
+                // MS-RDPEA Appendix A note <2>). Advertises the SAME format list the
+                // static RDPSND path encodes; the lossy 1+1 transport is enabled by the
+                // env bridge above. Verified on mstsc smooth at 5/10/15% loss.
+                if (args.enable_lossy_audio || multitransport::env_truthy("MACRDP_UDP_LOSSY_AUDIO"))
+                    && args.enable_aac
+                {
                     let formats = audio::server_audio_formats(args.enable_aac, args.aac_bitrate);
                     info!(
                         formats = formats.len(),
-                        "P2.4b (EXPERIMENTAL, MACRDP_UDP_LOSSY_AUDIO): offering AUDIO_PLAYBACK_LOSSY_DVC \
-                         (lossy-UDP audio) — AAC negotiation over TCP"
+                        "P2.4b lossy-UDP audio (--enable-lossy-audio): offering AUDIO_PLAYBACK_LOSSY_DVC \
+                         with 1+1 redundancy — AAC negotiation over TCP"
                     );
                     server.set_multitransport_lossy_audio_formats(Some(formats));
                 }
