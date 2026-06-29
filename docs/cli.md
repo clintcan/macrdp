@@ -171,6 +171,15 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   nicety, while --fork-workers fixes the real mstsc pain).
                           #   macOS-only. See the H.264 reconnect-blank quirk note.
 --cert-dir PATH           # default ~/Library/Application Support/macrdp
+--log-dir PATH            # Directory for the rotating log file (macrdp.log). If
+                          #   unset: a rotating file in ~/Library/Logs when running
+                          #   HEADLESS (stdout is not a TTY, e.g. under the
+                          #   LaunchAgent), or stdout when interactive (cargo run).
+                          #   The file is size-bounded — keeps macrdp.log + N
+                          #   logrotate-style archives (macrdp.log.1, .2, …),
+                          #   dropping the oldest. Tunables: MACRDP_LOG_MAX_BYTES
+                          #   (default 10 MiB), MACRDP_LOG_MAX_FILES (default 5).
+                          #   Config key: LOG_DIR.
 ```
 
 Testing against the server:

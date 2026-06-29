@@ -9,7 +9,11 @@
   Background Task Management identifies the agent by its stable Developer-ID
   identity (approve once, survives rebuilds) rather than re-flagging an unsigned
   wrapper script on every update. The binary reads config.env itself. Keeps the
-  job alive, and logs to ~/Library/Logs/macrdp.log.
+  job alive. The binary owns ~/Library/Logs/macrdp.log itself now (a self-rotating,
+  size-bounded file — see src/logging.rs), so there is NO StandardOutPath redirect:
+  having launchd ALSO write that path would corrupt the file and strand launchd on a
+  rotated-away inode. StandardErrorPath still captures panics + pre-logging stderr in
+  a small separate macrdp.err.log.
 -->
 <plist version="1.0">
 <dict>
@@ -31,10 +35,10 @@
     <key>KeepAlive</key>
     <true/>
 
-    <key>StandardOutPath</key>
-    <string>__HOME__/Library/Logs/macrdp.log</string>
+    <!-- No StandardOutPath: the binary writes (and rotates) macrdp.log itself.
+         StandardErrorPath keeps panics + pre-logging-init stderr in a small file. -->
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Logs/macrdp.log</string>
+    <string>__HOME__/Library/Logs/macrdp.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

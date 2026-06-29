@@ -160,6 +160,31 @@ src/multitransport.rs  macrdp-side RDP UDP multitransport provider
                   cookie-registry + Initiate-Request tests live here (the vendored
                   crates are test=false). See docs/rdp-udp-multitransport-
                   feasibility.md.
+src/logging.rs    Tracing sink + size-based log rotation. By default stdout
+                  (interactive). When headless (stdout not a TTY, e.g. under the
+                  LaunchAgent) or given --log-dir/LOG_DIR, writes a self-owned,
+                  size-bounded rotating file at ~/Library/Logs/macrdp.log — stable
+                  live name (the GUI reads it + scans for "panicked") rotating
+                  logrotate-style to macrdp.log.1..N (MACRDP_LOG_MAX_BYTES /
+                  MACRDP_LOG_MAX_FILES). Custom (not tracing-appender, which only
+                  does dated files; non_blocking was reverted) BLOCKING writer via
+                  a MakeWriter over Arc<Mutex<Rotator>>. On the file path it also
+                  installs a panic hook that routes panics through tracing into
+                  macrdp.log (observability only — cleanup is the reaper's job).
+                  The plist drops StandardOutPath (the binary owns the file) and
+                  points StandardErrorPath at a small macrdp.err.log.
+src/reaper.rs     Startup reaper — on launch, sweeps leftovers from a PRIOR macrdp
+                  that died uncleanly (SIGKILL/panic/power-loss skip Drop AND the
+                  signal handler): stale NFS mounts + $TMPDIR/macrdp-rdpdr-<pid>/
+                  and macrdp-{paste,lazy-paste}-<pid>-* dirs. Holds the shared,
+                  platform-independent primitives (process_is_alive via
+                  libc::kill(pid,0)→ESRCH; pid_from_tagged; for_each_stale);
+                  per-module reap_stale fns live next to each module's
+                  shutdown_cleanup (rdpdr/surface.rs, file_promise*.rs). Only
+                  DEAD-pid, non-self dirs are reaped, so it's safe with another
+                  instance live. Called once from async_main on a detached thread
+                  (a stale umount can't block startup); covers single-process,
+                  the fork supervisor, and each worker.
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via

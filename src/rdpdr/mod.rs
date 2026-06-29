@@ -28,6 +28,16 @@ pub fn shutdown_cleanup() {
     surface::shutdown_cleanup();
 }
 
+/// Reap RDPDR NFS-mount leftovers from a PRIOR macrdp process that died
+/// uncleanly (SIGKILL/panic skip both `Surface::Drop` and [`shutdown_cleanup`],
+/// stranding a stale mount + its `$TMPDIR/macrdp-rdpdr-<pid>` mountpoint dir).
+/// Called once at startup; dead-pid-gated and best-effort. No-op off macOS / when
+/// nothing was left behind. See `surface::reap_stale` and `crate::reaper`.
+pub fn reap_stale() {
+    #[cfg(target_os = "macos")]
+    surface::reap_stale();
+}
+
 /// Map a client-returned [`NtStatus`] to the closest NFS status.
 ///
 /// Extracted as a pure fn (no platform deps) so it's unit-tested on every

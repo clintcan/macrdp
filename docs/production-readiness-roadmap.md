@@ -41,11 +41,20 @@ are scope limits, not gaps to close.
    drift* item, and documented SCStream / NFS-mount leaks on hard kill (`SIGKILL` skips
    `Drop`). Run a 48–72 h soak (idle + active, with reconnect cycles) and fix what it
    surfaces.
-5. **Robust teardown + log rotation.** Ensure `SIGKILL`/panic never leaks a mount or
-   capture stream (audit the `shutdown_cleanup` / process-global handle paths); rotate
-   `~/Library/Logs/macrdp.log` so it can't grow unbounded. Add a lightweight
-   **health-check** that detects a hung-but-alive process and bounces it (LaunchAgent
-   `KeepAlive` already restarts on outright crash).
+5. **Robust teardown + log rotation.** *(log rotation + startup reaper SHIPPED 2026-06-30.)*
+   - **Log rotation — DONE.** `~/Library/Logs/macrdp.log` is now a self-owned, size-bounded
+     rotating file (`src/logging.rs`: `macrdp.log` + N logrotate-style archives, default
+     10 MiB × 5; tunable via `MACRDP_LOG_MAX_BYTES`/`MACRDP_LOG_MAX_FILES`). The plist no
+     longer redirects stdout there (panics → a small `macrdp.err.log`; a panic hook also
+     routes panics into `macrdp.log` so the GUI still detects crashes).
+   - **Startup reaper — DONE.** The graceful `SIGTERM`/`SIGINT` path already unmounts + cleans;
+     the remaining leak was `SIGKILL`/panic (uncatchable in-process). `src/reaper.rs` now sweeps
+     a *dead* prior process's leftovers on the next start (stale NFS mounts +
+     `$TMPDIR/macrdp-{rdpdr,paste,lazy-paste}-<pid>` dirs), dead-pid-gated so it's safe with
+     another instance live. (SCStreams / virtual display / blanking were already process-scoped
+     and auto-restore.)
+   - **Still TODO:** a lightweight **health-check** that detects a hung-but-alive process and
+     bounces it (LaunchAgent `KeepAlive` already restarts on outright crash, but not on a hang).
 6. **Make `--fork-workers` the production default.** It's what fixes the mstsc
    reconnect-blank that bites real users; recommend (or default) it for unattended
    deployments. Note it's mutually exclusive with `--enable-udp-multitransport`.

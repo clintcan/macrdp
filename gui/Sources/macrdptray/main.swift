@@ -31,6 +31,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var home: URL { FileManager.default.homeDirectoryForCurrentUser }
     var configURL: URL { home.appendingPathComponent("Library/Application Support/macrdp/config.env") }
     var logURL: URL { home.appendingPathComponent("Library/Logs/macrdp.log") }
+    // The server owns + rotates macrdp.log itself; stderr (panics, pre-logging
+    // startup errors) goes to a small separate file.
+    var errLogURL: URL { home.appendingPathComponent("Library/Logs/macrdp.err.log") }
     var plistURL: URL { home.appendingPathComponent("Library/LaunchAgents/\(label).plist") }
 
     var timer: Timer?
@@ -481,8 +484,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "ProgramArguments": [bin, "--config", configURL.path],
             "RunAtLoad": true,
             "KeepAlive": true,
-            "StandardOutPath": logURL.path,
-            "StandardErrorPath": logURL.path,
+            // No StandardOutPath: the server writes + rotates macrdp.log itself
+            // (a second writer would corrupt it / strand launchd on a rotated
+            // inode). StandardErrorPath keeps panics + pre-logging stderr.
+            "StandardErrorPath": errLogURL.path,
             "EnvironmentVariables": ["RUST_LOG": "info"],
         ]
         let fm = FileManager.default

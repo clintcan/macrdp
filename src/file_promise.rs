@@ -362,6 +362,24 @@ fn make_temp_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Reap eager-paste temp dirs (`$TMPDIR/macrdp-paste-<pid>-<nanos>`) left by a
+/// PRIOR macrdp process that died uncleanly (SIGKILL/panic skip the backend's
+/// Drop + the signal handler's cleanup). Dead-pid-gated, never our own, so it's
+/// safe with another instance live. Best-effort; called once at startup.
+pub fn reap_stale() {
+    crate::reaper::for_each_stale(
+        &std::env::temp_dir(),
+        "macrdp-paste-",
+        false,
+        std::process::id() as i32,
+        &crate::reaper::process_is_alive,
+        &mut |dir| {
+            let _ = std::fs::remove_dir_all(dir);
+            debug!(stale_dir = ?dir, "eager paste: reaped temp dir from a dead prior macrdp process");
+        },
+    );
+}
+
 fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount) {
     if paths.is_empty() {
         return;

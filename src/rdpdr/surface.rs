@@ -717,6 +717,38 @@ pub fn shutdown_cleanup() {
     }
 }
 
+/// Reap mount leftovers from a PRIOR macrdp process that died uncleanly. A
+/// SIGKILL/panic skips both `Surface::Drop` and [`shutdown_cleanup`], so its
+/// `$TMPDIR/macrdp-rdpdr-<pid>/<label>` mountpoint(s) — and the stale NFS mounts
+/// pointing at its now-dead server — survive. We `umount -f` each child
+/// mountpoint (reusing [`unmount_at`]) and remove the per-pid dir. Only dirs
+/// tagged with a DEAD pid (never our own) are touched, so this is safe to run
+/// while another macrdp instance is live. Best-effort; called once at startup
+/// off the async runtime. `/Volumes/<label>` mounts (the un-tagged primary
+/// location) are NOT reaped — they only occur when running as root, and there's
+/// no pid to gate on.
+pub fn reap_stale() {
+    crate::reaper::for_each_stale(
+        &std::env::temp_dir(),
+        "macrdp-rdpdr-",
+        true,
+        std::process::id() as i32,
+        &crate::reaper::process_is_alive,
+        &mut |dir| {
+            if let Ok(children) = std::fs::read_dir(dir) {
+                for child in children.flatten() {
+                    let mp = child.path();
+                    if mp.is_dir() {
+                        unmount_at(&mp);
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(dir);
+            info!(stale_dir = ?dir, "rdpdr nfs: reaped mount dir from a dead prior macrdp process");
+        },
+    );
+}
+
 /// Mount the loopback NFS export at `mountpoint`. Read-write, NFSv3 over TCP.
 /// Verified to need no root for a `localhost` mount onto a user-owned dir.
 ///

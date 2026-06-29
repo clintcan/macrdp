@@ -25,8 +25,10 @@ mod file_promise_lazy;
 mod h264;
 mod input;
 mod keyboard_layout;
+mod logging;
 mod multitransport;
 mod rdpdr;
+mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod switcher_hud;
@@ -233,6 +235,13 @@ struct Args {
     /// Defaults to ~/Library/Application Support/macrdp.
     #[arg(long)]
     cert_dir: Option<PathBuf>,
+
+    /// Directory for the rotating log file (`macrdp.log`, size-bounded via
+    /// MACRDP_LOG_MAX_BYTES / MACRDP_LOG_MAX_FILES). If unset, logs go to a
+    /// rotating file in ~/Library/Logs when running headless (stdout is not a
+    /// TTY, e.g. under the LaunchAgent) and to stdout when interactive.
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
 
     /// Show debug-level logs from macrdp and the underlying ironrdp / rustls
     /// crates. Without this, known-noisy lines (TLS SNI warnings, the
@@ -1454,6 +1463,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(layout.clone());
         }
     }
+    if let Some(dir) = cfg.get("LOG_DIR") {
+        if !dir.is_empty() {
+            argv.push("--log-dir".into());
+            argv.push(dir.clone());
+        }
+    }
     // EXTRA_FLAGS: space-separated escape hatch, appended verbatim.
     if let Some(extra) = cfg.get("EXTRA_FLAGS") {
         for tok in extra.split_whitespace() {
@@ -1492,7 +1507,20 @@ async fn async_main() -> Result<()> {
             "info,rustls=error,ironrdp_server::encoder=error,ironrdp_server::server=error",
         )
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    logging::init(filter, args.log_dir.as_deref());
+
+    // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
+    // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
+    // temp dirs). Dead-pid-gated so it's safe with another instance live; on a
+    // detached thread so a stale `umount` can never delay startup. Runs in every
+    // role (single-process, supervisor, each forked worker re-enters async_main —
+    // workers are serialized, so reaping a prior dead worker is safe too).
+    #[cfg(target_os = "macos")]
+    std::thread::spawn(|| {
+        rdpdr::reap_stale();
+        file_promise::reap_stale();
+        file_promise_lazy::reap_stale();
+    });
 
     // --fork-workers PoC. A process is a *worker* iff the supervisor set
     // MACRDP_WORKER_FD (the already-accepted client socket); that takes
