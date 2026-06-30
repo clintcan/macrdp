@@ -285,6 +285,11 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
 --cert PATH / --key PATH  Operator-supplied TLS cert + key (PEM) — serve a real CA / ACME /
                           Let's Encrypt cert instead of self-signed. Both required; no
                           silent self-sign fallback. Config: TLS_CERT / TLS_KEY.
+--log-dir PATH            Directory for the rotating log file (macrdp.log + N
+                          logrotate-style archives). Defaults to ~/Library/Logs when
+                          headless (e.g. under the LaunchAgent), or stdout when
+                          interactive. Size-bounded; see MACRDP_LOG_MAX_BYTES /
+                          MACRDP_LOG_MAX_FILES below. Config: LOG_DIR.
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen
                           stays untouched. Requires --width and --height.
@@ -342,6 +347,38 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
 ```
 
 `RUST_LOG=debug` for verbose logging.
+
+### Auth hardening (environment variables, on by default)
+
+In front of the NLA/CredSSP gate, macrdp rate-limits and (briefly, escalating) locks out
+source IPs that hammer the port, and writes a per-connection audit line. **Loopback
+(`127.0.0.1`/`::1`) is always exempt**, so this only bites when `--bind` exposes the server
+to other hosts — you can't lock yourself out locally. The defaults are conservative; these
+are env-only (no CLI flags) and can be set via `config.env` (the matching keys are shown) or
+the LaunchAgent plist's `EnvironmentVariables`:
+
+```
+MACRDP_CONN_GUARD=1               # master switch (0/off = disable rate-limit + lockout)   [config.env: CONN_GUARD]
+MACRDP_AUDIT_LOG=1                # connection audit log (independent of the guard)          [AUDIT_LOG]
+MACRDP_GUARD_RL_MAX=10            # max attempts per window per IP (0 = no rate-limit)        [GUARD_RL_MAX]
+MACRDP_GUARD_RL_WINDOW_SECS=60    # rate-limit sliding window                                 [GUARD_RL_WINDOW_SECS]
+MACRDP_GUARD_FAIL_THRESHOLD=5     # consecutive failures before lockout (0 = no lockout)      [GUARD_FAIL_THRESHOLD]
+MACRDP_GUARD_MIN_SESSION_SECS=10  # a connection shorter than this counts as a failure        [GUARD_MIN_SESSION_SECS]
+MACRDP_GUARD_COOLDOWN_BASE_SECS=30  # first lockout length, doubles per extra failure          [GUARD_COOLDOWN_BASE_SECS]
+MACRDP_GUARD_COOLDOWN_MAX_SECS=900  # lockout escalation cap (15 min)                          [GUARD_COOLDOWN_MAX_SECS]
+```
+
+The lockout **escalates and auto-expires** (no manual unlock): with the defaults it triggers
+at the 5th consecutive failure, then 30s → 60 → 120 → 240 → 480 → 900s (cap) as the IP keeps
+failing past each cooldown; **any clean, long-lived session resets that IP to 0**. It's
+heuristic (an errored or very-short connection ⇒ failure), so a single benign disconnect —
+e.g. mstsc's first-connect cert-prompt "Broken pipe" — never locks you out. Audit lines are
+tagged `macrdp::audit`: `grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows
+`event="accept|reject|disconnect"` with the source IP and (for rejects) the reason and
+retry-after.
+
+(Log rotation is likewise env-tunable: `MACRDP_LOG_MAX_BYTES` (default 10 MiB) and
+`MACRDP_LOG_MAX_FILES` (default 5); see `--log-dir`.)
 
 ## Headless mode
 
