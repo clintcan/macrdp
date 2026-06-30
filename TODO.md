@@ -99,6 +99,30 @@ then delete; promote a parked item to *In flight* when work actually starts.
     same VT-bitrate/frame-drop/IDR-backoff levers; only the input source differs per transport.
   Bigger than FEC (dead) or auto-fallback (band-aid). Worth a real-server↔mstsc capture
   first to read the URCP signaling. See finding #5 in `docs/rdp-udp-multitransport-feasibility.md`.
+- [ ] **SCReAM-style controller upgrade (replace the AIMD control law)** — scoped
+  2026-06-30, the concrete next step of the rate-control item above. Swap the current
+  `--adaptive-bitrate` AIMD law for an **open, real-time congestion controller**: SCReAM
+  (RFC 8298, self-clocked off acks + one-way-delay + loss — best fit for RDPEUDP feedback)
+  or a loss+RTT hybrid (Copa/BBR-lite). **Do NOT implement "URCP" by name** (no public
+  reference impl; outside the MS-RDPEUDP2 Open Specifications Promise → patent/licensing
+  gray zone) and **do NOT link libwebrtc/GCC** (huge C++ dep; GCC also fits worst — its
+  delay controller wants TWCC per-packet arrival timestamps RDPEUDP doesn't natively
+  produce). Steps: (1) extract the control law behind the existing controller seam, keeping
+  AIMD as an A/B fallback; (2) implement the SCReAM core in Rust (~a few hundred lines):
+  target rate / congestion window from OWD trend + loss + `RDPUDP_FLAG_CN`, self-clocked
+  off acks; (3) **feed it from the transport-level RDPEUDP datagram acks** (already parsed
+  in vendored `ironrdp-rdpeudp`), not today's coarse one-per-frame GFX `FrameAcknowledge`
+  lag — TCP path keeps its `TCP_CONNECTION_INFO` / write-backpressure signal; (4) outputs to
+  the existing VT levers (live `AverageBitRate`, `frame_drop_at_floor`, IDR backoff — already
+  wired); (5) tune + verify on real mstsc under loss, A/B vs AIMD. **Value:** better graceful
+  degradation on BOTH the reliable UDP tunnel AND the TCP path. **Caveat (the easy half):**
+  this does NOT stop the reliable-ordered-tunnel HOL-block *freeze* — that needs the deferred
+  lossy-video substrate (these CCs assume a droppable flow); a better controller on a reliable
+  stream still HOL-blocks. So it's a standalone graceful-degradation win, not the freeze cure;
+  `UDP_MIGRATE_EGFX=0` + watchdog→TCP stay the robust answer until the substrate exists.
+  mstsc-primary for the UDP path (Mac/FreeRDP are TCP-only). See finding #5 (the open-CC
+  analysis + signal-mapping table) in `docs/rdp-udp-multitransport-feasibility.md`; refs
+  SCReAM RFC 8298, NADA RFC 8698.
 - [ ] **A/V desync under packet loss** (user-reported 2026-06-29, after P3). Audio drifts
   from video under drops, most apparent on the TCP path. Root constraint: **RDP has no A/V
   sync primitive** (RDPSND + EGFX are independent channels, no shared clock/PTS) → true
