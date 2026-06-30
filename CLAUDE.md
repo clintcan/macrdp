@@ -18,8 +18,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Functional v0 — daily-driver usable on a trusted LAN. **Latest release: v0.8.19**
-(the congestion-responsive rate-control arc + loss-resilient lossy-UDP audio).
+Functional v0 — daily-driver usable on a trusted LAN. **Latest release: v0.8.20**
+(the production-readiness arc: operator-supplied TLS certs `--cert`/`--key`,
+connection rate-limiting + lockout + an auth audit log, and bounded log rotation +
+a startup reaper — Tier 1.1/1.2/2.5 of `@docs/production-readiness-roadmap.md`).
 RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) connect over TLS and get
 the macOS desktop with keyboard/mouse/clipboard/audio, optional H.264-over-EGFX,
 headless virtual displays, drive + smart-card redirection, and (opt-in) UDP
