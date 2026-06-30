@@ -519,6 +519,66 @@ reliable-only multitransport.
    Research "URCP: Universal Rate Control Protocol for Real-Time Communication";
    RDP Shortpath docs.)
 
+   **Can we implement URCP — and what should we actually implement? (scoped 2026-06-30.)**
+   Yes in principle, because URCP is a **sender-side rate-control *algorithm*, not a wire
+   protocol** — macrdp is the EGFX sender (server→client), so it needs **no client
+   cooperation and no interop**: mstsc doesn't have to "speak URCP"; the controller just
+   consumes the RDPEUDP feedback we already receive and decides a send rate. Microsoft
+   already proved the shape fits — URCP-on-RDPEUDP2 *is* "a real-time media CC bolted onto
+   an RDP UDP transport." But two conclusions:
+   - **Do NOT implement URCP-the-algorithm.** There is no public URCP reference
+     implementation, and the MS-RDPEUDP2 open spec only says it uses "URCP-based rate
+     control" *without specifying the algorithm* — so URCP itself is **outside the Open
+     Specifications Promise**, a patent/licensing gray zone for an MIT/Apache project.
+     Use an open, royalty-free, RFC'd controller that does the same job and has reference
+     code: **SCReAM** (RFC 8298, self-clocked, built for RTP video), **NADA** (RFC 8698),
+     or **GCC** (Google Congestion Control, libwebrtc).
+   - **Which fits RDP best.** These are transport-agnostic; the RTP/RTCP parts are just
+     input/output *adapters* we'd swap for RDP equivalents. Fit ranking on RDPEUDP feedback:
+     **SCReAM fits best** (self-clocked off acks + one-way-delay + loss — matches the
+     ACK-vector + RTT feedback RDPEUDP actually gives); **NADA** similar; a plain
+     **loss+RTT hybrid** (Copa/BBR-lite) also natural. **GCC fits *worst*** despite being
+     the most battle-tested — its delay controller is built around **transport-wide
+     per-packet arrival timestamps (TWCC / RFC 8888)**, which RDPEUDP does not natively
+     produce, so its main input would have to be reshaped/approximated.
+
+   Signal-by-signal mapping onto macrdp/RDPEUDP (what's native vs approximated):
+   | Controller input | RDPEUDP source | Fit |
+   |---|---|---|
+   | Loss | `RDPUDP_ACK_VECTOR_HEADER` gaps + retransmits | native ✅ |
+   | RTT | ACK round-trip timing (sender-side) | good ✅ |
+   | Delay gradient / OWD trend | RDPEUDP2 ack timestamps (our v1 reliable tunnel → RTT-trend only) | partial ⚠️ |
+   | Per-packet receiver arrival times (TWCC) | not how RDPEUDP feedback is shaped | approximate ❌ |
+   | Explicit congestion | `RDPUDP_FLAG_CN` (reply `RDPUDP_FLAG_CWR`) | native ✅ |
+   | Actuation: target bitrate + pacing + drop | live VideoToolbox bitrate + frame-drop + IDR backoff (already wired for `--adaptive-bitrate`) | native ✅ |
+
+   Two implementation notes that matter more than the algorithm choice:
+   - **Feed it from the *transport* acks, not the GFX frame-acks.** Today `--adaptive-bitrate`
+     reads the EGFX `FrameAcknowledge` lag — coarse (one signal per video frame). A real
+     SCReAM/URCP-style controller wants the far-more-frequent **RDPEUDP datagram-level acks**
+     (already parsed in vendored `ironrdp-rdpeudp`) for a usable delay/loss signal.
+   - **Re-implement the control law in Rust** (a few hundred lines — SCReAM's core
+     especially); do **not** link libwebrtc/GCC (a huge C++ dependency). Inputs from the
+     RDPEUDP feedback we already parse; outputs to the VT bitrate/frame-drop levers we have.
+
+   **The substrate still gates the payoff (same caveat as the rest of finding #5).** All of
+   these CCs assume a **droppable** media flow — you pace, and late packets are simply
+   dropped. macrdp's EGFX rides a **reliable, ordered** tunnel today, where a better
+   controller **cannot stop the freeze**: you still head-of-line-block on a lost packet, and
+   you'd effectively run congestion control twice (over the reliability layer's own
+   retransmit/window). They only deliver their benefit once EGFX moves to a **lossy flow +
+   encoder frame-drop** (the deferred Phase-2 lift; mstsc lossy-*video* acceptance is
+   unverified — the lossy path is proven for audio only, and Mac/FreeRDP clients are
+   TCP-only, so the audience is mstsc-only). On the reliable tunnel / TCP path, the upgraded
+   controller still improves *graceful degradation*, just not the UDP-under-loss freeze.
+
+   **Verdict:** the controller swap (AIMD → SCReAM/loss+RTT, driven by transport acks) is a
+   modest, well-scoped win on both transports and the right thing to do *if* this is picked
+   up; "implement URCP by name" is not (licensing + no reference impl). But it is the *easy
+   half* — the freeze fix still needs the lossy-video substrate underneath it, so until that
+   exists, `UDP_MIGRATE_EGFX=0` + the watchdog→TCP backstop remain the robust answer. (Refs:
+   SCReAM RFC 8298; NADA RFC 8698; Google Congestion Control / libwebrtc.)
+
 ### M3c peer GC — the listener leaked dead peers (fixed 2026-06-28)
 
 A separate, transport-level correctness bug surfaced from a real mstsc pcap
