@@ -7,11 +7,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- (nothing in flight — the congestion-responsive rate-control arc is complete and verified
-  on real mstsc: watchdog #93, adaptive-bitrate P1 #94, IDR-backoff + ack-lag P2a #95,
-  de-migrate bitrate restore #96, TCP-path P3 #97, EWMA + 3-zone hold #98, minimize/restore
-  proactive de-migrate #99, lossy-audio flag #101, **P2b frame-rate floor #102**. Remaining
-  pieces — softer UDP signal, stronger TCP signal, audio-resync lever B — are in Deferred.)
+- [ ] **Tier 2.4 — multi-day soak (RUNNING, started 2026-07-01 on a separate machine).**
+  The last leg of the production-readiness trio (TLS ✓ #104, auth ✓ #105). Watching for
+  memory/fd/thread creep, leaked SCStreams / NFS mounts, runaway log growth, audio
+  long-session drift, and any panic. Tooling: `scripts/soak-monitor.sh monitor` samples a
+  resource CSV during the run; `… analyze` summarizes the trend + greps logs for
+  CRITICAL/WATCH events. **Next action:** let it run, then pull back the CSV + rotated
+  `~/Library/Logs/macrdp.log*` and analyze. Fix whatever it surfaces.
 
 ## Deferred — scoped, not started
 
@@ -198,7 +200,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `docs/production-readiness-roadmap.md`. Recommended starting trio status: (1) real
   operator-supplied TLS certs (`--cert`/`--key`) **DONE 2026-06-30 #104**; (2) auth
   rate-limit + lockout + audit log (`src/auth_guard.rs`) **DONE 2026-06-30 #105**; (3) a
-  48–72 h **soak to shake out leaks/drift — NEXT (Tier 2.4, not started)**. Also done:
+  48–72 h **soak to shake out leaks/drift — IN FLIGHT (Tier 2.4, running 2026-07-01; see
+  the In flight section above + `scripts/soak-monitor.sh`)**. Also done:
   log rotation + startup reaper (Tier 2.5, #103). Still open beyond the soak: Tier 2.5
   hung-but-alive health-check/bounce; Tier 3 polish. Hard ceiling (NO-GO): multi-user
   concurrent GUI sessions (macOS limit).
