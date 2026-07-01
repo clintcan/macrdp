@@ -1301,12 +1301,22 @@ fn make_tls_acceptor(
     let cert_der = cert_der_bytes.to_vec();
     let key_der = key.secret_der().to_vec();
 
-    let config = Arc::new(
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .context("build rustls ServerConfig")?,
-    );
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("build rustls ServerConfig")?;
+    // Honor SSLKEYLOGFILE (Wireshark TLS decryption) for protocol debugging.
+    // KeyLogFile is a no-op unless the env var is set. Covers the TCP RDP
+    // connection AND the reliable-UDP multitransport flow (same config); the
+    // lossy flow's DTLS (boring) is not covered.
+    config.key_log = Arc::new(rustls::KeyLogFile::new());
+    if std::env::var_os("SSLKEYLOGFILE").is_some() {
+        warn!(
+            "SSLKEYLOGFILE is set — TLS session keys are being written to that file for \
+             debugging; unset it outside of protocol-capture sessions"
+        );
+    }
+    let config = Arc::new(config);
     // The same cert/config also secures the auxiliary UDP multitransport (MS-RDPEMT
     // over TLS for the reliable flow; DTLS for the lossy flow) — the client trusts
     // it via the main connection's TOFU. Returned so the UDP listener can reuse it

@@ -251,3 +251,9 @@ xfreerdp /v:127.0.0.1:3390 /u:$USER /cert:ignore /log-level:DEBUG
 ```
 
 When iterating on the capture/encode path, prefer FreeRDP with `/log-level:DEBUG` — its PDU traces are far more useful than mstsc's silent failures.
+
+To decrypt a Wireshark capture of a session, run macrdp with `SSLKEYLOGFILE=/path/to/keylog.txt`
+and point Wireshark at that file (Preferences → Protocols → TLS → "(Pre)-Master-Secret log
+filename"). Covers the TCP RDP connection and the reliable-UDP multitransport flow (rustls);
+the lossy flow's DTLS is not covered. macrdp warns loudly at startup while the var is set —
+session keys on disk break the capture's confidentiality, so use it only for protocol debugging.
