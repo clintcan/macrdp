@@ -231,5 +231,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - IronRDP forks are effectively permanent (each carries un-upstreamed divergences:
   multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch).
-  Two PRs still open upstream: **#1359** (rdpsnd) and **#1373** (acceptor honor-size).
-  Nothing is currently de-vendorable. See `project_upstream_ironrdp_open_prs` memory.
+  **#1359 (rdpsnd) MERGED upstream 2026-07-01 (`2d3bdef`); only #1373 (acceptor honor-size)
+  still open** (mergeable, awaiting review). Nothing is currently de-vendorable. **Pin-bump note:**
+  bumping the ironrdp git pin past `2d3bdef` requires `src/audio.rs` to adopt the new rdpsnd
+  handler API (`choose_format` + fallible `start(&NegotiatedFormat)`), dropping the hand-rolled
+  `wFormatNo` index logic. See `project_upstream_ironrdp_open_prs` memory.
