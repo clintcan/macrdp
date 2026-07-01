@@ -231,8 +231,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - IronRDP forks are effectively permanent (each carries un-upstreamed divergences:
   multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch).
-  **#1359 (rdpsnd) MERGED upstream 2026-07-01 (`2d3bdef`); only #1373 (acceptor honor-size)
-  still open** (mergeable, awaiting review). Nothing is currently de-vendorable. **Pin-bump note:**
-  bumping the ironrdp git pin past `2d3bdef` requires `src/audio.rs` to adopt the new rdpsnd
-  handler API (`choose_format` + fallible `start(&NegotiatedFormat)`), dropping the hand-rolled
-  `wFormatNo` index logic. See `project_upstream_ironrdp_open_prs` memory.
+  **#1359 (rdpsnd) MERGED upstream 2026-07-01 (`2d3bdef`); open: #1373 (acceptor honor-size)
+  + #1397 (acceptor keyboard-layout on `AcceptorResult`, the one clean quick win, shipped
+  2026-07-01).** Nothing is currently de-vendorable. **Pin-bump note:** bumping the ironrdp git
+  pin past `2d3bdef` requires `src/audio.rs` to adopt the new rdpsnd handler API (`choose_format`
+  + fallible `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic.
+- Upstream-ability of the remaining divergences was surveyed 2026-07-01 (don't re-survey; ranking
+  in `project_upstream_ironrdp_open_prs` memory). The other "quick" items (RDPDR decode halves,
+  AudioWave `duration_ms`, keyboard-layout handle) are **held** — no upstream consumer yet, so they
+  belong with their larger feature (server-RDPDR processor, audio-lag model), not standalone PRs.
