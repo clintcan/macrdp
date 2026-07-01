@@ -41,12 +41,15 @@ sample_row() {
     rss=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print int($1/1024)}')
     thr=$(ps -M "$pid" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
     fds=$(lsof -p "$pid" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
-    scs=$(lsof -p "$pid" 2>/dev/null | grep -ci 'ScreenCaptureKit\|CoreMedia')
+    # Established inbound connections = "is a client connected right now". More
+    # reliable than trying to detect an SCStream: system frameworks live in the
+    # dyld shared cache, so `lsof | grep ScreenCaptureKit` never matched.
+    conns=$(lsof -nP -p "$pid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
     procs=$(pgrep -f "$MACRDP_RE" 2>/dev/null | wc -l | tr -d ' ')
     nfs=$(mount 2>/dev/null | grep -c 'macrdp-rdpdr\|localhost:/')
     tmp=$(ls -d "${TMPDIR:-/tmp/}"macrdp-* /tmp/macrdp-* 2>/dev/null | wc -l | tr -d ' ')
     logmb=$(stat -f%z "$DEFAULT_LOGS" 2>/dev/null | awk '{print int($1/1048576)}')
-    echo "$(date '+%Y-%m-%dT%H:%M:%S'),${rss:-0},${thr:-0},${fds:-0},${scs:-0},${procs:-0},${nfs:-0},${tmp:-0},${logmb:-0}"
+    echo "$(date '+%Y-%m-%dT%H:%M:%S'),${rss:-0},${thr:-0},${fds:-0},${conns:-0},${procs:-0},${nfs:-0},${tmp:-0},${logmb:-0}"
 }
 
 cmd_monitor() {
@@ -67,7 +70,7 @@ cmd_monitor() {
         exit 1
     fi
     echo "monitoring pid $pid every ${interval}s -> $out" >&2
-    echo "ts,rss_mb,threads,fds,scstreams,procs,nfs_mounts,tmp_dirs,log_mb" > "$out"
+    echo "ts,rss_mb,threads,fds,conns,procs,nfs_mounts,tmp_dirs,log_mb" > "$out"
     while row="$(sample_row "$pid")"; do
         echo "$row" >> "$out"
         echo "$row"
@@ -108,7 +111,7 @@ cmd_analyze() {
         echo "  rss_mb     : $(col_stats "$csv" 2)"
         echo "  threads    : $(col_stats "$csv" 3)"
         echo "  fds        : $(col_stats "$csv" 4)"
-        echo "  scstreams  : $(col_stats "$csv" 5)"
+        echo "  conns      : $(col_stats "$csv" 5)   (established client connections)"
         echo "  procs      : $(col_stats "$csv" 6)"
         echo "  nfs_mounts : $(col_stats "$csv" 7)"
         echo "  tmp_dirs   : $(col_stats "$csv" 8)"
@@ -134,6 +137,21 @@ cmd_analyze() {
     # shellcheck disable=SC2086
     grep -hiE 'writer stalled|self-heal|de-migrat|watchdog|resync|too many open files|EMFILE' $logs 2>/dev/null \
         | strip | sort | uniq -c | sort -rn | head -20
+    echo
+    echo "==> AUTH GUARD (macrdp::audit) — rejections mean a client was blocked:"
+    # shellcheck disable=SC2086
+    lock=$(grep -h 'macrdp::audit' $logs 2>/dev/null | grep -c 'reason=.\?lockout')
+    rl=$(grep -h 'macrdp::audit' $logs 2>/dev/null | grep -c 'reason=.\?rate_limit')
+    accepts=$(grep -h 'macrdp::audit' $logs 2>/dev/null | grep -c 'event=.\?accept')
+    echo "  accepts=$accepts  rate_limit_rejects=$rl  lockout_rejects=$lock"
+    if [ "$lock" -gt 0 ] || [ "$rl" -gt 0 ]; then
+        echo "  ⚠️  a client was blocked by the connection guard. If it was a LEGIT client,"
+        echo "     loosen/disable it: MACRDP_CONN_GUARD=0 (or raise thresholds) in config.env."
+        echo "     Most-recent rejections:"
+        # shellcheck disable=SC2086
+        grep -h 'macrdp::audit' $logs 2>/dev/null | grep -E 'reason=.\?(lockout|rate_limit)' \
+            | strip | tail -5 | sed 's/^/       /'
+    fi
     echo
     echo "  tip: re-run analyze later and compare WATCH counts — flat/slow = healthy,"
     echo "  growing fast = a real issue. Any CRITICAL hit means dig into that log."

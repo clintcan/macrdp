@@ -22,13 +22,17 @@
 //!
 //! ## Heuristic lockout (deliberate)
 //! `on_disconnected` only sees `Option<&anyhow::Error>`, which can't cleanly
-//! distinguish a wrong-password CredSSP failure from a benign disconnect (the
-//! documented mstsc first-connect "Broken pipe" cert prompt). Rather than carry a
-//! vendored-server signal, we classify by **outcome heuristic**: an errored OR
-//! very-short connection is a `Failure`; a clean, long-lived session is a
-//! `Success` that resets the IP's counter. This is forgiving by design — a single
-//! benign error can never reach the lockout threshold because the immediate clean
-//! reconnect resets it.
+//! distinguish a wrong-password CredSSP failure from a benign disconnect. Rather
+//! than carry a vendored-server signal, we classify by a **fail-fast heuristic**
+//! (see [`classify_outcome`]): only a connection that errored *and* ended within
+//! the fail-fast window — i.e. never got past the handshake, the brute-force
+//! signature — counts as a `Failure`. Any connection that ran longer (even if it
+//! later errored) is a `Success` that resets the counter, because it authenticated
+//! and is a legitimate client with session trouble, not a login attack. This is
+//! forgiving by design: a reconnecting real client (e.g. the mstsc reconnect-blank
+//! or a flaky link, which errors a few seconds *into* a session) is never locked
+//! out — the pre-fix `errored || short` rule was too aggressive and locked out
+//! legit clients (observed in a soak 2026-07-01).
 //!
 //! ## Scope
 //! Loopback (`127.0.0.1`/`::1`, incl. IPv4-mapped) is **exempt** (the default
@@ -93,9 +97,14 @@ pub struct GuardConfig {
     max_attempts: usize,
     /// Consecutive failures before the first lockout. `0` disables lockout.
     failure_threshold: u32,
-    /// A connection shorter than this (or errored) counts as a failure; one at
-    /// least this long *and* clean counts as a success.
-    min_session: Duration,
+    /// Fail-fast window: an errored connection counts as a lockout **failure**
+    /// only if it ended *within* this window — i.e. it never got past the
+    /// TLS/CredSSP handshake, the brute-force / port-scan signature. A connection
+    /// that ran *longer* than this (even if it later errored) is assumed to have
+    /// authenticated — a legitimate client with session trouble — and resets the
+    /// counter instead of accruing toward a lockout. Keep it short (a few
+    /// seconds), just past the handshake.
+    failfast_window: Duration,
     /// First lockout length; doubles per failure past the threshold.
     base_cooldown: Duration,
     /// Cap on the escalated cooldown.
@@ -110,7 +119,7 @@ impl GuardConfig {
             window: Duration::from_secs(env_u64("MACRDP_GUARD_RL_WINDOW_SECS", 60)),
             max_attempts: env_u64("MACRDP_GUARD_RL_MAX", 10) as usize,
             failure_threshold: env_u64("MACRDP_GUARD_FAIL_THRESHOLD", 5) as u32,
-            min_session: Duration::from_secs(env_u64("MACRDP_GUARD_MIN_SESSION_SECS", 10)),
+            failfast_window: Duration::from_secs(env_u64("MACRDP_GUARD_FAILFAST_SECS", 3)),
             base_cooldown: Duration::from_secs(env_u64("MACRDP_GUARD_COOLDOWN_BASE_SECS", 30)),
             max_cooldown: Duration::from_secs(env_u64("MACRDP_GUARD_COOLDOWN_MAX_SECS", 900)),
         }
@@ -174,6 +183,29 @@ pub enum Outcome {
     Failure,
 }
 
+/// Classify a finished connection for lockout accounting.
+///
+/// A [`Outcome::Failure`] (which accrues toward a lockout) is recorded **only**
+/// when the connection both errored *and* ended within `failfast_window` — i.e.
+/// it never got past the TLS/CredSSP handshake, the brute-force / port-scan
+/// signature. Anything else is a [`Outcome::Success`] that resets the counter:
+/// a clean disconnect, or — crucially — a connection that ran *longer* than the
+/// window before erroring, which is a legitimate client that authenticated and
+/// then hit session trouble (e.g. the mstsc reconnect-blank or a flaky link),
+/// not a login attack. This is what stops a reconnecting real client from being
+/// locked out (the pre-fix heuristic counted any errored connection as a
+/// failure, which locked out legit clients — observed in a soak 2026-07-01).
+///
+/// `errored` is the transport-agnostic error signal: `Some(err)` on the
+/// single-process path, or a non-zero worker exit on the `--fork-workers` path.
+pub fn classify_outcome(errored: bool, duration: Duration, failfast_window: Duration) -> Outcome {
+    if errored && duration < failfast_window {
+        Outcome::Failure
+    } else {
+        Outcome::Success
+    }
+}
+
 /// Pure per-IP rate-limit + lockout decision core. See the module docs.
 pub struct AuthGuardCore {
     ips: HashMap<IpAddr, PerIp>,
@@ -198,9 +230,9 @@ impl AuthGuardCore {
         }
     }
 
-    /// The "long-lived session" bar used to classify outcomes.
-    pub fn min_session(&self) -> Duration {
-        self.cfg.min_session
+    /// The fail-fast window used to classify outcomes (see [`classify_outcome`]).
+    pub fn failfast_window(&self) -> Duration {
+        self.cfg.failfast_window
     }
 
     /// Decide whether to accept a fresh attempt from `ip` at `now`.
@@ -432,11 +464,7 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         duration: Duration,
         error: Option<&anyhow::Error>,
     ) -> ironrdp_server::PostConnectionAction {
-        let outcome = if error.is_some() || duration < self.core.min_session() {
-            Outcome::Failure
-        } else {
-            Outcome::Success
-        };
+        let outcome = classify_outcome(error.is_some(), duration, self.core.failfast_window());
         self.core.record_outcome(Instant::now(), peer.ip(), outcome);
         audit_disconnect(peer.ip(), duration, outcome);
         // The guard must never halt the server.
@@ -454,9 +482,65 @@ mod tests {
             window: Duration::from_secs(60),
             max_attempts: 10,
             failure_threshold: 5,
-            min_session: Duration::from_secs(10),
+            failfast_window: Duration::from_secs(3),
             base_cooldown: Duration::from_secs(30),
             max_cooldown: Duration::from_secs(900),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_only_counts_fast_errored_connections() {
+        let w = Duration::from_secs(3);
+        // Fast + errored = the brute-force/scan signature → Failure.
+        assert_eq!(
+            classify_outcome(true, Duration::from_millis(1), w),
+            Outcome::Failure
+        );
+        assert_eq!(
+            classify_outcome(true, Duration::from_millis(900), w),
+            Outcome::Failure
+        );
+        // Errored but ran past the window = a client that authenticated then hit
+        // session trouble (the soak false-lockout case) → Success (resets).
+        assert_eq!(
+            classify_outcome(true, Duration::from_secs(7), w),
+            Outcome::Success
+        );
+        assert_eq!(
+            classify_outcome(true, Duration::from_millis(3001), w),
+            Outcome::Success
+        );
+        // Clean disconnects never count, short or long.
+        assert_eq!(
+            classify_outcome(false, Duration::from_millis(1), w),
+            Outcome::Success
+        );
+        assert_eq!(
+            classify_outcome(false, Duration::from_secs(3600), w),
+            Outcome::Success
+        );
+    }
+
+    #[test]
+    fn reconnecting_client_with_session_errors_is_not_locked_out() {
+        // Regression for the 2026-07-01 soak: a legit client whose sessions
+        // establish then error at ~7s must NOT accrue toward a lockout.
+        let mut c = core();
+        let t0 = Instant::now();
+        let peer = ip(20);
+        let w = c.failfast_window();
+        for k in 0..20 {
+            let dur = Duration::from_secs(7); // errored after authenticating
+            c.record_outcome(
+                t0 + Duration::from_secs(k * 10),
+                peer,
+                classify_outcome(true, dur, w),
+            );
+            assert_eq!(
+                c.decide(t0 + Duration::from_secs(k * 10 + 1), peer),
+                Decision::Accept,
+                "iteration {k}: a reconnecting client must stay accepted"
+            );
         }
     }
 

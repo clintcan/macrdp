@@ -363,16 +363,18 @@ MACRDP_AUDIT_LOG=1                # connection audit log (independent of the gua
 MACRDP_GUARD_RL_MAX=10            # max attempts per window per IP (0 = no rate-limit)        [GUARD_RL_MAX]
 MACRDP_GUARD_RL_WINDOW_SECS=60    # rate-limit sliding window                                 [GUARD_RL_WINDOW_SECS]
 MACRDP_GUARD_FAIL_THRESHOLD=5     # consecutive failures before lockout (0 = no lockout)      [GUARD_FAIL_THRESHOLD]
-MACRDP_GUARD_MIN_SESSION_SECS=10  # a connection shorter than this counts as a failure        [GUARD_MIN_SESSION_SECS]
+MACRDP_GUARD_FAILFAST_SECS=3      # only errored connections that fail this fast (pre-handshake) count toward lockout  [GUARD_FAILFAST_SECS]
 MACRDP_GUARD_COOLDOWN_BASE_SECS=30  # first lockout length, doubles per extra failure          [GUARD_COOLDOWN_BASE_SECS]
 MACRDP_GUARD_COOLDOWN_MAX_SECS=900  # lockout escalation cap (15 min)                          [GUARD_COOLDOWN_MAX_SECS]
 ```
 
 The lockout **escalates and auto-expires** (no manual unlock): with the defaults it triggers
 at the 5th consecutive failure, then 30s → 60 → 120 → 240 → 480 → 900s (cap) as the IP keeps
-failing past each cooldown; **any clean, long-lived session resets that IP to 0**. It's
-heuristic (an errored or very-short connection ⇒ failure), so a single benign disconnect —
-e.g. mstsc's first-connect cert-prompt "Broken pipe" — never locks you out. Audit lines are
+failing past each cooldown; **a clean session — or any connection that got past the handshake
+— resets that IP to 0**. It's heuristic: only a connection that errored *and* failed within
+the fail-fast window (~3s, i.e. never authenticated) counts as a failure, so a reconnecting
+real client (mstsc reconnect-blank, flaky link) and a single benign disconnect (mstsc's
+first-connect cert-prompt "Broken pipe") never lock you out. Audit lines are
 tagged `macrdp::audit`: `grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows
 `event="accept|reject|disconnect"` with the source IP and (for rejects) the reason and
 retry-after.

@@ -804,12 +804,12 @@ async fn run_fork_supervisor(
     // directly — pre-spawn rate-limit/lockout + per-IP outcome recording on worker
     // drain. `None` when MACRDP_CONN_GUARD is off. Loopback is exempt in the core.
     let mut guard = auth_guard::AuthGuardCore::from_env();
-    // "Long-lived session" bar for the supervisor's outcome heuristic; falls back
-    // to the documented default when the guard is disabled but audit is still on.
-    let min_session = guard
+    // Fail-fast window for the supervisor's outcome heuristic; falls back to the
+    // documented default when the guard is disabled but audit is still on.
+    let failfast_window = guard
         .as_ref()
-        .map(|g| g.min_session())
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+        .map(|g| g.failfast_window())
+        .unwrap_or_else(|| std::time::Duration::from_secs(3));
 
     // SCK capture-slot settle, env-overridable for hardware-in-the-loop tuning.
     let sck_settle = std::env::var(WORKER_SCK_SETTLE_ENV)
@@ -863,20 +863,13 @@ async fn run_fork_supervisor(
             .await;
             // Classify the finished worker for the guard's lockout heuristic. The
             // worker exits 0 on a clean connection end / 1 on error (see the worker
-            // branch's process::exit). Clean + long-lived ⇒ success; nonzero or
-            // short ⇒ failure; a wait/join error ⇒ don't penalize; a >timeout
-            // still-alive worker is clearly a long-lived session ⇒ success.
-            let outcome = match &waited {
-                Ok(Ok(Ok(status))) => {
-                    if status.success() && dur >= min_session {
-                        auth_guard::Outcome::Success
-                    } else {
-                        auth_guard::Outcome::Failure
-                    }
-                }
-                Ok(_) => auth_guard::Outcome::Success,
-                Err(_) => auth_guard::Outcome::Success,
-            };
+            // branch's process::exit). Only a FAST errored worker (exited non-zero
+            // within the fail-fast window — never got past the handshake) counts as
+            // a lockout failure; an errored worker that ran longer authenticated
+            // and is a legit client with session trouble, and a wait timeout /
+            // join error is treated as not-errored. See classify_outcome.
+            let errored = matches!(&waited, Ok(Ok(Ok(status))) if !status.success());
+            let outcome = auth_guard::classify_outcome(errored, dur, failfast_window);
             if waited.is_err() {
                 // Timed out: the old connection is still alive. The detached
                 // spawn_blocking keeps running and reaps it; proceed anyway so a
@@ -1632,7 +1625,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ("GUARD_RL_MAX", "MACRDP_GUARD_RL_MAX"),
         ("GUARD_RL_WINDOW_SECS", "MACRDP_GUARD_RL_WINDOW_SECS"),
         ("GUARD_FAIL_THRESHOLD", "MACRDP_GUARD_FAIL_THRESHOLD"),
-        ("GUARD_MIN_SESSION_SECS", "MACRDP_GUARD_MIN_SESSION_SECS"),
+        ("GUARD_FAILFAST_SECS", "MACRDP_GUARD_FAILFAST_SECS"),
         (
             "GUARD_COOLDOWN_BASE_SECS",
             "MACRDP_GUARD_COOLDOWN_BASE_SECS",
