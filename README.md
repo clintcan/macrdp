@@ -32,7 +32,7 @@ Short version: **a polished v0 daily-driver for trusted LANs — not an enterpri
 - **The UDP multitransport / lossy-audio paths are EXPERIMENTAL** (opt-in, default OFF) — robust in testing but newer and less soaked than the TCP core, which remains the default everything rides on.
 - **It's a solo v0** built on vendored [IronRDP](https://github.com/Devolutions/IronRDP) forks — no commercial support or SLA.
 
-If your use case is "remote into my own Mac over my LAN/VPN," it's in good shape. If it's unattended production, untrusted networks, or multi-user, it isn't there yet — see [`docs/production-readiness-roadmap.md`](docs/production-readiness-roadmap.md) for what would close that gap (real TLS certs ✓ done; auth hardening ✓ done; a multi-day soak still open) and what can't be (multi-user GUI sessions, on macOS).
+If your use case is "remote into my own Mac over my LAN/VPN," it's in good shape. If it's unattended production, untrusted networks, or multi-user, it isn't there yet — see [`docs/production-readiness-roadmap.md`](docs/production-readiness-roadmap.md) for what would close that gap (real TLS certs ✓ done; auth hardening ✓ done; a multi-day soak — foundation core passed a 31 h leak/drift run, full 48–72 h on the latest build still open) and what can't be (multi-user GUI sessions, on macOS).
 
 ## Quick start
 
@@ -400,6 +400,10 @@ Both restore the original layout when the last client disconnects, and both auto
 ./macrdp
 
 # Accept LAN connections, force a non-$USER account.
+# NETWORK EXPOSURE: --bind 0.0.0.0 opens the port to your LAN. Keep it on a
+# network you control. Do NOT port-forward / expose it to the public internet —
+# even with TLS + NLA/CredSSP + rate-limit/lockout, the production answer for any
+# RDP server is to reach it over a VPN or an RD Gateway, never a raw public IP.
 ./macrdp --bind 0.0.0.0:3390 --username clint
 
 # Higher frame rate, custom cert dir.

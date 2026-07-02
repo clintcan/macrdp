@@ -720,7 +720,7 @@ async fn run_recv_loop(
                     [0xFE, 0xFD] => "DTLS 1.2",
                     _ => "DTLS",
                 };
-                warn!(
+                debug!(
                     %peer_addr, %dtls,
                     "P2.0 SPIKE GREEN: client opened a LOSSY (UdpFecL) UDP flow — \
                      it sent a {dtls} ClientHello. Lossy multitransport is reachable; \
@@ -838,7 +838,7 @@ async fn run_recv_loop(
                         }
                         if !dtls_err && conn.is_handshake_done() && !*dtls_done_logged {
                             *dtls_done_logged = true;
-                            warn!(
+                            debug!(
                                 %peer_addr,
                                 "P2.1 GREEN: DTLS 1.2 handshake COMPLETE on the LOSSY (UdpFecL) flow — MS-RDPEMT-over-DTLS reachable"
                             );
@@ -865,7 +865,7 @@ async fn run_recv_loop(
                                             let o = sm.enqueue(now_ms, &dg);
                                             send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
                                         }
-                                        warn!(
+                                        debug!(
                                             %peer_addr,
                                             "P2.4 GREEN: MS-RDPEMT tunnel ESTABLISHED over DTLS (lossy flow) — CREATERESPONSE(S_OK) sent"
                                         );

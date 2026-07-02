@@ -39,9 +39,12 @@ are scope limits, not gaps to close.
    (errored/very-short ⇒ failure; clean long session resets), so a benign disconnect never
    locks anyone out. Not done here: precise CredSSP-failure classification (would need a
    vendored signal — intentionally avoided).
-3. **Document the posture honestly.** Even hardened, internet-facing RDP is a bad idea
-   for *any* server — the production answer is "behind a VPN or an RD Gateway." Make that
-   explicit alongside Tier 1.1.
+3. **Document the posture honestly — DONE.** Even hardened, internet-facing RDP is a bad
+   idea for *any* server — the production answer is "behind a VPN or an RD Gateway." This is
+   stated in the README **§Production readiness** (the "Short version" line: don't put it on a
+   public IP, and the trusted-LAN-scope limitation: put internet-facing RDP behind a VPN / RD
+   Gateway), and reinforced by a **Network exposure** note next to the LAN-bind examples in
+   **§Examples**. See also `@docs/macos-gotchas.md` (port 3389 privileged → 3390 default).
 
 ## Tier 2 — Reliability / unattended operation
 

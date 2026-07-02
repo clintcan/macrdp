@@ -71,9 +71,17 @@ cmd_monitor() {
     fi
     echo "monitoring pid $pid every ${interval}s -> $out" >&2
     echo "ts,rss_mb,threads,fds,conns,procs,nfs_mounts,tmp_dirs,log_mb" > "$out"
+    # Flush to disk after every append. At 1 sample/min the cost is nil, and it
+    # guarantees the on-disk CSV always reflects the samples — so pulling the file
+    # mid-run (or an interrupted transfer off the soak box) can't come back with
+    # allocated-but-unflushed blocks reading as zeros (which is what happened once
+    # — see docs/production-readiness-roadmap.md Tier 2.4). `sync` is coarse but
+    # portable; a per-fd F_FULLFSYNC isn't reachable from shell.
+    sync
     while row="$(sample_row "$pid")"; do
         echo "$row" >> "$out"
         echo "$row"
+        sync
         sleep "$interval"
     done
     echo "pid $pid exited; samples in $out" >&2

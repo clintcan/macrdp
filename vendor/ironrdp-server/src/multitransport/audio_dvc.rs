@@ -269,7 +269,7 @@ impl DvcProcessor for AudioLossyDvc {
                     Some(idx) => {
                         let is_aac = cf.formats[idx].format == WaveFormat::AAC_MS;
                         self.chosen_format_no = Some(u16::try_from(idx).unwrap_or(0));
-                        warn!(
+                        debug!(
                             channel = self.channel_name,
                             client_formats = cf.formats.len(),
                             chosen_wformatno = idx,
@@ -302,7 +302,7 @@ impl DvcProcessor for AudioLossyDvc {
                 if let (Some(shared), Some(idx)) = (self.negotiated.as_ref(), self.chosen_format_no) {
                     shared.set(idx);
                 }
-                warn!(
+                debug!(
                     channel = self.channel_name,
                     chosen_wformatno = ?self.chosen_format_no,
                     "P2.4b GREEN: reliable audio DVC negotiated + training confirmed over TCP — \
