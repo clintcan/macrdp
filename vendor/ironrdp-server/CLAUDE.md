@@ -909,5 +909,16 @@ AND released — #1276 landing is NOT sufficient.
     re-auths via NLA every connection), so this only *enables the client's*
     auto-reconnect loop; a fixed per-process `logon_id`/`random_bits` is fine.
     Additive + standard RDP server behavior → cleanly upstreamable (a real RDP
-    server always sends this). Verified: build/clippy/test clean; live mstsc
-    reconnect verification PENDING (paired with the blank-recovery drop test).
+    server always sends this). **UPSTREAMED 2026-07-02 as PR #1405**
+    (`feat(server): send the Server Auto-Reconnect Cookie during logon`, branch
+    `clintcan:feat/server-auto-reconnect-cookie`, OPEN/CI-green/MERGEABLE,
+    awaiting review). The upstream port keeps the same send point + per-connection
+    guard but shapes the API like `credential_validator` — a builder method
+    `with_auto_reconnect_cookie(Option<ServerAutoReconnect>)` + a runtime setter
+    `set_auto_reconnect_cookie(Option<..>)` (vs this vendored `(logon_id,
+    random_bits)` setter); when the pin bumps past its merge+release, macrdp can
+    adopt the upstream API and drop this divergence (the acceptor/rdpdr/dvc/
+    rdpeudp forks stay for their own divergences). Verified: build/clippy/test
+    clean. **Cookie behavior IS live-verified** — the blank-recovery drop test
+    (2026-07-02) auto-reconnected mstsc on its own, which only happens if the
+    cookie was provisioned during logon (see the h264 reconnect-blank quirk note).

@@ -230,21 +230,32 @@ then delete; promote a parked item to *In flight* when work actually starts.
 ## Upstreaming watch (no action unless a release lands)
 
 - IronRDP forks are effectively permanent (each carries un-upstreamed divergences:
-  multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch).
-  **#1359 (rdpsnd) + #1397 (acceptor keyboard-layout on `AcceptorResult`) MERGED upstream
-  2026-07-01; #1373 (acceptor honor-size) open — 4 review changes addressed (commit `3d315f8`,
-  rebased on master), awaiting re-review.**
-  Nothing is currently de-vendorable. **Pin-bump note:** bumping the ironrdp git pin past
-  `2d3bdef` requires `src/audio.rs` to adopt the new rdpsnd handler API (`choose_format`
-  + fallible `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic.
+  multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch,
+  server ARC auto-reconnect cookie). **#1359 (rdpsnd) + #1397 (acceptor keyboard-layout on
+  `AcceptorResult`) MERGED 2026-07-01; #1373 (acceptor honor-size) MERGED 2026-07-02 (`d471bd06`).**
+  **Two clintcan PRs currently OPEN (both CI-green, MERGEABLE, awaiting review — reactive-only, do
+  not poll/nudge):**
+  - [ ] **#1404** `feat(acceptor)!: clamp honored client desktop size to an operator maximum` — the
+    honor-size resource-hardening CBenoit green-lit in his #1373 approval. Replaces the `bool` with
+    `Option<DesktopSize>` = operator max; client request clamped per-dimension. Upstreams the
+    hardened form of acceptor divergence (1).
+  - [ ] **#1405** `feat(server): send the Server Auto-Reconnect Cookie during logon` — upstreams
+    vendored `ironrdp-server` divergence (13). Additive (default `None`): optional ARC_SC cookie
+    (MS-RDPBCGR 2.2.4.3) sent as a Save Session Info PDU once per connection, so a client
+    auto-reconnects on an ungraceful drop (mstsc won't without it). API mirrors `credential_validator`
+    (builder `with_auto_reconnect_cookie` + setter). PR body flags the one open design point:
+    send-only, does NOT validate the returning ARC_CS cookie (offered as a follow-up).
+  Nothing is currently de-vendorable. **Pin-bump follow-ups (when the git pin bumps past the merges):**
+  (a) past `2d3bdef` → `src/audio.rs` adopts the new rdpsnd handler API (`choose_format` + fallible
+  `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic; (b) past `d471bd06`
+  → `main.rs` switches `set_honor_client_desktop_size(bool)` to the builder `with_honor_client_desktop_size`
+  (and, once #1404 lands, to `Some(max)` capped to the Mac's native res — see the honor-size counterpart below).
 - Upstream-ability of the remaining divergences was surveyed 2026-07-01 (don't re-survey; ranking
   in `project_upstream_ironrdp_open_prs` memory). The other "quick" items (RDPDR decode halves,
   AudioWave `duration_ms`, keyboard-layout handle) are **held** — no upstream consumer yet, so they
   belong with their larger feature (server-RDPDR processor, audio-lag model), not standalone PRs.
-- [ ] **Follow-up (deferred, not part of #1373): harden the honor-size resource angle.** With
-  honor-client-desktop-size ON, the client-controlled size (bounded only by the protocol
-  [200, 8192]) drives the server's encoder/surface allocation — a client can request 8192×8192
-  (~256 MB/frame) as a mild DoS. CBenoit's hint = "a clamp/range policy rather than a bare bool":
-  upgrade the option to an operator-set MAX (honored size = client request clamped to the operator
-  ceiling). Separate future upstream PR. macrdp-side counterpart: a `--max-client-size` (or cap to
-  the Mac's native resolution). Neither blocks #1373. See `project_upstream_ironrdp_open_prs` memory.
+- [ ] **macrdp-side honor-size counterpart to #1404 (defense-in-depth, deferred).** macrdp sanity-bands
+  the client-requested size to [200, 8192] but has no operator max, so the same 8192×8192 (~256 MB/frame)
+  allocation vector exists locally. Add a `--max-client-size` flag (or cap to the Mac's native resolution)
+  and, when the pin bumps past #1404, pass it through the new `Option<DesktopSize>` honor-size API. Not
+  urgent; pairs with pin-bump follow-up (b) above.
