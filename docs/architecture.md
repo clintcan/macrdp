@@ -198,6 +198,22 @@ src/reaper.rs     Startup reaper — on launch, sweeps leftovers from a PRIOR ma
                   instance live. Called once from async_main on a detached thread
                   (a stale umount can't block startup); covers single-process,
                   the fork supervisor, and each worker.
+src/health.rs     Health-check watchdog (Tier 2.5) — turns a hung-but-alive
+                  process into a clean exit so launchd KeepAlive / the
+                  --fork-workers supervisor restarts a fresh one (KeepAlive only
+                  catches an outright crash, not a wedge). A dedicated OS thread
+                  (NOT a tokio task, so it ticks even when the runtime is wedged)
+                  submits a trivial probe onto the tokio runtime each interval and
+                  waits a bounded time; a deadlocked runtime never runs it, and
+                  after N consecutive misses it process::exits with code 70. Pure,
+                  unit-tested decision + parsing (should_arm / HealthConfig); armed
+                  from async_main on the long-lived launchd-watched process
+                  (single-process OR supervisor), skipped on short-lived fork
+                  workers and (by default) interactively (stdout a TTY).
+                  Conservative defaults (15s interval / 30s timeout / 2 misses ⇒
+                  ~90s to bounce). Env: MACRDP_HEALTHCHECK=0/1 +
+                  MACRDP_HEALTHCHECK_{INTERVAL_SECS,TIMEOUT_SECS,FAILURES}
+                  (config.env HEALTH_CHECK / HEALTHCHECK_*). Cross-platform.
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via

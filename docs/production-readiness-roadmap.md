@@ -81,7 +81,7 @@ are scope limits, not gaps to close.
      periodically (or tee key events to the crash-durable macOS unified log) so a transfer/
      interruption can't zero-fill the record; and the `multitransport`/`audio_dvc` "GREEN"
      status lines log at WARN — demote to INFO/DEBUG to cut soak noise.
-5. **Robust teardown + log rotation.** *(log rotation + startup reaper SHIPPED 2026-06-30.)*
+5. **Robust teardown + log rotation.** *(log rotation + startup reaper SHIPPED 2026-06-30; health-check watchdog SHIPPED 2026-07-03 — Tier 2.5 complete.)*
    - **Log rotation — DONE.** `~/Library/Logs/macrdp.log` is now a self-owned, size-bounded
      rotating file (`src/logging.rs`: `macrdp.log` + N logrotate-style archives, default
      10 MiB × 5; tunable via `MACRDP_LOG_MAX_BYTES`/`MACRDP_LOG_MAX_FILES`). The plist no
@@ -93,8 +93,20 @@ are scope limits, not gaps to close.
      `$TMPDIR/macrdp-{rdpdr,paste,lazy-paste}-<pid>` dirs), dead-pid-gated so it's safe with
      another instance live. (SCStreams / virtual display / blanking were already process-scoped
      and auto-restore.)
-   - **Still TODO:** a lightweight **health-check** that detects a hung-but-alive process and
-     bounces it (LaunchAgent `KeepAlive` already restarts on outright crash, but not on a hang).
+   - **Health-check watchdog — DONE (2026-07-03).** `src/health.rs`: a dedicated OS thread
+     (not a tokio task, so it survives a wedged runtime) periodically submits a trivial probe
+     onto the tokio runtime and waits a bounded time for it to run. A deadlocked runtime never
+     runs it; after N consecutive misses the watchdog `process::exit`s with a distinct code
+     (70/EX_SOFTWARE) so `KeepAlive`/the `--fork-workers` supervisor restarts a fresh process —
+     closing the "alive but wedged" gap `KeepAlive` alone can't. Conservative by default (15 s
+     interval, 30 s timeout, 2 misses ⇒ a wedge must persist ~90 s before a bounce, so load
+     spikes never trip it). Armed on the long-lived launchd-watched process (single-process serve
+     OR the supervisor); skipped on short-lived fork *workers* and, by default, interactively
+     (stdout a TTY). Env: `MACRDP_HEALTHCHECK=0/1` + `MACRDP_HEALTHCHECK_{INTERVAL_SECS,TIMEOUT_SECS,FAILURES}`
+     (config.env keys `HEALTH_CHECK` / `HEALTHCHECK_*`). Verified: arms headless, no false bounce
+     on an idle runtime. **Scope:** targets runtime-level hangs (deadlock / all workers blocked);
+     a listener-level heartbeat for "accept loop silently stopped while the runtime is healthy"
+     is a possible follow-up.
 6. **Make `--fork-workers` the production default.** It's what fixes the mstsc
    reconnect-blank that bites real users; recommend (or default) it for unattended
    deployments. Note it's mutually exclusive with `--enable-udp-multitransport`.

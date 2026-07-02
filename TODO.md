@@ -212,9 +212,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   rate-limit + lockout + audit log (`src/auth_guard.rs`) **DONE 2026-06-30 #105**; (3) a
   48–72 h **soak to shake out leaks/drift — IN FLIGHT (Tier 2.4, running 2026-07-01; see
   the In flight section above + `scripts/soak-monitor.sh`)**. Also done:
-  log rotation + startup reaper (Tier 2.5, #103). Still open beyond the soak: Tier 2.5
-  hung-but-alive health-check/bounce; Tier 3 polish. Hard ceiling (NO-GO): multi-user
-  concurrent GUI sessions (macOS limit).
+  log rotation + startup reaper (Tier 2.5, #103) and the **hung-but-alive health-check
+  watchdog (`src/health.rs`) — DONE 2026-07-03** (probes the tokio runtime from a
+  dedicated OS thread; exits code 70 on a sustained wedge → launchd/supervisor restarts;
+  on by default when headless, env-tunable). **Tier 2.5 now complete.** Still open beyond
+  the soak: the `--fork-workers`-as-default decision (Tier 2.6); Tier 3 polish. Hard
+  ceiling (NO-GO): multi-user concurrent GUI sessions (macOS limit).
 
 ## Parked — scoped, low priority
 

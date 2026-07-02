@@ -237,6 +237,29 @@ first-connect cert-prompt "Broken pipe") never does either. Audit lines are tagg
 `event="accept|reject|disconnect"` with the source IP and (for rejects) the reason
 and retry-after.
 
+Health-check watchdog (env-only; **on by default when headless**). Detects a
+**hung-but-alive** process — the tokio runtime deadlocked / all workers blocked —
+and exits (code 70) so the LaunchAgent `KeepAlive` (or the `--fork-workers`
+supervisor) restarts a fresh one. `KeepAlive` alone only restarts on an outright
+crash, not a wedge; this closes that gap. It's armed on the long-lived
+launchd-watched process (single-process serve or the supervisor) and **skipped on
+short-lived fork workers** and, by default, **interactively** (stdout is a TTY,
+e.g. `cargo run` — a false bounce there would just kill a dev session, and nothing
+would restart it). Defaults are conservative — a wedge must persist ~90 s before a
+bounce, so load spikes never trip it. Tune / force / disable via env (or the
+matching `config.env` keys):
+```
+MACRDP_HEALTHCHECK=1                 # force on (even interactive); 0/off = disable
+MACRDP_HEALTHCHECK_INTERVAL_SECS=15  # delay between liveness probes
+MACRDP_HEALTHCHECK_TIMEOUT_SECS=30   # max time a probe may take before it's a miss
+MACRDP_HEALTHCHECK_FAILURES=2        # consecutive misses before the process exits
+```
+The mechanism: a dedicated OS thread (not a tokio task, so it keeps ticking even
+when the runtime it watches is wedged) submits a trivial probe onto the runtime
+each interval and waits `TIMEOUT_SECS` for it to run; a deadlocked runtime never
+runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
+exiting.
+
 Testing against the server:
 ```bash
 # FreeRDP — easiest to script and get verbose logs from.

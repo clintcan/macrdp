@@ -20,7 +20,7 @@ Short version: **a polished v0 daily-driver for trusted LANs — not an enterpri
 - Real auth — TLS + NLA/CredSSP against the macOS account via PAM, password from the Keychain. TLS can use a real CA / ACME / Let's Encrypt cert (`--cert`/`--key`), or the self-signed default. Per-IP connection **rate-limiting + lockout + an audit log** sit in front of the auth gate (on by default, loopback-exempt).
 - The full daily workflow — display, keyboard/mouse (incl. non-US layouts, Cmd+Tab, optional Ctrl→Cmd), clipboard text/images/files both ways, system audio, drive + smart-card redirection, headless virtual displays.
 - H.264/EGFX with **congestion-responsive rate control** — under packet loss it degrades gracefully (bitrate backs off → fps sheds at the floor → stays choppy-but-in-sync) instead of freezing, and audio can ride a loss-resilient lossy-UDP path.
-- Deployable — signed + notarized `.app`, a LaunchAgent, and a menu-bar GUI controller; TCC grants survive rebuilds.
+- Deployable — signed + notarized `.app`, a LaunchAgent, and a menu-bar GUI controller; TCC grants survive rebuilds. A **health-check watchdog** bounces a hung-but-alive process so launchd restarts it (not just on crash).
 - Tested — 130+ unit tests + a regression harness, run in CI on every push.
 
 **Known limitations — read before relying on it:**

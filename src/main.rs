@@ -24,6 +24,7 @@ mod file_promise;
 mod file_promise_lazy;
 #[cfg(target_os = "macos")]
 mod h264;
+mod health;
 mod input;
 mod keyboard_layout;
 mod logging;
@@ -37,7 +38,7 @@ mod videotoolbox;
 mod virtual_display;
 
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, IsTerminal};
 use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
@@ -1641,6 +1642,18 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_GUARD_COOLDOWN_BASE_SECS",
         ),
         ("GUARD_COOLDOWN_MAX_SECS", "MACRDP_GUARD_COOLDOWN_MAX_SECS"),
+        // Health-check watchdog (env-driven like the auth guard; on by default
+        // when headless). See src/health.rs.
+        ("HEALTH_CHECK", "MACRDP_HEALTHCHECK"),
+        (
+            "HEALTHCHECK_INTERVAL_SECS",
+            "MACRDP_HEALTHCHECK_INTERVAL_SECS",
+        ),
+        (
+            "HEALTHCHECK_TIMEOUT_SECS",
+            "MACRDP_HEALTHCHECK_TIMEOUT_SECS",
+        ),
+        ("HEALTHCHECK_FAILURES", "MACRDP_HEALTHCHECK_FAILURES"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
@@ -1713,6 +1726,25 @@ async fn async_main() -> Result<()> {
     let supervisor_vd_id: Option<u32> = std::env::var(WORKER_VD_ID_ENV)
         .ok()
         .and_then(|s| s.parse::<u32>().ok());
+
+    // Arm the health-check watchdog on the long-lived, launchd-watched process
+    // (single-process serve OR the --fork-workers supervisor) so a hung-but-alive
+    // runtime — which KeepAlive can't tell from a healthy one — gets bounced into
+    // a restart. Skipped on a fork *worker* (short-lived; the supervisor owns its
+    // liveness) and, by default, when interactive (stdout is a TTY, e.g.
+    // `cargo run`, where nothing would restart a bounce). MACRDP_HEALTHCHECK=0/1
+    // overrides; see src/health.rs.
+    if health::should_arm(
+        worker_fd.is_some(),
+        std::io::stdout().is_terminal(),
+        std::env::var("MACRDP_HEALTHCHECK").ok().as_deref(),
+    ) {
+        health::spawn(
+            tokio::runtime::Handle::current(),
+            health::HealthConfig::from_env(),
+        );
+    }
+
     if args.fork_workers && worker_fd.is_none() {
         // Supervisor role.
         //
