@@ -1979,6 +1979,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-graphics",
  "der 0.7.10",
+ "getrandom 0.2.17",
  "image",
  "ironrdp",
  "ironrdp-acceptor",

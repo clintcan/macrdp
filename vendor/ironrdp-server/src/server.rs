@@ -363,6 +363,22 @@ pub struct RdpServer {
     /// `MacInputHandler`) holds a clone and auto-selects a matching layout, so
     /// non-US clients type correctly with no manual configuration. 0 = unknown.
     keyboard_layout: Option<Arc<AtomicU32>>,
+    /// (vendored, divergence 13) Optional Server Auto-Reconnect Cookie
+    /// (MS-RDPBCGR 2.2.4.3 ARC_SC_PRIVATE_PACKET). When set, the server sends a
+    /// Save Session Info PDU carrying it once per TCP connection, right after
+    /// activation. A client (mstsc) only enters its "Attempting to reconnect"
+    /// auto-reconnect loop on an *ungraceful* disconnect if it was given this
+    /// cookie during logon; without it a dropped connection just reports
+    /// disconnected. `macrdp` sets it (`set_auto_reconnect_cookie`) so the
+    /// EGFX blank-recovery connection drop (`src/h264.rs`) heals with a seamless
+    /// auto-reconnect instead of a manual one. `None` = don't send (default);
+    /// the returning ARC_CS cookie is not validated (single console session +
+    /// NLA re-auth), so this only *enables the client's* auto-reconnect.
+    auto_reconnect_cookie: Option<rdp::session_info::ServerAutoReconnect>,
+    /// (vendored, divergence 13) Per-TCP-connection guard so the cookie is sent
+    /// exactly once (after the first activation), not again on each
+    /// deactivation-reactivation resize. Reset at the top of `run_connection`.
+    auto_reconnect_sent: bool,
     /// (vendored) Optional UDP-multitransport provider (MS-RDPEMT). When set,
     /// the server offers an auxiliary UDP transport to clients that advertise
     /// support in their GCC MultiTransportChannelData block. M1: negotiation
@@ -553,6 +569,8 @@ impl RdpServer {
             connection_handler,
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
+            auto_reconnect_cookie: None,
+            auto_reconnect_sent: false,
             honor_client_desktop_size: false,
             #[cfg(feature = "multitransport")]
             multitransport: None,
@@ -628,6 +646,18 @@ impl RdpServer {
     /// client connects.
     pub fn set_honor_client_desktop_size(&mut self, honor: bool) {
         self.honor_client_desktop_size = honor;
+    }
+
+    /// (vendored, divergence 13) Provision the Server Auto-Reconnect Cookie
+    /// (ARC_SC_PRIVATE_PACKET) sent in a Save Session Info PDU once per
+    /// connection after activation. `logon_id` identifies the session and
+    /// `random_bits` is the 16-byte auto-reconnect random (a CSPRNG value
+    /// supplied by the caller). Enabling this lets a client (mstsc) auto-
+    /// reconnect after an ungraceful drop instead of showing "disconnected" —
+    /// macrdp pairs it with the EGFX blank-recovery connection drop so the
+    /// recovery reconnect is seamless. Must be called before a client connects.
+    pub fn set_auto_reconnect_cookie(&mut self, logon_id: u32, random_bits: [u8; 16]) {
+        self.auto_reconnect_cookie = Some(rdp::session_info::ServerAutoReconnect { logon_id, random_bits });
     }
 
     /// (vendored) Share a cell the server fills with the client's announced
@@ -840,6 +870,11 @@ impl RdpServer {
         // lives task-local to `dispatch_audio`, which is spawned fresh in
         // `client_loop` for each connection, so no reset is needed at
         // this layer anymore.
+
+        // (vendored, divergence 13) Fresh TCP connection: re-arm the one-shot
+        // auto-reconnect-cookie send (it's sent after the first activation, not
+        // again on each deactivation-reactivation resize within this connection).
+        self.auto_reconnect_sent = false;
 
         let framed = TokioFramed::new(stream);
 
@@ -2228,6 +2263,30 @@ impl RdpServer {
         let desktop_size = self.display.lock().await.size().await;
         let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs, self.opts.max_request_size)
             .context("failed to initialize update encoder")?;
+
+        // (vendored, divergence 13) Provision the Server Auto-Reconnect Cookie
+        // once per TCP connection, now that activation is complete (Confirm
+        // Active processed, encoder built). A Save Session Info PDU carrying the
+        // ARC_SC cookie is what makes mstsc auto-reconnect on an ungraceful drop
+        // (e.g. the EGFX blank-recovery connection drop) instead of showing
+        // "disconnected". Not re-sent on deactivation-reactivation resizes
+        // (`auto_reconnect_sent` guard, reset per connection in run_connection).
+        if !self.auto_reconnect_sent {
+            if let Some(cookie) = self.auto_reconnect_cookie.clone() {
+                let pdu = rdp::headers::ShareDataPdu::SaveSessionInfo(rdp::session_info::SaveSessionInfoPdu {
+                    info_type: rdp::session_info::InfoType::LogonExtended,
+                    info_data: rdp::session_info::InfoData::LogonExtended(rdp::session_info::LogonInfoExtended {
+                        present_fields_flags: rdp::session_info::LogonExFlags::AUTO_RECONNECT_COOKIE,
+                        auto_reconnect: Some(cookie),
+                        errors_info: None,
+                    }),
+                });
+                let data = encode_share_data_pdu(pdu, result.io_channel_id, result.user_channel_id)?;
+                writer.write_all(&data).await.context("send auto-reconnect cookie")?;
+                self.auto_reconnect_sent = true;
+                debug!("Sent Server Auto-Reconnect Cookie (Save Session Info PDU)");
+            }
+        }
 
         let state = self
             .client_loop(reader, writer, result.io_channel_id, result.user_channel_id, encoder)

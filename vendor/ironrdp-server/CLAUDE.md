@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(13) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -885,3 +885,29 @@ AND released — #1276 landing is NOT sufficient.
     "rate control P1". **Watchdog follow-up (TODO):** under sustained loss mstsc resets
     ~60s after a de-migration (its multitransport dead-tunnel timeout on the now-silent
     UDP tunnel) — keepalive or cleanly close the abandoned tunnel on de-migrate.
+
+(13) Server Auto-Reconnect Cookie (MS-RDPBCGR ARC_SC_PRIVATE_PACKET) — NOT
+    upstreamed; added 2026-07-02. `RdpServer` gains `auto_reconnect_cookie:
+    Option<rdp::session_info::ServerAutoReconnect>` (default None) + a
+    per-TCP-connection `auto_reconnect_sent: bool` guard, and a setter
+    `set_auto_reconnect_cookie(logon_id: u32, random_bits: [u8;16])`. When set,
+    `client_accepted` sends a Save Session Info PDU
+    (`ShareDataPdu::SaveSessionInfo` → `InfoData::LogonExtended` with
+    `LogonExFlags::AUTO_RECONNECT_COOKIE` + the `ServerAutoReconnect`) via the
+    existing `encode_share_data_pdu` on the IO channel, once, right after
+    activation completes (Confirm Active processed + encoder built, before
+    `client_loop`); the guard is reset at the top of `run_connection` so a
+    deactivation-reactivation resize doesn't re-send it. All the PDU types
+    already exist in `ironrdp-pdu` (`rdp::session_info`) — only the server-side
+    send is new. **Why:** without this cookie a client (mstsc) does NOT
+    auto-reconnect on an ungraceful drop — it just reports disconnected. macrdp
+    provisions it (`main.rs`, default on, `MACRDP_AUTO_RECONNECT=0` disables) so
+    the EGFX blank-recovery connection drop (`src/h264.rs`
+    `perform_blank_drop` → `ServerEvent::Quit`) heals with a seamless
+    client-driven auto-reconnect instead of a manual one. The returning ARC_CS
+    cookie is intentionally NOT validated (macrdp is single-console-session and
+    re-auths via NLA every connection), so this only *enables the client's*
+    auto-reconnect loop; a fixed per-process `logon_id`/`random_bits` is fine.
+    Additive + standard RDP server behavior → cleanly upstreamable (a real RDP
+    server always sends this). Verified: build/clippy/test clean; live mstsc
+    reconnect verification PENDING (paired with the blank-recovery drop test).

@@ -2428,6 +2428,34 @@ async fn async_main() -> Result<()> {
     // pipeline all read.
     server.set_honor_client_desktop_size(auto_size);
 
+    // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
+    // (mstsc) auto-reconnects on an ungraceful drop instead of showing
+    // "disconnected". This is what makes the EGFX blank-recovery connection drop
+    // (src/h264.rs, when a reconnect lands on mstsc's stale surface and never
+    // presents) heal seamlessly — the client re-establishes on its own. Default
+    // on (harmless + standard RDP server behavior); MACRDP_AUTO_RECONNECT=0
+    // disables. The returning ARC_CS cookie is not validated (single console
+    // session, NLA re-auths every connection), so a fixed per-process value is
+    // fine — it only enables the client's auto-reconnect loop.
+    let auto_reconnect = !matches!(
+        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    );
+    if auto_reconnect {
+        let mut random_bits = [0u8; 16];
+        match getrandom::getrandom(&mut random_bits) {
+            Ok(()) => {
+                // logon_id is informational for us; a stable per-process id.
+                let logon_id = std::process::id();
+                server.set_auto_reconnect_cookie(logon_id, random_bits);
+                info!("server auto-reconnect cookie provisioned (clients auto-reconnect on an ungraceful drop)");
+            }
+            Err(e) => {
+                warn!(error = %e, "could not generate auto-reconnect cookie random bits — skipping")
+            }
+        }
+    }
+
     // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
     // provider so the server offers reliable UDP to clients that advertise it,
     // and (M3) bind a real UDP listener on the same address/port as TCP — the

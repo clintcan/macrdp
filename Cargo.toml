@@ -41,6 +41,10 @@ ironrdp = "0.14"
 ironrdp-server = { version = "0.10", features = ["egfx", "multitransport"] }  # patched locally — see [patch.crates-io] below
 ironrdp-acceptor = "0.8"
 ironrdp-pdu = "0.7"
+# CSPRNG for the Server Auto-Reconnect Cookie random bits (already in the tree
+# via rustls/aws-lc-rs); a direct dep so the base build doesn't rely on the
+# multitransport feature for it.
+getrandom = "0.2"
 ironrdp-cliprdr = "0.5"
 ironrdp-core = "0.1"
 ironrdp-rdpsnd = "0.7"

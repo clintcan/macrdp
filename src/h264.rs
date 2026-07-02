@@ -224,6 +224,18 @@ struct ConnectionContext {
     /// congested). Throttles let-throughs to `Gfx::adaptive_min_fps_interval`, like
     /// `last_throttle_ship` does for the EGFX-on-UDP trickle. See [`frame_drop_at_floor`].
     last_floor_fps_pass: Instant,
+    /// Blank-presentation detector state (the mstsc reconnect-blank; see
+    /// [`should_blank_recover`]). `qoe_reports` counts `on_qoe_metrics`
+    /// callbacks (reset per recovery attempt so a re-fire needs a fresh
+    /// all-zero window); `qoe_render_seen` latches true on the first report
+    /// with a nonzero decode+render time (`time_diff_dr > 0`) — the proof the
+    /// client actually presents, which disarms the detector for the connection.
+    qoe_reports: u64,
+    qoe_render_seen: bool,
+    /// Recovery attempts this connection + when the last one ran (init to the
+    /// connection epoch, which also serves as the arm-delay baseline).
+    blank_recovery_attempts: u32,
+    last_blank_recovery_at: Instant,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -309,6 +321,109 @@ fn should_demigrate_to_tcp(
         && !acks_suspended
         && since_ship <= active_window
         && since_ack >= wedge_timeout
+}
+
+/// Tunables for the blank-presentation detector + recovery (the mstsc
+/// reconnect-blank). See [`should_blank_recover`] and the H.264 reconnect
+/// quirk note in `docs/known-quirks.md`.
+#[derive(Clone, Copy, Debug)]
+struct BlankRecoveryParams {
+    /// QoE reports that must accumulate (all with `time_diff_dr == 0`) before
+    /// the session is declared blank. Upstream delivers ~8 `on_qoe_metrics`
+    /// callbacks/s during active decoding (~1 per DVC batch, NOT per wire PDU —
+    /// measured live 2026-07-02: ~850 wire QoE PDUs produced exactly 120
+    /// callbacks), so 40 ≈ 5 s of active decoding. Also a floor on real decode
+    /// activity — a static screen accrues slowly and simply defers detection.
+    /// A *rendering* session is disarmed by its very first callbacks: the
+    /// initial full-screen IDR present always costs >1 ms (observed 7–14 ms
+    /// within ~230 ms of connect on every healthy session).
+    min_qoe_reports: u64,
+    /// Don't evaluate before this much of the connection has elapsed — the
+    /// connect-time surface/caps churn shouldn't race the detector.
+    arm_delay: Duration,
+    /// Minimum spacing between recovery attempts (the QoE-report counter also
+    /// resets per attempt, so a re-fire needs a full fresh all-zero window).
+    retry_interval: Duration,
+    /// Total attempts per connection. All attempts but the last REMAP the
+    /// output to a fresh surface (non-destructive); the LAST attempt drops the
+    /// connection so the client auto-reconnects (a fresh attempt renders with
+    /// high probability, and the detector re-checks the new session).
+    max_attempts: u32,
+}
+
+/// Which recovery lever to pull for a given (1-based) attempt number: every
+/// attempt before the last remaps to a fresh surface; the last one drops the
+/// connection. Pure, unit-tested.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum BlankAction {
+    /// Create a fresh surface, map it over the output, force an IDR — the
+    /// non-destructive in-session heal. Deliberately sends NO DeleteSurface and
+    /// NO RESET_GRAPHICS: the resize-dance variant (upstream `resize_with_
+    /// monitors`, whose first PDU deletes the mapped surface) was tried live
+    /// 2026-07-02 and KILLED mstsc's GFX channel outright (zero acks/QoE for
+    /// the rest of the session) — the third independent confirmation that any
+    /// DeleteSurface aimed at a blank mstsc is fatal. The old surface is left
+    /// alive; the client leaks at most (max_attempts − 1) surfaces.
+    Remap,
+    /// Drop the connection (`ServerEvent::Quit` → per-connection
+    /// `RunState::Disconnect`). mstsc treats the unexpected loss as an outage
+    /// and auto-reconnects with its reconnect cookie; a fresh connection
+    /// renders with high probability and the detector re-checks it.
+    Drop,
+}
+
+fn blank_action(attempt: u32, max_attempts: u32) -> BlankAction {
+    if attempt < max_attempts {
+        BlankAction::Remap
+    } else {
+        BlankAction::Drop
+    }
+}
+
+/// Decide whether to run a blank-recovery attempt. Pure (counters + Durations,
+/// not a clock) so it's unit-testable without timing.
+///
+/// The signal (pcap-proven 2026-07-02, validated live the same day — see
+/// [[h264-reconnect-blank]]): a reconnect that lands on mstsc's stale retained
+/// surface DECODES every frame — FrameAcks and QoE acks flow normally — but
+/// never PRESENTS, and its QoE Frame Acknowledge PDUs report `timeDiffEDR == 0`
+/// on every single frame. A rendering session shows nonzero EDR on its first
+/// callbacks (~100–230 ms after connect). So: QoE flowing + zero render-time
+/// ever = the client is painting into a surface nobody composites (the
+/// reconnect-blank). The caller then pulls the [`blank_action`] lever for the
+/// attempt number: remap to a fresh surface, or drop the connection.
+///
+/// Each clause guards a distinct failure mode:
+/// - `qoe_reports >= min_qoe_reports`: enough evidence, and implies the client
+///   actually sends QoE acks at all (FreeRDP-family clients that don't are
+///   simply never evaluated — no false recovery on non-QoE clients).
+/// - `!qoe_render_seen`: a single nonzero EDR proves presentation and disarms
+///   the detector for the connection.
+/// - `egfx_acks_seen && !acks_suspended`: regular FrameAcks flowing too — the
+///   blank signature is "acking normally while EDR stays zero", not a stalled
+///   or suspended client (those are congestion, handled elsewhere).
+/// - `since_connect >= arm_delay`: skip the connect-time churn window.
+/// - `since_last_attempt >= retry_interval` + `attempts < max_attempts`:
+///   rate-limit; the final attempt is the connection drop, after which the
+///   fresh connection starts a fresh detector.
+#[allow(clippy::too_many_arguments)]
+fn should_blank_recover(
+    qoe_reports: u64,
+    qoe_render_seen: bool,
+    egfx_acks_seen: bool,
+    acks_suspended: bool,
+    since_connect: Duration,
+    since_last_attempt: Duration,
+    attempts: u32,
+    p: &BlankRecoveryParams,
+) -> bool {
+    qoe_reports >= p.min_qoe_reports
+        && !qoe_render_seen
+        && egfx_acks_seen
+        && !acks_suspended
+        && since_connect >= p.arm_delay
+        && since_last_attempt >= p.retry_interval
+        && attempts < p.max_attempts
 }
 
 /// Pure AIMD step for congestion-responsive bitrate (P1). Given the current target,
@@ -624,6 +739,15 @@ pub struct Gfx {
     /// so a congested link sheds packet load that bitrate cuts alone can't. Default 10
     /// fps (100 ms); `MACRDP_ADAPTIVE_FLOOR_FPS` overrides. See [`frame_drop_at_floor`].
     adaptive_min_fps_interval: Duration,
+    /// Blank-presentation recovery (the mstsc reconnect-blank). On by default
+    /// (`MACRDP_BLANK_RECOVERY=0` disables); a strict no-op unless a QoE-acking
+    /// client (mstsc) decodes a whole detection window without ever presenting —
+    /// see [`should_blank_recover`]. On detection: remap the output to a fresh
+    /// surface + IDR ([`Gfx::perform_blank_remap`]); if the blank persists
+    /// through a fresh window, drop the connection so the client auto-reconnects
+    /// (see [`BlankAction`]).
+    blank_recovery_enabled: bool,
+    blank_params: BlankRecoveryParams,
 }
 
 impl Gfx {
@@ -734,6 +858,24 @@ impl Gfx {
         let normal_keyframe_frames =
             (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
         let stretched_keyframe_frames = fps.saturating_mul(600).max(normal_keyframe_frames + 1);
+        // Blank-presentation recovery (the mstsc reconnect-blank): on by default —
+        // it only ever acts on the pcap-proven blank signature (QoE acks flowing
+        // with decode+render time zero on EVERY frame of a whole window), so a
+        // rendering client is effectively never touched. `MACRDP_BLANK_RECOVERY=0`
+        // is the kill switch; the window tunables are for experimentation.
+        // min_qoe 40 ≈ 5 s of active decoding (callbacks arrive ~8/s, per DVC
+        // batch — measured live). max_attempts 2 = one non-destructive remap,
+        // then the connection drop.
+        let blank_recovery_enabled = match std::env::var("MACRDP_BLANK_RECOVERY") {
+            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+            Err(_) => true,
+        };
+        let blank_params = BlankRecoveryParams {
+            min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 40)),
+            arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
+            retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 5000),
+            max_attempts: env_u32("MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS", 2),
+        };
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -794,6 +936,8 @@ impl Gfx {
             stretched_keyframe_frames,
             congestion_retransmits,
             adaptive_min_fps_interval,
+            blank_recovery_enabled,
+            blank_params,
         }
     }
 
@@ -858,6 +1002,11 @@ impl Gfx {
         // instant it's ready. The capture thread never blocks on the encoder, so
         // it keeps pace with ScreenCaptureKit instead of falling behind under
         // heavy frames (which would queue stale frames → growing latency).
+        // Blank-presentation recovery: when the detector fires inside the ctx
+        // guard below, the action itself must run OUTSIDE it (the remap locks
+        // `server_handle`, which is never taken while holding ctx — the ship/ack
+        // lock-order invariant). The decision extracts what the action needs here.
+        let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
         let force_keyframe = {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
@@ -940,6 +1089,52 @@ impl Gfx {
             // and spawns the ship thread).
             if ctx.surface_id.is_none() || ctx.encoder.is_none() {
                 self.setup_locked(ctx)?;
+            }
+            // Blank-presentation detector (the mstsc reconnect-blank): the client
+            // is decoding + acking every frame (QoE reports flowing) but its
+            // reported decode+render time has been zero on every single one — it
+            // is compositing into a stale retained surface and never presenting
+            // (pcap-proven signature, 2026-07-02). Pull the recovery lever for
+            // this attempt: remap the output to a fresh surface, or (last
+            // attempt) drop the connection so the client auto-reconnects.
+            // Decision here (under ctx), action after the guard drops.
+            // `qoe_reports` resets so a re-fire needs a fresh all-zero window.
+            if self.blank_recovery_enabled && ctx.surface_id.is_some() {
+                let now = Instant::now();
+                if should_blank_recover(
+                    ctx.qoe_reports,
+                    ctx.qoe_render_seen,
+                    ctx.egfx_acks_seen,
+                    ctx.acks_suspended,
+                    now.saturating_duration_since(ctx.epoch),
+                    now.saturating_duration_since(ctx.last_blank_recovery_at),
+                    ctx.blank_recovery_attempts,
+                    &self.blank_params,
+                ) {
+                    ctx.blank_recovery_attempts += 1;
+                    ctx.last_blank_recovery_at = now;
+                    let evidence = ctx.qoe_reports;
+                    ctx.qoe_reports = 0;
+                    let (w, h) = ctx.dims;
+                    let action =
+                        blank_action(ctx.blank_recovery_attempts, self.blank_params.max_attempts);
+                    blank_recovery = Some((
+                        action,
+                        ctx.server_handle.clone(),
+                        w,
+                        h,
+                        ctx.blank_recovery_attempts,
+                    ));
+                    warn!(
+                        ?action,
+                        attempt = ctx.blank_recovery_attempts,
+                        max_attempts = self.blank_params.max_attempts,
+                        qoe_reports_all_zero = evidence,
+                        "EGFX client is decoding but not presenting (QoE decode+render \
+                         time zero across the whole window — the reconnect-blank) — \
+                         running blank recovery"
+                    );
+                }
             }
             // P2b frame-rate floor: once the adaptive controller has cut the bitrate to
             // its floor AND the link is still congested, lowering quality can't help —
@@ -1038,6 +1233,22 @@ impl Gfx {
             }
             std::mem::replace(&mut ctx.need_keyframe, false)
         };
+
+        // Run the armed recovery action now that ctx is released (lock order).
+        // This capture is dropped either way: a remap re-arms `need_keyframe`,
+        // so the NEXT capture ships as the IDR into the fresh surface, cleanly
+        // ordered after the queued CreateSurface/Map PDUs; a drop needs no frame
+        // at all (the connection is ending).
+        if let Some((action, server_handle, width, height, attempt)) = blank_recovery {
+            let result = match action {
+                BlankAction::Remap => self.perform_blank_remap(&server_handle, width, height),
+                BlankAction::Drop => self.perform_blank_drop(),
+            };
+            if let Err(e) = result {
+                warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
+            }
+            return Ok(true);
+        }
 
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
         // output; we just count the submission for the drop-to-latest throttle.
@@ -1355,6 +1566,113 @@ impl Gfx {
         Ok(())
     }
 
+    /// Blank-recovery attempt A — remap the graphics output to a FRESH surface
+    /// (see [`should_blank_recover`] / [`BlankAction::Remap`]): CreateSurface
+    /// with a fresh id + MapSurfaceToOutput over the same origin + a forced IDR
+    /// on the next capture. Deliberately **non-destructive**: no DeleteSurface,
+    /// no RESET_GRAPHICS — the resize-dance variant (upstream
+    /// `resize_with_monitors`, whose first PDU deletes the mapped surface) was
+    /// tried live 2026-07-02 and killed mstsc's GFX channel outright (zero
+    /// acks/QoE afterwards; visual: shrunken black + transparent). The stale
+    /// surface is left alive client-side (bounded: at most `max_attempts − 1`
+    /// extra surfaces per connection); MapSurfaceToOutput over the same output
+    /// origin makes the fresh surface the composite source per MS-RDPEGFX.
+    ///
+    /// Lock order: `server_handle` is taken ALONE (never under ctx — the
+    /// ship/ack invariant); ctx is re-taken afterwards to publish the new
+    /// surface id, guarded by `Arc::ptr_eq` so a reconnect that swapped the
+    /// context mid-remap is left untouched. Frames the ship thread sends in
+    /// that window still target the old surface — which still exists (nothing
+    /// was deleted), so the stream stays valid either way.
+    fn perform_blank_remap(
+        &self,
+        server_handle: &GfxServerHandle,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        let (dvc_messages, egfx_channel_id, new_sid) = {
+            let mut server = server_handle.lock().unwrap();
+            let egfx_channel_id = server
+                .channel_id()
+                .ok_or_else(|| anyhow!("EGFX blank remap: channel_id not assigned"))?;
+            // Fresh id: the allocator has advanced past the (stale) id 0.
+            // reset_graphics_sent is true since setup, so no implicit
+            // RESET_GRAPHICS rides along with the create.
+            let sid = server
+                .create_surface_with_format(width, height, PixelFormat::XRgb)
+                .ok_or_else(|| anyhow!("EGFX blank remap: create_surface failed"))?;
+            if !server.map_surface_to_output(sid, 0, 0) {
+                return Err(anyhow!("EGFX blank remap: map_surface_to_output failed"));
+            }
+            (server.drain_output(), egfx_channel_id, sid)
+        };
+        if !dvc_messages.is_empty() {
+            let svc_messages =
+                encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                    .map_err(|e| anyhow!("EGFX blank remap: encode_dvc_messages failed: {e}"))?;
+            let sender = self
+                .sender
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("EGFX blank remap: server-event sender not set"))?;
+            sender
+                .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                    messages: svc_messages,
+                }))
+                .map_err(|_| anyhow!("EGFX blank remap: ServerEvent send failed"))?;
+        }
+        // Publish the fresh surface to the connection — unless a reconnect
+        // swapped the context out from under the remap.
+        let mut guard = self.ctx.lock().unwrap();
+        match guard.as_mut() {
+            Some(ctx) if Arc::ptr_eq(&ctx.server_handle, server_handle) => {
+                ctx.surface_id = Some(new_sid);
+                ctx.need_keyframe = true;
+                info!(
+                    new_surface_id = new_sid,
+                    w = width,
+                    h = height,
+                    "EGFX blank remap complete — fresh surface mapped over the output, next \
+                     frame is an IDR; a nonzero QoE decode+render time will confirm the client \
+                     presents"
+                );
+            }
+            _ => warn!("EGFX blank remap finished on a stale connection — result discarded"),
+        }
+        Ok(())
+    }
+
+    /// Blank-recovery attempt B — drop the connection
+    /// ([`BlankAction::Drop`]). `ServerEvent::Quit` is handled by the active
+    /// connection's `client_loop` as a per-connection `RunState::Disconnect`
+    /// (the listener keeps accepting), and mstsc treats the unexpected loss as
+    /// an outage and auto-reconnects with its reconnect cookie — a fresh
+    /// connection renders with high probability, and its fresh detector
+    /// re-checks. (Narrow, accepted race: if the client vanishes in the same
+    /// instant, the queued Quit could reach the between-connections event loop
+    /// and stop the server — under the LaunchAgent that's an auto-restart; the
+    /// detector only fires on a live, actively-decoding connection, so the
+    /// window is microscopic.)
+    fn perform_blank_drop(&self) -> Result<()> {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("EGFX blank drop: server-event sender not set"))?;
+        warn!(
+            "EGFX blank persisted through the fresh-surface remap — dropping the connection \
+             so the client auto-reconnects (a fresh connection usually renders)"
+        );
+        sender
+            .send(ServerEvent::Quit(
+                "EGFX blank recovery: client decodes but never presents".into(),
+            ))
+            .map_err(|_| anyhow!("EGFX blank drop: ServerEvent send failed"))?;
+        Ok(())
+    }
+
     fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
@@ -1569,6 +1887,10 @@ impl GfxServerFactory for Gfx {
             adaptive_lag_ewma: 0.0,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
+            qoe_reports: 0,
+            qoe_render_seen: false,
+            blank_recovery_attempts: 0,
+            last_blank_recovery_at: Instant::now(),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -1711,11 +2033,27 @@ impl GraphicsPipelineHandler for GfxHandler {
         );
     }
 
-    /// Inbound client QoE frame-acknowledge — a client-liveness signal. Logged at
-    /// trace so a graceful-disconnect capture can show whether the client keeps
-    /// sending QoE up to the channel close.
+    /// Inbound client QoE frame-acknowledge. Feeds the blank-presentation
+    /// detector (see [`should_blank_recover`]): `time_diff_dr` is the client's own
+    /// decode+render time for the frame — a blank (stale-surface) mstsc session
+    /// reports it as 0 on EVERY frame while still decoding/acking normally,
+    /// whereas a rendering session shows nonzero values within ~60 ms of the
+    /// first frame (pcap-proven 2026-07-02). Runs with the server mutex held
+    /// (like `on_frame_ack`), so it only touches ctx — never `server_handle`.
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
         trace!(?metrics, "EGFX on_qoe_metrics");
+        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            ctx.qoe_reports = ctx.qoe_reports.saturating_add(1);
+            if metrics.time_diff_dr > 0 && !ctx.qoe_render_seen {
+                ctx.qoe_render_seen = true;
+                debug!(
+                    frame_id = metrics.frame_id,
+                    time_diff_dr = metrics.time_diff_dr,
+                    "EGFX first nonzero QoE decode+render time — client is presenting \
+                     (blank detector disarmed for this connection)"
+                );
+            }
+        }
     }
 
     fn on_close(&mut self) {
@@ -2260,6 +2598,168 @@ mod tests {
             rate_action(1.0, 8.0, lossy, true, true),
             RateAction::Decrease
         );
+    }
+
+    // ---- Blank-presentation detector (reconnect-blank resize dance) ----
+
+    fn blank_params() -> BlankRecoveryParams {
+        BlankRecoveryParams {
+            min_qoe_reports: 120,
+            arm_delay: ms(3000),
+            retry_interval: ms(5000),
+            max_attempts: 2,
+        }
+    }
+
+    #[test]
+    fn blank_recovery_fires_on_the_pcap_signature() {
+        // The captured blank session: QoE reports flowing (well past the window),
+        // zero render-time ever, regular acks alive, connection well past arm.
+        let p = blank_params();
+        assert!(should_blank_recover(
+            131,
+            false,
+            true,
+            false,
+            ms(10_000),
+            ms(10_000),
+            0,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_disarmed_by_a_single_nonzero_render_time() {
+        // A rendering session shows nonzero EDR within ~60 ms of the first frame —
+        // one report disarms the detector no matter what else holds.
+        let p = blank_params();
+        assert!(!should_blank_recover(
+            10_000,
+            true,
+            true,
+            false,
+            ms(60_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_needs_a_full_evidence_window() {
+        // Too few QoE reports (also covers non-QoE clients: FreeRDP sends none,
+        // so the count never reaches the window and the dance never fires).
+        let p = blank_params();
+        assert!(!should_blank_recover(
+            119,
+            false,
+            true,
+            false,
+            ms(10_000),
+            ms(10_000),
+            0,
+            &p
+        ));
+        assert!(!should_blank_recover(
+            0,
+            false,
+            true,
+            false,
+            ms(10_000),
+            ms(10_000),
+            0,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_requires_live_unsuspended_acks() {
+        let p = blank_params();
+        // No regular FrameAcks seen → not the blank signature.
+        assert!(!should_blank_recover(
+            200,
+            false,
+            false,
+            false,
+            ms(10_000),
+            ms(10_000),
+            0,
+            &p
+        ));
+        // Acks suspended (queueDepth sentinel) → congestion territory, not blank.
+        assert!(!should_blank_recover(
+            200,
+            false,
+            true,
+            true,
+            ms(10_000),
+            ms(10_000),
+            0,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_respects_arm_delay_spacing_and_attempt_cap() {
+        let p = blank_params();
+        // Inside the connect-time arm delay → hold.
+        assert!(!should_blank_recover(
+            200,
+            false,
+            true,
+            false,
+            ms(2999),
+            ms(2999),
+            0,
+            &p
+        ));
+        // Too soon after the previous dance → hold.
+        assert!(!should_blank_recover(
+            200,
+            false,
+            true,
+            false,
+            ms(10_000),
+            ms(4999),
+            1,
+            &p
+        ));
+        // Attempts exhausted → give up (client-side floor).
+        assert!(!should_blank_recover(
+            200,
+            false,
+            true,
+            false,
+            ms(60_000),
+            ms(60_000),
+            2,
+            &p
+        ));
+        // Second attempt inside the cap, past the spacing → fires.
+        assert!(should_blank_recover(
+            200,
+            false,
+            true,
+            false,
+            ms(10_000),
+            ms(5000),
+            1,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_action_remaps_then_drops() {
+        // Default max_attempts=2: attempt 1 = the non-destructive remap,
+        // attempt 2 (last) = drop the connection.
+        assert_eq!(blank_action(1, 2), BlankAction::Remap);
+        assert_eq!(blank_action(2, 2), BlankAction::Drop);
+        // A tuned max_attempts=3 gets two remaps before the drop.
+        assert_eq!(blank_action(1, 3), BlankAction::Remap);
+        assert_eq!(blank_action(2, 3), BlankAction::Remap);
+        assert_eq!(blank_action(3, 3), BlankAction::Drop);
+        // max_attempts=1: straight to the drop.
+        assert_eq!(blank_action(1, 1), BlankAction::Drop);
     }
 
     // ---- P2b: frame_drop_at_floor ----
