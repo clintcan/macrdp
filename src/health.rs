@@ -264,4 +264,36 @@ mod tests {
         // A healthy runtime runs the probe well within the deadline.
         assert!(probe_ok(&rt.handle().clone(), Duration::from_secs(5)));
     }
+
+    #[test]
+    fn probe_reports_wedged_when_the_runtime_is_blocked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // A single-worker runtime whose only worker we occupy with a task that
+        // never yields to the scheduler (no `.await`) — the deadlock the
+        // watchdog exists to catch. The probe task can then never be polled.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let handle = rt.handle().clone();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = stop.clone();
+        handle.spawn(async move {
+            while !stop_worker.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        // Let the blocker get scheduled onto the sole worker before we probe.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // The wedge is detected: the probe cannot complete within the deadline.
+        assert!(!probe_ok(&handle, Duration::from_millis(400)));
+
+        // Release the worker so the runtime shuts down cleanly at drop.
+        stop.store(true, Ordering::Relaxed);
+    }
 }
