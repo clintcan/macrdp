@@ -50,6 +50,34 @@ are scope limits, not gaps to close.
    drift* item, and documented SCStream / NFS-mount leaks on hard kill (`SIGKILL` skips
    `Drop`). Run a 48–72 h soak (idle + active, with reconnect cycles) and fix what it
    surfaces.
+   - **Status — foundation core PASSED a 31 h leak/drift soak; full 48–72 h on v0.8.22+ still
+     pending.** The soak run (started 2026-07-01 18:39, **pre-v0.8.22 / pre-ARC** build, 31 h /
+     1861 one-minute samples; data recovered on a clean re-copy after a first transfer came back
+     zero-filled) shows the **foundation core is clean over time, not just alive:**
+     - **No memory leak** — RSS bounded 18–88 MB, tracking activity (88 active at start, down to
+       18 idle, back to ~60–71 active), ending *lower* than it started. No threads/fds/SCStreams/
+       NFS-mounts/log growth either; **single process the whole run** (no crash/restart/hang).
+       Corroborated independently by `pmset` (the `caffeinate` assertion is `-w`-tied to macrdp's
+       pid and held unbroken 30 h 45 m) + ~36-day machine uptime.
+     - **0 panics.** The 55 `Connection error`s are all per-connection (write-all / accept_begin /
+       CredSSP) — the normal client-drop / half-open-probe signatures, non-fatal.
+     - **v0.8.21 auth-guard fix FIELD-VALIDATED.** The run captured the before/after: the 17
+       lockout rejects of a legitimate LAN client (escalating to ~239 s) are all **pre-fix**
+       (06-30 + 07-01 02:xx, before the 18:39 build swap) — this *is* the false-lockout that
+       surfaced the v0.8.21 fix. The **post-fix soak window had ZERO lockouts** and 14 perfectly
+       balanced accept/disconnect pairs. (The overnight escalation cluster is the "took a few
+       tries while I was out" incident — pre-fix, now fixed.)
+   - **Why still not "DONE":** (a) 31 h is short of the 48–72 h target; (b) the run predates
+     v0.8.22, so its **new features were NOT exercised** — the blank-recovery detector (runs
+     per-QoE-callback, can drop the connection) and the ARC auto-reconnect cookie. So the
+     *foundation core* (capture → encode → ship → audio → input steady state) is
+     **production-validated for leak/drift + no-crash longevity over 31 h**; a **full 48–72 h
+     re-soak on v0.8.22+**, biased toward reconnect cycles, is still needed to (1) extend the
+     duration and (2) validate the v0.8.22 deltas (esp. blank-recovery false-positive resistance
+     over hours). Two logging notes for that run: harden the soak logger to `fsync`/`F_FULLFSYNC`
+     periodically (or tee key events to the crash-durable macOS unified log) so a transfer/
+     interruption can't zero-fill the record; and the `multitransport`/`audio_dvc` "GREEN"
+     status lines log at WARN — demote to INFO/DEBUG to cut soak noise.
 5. **Robust teardown + log rotation.** *(log rotation + startup reaper SHIPPED 2026-06-30.)*
    - **Log rotation — DONE.** `~/Library/Logs/macrdp.log` is now a self-owned, size-bounded
      rotating file (`src/logging.rs`: `macrdp.log` + N logrotate-style archives, default
@@ -95,8 +123,13 @@ If picking a starting batch, do these three:
 
 1. **Real TLS certs** (Tier 1.1) — **DONE (2026-06-30).**
 2. **Auth rate-limit + lockout + audit log** (Tier 1.2) — **DONE (2026-06-30).**
-3. **A 48–72 h soak to shake out leaks/drift** (Tier 2.4) — next.
+3. **A 48–72 h soak to shake out leaks/drift** (Tier 2.4) — **foundation core PASSED (31 h).**
+   A 31 h run confirmed no memory/fd/thread/stream/mount leak, 0 panics, and **field-validated
+   the v0.8.21 auth-guard fix** (pre-fix lockouts captured; post-fix window clean); see Tier 2.4
+   above. Remaining to fully close it out: a **48–72 h re-soak on v0.8.22+** exercising reconnect
+   cycles (ARC cookie + blank-recovery detector).
 
 That trio takes it from "daily-driver I babysit" to "I can deploy this and walk away on a
-network I control." With 1.1 + 1.2 landed, the remaining high-value item is the soak (2.4);
-everything else is incremental.
+network I control." With 1.1 + 1.2 landed, the foundation core is soak-validated for leak/drift
++ no-crash longevity (31 h); closing out Tier 2.4 (full 48–72 h on v0.8.22+) is the remaining
+high-value item; everything else is incremental.

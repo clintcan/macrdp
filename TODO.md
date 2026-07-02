@@ -7,13 +7,23 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Tier 2.4 — multi-day soak (RUNNING, started 2026-07-01 on a separate machine).**
-  The last leg of the production-readiness trio (TLS ✓ #104, auth ✓ #105). Watching for
-  memory/fd/thread creep, leaked SCStreams / NFS mounts, runaway log growth, audio
-  long-session drift, and any panic. Tooling: `scripts/soak-monitor.sh monitor` samples a
-  resource CSV during the run; `… analyze` summarizes the trend + greps logs for
-  CRITICAL/WATCH events. **Next action:** let it run, then pull back the CSV + rotated
-  `~/Library/Logs/macrdp.log*` and analyze. Fix whatever it surfaces.
+- [ ] **Tier 2.4 — multi-day soak (foundation core PASSED 31 h 2026-07-03; full 48–72 h on
+  v0.8.22+ still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
+  #105). Tooling: `scripts/soak-monitor.sh monitor` samples a resource CSV; `… analyze`
+  summarizes. **2026-07-01 run (31 h / 1861 samples, pre-v0.8.22 / pre-ARC build; data recovered
+  on a clean re-copy after a first transfer zero-filled):** CLEAN — **no memory leak** (RSS
+  bounded 18–88 MB, tracks activity, ended lower than start), no fd/thread/SCStream/NFS/log
+  growth, **single process throughout**, **0 panics** (the 55 `Connection error`s are normal
+  per-connection client-drop/probe signatures). **v0.8.21 auth-guard fix FIELD-VALIDATED:** the
+  17 lockouts of a legit LAN client (escalating to ~239 s) are all **pre-fix** (06-30 + 07-01
+  02:xx, before the 18:39 build swap — the false-lockout that *surfaced* v0.8.21, and the "took
+  a few tries while I was out" incident); the **post-fix soak window had ZERO lockouts** + 14
+  balanced accept/disconnect pairs. **Still open because:** (a) 31 h < the 48–72 h target; (b)
+  predates v0.8.22 → **blank-recovery detector** (per-QoE-callback, can drop the connection) +
+  **ARC cookie** not exercised. **Next action:** 48–72 h re-soak on **v0.8.22+**, biased toward
+  reconnect cycles. Logging fixes for that run: `fsync`/`F_FULLFSYNC` the soak logger (or tee to
+  the macOS unified log) so a transfer can't zero-fill it; demote the `multitransport`/`audio_dvc`
+  "GREEN" status lines from WARN to INFO/DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.
 
 ## Deferred — scoped, not started
 
