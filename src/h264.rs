@@ -132,6 +132,17 @@ struct ConnectionContext {
     /// AVC420 to a client that can't decode it (which it rejects with
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
     client_supports_avc: bool,
+    /// Channel-level decline, shared with this connection's `GfxDvcBridge`
+    /// (`with_decline_flag`). Set true in `on_ready` when the client
+    /// advertised EGFX but no AVC420 support: the bridge then discards ALL
+    /// EGFX output — crucially the CapabilitiesConfirm — so the client is
+    /// never told the graphics pipeline is active and keeps rendering the
+    /// legacy BitmapUpdates we actually send. Without this we confirmed caps
+    /// and then sent legacy updates anyway, which Windows App for Android
+    /// (advertises EGFX with AVC_DISABLED on every capset) treats as a
+    /// protocol error and hard-disconnects ~2 s after activation (observed
+    /// live 2026-07-04).
+    egfx_declined: Arc<AtomicBool>,
     /// Drop-to-latest throttle counters for the push pipeline. `submitted` is
     /// bumped by `submit_bgra` (capture thread) per frame handed to VT;
     /// `shipped` is bumped by the ship thread per frame pulled back out and
@@ -1939,6 +1950,10 @@ impl GfxServerFactory for Gfx {
         debug!("EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)");
         let server = GraphicsPipelineServer::new(handler);
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
+        // Channel-level decline flag, shared between this connection's ctx
+        // (set by on_ready for a no-AVC client) and its bridge (discards all
+        // EGFX output while set). Per-connection: a reconnect starts fresh.
+        let egfx_declined = Arc::new(AtomicBool::new(false));
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
             server_handle: handle.clone(),
             encoder: None,
@@ -1947,6 +1962,7 @@ impl GfxServerFactory for Gfx {
             epoch: Instant::now(),
             need_keyframe: true,
             client_supports_avc: false,
+            egfx_declined: egfx_declined.clone(),
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
             dims: (0, 0),
@@ -1973,7 +1989,10 @@ impl GfxServerFactory for Gfx {
             blank_recovery_attempts: 0,
             last_blank_recovery_at: Instant::now(),
         });
-        Some((GfxDvcBridge::new(handle.clone()), handle))
+        Some((
+            GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
+            handle,
+        ))
     }
 }
 
@@ -2059,9 +2078,19 @@ impl GraphicsPipelineHandler for GfxHandler {
                 info!(?negotiated, "EGFX channel ready (H.264 active)");
             } else {
                 ctx.is_ready = false;
+                // Decline at the CHANNEL level, not just skip-using-it: flag
+                // the bridge to discard this connection's EGFX output so the
+                // CapabilitiesConfirm upstream just queued is never sent.
+                // Confirming the pipeline and then shipping legacy bitmap
+                // updates anyway is a protocol violation Windows App for
+                // Android (EGFX advertised with AVC_DISABLED on every capset)
+                // hard-disconnects on; an unconfirmed pipeline is the normal
+                // "not yet active" state every client renders legacy in.
+                ctx.egfx_declined.store(true, Ordering::Relaxed);
                 warn!(
                     ?negotiated,
-                    "EGFX client advertised no AVC420 support — falling back to legacy BitmapUpdate"
+                    "EGFX client advertised no AVC420 support — declining the graphics \
+                     pipeline (no CapabilitiesConfirm) and serving legacy BitmapUpdate"
                 );
             }
         }

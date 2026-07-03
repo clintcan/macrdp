@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(13) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(13)/(14) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -922,3 +922,31 @@ AND released — #1276 landing is NOT sufficient.
     clean. **Cookie behavior IS live-verified** — the blank-recovery drop test
     (2026-07-02) auto-reconnected mstsc on its own, which only happens if the
     cookie was provisioned during logon (see the h264 reconnect-blank quirk note).
+
+(14) GfxDvcBridge channel-level decline flag (NOT upstreamed; added
+    2026-07-04). `GfxDvcBridge` gains an optional shared
+    `decline_output: Option<Arc<AtomicBool>>` (constructor
+    `with_decline_flag`; `new` keeps `None` = upstream behavior). When the
+    flag is true after the inner `GraphicsPipelineServer::process` returns
+    (the application's `GraphicsPipelineHandler` runs synchronously inside
+    it, so the flag is current for the PDU just handled), `process` discards
+    the output instead of shipping it — crucially the `CapabilitiesConfirm`.
+    WHY: upstream's `handle_capabilities_advertise` unconditionally queues a
+    CapabilitiesConfirm — there is no decline path — so a server that can't
+    actually drive the pipeline for this client (macrdp: client advertised
+    EGFX with AVC_DISABLED on every capset; macrdp only implements AVC420
+    over EGFX) used to confirm the pipeline and then send legacy bitmap
+    updates anyway. Windows App for ANDROID does exactly this advertise and
+    treats confirmed-pipeline+legacy-updates as a protocol error —
+    hard-disconnect ~2 s after activation (observed live 2026-07-04). With
+    the decline, the client is never told the pipeline came up (an
+    unconfirmed pipeline is the normal "not yet active" state every client
+    renders legacy in) and stays on legacy BitmapUpdate. macrdp wires the
+    flag per connection in h264.rs `build_server_with_handle` and sets it in
+    `on_ready` when `client_supports_avc` is false. VERIFIED locally both
+    ways with sdl-freerdp: `/gfx:progressive` (advertises the same
+    AVC_DISABLED signature as Android) → declined, stays connected on legacy,
+    zero protocol errors; plain (AVC420) → H.264 fully active, unaffected.
+    Upstreamable as-is (additive), or better as a real decline hook on
+    `GraphicsPipelineHandler` (e.g. `fn accept_pipeline(&caps) -> bool`
+    consulted before queueing the confirm) — offer alongside the egfx work.

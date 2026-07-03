@@ -7,6 +7,7 @@
 //! so the display handler can call `send_avc420_frame()` proactively while the
 //! DVC infrastructure handles client messages (capability negotiation, frame acks).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ironrdp_core::impl_as_any;
@@ -47,11 +48,33 @@ pub trait GfxServerFactory: ServerEventSender + Send {
 /// enabling shared access from both the DVC layer and the display handler.
 pub struct GfxDvcBridge {
     inner: GfxServerHandle,
+    /// Optional "decline the graphics pipeline" flag, set by the application's
+    /// `GraphicsPipelineHandler` (synchronously during `process` — the inner
+    /// server invokes the handler before returning). When true, `process`
+    /// discards the inner server's output instead of shipping it — most
+    /// importantly the `CapabilitiesConfirm`, so a client whose advertised
+    /// capabilities the application can't serve (e.g. EGFX offered but AVC
+    /// disabled on every capset) is never told the pipeline is active and
+    /// keeps rendering legacy updates. Confirming caps and then sending legacy
+    /// updates anyway is a protocol violation some clients (Windows App for
+    /// Android) hard-disconnect on. `None` = never decline (default).
+    decline_output: Option<Arc<AtomicBool>>,
 }
 
 impl GfxDvcBridge {
     pub fn new(server: GfxServerHandle) -> Self {
-        Self { inner: server }
+        Self {
+            inner: server,
+            decline_output: None,
+        }
+    }
+
+    /// Like [`Self::new`] but with a shared decline flag (see the field note).
+    pub fn with_decline_flag(server: GfxServerHandle, decline: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: server,
+            decline_output: Some(decline),
+        }
     }
 
     pub fn server(&self) -> &GfxServerHandle {
@@ -74,10 +97,21 @@ impl DvcProcessor for GfxDvcBridge {
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        self.inner
+        let out = self
+            .inner
             .lock()
             .expect("GfxServerHandle mutex poisoned")
-            .process(channel_id, payload)
+            .process(channel_id, payload)?;
+        // The handler ran synchronously inside `process` above, so the decline
+        // flag is current for the PDU just handled. Discarding the output here
+        // (rather than not processing) keeps the inner server's state machine
+        // consistent while the client is never told the pipeline came up.
+        if let Some(declined) = &self.decline_output {
+            if declined.load(Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
+        }
+        Ok(out)
     }
 
     fn close(&mut self, channel_id: u32) {
