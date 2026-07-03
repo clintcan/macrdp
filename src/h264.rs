@@ -48,7 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -332,11 +332,15 @@ struct BlankRecoveryParams {
     /// the session is declared blank. Upstream delivers ~8 `on_qoe_metrics`
     /// callbacks/s during active decoding (~1 per DVC batch, NOT per wire PDU —
     /// measured live 2026-07-02: ~850 wire QoE PDUs produced exactly 120
-    /// callbacks), so 40 ≈ 5 s of active decoding. Also a floor on real decode
-    /// activity — a static screen accrues slowly and simply defers detection.
-    /// A *rendering* session is disarmed by its very first callbacks: the
-    /// initial full-screen IDR present always costs >1 ms (observed 7–14 ms
-    /// within ~230 ms of connect on every healthy session).
+    /// callbacks), so the default 24 ≈ 3 s of active decoding. Also a floor on
+    /// real decode activity — a static screen accrues slowly and simply defers
+    /// detection. A *rendering* session is disarmed by its very first
+    /// callbacks: the initial full-screen IDR present always costs >1 ms
+    /// (observed 7–14 ms within ~230 ms of connect on every healthy session),
+    /// so a whole all-zero window is unambiguous well before 24. (The original
+    /// default was 40 ≈ 5 s; tightened once the drop became self-healing via
+    /// the auto-reconnect cookie — a hypothetical false positive now costs one
+    /// client-driven reconnect, not a dead session.)
     min_qoe_reports: u64,
     /// Don't evaluate before this much of the connection has elapsed — the
     /// connect-time surface/caps churn shouldn't race the detector.
@@ -347,8 +351,26 @@ struct BlankRecoveryParams {
     /// Total attempts per connection. All attempts but the last REMAP the
     /// output to a fresh surface (non-destructive); the LAST attempt drops the
     /// connection so the client auto-reconnects (a fresh attempt renders with
-    /// high probability, and the detector re-checks the new session).
+    /// high probability, and the detector re-checks the new session). The
+    /// default is 1 — i.e. go STRAIGHT to the drop: the remap was live-verified
+    /// (2026-07-02) to never heal mstsc (its layer-2 re-composite bug is
+    /// client-fatal for in-session surface swaps), so remap-first only added
+    /// ~10 s of black (a wasted attempt + a second full detection window)
+    /// before the drop that actually heals. Set ≥2 via
+    /// `MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS` to re-enable remap-first
+    /// experimentation (e.g. against a non-mstsc QoE-reporting client).
     max_attempts: u32,
+    /// Reconnect-storm guard: if this many CONSECUTIVE connections all ended in
+    /// a blank-recovery drop (no connection in between ever presented a frame),
+    /// stop dropping — the client is truly stuck (mstsc retains surfaces for
+    /// its whole process lifetime, and on rare clients every in-process
+    /// reconnect lands blank), and an endless drop → auto-reconnect → blank →
+    /// drop loop flashing "reconnecting…" every few seconds is worse than a
+    /// stable session plus clear log guidance (close + reopen the client — the
+    /// known-reliable recovery). The counter resets the moment any connection
+    /// reports a nonzero decode+render time (i.e. actually presents). 0 = no
+    /// cap.
+    max_consecutive_drops: u32,
 }
 
 /// Which recovery lever to pull for a given (1-based) attempt number: every
@@ -378,6 +400,14 @@ fn blank_action(attempt: u32, max_attempts: u32) -> BlankAction {
     } else {
         BlankAction::Drop
     }
+}
+
+/// Reconnect-storm guard (see [`BlankRecoveryParams::max_consecutive_drops`]):
+/// true when the blank-recovery DROP lever must be withheld because the last
+/// `cap` consecutive connections all ended in a blank drop without any
+/// connection presenting in between. Pure, unit-tested.
+fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
+    cap > 0 && consecutive_drops >= cap
 }
 
 /// Decide whether to run a blank-recovery attempt. Pure (counters + Durations,
@@ -742,12 +772,21 @@ pub struct Gfx {
     /// Blank-presentation recovery (the mstsc reconnect-blank). On by default
     /// (`MACRDP_BLANK_RECOVERY=0` disables); a strict no-op unless a QoE-acking
     /// client (mstsc) decodes a whole detection window without ever presenting —
-    /// see [`should_blank_recover`]. On detection: remap the output to a fresh
-    /// surface + IDR ([`Gfx::perform_blank_remap`]); if the blank persists
-    /// through a fresh window, drop the connection so the client auto-reconnects
-    /// (see [`BlankAction`]).
+    /// see [`should_blank_recover`]. On detection (default): drop the connection
+    /// so the client auto-reconnects via the auto-reconnect cookie — the fresh
+    /// connection renders with high probability. `MACRDP_BLANK_RECOVERY_MAX_
+    /// ATTEMPTS ≥ 2` re-enables the non-destructive fresh-surface remap first
+    /// ([`Gfx::perform_blank_remap`]; live-verified NOT to heal mstsc, kept for
+    /// experimentation) — see [`BlankAction`].
     blank_recovery_enabled: bool,
     blank_params: BlankRecoveryParams,
+    /// Consecutive connections (process lifetime) that ended in a blank-recovery
+    /// DROP with no connection presenting in between — the reconnect-storm guard
+    /// counter (see [`blank_drop_capped`]). Incremented when a drop is armed;
+    /// reset to 0 the moment any connection reports a nonzero decode+render
+    /// time. Lives on the factory (not per-connection ctx) precisely because it
+    /// must survive the drop → auto-reconnect cycle it guards against.
+    consecutive_blank_drops: Arc<AtomicU32>,
 }
 
 impl Gfx {
@@ -863,18 +902,21 @@ impl Gfx {
         // with decode+render time zero on EVERY frame of a whole window), so a
         // rendering client is effectively never touched. `MACRDP_BLANK_RECOVERY=0`
         // is the kill switch; the window tunables are for experimentation.
-        // min_qoe 40 ≈ 5 s of active decoding (callbacks arrive ~8/s, per DVC
-        // batch — measured live). max_attempts 2 = one non-destructive remap,
-        // then the connection drop.
+        // min_qoe 24 ≈ 3 s of active decoding (callbacks arrive ~8/s, per DVC
+        // batch — measured live). max_attempts 1 = drop straight away (the
+        // remap was live-verified never to heal mstsc; ≥2 re-enables
+        // remap-first). max_consecutive_drops caps the cross-connection
+        // drop → reconnect → blank → drop loop on a truly-stuck client.
         let blank_recovery_enabled = match std::env::var("MACRDP_BLANK_RECOVERY") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true,
         };
         let blank_params = BlankRecoveryParams {
-            min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 40)),
+            min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 24)),
             arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
             retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 5000),
-            max_attempts: env_u32("MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS", 2),
+            max_attempts: env_u32("MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS", 1),
+            max_consecutive_drops: env_u32("MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS", 3),
         };
         let (width, height) = desktop_size.get();
         info!(
@@ -938,6 +980,7 @@ impl Gfx {
             adaptive_min_fps_interval,
             blank_recovery_enabled,
             blank_params,
+            consecutive_blank_drops: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -1100,6 +1143,14 @@ impl Gfx {
             // Decision here (under ctx), action after the guard drops.
             // `qoe_reports` resets so a re-fire needs a fresh all-zero window.
             if self.blank_recovery_enabled && ctx.surface_id.is_some() {
+                // A presenting connection clears the reconnect-storm guard: the
+                // consecutive-drop counter only tracks UNBROKEN runs of
+                // blank-dropped connections (see `blank_drop_capped`).
+                if ctx.qoe_render_seen && self.consecutive_blank_drops.load(Ordering::Relaxed) != 0
+                {
+                    self.consecutive_blank_drops.store(0, Ordering::Relaxed);
+                    debug!("EGFX connection presented — consecutive blank-drop counter reset");
+                }
                 let now = Instant::now();
                 if should_blank_recover(
                     ctx.qoe_reports,
@@ -1111,29 +1162,59 @@ impl Gfx {
                     ctx.blank_recovery_attempts,
                     &self.blank_params,
                 ) {
-                    ctx.blank_recovery_attempts += 1;
-                    ctx.last_blank_recovery_at = now;
-                    let evidence = ctx.qoe_reports;
-                    ctx.qoe_reports = 0;
-                    let (w, h) = ctx.dims;
-                    let action =
-                        blank_action(ctx.blank_recovery_attempts, self.blank_params.max_attempts);
-                    blank_recovery = Some((
-                        action,
-                        ctx.server_handle.clone(),
-                        w,
-                        h,
-                        ctx.blank_recovery_attempts,
-                    ));
-                    warn!(
-                        ?action,
-                        attempt = ctx.blank_recovery_attempts,
-                        max_attempts = self.blank_params.max_attempts,
-                        qoe_reports_all_zero = evidence,
-                        "EGFX client is decoding but not presenting (QoE decode+render \
-                         time zero across the whole window — the reconnect-blank) — \
-                         running blank recovery"
+                    let action = blank_action(
+                        ctx.blank_recovery_attempts + 1,
+                        self.blank_params.max_attempts,
                     );
+                    let drops_so_far = self.consecutive_blank_drops.load(Ordering::Relaxed);
+                    if action == BlankAction::Drop
+                        && blank_drop_capped(drops_so_far, self.blank_params.max_consecutive_drops)
+                    {
+                        // Reconnect-storm guard: the last N connections ALL
+                        // ended in a blank drop and none presented in between —
+                        // another drop won't heal this client. Permanently
+                        // disarm the detector for this connection (attempts =
+                        // max stops `should_blank_recover` re-firing) and hand
+                        // the user the known-reliable recovery instead of an
+                        // endless reconnect loop.
+                        ctx.blank_recovery_attempts = self.blank_params.max_attempts;
+                        warn!(
+                            consecutive_blank_drops = drops_so_far,
+                            cap = self.blank_params.max_consecutive_drops,
+                            "EGFX blank persisted across every auto-reconnect — giving up on \
+                             automatic recovery for this client (it re-lands on its stale \
+                             surface every time). Fully close and reopen the RDP client \
+                             window to clear its surface cache, or use --fork-workers."
+                        );
+                    } else {
+                        ctx.blank_recovery_attempts += 1;
+                        ctx.last_blank_recovery_at = now;
+                        let evidence = ctx.qoe_reports;
+                        ctx.qoe_reports = 0;
+                        let (w, h) = ctx.dims;
+                        if action == BlankAction::Drop {
+                            // Count the drop toward the storm guard now (arming
+                            // time): the connection is ending either way.
+                            self.consecutive_blank_drops
+                                .store(drops_so_far.saturating_add(1), Ordering::Relaxed);
+                        }
+                        blank_recovery = Some((
+                            action,
+                            ctx.server_handle.clone(),
+                            w,
+                            h,
+                            ctx.blank_recovery_attempts,
+                        ));
+                        warn!(
+                            ?action,
+                            attempt = ctx.blank_recovery_attempts,
+                            max_attempts = self.blank_params.max_attempts,
+                            qoe_reports_all_zero = evidence,
+                            "EGFX client is decoding but not presenting (QoE decode+render \
+                             time zero across the whole window — the reconnect-blank) — \
+                             running blank recovery"
+                        );
+                    }
                 }
             }
             // P2b frame-rate floor: once the adaptive controller has cut the bitrate to
@@ -1662,8 +1743,8 @@ impl Gfx {
             .clone()
             .ok_or_else(|| anyhow!("EGFX blank drop: server-event sender not set"))?;
         warn!(
-            "EGFX blank persisted through the fresh-surface remap — dropping the connection \
-             so the client auto-reconnects (a fresh connection usually renders)"
+            "EGFX blank recovery: dropping the connection so the client auto-reconnects \
+             via the auto-reconnect cookie (a fresh connection usually renders)"
         );
         sender
             .send(ServerEvent::Quit(
@@ -2608,6 +2689,7 @@ mod tests {
             arm_delay: ms(3000),
             retry_interval: ms(5000),
             max_attempts: 2,
+            max_consecutive_drops: 3,
         }
     }
 
@@ -2750,16 +2832,31 @@ mod tests {
 
     #[test]
     fn blank_action_remaps_then_drops() {
-        // Default max_attempts=2: attempt 1 = the non-destructive remap,
-        // attempt 2 (last) = drop the connection.
+        // DEFAULT max_attempts=1: straight to the drop — the remap was
+        // live-verified never to heal mstsc, so remap-first only delayed the
+        // heal by a wasted attempt + a second detection window.
+        assert_eq!(blank_action(1, 1), BlankAction::Drop);
+        // Tuned max_attempts=2 (the original default): attempt 1 = the
+        // non-destructive remap, attempt 2 (last) = drop the connection.
         assert_eq!(blank_action(1, 2), BlankAction::Remap);
         assert_eq!(blank_action(2, 2), BlankAction::Drop);
-        // A tuned max_attempts=3 gets two remaps before the drop.
+        // max_attempts=3 gets two remaps before the drop.
         assert_eq!(blank_action(1, 3), BlankAction::Remap);
         assert_eq!(blank_action(2, 3), BlankAction::Remap);
         assert_eq!(blank_action(3, 3), BlankAction::Drop);
-        // max_attempts=1: straight to the drop.
-        assert_eq!(blank_action(1, 1), BlankAction::Drop);
+    }
+
+    #[test]
+    fn blank_drop_cap_stops_a_reconnect_storm() {
+        // Below the cap: drops allowed.
+        assert!(!blank_drop_capped(0, 3));
+        assert!(!blank_drop_capped(2, 3));
+        // At/over the cap: withhold the drop (stable session + guidance beats
+        // an endless drop → auto-reconnect → blank loop).
+        assert!(blank_drop_capped(3, 3));
+        assert!(blank_drop_capped(7, 3));
+        // cap = 0 disables the guard entirely.
+        assert!(!blank_drop_capped(100, 0));
     }
 
     // ---- P2b: frame_drop_at_floor ----
