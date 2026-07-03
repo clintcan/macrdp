@@ -537,11 +537,18 @@ mod macos {
         middle_down: bool,
         mods: ModifierState,
         // `None` → use CGDisplay::main() bounds; `Some(id)` → look up
-        // that specific display. Re-queried per mouse move so a
-        // mid-session bounds change (e.g. --detach-primary disabling
-        // the built-in mid-flight) doesn't strand events on stale
-        // coords.
+        // that specific display. Re-queried (through a short TTL cache —
+        // see `target_bounds`) so a mid-session bounds change (e.g.
+        // --detach-primary disabling the built-in mid-flight) doesn't
+        // strand events on stale coords.
         target_display_id: Option<u32>,
+        // TTL cache for `target_bounds`: the CoreGraphics bounds query sits
+        // on the busiest input path (mouse-move fires hundreds of times/s
+        // during a drag) while display geometry changes only on a rare
+        // reconfiguration. The cache sheds ~99% of the queries; worst case a
+        // reconfig mis-maps moves for < the TTL before self-correcting.
+        cached_bounds: Option<(f64, f64, f64, f64)>,
+        bounds_cached_at: Instant,
         // Per-button click history so a quick second press at (roughly) the
         // same spot becomes click_count=2 and Finder recognises a double-
         // click. Without this every press has click_count=1 implicitly and
@@ -632,6 +639,8 @@ mod macos {
                 middle_down: false,
                 mods: ModifierState::default(),
                 target_display_id,
+                cached_bounds: None,
+                bounds_cached_at: Instant::now(),
                 click_left: None,
                 click_right: None,
                 click_middle: None,
@@ -644,20 +653,37 @@ mod macos {
             })
         }
 
-        /// Current global-coord bounds of the target display, queried
-        /// fresh so a layout change since this handler was built (vd
-        /// moving to (0,0) when --detach-primary disables the built-in
-        /// panel) doesn't leave us posting to a stale rectangle.
-        fn target_bounds(&self) -> (f64, f64, f64, f64) {
+        /// How long a `target_bounds` result may be served from cache. Long
+        /// enough to shed the per-mouse-move CoreGraphics query (hundreds/s
+        /// during a drag), short enough that a display reconfiguration (rare;
+        /// e.g. --detach-primary engaging at connect) mis-maps coords for at
+        /// most a quarter second before self-correcting.
+        const BOUNDS_CACHE_TTL: Duration = Duration::from_millis(250);
+
+        /// Current global-coord bounds of the target display. Re-queried
+        /// through a short TTL cache so a layout change since this handler
+        /// was built (vd moving to (0,0) when --detach-primary disables the
+        /// built-in panel) doesn't leave us posting to a stale rectangle,
+        /// without paying a CG display lookup on every mouse move.
+        fn target_bounds(&mut self) -> (f64, f64, f64, f64) {
+            if let Some(b) = self.cached_bounds {
+                if self.bounds_cached_at.elapsed() < Self::BOUNDS_CACHE_TTL {
+                    return b;
+                }
+            }
             let d = match self.target_display_id {
                 Some(id) => CGDisplay::new(id),
                 None => CGDisplay::main(),
             };
             let b = d.bounds();
-            (b.origin.x, b.origin.y, b.size.width, b.size.height)
+            let bounds = (b.origin.x, b.origin.y, b.size.width, b.size.height);
+            self.cached_bounds = Some(bounds);
+            self.bounds_cached_at = Instant::now();
+            bounds
         }
 
         pub fn keyboard(&mut self, event: KeyboardEvent) {
+            mark_input_activity();
             match event {
                 KeyboardEvent::Pressed { code, extended } => self.key(code, extended, true),
                 KeyboardEvent::Released { code, extended } => self.key(code, extended, false),
@@ -1057,6 +1083,7 @@ mod macos {
             desktop_h: u16,
             letterbox: bool,
         ) {
+            mark_input_activity();
             match event {
                 MouseEvent::Move { x, y } => self.move_to(x, y, desktop_w, desktop_h, letterbox),
                 MouseEvent::LeftPressed => self.button(CGMouseButton::Left, true),
@@ -1407,6 +1434,40 @@ mod macos {
         });
     }
 
+    /// Millis-since-process-start of the last forwarded RDP input event
+    /// (`u64::MAX` = none yet). One relaxed store per event from
+    /// `Inner::{keyboard,mouse}`; read by the MRU focus poller so its 5×/s
+    /// system-wide AX query parks while the session is input-idle — the MRU /
+    /// focus data it maintains only matters while a user is actually driving
+    /// input (Cmd+Tab, Ctrl→Cmd remap gating), and without the gate the
+    /// poller kept waking the process forever, including after the client
+    /// disconnected.
+    static LAST_INPUT_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(u64::MAX);
+
+    /// Monotonic millis since process start (first call anchors the epoch).
+    fn monotonic_ms() -> u64 {
+        use std::sync::OnceLock;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// Record that an RDP input event was just forwarded.
+    fn mark_input_activity() {
+        LAST_INPUT_MS.store(monotonic_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True while input was seen within the last minute — the window during
+    /// which the MRU poller keeps its full 5 Hz cadence. Generous on purpose:
+    /// the poller's fallback focus data may be consulted by the very first
+    /// keystroke after a pause, and a poller parked ≤1 s behind (see the loop)
+    /// combined with the event-driven feeders (NSWorkspace observer + click
+    /// hit-test) covers that first keystroke fine.
+    fn input_recently_active() -> bool {
+        let last = LAST_INPUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        last != u64::MAX && monotonic_ms().saturating_sub(last) < 60_000
+    }
+
     /// Read the pid of the AX system-wide focused application. Returns
     /// None if AX can't resolve it (permission missing, focus on a non-
     /// AX-bearing element, etc.).
@@ -1694,6 +1755,15 @@ mod macos {
     fn ax_focus_mru_poller_loop() {
         let mut last_seen_pid: libc::pid_t = 0;
         loop {
+            // Park while input-idle: no RDP input in the last minute (or ever)
+            // means nobody is Cmd+Tab-ing or typing, so the system-wide AX
+            // focus query 5×/s is pure wasted wakeups — including forever
+            // after a disconnect. Check a cheap atomic at 1 Hz instead; the
+            // first event after a pause restores full cadence within ~1 s.
+            if !input_recently_active() {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
             std::thread::sleep(Duration::from_millis(200));
             let Some(pid) = ax_focused_application_pid() else {
                 continue;

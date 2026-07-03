@@ -28,6 +28,23 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
+- [ ] **Perf: eliminate the per-capture full-frame `last_frame` memcpy** (from the 2026-07-03
+  3-agent optimization audit — the one HIGH finding left). `capture.rs` copies the whole BGRA
+  frame into the flush-burst stash on every EGFX-accepted capture (~8 MB @1080p / ~24 MB @HiDPI
+  × 60 fps ≈ **1.4 GB/s** of memory-bus traffic competing with the encoder), yet the stash is
+  read only when SCK goes idle. Fix shape: retain the SCK `CVPixelBuffer` (refcount bump,
+  release the prior) and re-lock it during the flush burst. RISK: holding a buffer pins one
+  slot of SCK's fixed frame pool — must verify SCK keeps delivering (queue-depth interaction)
+  and A/B on a real client before landing. Do as its OWN change, not batched.
+- [ ] **Perf (upstream candidates, vendored server — do NOT land as new divergences):** from
+  the same audit: (a) `SharedWriter`/dispatch write coalescing — every fragment/event is its
+  own `write_all` = 2 boxed futures + syscall + flush (`server.rs:2643` + git-pinned
+  `ironrdp-tokio`), dozens–hundreds per EGFX batch; coalescing a batch into one write is a
+  med-high win under load but touches the most sensitive path → propose upstream. (b) legacy
+  bitmap encoder: fresh `vec![0; len*2]` per diff-rect + one `spawn_blocking` round-trip per
+  rect (`encoder/mod.rs:520,337`) — reuse a scratch buffer + one `spawn_blocking` per update;
+  legacy-clients-only, clean upstream PRs. NOT worth doing: RDPEUDP per-datagram allocs
+  (inherent to sans-I/O design), NFS readdir pagination cache, UDP idle tick suppression.
 - [x] **Softer UDP adaptive-bitrate signal over WiFi (retransmit tolerance).** SHIPPED
   2026-06-29 (#100): `MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE` (default 2) so sporadic wireless
   retransmits don't ratchet the bitrate down. BUT the live mstsc/WiFi6 test disproved the

@@ -228,6 +228,14 @@ pub struct MacCliprdr {
     /// Coordinates the advertise retry loop with the cliprdr backend's
     /// `on_format_list_response` hook. See [`AdvertiseState`].
     advertise_state: Arc<AdvertiseState>,
+    /// Number of live cliprdr backends — i.e. connected clients with an
+    /// active clipboard channel. Incremented in `build_cliprdr_backend`
+    /// (per connection), decremented in the backend's `Drop` (disconnect).
+    /// The pasteboard poller parks while this is 0, so an idle macrdp
+    /// doesn't do an NSPasteboard round-trip 4×/s forever from process
+    /// start — that poller was the sole reason a zero-client server wasn't
+    /// ~0% idle. Per-process, so it works under `--fork-workers` too.
+    active_backends: Arc<std::sync::atomic::AtomicUsize>,
     /// When true (default), on_remote_file_list dispatches to
     /// `file_promise_lazy::spawn_lazy_paste`. Set false via
     /// `--no-lazy-paste` to use the eager path instead. Single-file and
@@ -256,6 +264,7 @@ impl MacCliprdr {
             paste_temp_dir,
             self_change_count,
             advertise_state: Arc::new(AdvertiseState::default()),
+            active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lazy_paste,
         }
     }
@@ -268,6 +277,7 @@ impl MacCliprdr {
             sender: Arc::new(Mutex::new(None)),
             file_paths: Arc::new(Mutex::new(Vec::new())),
             advertise_state: Arc::new(AdvertiseState::default()),
+            active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -283,12 +293,25 @@ impl ServerEventSender for MacCliprdr {
         #[cfg(target_os = "macos")]
         let self_cc = self.self_change_count.clone();
         let advertise_state = self.advertise_state.clone();
+        let active_backends = self.active_backends.clone();
         tokio::spawn(async move {
             // NSPasteboard.changeCount is monotonic; record the starting
             // value so we don't fire an event for whatever was already on
             // the clipboard when macrdp launched.
             let mut last_seen = pb::change_count();
             loop {
+                // Park while no client has a clipboard channel: there is
+                // nobody to advertise to, so the NSPasteboard IPC 4×/s is
+                // pure idle wakeups (this poller starts at process launch —
+                // the server constructor calls set_sender — and used to run
+                // forever). Idle at 1 Hz on a cheap atomic instead; on
+                // connect it resumes within a second, and a copy made while
+                // parked is advertised THEN (the fresh client learns the
+                // current Mac clipboard, which is also the better behavior).
+                if active_backends.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let current = pb::change_count();
                 if current == last_seen {
@@ -352,9 +375,14 @@ impl ServerEventSender for MacCliprdr {
 
 impl CliprdrBackendFactory for MacCliprdr {
     fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        // Un-park the pasteboard poller: a client just brought up its
+        // clipboard channel. Balanced by the decrement in the backend's Drop.
+        self.active_backends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Box::new(MacCliprdrBackend {
             sender: self.sender.clone(),
             last_requested: None,
+            active_backends: self.active_backends.clone(),
             file_paths: self.file_paths.clone(),
             #[cfg(target_os = "macos")]
             download_router: self.download_router.clone(),
@@ -378,6 +406,10 @@ struct MacCliprdrBackend {
     // doesn't include the format ID, so we keep it here to know whether to
     // decode the payload as UTF-16 text or as a DIB.
     last_requested: Option<ClipboardFormatId>,
+    // Live-backend counter shared with `MacCliprdr` — incremented when this
+    // backend was built, decremented in Drop. Parks the pasteboard poller
+    // while no client has a clipboard channel. See MacCliprdr::active_backends.
+    active_backends: Arc<std::sync::atomic::AtomicUsize>,
     // Shared with `MacCliprdr` so the poller and the backend agree on which
     // paths back the currently-advertised FILEGROUPDESCRIPTORW.
     file_paths: Paths,
@@ -414,9 +446,13 @@ struct MacCliprdrBackend {
 /// and temp-dir removal is std::fs blocking — we do NOT wait on either,
 /// because Drop runs synchronously on the ironrdp_server task thread
 /// and we don't want to stall the disconnect path.
-#[cfg(target_os = "macos")]
 impl Drop for MacCliprdrBackend {
     fn drop(&mut self) {
+        // Re-park the pasteboard poller if this was the last connected
+        // clipboard channel (balances build_cliprdr_backend's increment).
+        self.active_backends
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
         crate::file_promise_lazy::cleanup_on_disconnect(
             &self.paste_temp_dir,
             &self.self_change_count,

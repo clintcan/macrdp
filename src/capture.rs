@@ -493,6 +493,15 @@ mod macos {
         // then keeps the actual bandwidth reasonable.
         force_full_frame: bool,
         cursor: CursorState,
+        /// Last time the cursor shape was polled (`None` = never → poll
+        /// immediately so the client gets its initial pointer). Each poll is a
+        /// synchronous `SLSGetGlobalCursorData` WindowServer IPC sitting inline
+        /// on the capture/encode path, and shape changes are human-timescale —
+        /// so polling is throttled to ~15 Hz instead of once per 60 fps frame.
+        /// Time-based, NOT identity-gated, so animated cursors (beachball /
+        /// watch) still animate — just at ~15 fps (the identity-gate variant
+        /// froze them entirely; see the cursor-animation feedback note).
+        last_cursor_poll: Option<Instant>,
         /// EGFX/H.264 frame sink; `None` unless `--enable-h264`.
         gfx: Option<crate::h264::Gfx>,
         /// On-demand-keyframe tuning (`--keyframe-on-change`). When disabled, no
@@ -748,6 +757,7 @@ mod macos {
                 seeded: false,
                 force_full_frame,
                 cursor,
+                last_cursor_poll: None,
                 gfx,
                 keyframe_on_change,
                 kf_armed: true,
@@ -831,16 +841,27 @@ mod macos {
     impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
         async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
-                // Poll cursor on every call — preempts queued bitmap rects so
-                // pointer position keeps up with mouse movement instead of
-                // batching behind the bitmap drain of the previous SCK sample.
-                let mut cursor_updates = self.cursor.poll();
-                if !cursor_updates.is_empty() {
-                    let first = cursor_updates.remove(0);
-                    for u in cursor_updates.into_iter().rev() {
-                        self.pending.push_front(u);
+                // Poll cursor at loop top — preempts queued bitmap rects so
+                // pointer shape updates keep up instead of batching behind the
+                // bitmap drain of the previous SCK sample. Throttled to
+                // ~15 Hz: each poll is a synchronous WindowServer IPC on the
+                // capture/encode critical path, and 60 Hz buys nothing over
+                // 15 Hz for shape changes (see the `last_cursor_poll` field
+                // note — time-based, so animated cursors keep animating).
+                const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(66);
+                let poll_due = self
+                    .last_cursor_poll
+                    .is_none_or(|t| t.elapsed() >= CURSOR_POLL_INTERVAL);
+                if poll_due {
+                    self.last_cursor_poll = Some(Instant::now());
+                    let mut cursor_updates = self.cursor.poll();
+                    if !cursor_updates.is_empty() {
+                        let first = cursor_updates.remove(0);
+                        for u in cursor_updates.into_iter().rev() {
+                            self.pending.push_front(u);
+                        }
+                        return Ok(Some(first));
                     }
-                    return Ok(Some(first));
                 }
 
                 if let Some(update) = self.pending.pop_front() {
