@@ -161,6 +161,17 @@ another machine) and the Mac's built-in `pf`/`dnctl` traffic shaper.
 **Tooling:** `scripts/netshape.sh` shapes both directions of TCP+UDP on the macrdp
 port (default 3390) via dummynet — `sudo scripts/netshape.sh on --loss 5 --delay 100`
 to apply, `sudo scripts/netshape.sh off` to restore, `status` to inspect.
+
+> ⚠️ **netshape direction bug, fixed 2026-07-04.** Until that date BOTH pf rules
+> matched `to any port $PORT` (destination = the RDP port), so only the
+> **client→server** direction was ever shaped — **server→client data (video
+> frames, audio datagrams) was completely unshaped**, and on loopback the
+> client→server leg was piped TWICE (in + out pass), doubling the configured
+> delay. Any pre-fix netshape-based conclusion about how *outbound* media behaves
+> under loss/bandwidth limits should be re-checked: the "loss" those runs applied
+> hit only acks/input/client requests. (Runs shaped with **clumsy on the Windows
+> client** are unaffected — that shaped both directions at the client.) The fixed
+> rules match dst-port on the in pass and src-port on the out pass.
 `scripts/soak-lossy.sh` is a turnkey server runner for the **lossy-delivery** soak (sets
 the lossy env gates, captures the full log, live-prints the handshake markers) — see the
 "P2.2 lossy-delivery soak (runbook)" subsection below.
@@ -497,6 +508,35 @@ reliable-only multitransport.
    Remaining rate-control refinements: a stronger/less-spiky TCP signal
    (`TCP_CONNECTION_INFO` RTT+retransmits / write-backpressure), the CN/RTT/window signals,
    and tuning against a real-Windows-server capture.
+
+   **SHIPPED 2026-07-04 — the congestion signal is now RTT-aware standing QUEUE DELAY
+   (fixes "frozen/partial video over VPN/ZeroTier").** The "stronger signal" refinement
+   above, forced by a user report: video froze / rendered partially over any high-latency
+   internet path while LAN was fine. Lab repro (shaped 240 ms RTT + 2 Mbit via netshape)
+   caught the old frame-count signal red-handed: **frames-in-flight = RTT × fps**, so a
+   *clean* 240 ms link at 60 fps held `shipped − acked` ≈ 14 — permanently over the TCP
+   threshold of 12 — and the controller crater-climb oscillated (97 adjustments, 223
+   fps-floor engagements in 60 s, bitrate pinned floor↔2 M) on a link with zero actual
+   congestion. RTT is not congestion. New signal: each frame's ship→ack round trip
+   (ship-time ring, `frame_id % 128`) minus a **two-bucket 30 s windowed-minimum RTT** =
+   standing queue delay in ms; EWMA + hysteresis + 3-zone hold unchanged; threshold
+   `MACRDP_ADAPTIVE_QUEUE_HIGH_MS` (default 100 ms — LEDBAT's classic target) replaces the
+   removed per-transport frame thresholds. Two hard-won hardening cases from the lab: (1)
+   **ring-overwritten acks** (client >128 frames behind) feed the overwriting frame's age
+   as a lower-bound sample instead of being skipped — skipping blinded the controller
+   exactly at max backlog; (2) **no-ack distress fallback** — a fully choked pipe can stop
+   acks entirely (observed: ack lag 275→4746, zero FrameAcknowledge PDUs the whole
+   session), so while actively shipping into outstanding frames past a 3 s connect grace,
+   `now − last_real_ack` floors the sample and makes the signal usable on its own (a
+   client that never acks at all converges to the floor — with zero feedback, conservatism
+   beats flooding). IDR backoff is now **both transports** (was UDP-only; a ~120 KB IDR is
+   seconds of link time on a thin pipe, and with the RTT-aware signal "congested" no
+   longer false-positives on TCP). Lab-verified all three regimes: clean LAN byte-similar
+   (queue ~2 ms, zero adjustments); 240 ms/2 Mbit **full quality, zero oscillation** (the
+   fix); saturated 500 Kbit detects in ~3 s → floor + IDR backoff + fps floor → **queue
+   drains 2.9 s → 45 ms, ack lag thousands → 2–3, video alive-and-in-sync** at the
+   sustainable rate. (The same lab session found + fixed the netshape direction bug —
+   see the soak-tooling warning above.)
 
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the

@@ -97,8 +97,16 @@ case "$cmd" in
             echo "anchor \"$ANCHOR\""
         } | pfctl -q -f -
 
+        # Direction matters: client→server packets have DESTINATION port $PORT
+        # (match them on the in pass), server→client packets have SOURCE port
+        # $PORT (match them on the out pass). The original version used
+        # `to any port` on BOTH rules, which (a) never matched the
+        # server→client direction at all — video/audio data was NEVER shaped —
+        # and (b) piped client→server twice on loopback (in + out pass),
+        # doubling the configured delay. Found 2026-07-04 while lab-reproducing
+        # the VPN video issue: the "500 Kbit" pipe carried 6 Mbps of video.
         echo "dummynet in  quick proto { tcp udp } from any to any port $PORT pipe $PIPE_IN
-dummynet out quick proto { tcp udp } from any to any port $PORT pipe $PIPE_OUT" \
+dummynet out quick proto { tcp udp } from any port $PORT to any pipe $PIPE_OUT" \
             | pfctl -q -a "$ANCHOR" -f -
 
         pfctl -q -E 2>/dev/null || pfctl -q -e 2>/dev/null || true

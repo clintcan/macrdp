@@ -87,6 +87,57 @@ const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
 /// stays active during warmup (it's acks-independent).
 const ADAPTIVE_WARMUP: Duration = Duration::from_secs(2);
 
+/// Slots in the per-connection ship-time ring used to sample each frame's
+/// ship→ack round trip (indexed `frame_id % RTT_RING`). 128 comfortably covers
+/// any realistic frames-in-flight window (even 500 ms RTT at 60 fps is ~30).
+const RTT_RING: usize = 128;
+
+/// Bucket width of the two-bucket windowed-minimum RTT filter. The min over
+/// the current + previous bucket is the base-RTT estimate the queue-delay
+/// signal subtracts; a route change (VPN reconnect) re-baselines within ~2
+/// buckets. Long on purpose: a SHORT window lets a slowly-growing standing
+/// queue launder itself into the baseline (the min "chases" the queued
+/// samples and the measured delay reads as growth-per-window instead of the
+/// absolute queue). 30 s buckets keep the base honest for 30–60 s while
+/// still re-baselining after a genuine route change within a minute.
+const RTT_MIN_WINDOW: Duration = Duration::from_secs(30);
+
+/// Fold one ack-RTT sample into the current windowed-min bucket and return
+/// `(new_bucket_min, standing_queue_delay_ms)` — the delay is the sample's
+/// excess over the two-bucket minimum (never negative). Pure, unit-tested;
+/// bucket rotation happens at the call site (it needs the clock).
+fn queue_delay_fold(sample_ms: f64, bucket_min_ms: f64, prev_bucket_min_ms: f64) -> (f64, f64) {
+    let cur = bucket_min_ms.min(sample_ms);
+    let base = cur.min(prev_bucket_min_ms);
+    (cur, (sample_ms - base).max(0.0))
+}
+
+/// The controller's effective congestion sample for one interval: the latest
+/// ack-derived queue delay, floored by the **no-ack fallback** — when frames
+/// are outstanding and we're actively shipping but acks have gone quiet, the
+/// time since the last ack is itself a lower bound on the standing delay.
+/// Without this, TOTAL saturation goes dark: a fully choked pipe delivers so
+/// few frames that acks stop entirely → no RTT samples → `queue_delay_ms`
+/// freezes at its last (healthy) value and the controller reads a drowning
+/// link as clean (observed live on a shaped 500 Kbit pipe 2026-07-04: ack lag
+/// grew 275→4746 while the sampled delay stayed 0.0). On a healthy link acks
+/// arrive continuously, so `since_ack_ms` is just the tiny inter-ack gap and
+/// the max() is a no-op; with nothing outstanding (static screen) or shipping
+/// stopped (suppressed), the fallback is skipped so idle never reads as
+/// congestion. Pure, unit-tested.
+fn effective_queue_delay(
+    queue_delay_ms: f64,
+    since_ack_ms: f64,
+    outstanding: bool,
+    actively_shipping: bool,
+) -> f64 {
+    if outstanding && actively_shipping {
+        queue_delay_ms.max(since_ack_ms)
+    } else {
+        queue_delay_ms
+    }
+}
+
 /// How the H.264 NAL units are framed inside the AVC420 wire payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireFormat {
@@ -167,6 +218,13 @@ struct ConnectionContext {
     /// in `ship_frames`; `last_recovery_at` set when a recovery IDR is armed in
     /// `submit_bgra`. See [`should_force_recovery_idr`].
     last_ack_at: Instant,
+    /// When the acked-frame id last ADVANCED (a real ack, not the suspend
+    /// sentinel — `last_ack_at` refreshes on suspends too, by design, for the
+    /// UDP watchdog). Drives the no-ack distress fallback: time since this is
+    /// a lower bound on the standing delay while frames are outstanding.
+    /// Initialized to the connection epoch, so a client that NEVER acks reads
+    /// as maximally stale once past the connect grace.
+    last_ack_advance_at: Instant,
     acks_suspended: bool,
     last_ship_at: Instant,
     last_recovery_at: Instant,
@@ -186,6 +244,29 @@ struct ConnectionContext {
     last_shipped_frame_id: Arc<AtomicU64>,
     last_acked_frame_id: Arc<AtomicU64>,
     egfx_acks_seen: bool,
+    /// Ship-time ring for ack-RTT sampling: slot `frame_id % RTT_RING` holds
+    /// `(frame_id, shipped_at)`, written by the ship thread right after
+    /// `send_avc420_frame` allocates the id (a leaf mutex held for
+    /// nanoseconds; never taken while holding another lock), read in
+    /// `on_frame_ack` to time each frame's ship→ack round trip.
+    ship_times: Arc<Mutex<Vec<(u64, Instant)>>>,
+    /// Windowed-minimum ack RTT (two `RTT_MIN_WINDOW` buckets, so a route
+    /// change re-baselines within ~2 windows). The minimum over the window is
+    /// the link's base RTT including the empty-pipe server-side path;
+    /// everything above it is standing queue.
+    rtt_min_cur_ms: f64,
+    rtt_min_prev_ms: f64,
+    rtt_bucket_started: Instant,
+    /// Latest ack's queue delay: `sample_rtt − windowed_min_rtt`, in ms. THE
+    /// adaptive controller's congestion signal (EWMA'd per control interval).
+    /// Time-based, not frame-count: frames-in-flight scales with RTT × fps, so
+    /// the old `shipped − acked` count read a long-but-CLEAN pipe (VPN /
+    /// ZeroTier at ~240 ms RTT ⇒ ~14 frames in flight at 60 fps) as permanent
+    /// congestion and crater-climb oscillated between floor and ceiling
+    /// (diagnosed live under a shaped 240 ms/2 Mbit link, 2026-07-04). Queue
+    /// delay is ~0 on a clean link at ANY RTT/fps and rises only when the pipe
+    /// actually backs up.
+    queue_delay_ms: f64,
     /// When the EGFX-on-UDP backpressure gate last let a "trickle" frame
     /// through while lag was over the threshold. The gate drops MOST captures
     /// when the client is behind, but NOT all of them: mstsc only *presents*
@@ -224,9 +305,10 @@ struct ConnectionContext {
     /// signal is ignored (the connect-time startup backlog isn't congestion).
     /// `None` until the first ack. See [`Gfx::adaptive_bitrate_step`].
     adaptive_warmup_until: Option<Instant>,
-    /// EWMA of the ack-lag signal (only updated while acks are usable, so the
-    /// connect-time backlog never enters it). Fed to [`congested_hysteresis`].
-    adaptive_lag_ewma: f64,
+    /// EWMA of the queue-delay signal, in ms (only updated while acks are
+    /// usable, so the connect-time backlog never enters it). Fed to
+    /// [`congested_hysteresis`]. See [`ConnectionContext::queue_delay_ms`].
+    adaptive_delay_ewma: f64,
     /// Hysteresis state: whether the controller is currently in a congestion episode
     /// (enters when the EWMA lag clears the high mark, exits below the low mark).
     adaptive_congested: bool,
@@ -719,40 +801,38 @@ pub struct Gfx {
     /// Shared with the vendored server: set true here on a wedge, read there to
     /// flip `egfx_on_udp` → TCP routing; reset there on reconnect.
     demigrate_request: Arc<AtomicBool>,
-    /// Adaptive bitrate (congestion-responsive rate control, P1). On by
-    /// `--adaptive-bitrate` (or `MACRDP_UDP_ADAPTIVE_BITRATE`); only acts while EGFX
-    /// is on a UDP tunnel, so it's a no-op on TCP. The controller (AIMD) detects
-    /// congestion primarily from the client's **frame-ack lag** (`shipped − acked` >
-    /// `adaptive_lag_threshold`) — the FAST signal that rises the moment the client
-    /// stops acking, ~2 s before the watchdog's ack-silence trigger — and secondarily
-    /// from the shared `congestion_retransmits` counter (a late RTO-based signal). It
-    /// live-adjusts the VideoToolbox bitrate within `[adaptive_floor_bps, bitrate_bps]`:
-    /// multiplicative-decrease `adaptive_decrease` per interval with congestion,
-    /// additive-increase `adaptive_increase_bps` per interval when clean. `bitrate_bps`
-    /// (the `--bitrate` value) is the ceiling. See [`Gfx::adaptive_bitrate_step`].
+    /// Adaptive bitrate (congestion-responsive rate control). On by
+    /// `--adaptive-bitrate` (or `MACRDP_UDP_ADAPTIVE_BITRATE`); runs on both the UDP
+    /// tunnel and the TCP path. The controller (AIMD) detects congestion primarily
+    /// from **standing queue delay** — each frame's ship→ack round trip minus the
+    /// windowed-minimum RTT (see [`ConnectionContext::queue_delay_ms`]) — and
+    /// secondarily from the shared `congestion_retransmits` counter (a late
+    /// RTO-based signal). It live-adjusts the VideoToolbox bitrate within
+    /// `[adaptive_floor_bps, bitrate_bps]`: multiplicative-decrease
+    /// `adaptive_decrease` per interval with congestion, additive-increase
+    /// `adaptive_increase_bps` per interval when clean. `bitrate_bps` (the
+    /// `--bitrate` value) is the ceiling. See [`Gfx::adaptive_bitrate_step`].
     adaptive_enabled: bool,
     adaptive_floor_bps: u32,
     adaptive_increase_bps: u32,
     adaptive_decrease: f32,
     adaptive_interval: Duration,
-    /// Frame-ack lag (shipped − acked, in frames) above which the controller treats
-    /// the link as congested — the fast pre-watchdog signal. Below `max_frame_lag`
-    /// (the frame-DROP threshold) so the controller leads the backpressure gate, and
-    /// well above mstsc's healthy presentation jitter (~0–2). Default `max_frame_lag
-    /// / 2`; `MACRDP_UDP_ADAPTIVE_LAG_THRESHOLD` overrides.
-    adaptive_lag_threshold: u64,
-    /// P3: ack-lag congestion threshold for the **TCP** path. The same `shipped −
-    /// acked` signal works on TCP (the EGFX `FrameAcknowledge` flows there too, and
-    /// the unbounded ship channel lets `shipped` advance so the lag reflects the
-    /// full encoder→socket→client backlog), but TCP's send buffer adds baseline
-    /// depth, so the threshold is higher than the UDP one. Default `max_frame_lag`;
-    /// `MACRDP_TCP_ADAPTIVE_LAG_THRESHOLD` overrides. Only consulted while EGFX is
-    /// on TCP and `--adaptive-bitrate` is set.
-    adaptive_tcp_lag_threshold: u64,
-    /// EWMA weight on each new ack-lag sample in (0,1]: `ewma = α·sample + (1−α)·ewma`.
-    /// Smooths the spiky raw lag so single bursts don't pump the bitrate; lower = more
-    /// smoothing (slower reaction). Default 0.3; `MACRDP_ADAPTIVE_EWMA_ALPHA` overrides.
-    /// The hysteresis exit threshold is half the (transport) entry threshold.
+    /// Standing queue delay (ms above the windowed-min RTT) at which the
+    /// controller treats the link as congested; hysteresis exits at half this.
+    /// Time-based and transport-agnostic — it replaced the per-transport
+    /// frame-count ack-lag thresholds (`MACRDP_{UDP,TCP}_ADAPTIVE_LAG_THRESHOLD`,
+    /// now unused), which conflated RTT with congestion: frames-in-flight scales
+    /// with RTT × fps, so a clean 240 ms VPN link at 60 fps sat permanently over
+    /// the old threshold and the controller crater-climb oscillated (diagnosed
+    /// live under a shaped 240 ms/2 Mbit link, 2026-07-04). 100 ms of standing
+    /// queue is unambiguous congestion at any RTT (LEDBAT's classic target);
+    /// `MACRDP_ADAPTIVE_QUEUE_HIGH_MS` overrides.
+    adaptive_queue_high_ms: f64,
+    /// EWMA weight on each new queue-delay sample in (0,1]: `ewma = α·sample +
+    /// (1−α)·ewma`. Smooths the spiky raw signal so single bursts don't pump the
+    /// bitrate; lower = more smoothing (slower reaction). Default 0.3;
+    /// `MACRDP_ADAPTIVE_EWMA_ALPHA` overrides. The hysteresis exit threshold is
+    /// half the entry threshold.
     adaptive_ewma_alpha: f64,
     /// Retransmit tolerance (per control interval) for the UDP loss signal. The
     /// reliable tunnel retransmits on *any* packet loss, and a wireless link (WiFi)
@@ -866,23 +946,17 @@ impl Gfx {
             .filter(|&f| f > 0.0 && f < 1.0)
             .unwrap_or(0.7);
         let adaptive_interval = watchdog_ms("MACRDP_UDP_ADAPTIVE_INTERVAL_MS", 300);
-        // Congestion lag threshold: react below the frame-DROP point (max_frame_lag)
-        // so the controller leads the backpressure gate, and above healthy jitter.
-        let adaptive_lag_threshold = std::env::var("MACRDP_UDP_ADAPTIVE_LAG_THRESHOLD")
+        // Congestion threshold: STANDING QUEUE DELAY in ms (sample ack-RTT minus
+        // the windowed-min RTT). Time-based and transport-agnostic — replaced the
+        // per-transport frame-count lag thresholds, which read a long-but-clean
+        // pipe (high-RTT VPN/ZeroTier) as permanent congestion. 100 ms of queue
+        // is unambiguous at any RTT; exit hysteresis at half.
+        let adaptive_queue_high_ms = std::env::var("MACRDP_ADAPTIVE_QUEUE_HIGH_MS")
             .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or((max_frame_lag / 2).max(4));
-        // P3 TCP-path threshold: higher than UDP (TCP send-buffer adds baseline lag),
-        // but below the frame-DROP point. Default ¾·max_frame_lag (=12 at the default
-        // 16) — validated on real mstsc under clumsy TCP loss to catch genuine
-        // congestion spikes (ack_lag 14–40) while ignoring the healthy 0–12 jitter.
-        let adaptive_tcp_lag_threshold = std::env::var("MACRDP_TCP_ADAPTIVE_LAG_THRESHOLD")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or((max_frame_lag * 3 / 4).max(6));
-        // EWMA smoothing weight for the ack-lag signal (clamped to (0,1]); default 0.3.
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|&n| n > 0.0)
+            .unwrap_or(100.0);
+        // EWMA smoothing weight for the queue-delay signal (clamped to (0,1]); default 0.3.
         let adaptive_ewma_alpha = std::env::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
@@ -948,8 +1022,7 @@ impl Gfx {
                 increase_bps = adaptive_increase_bps,
                 decrease = adaptive_decrease,
                 interval_ms = adaptive_interval.as_millis() as u64,
-                lag_threshold = adaptive_lag_threshold,
-                tcp_lag_threshold = adaptive_tcp_lag_threshold,
+                queue_high_ms = adaptive_queue_high_ms,
                 ewma_alpha = adaptive_ewma_alpha,
                 normal_keyframe_frames,
                 stretched_keyframe_frames,
@@ -981,8 +1054,7 @@ impl Gfx {
             adaptive_increase_bps,
             adaptive_decrease,
             adaptive_interval,
-            adaptive_lag_threshold,
-            adaptive_tcp_lag_threshold,
+            adaptive_queue_high_ms,
             adaptive_ewma_alpha,
             adaptive_retx_tolerance,
             normal_keyframe_frames,
@@ -1431,7 +1503,7 @@ impl Gfx {
                 );
             }
             // Stale UDP-side smoothing state doesn't apply to the fresh TCP path.
-            ctx.adaptive_lag_ewma = 0.0;
+            ctx.adaptive_delay_ewma = 0.0;
             ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
@@ -1449,35 +1521,82 @@ impl Gfx {
         // decrease while an increase needed a zero-retransmit interval (rare on WiFi)
         // → the bitrate ratcheted down with no recovery.
         let retransmit_lossy = retransmit_is_lossy(retransmit_delta, self.adaptive_retx_tolerance);
-        // Congestion signal: the client's frame-ack lag (shipped − acked). On UDP it
-        // rises ~2 s before the watchdog's ack-silence trigger (the retransmit counter
-        // only climbs after an RTO, too late); on TCP it reflects the encoder→socket→
-        // client backlog growing under congestion. The raw lag is spiky (TCP bursts
-        // 0↔40 even at moderate loss), so smooth it with an EWMA and decide via
-        // hysteresis — otherwise single spikes pump the bitrate. Threshold is
-        // transport-specific (TCP's send buffer adds baseline depth); exit at half it.
+        // Congestion signal: STANDING QUEUE DELAY in ms — the latest frame's
+        // ship→ack round trip minus the windowed-minimum RTT (sampled in
+        // `on_frame_ack`; see `ConnectionContext::queue_delay_ms`). Time-based,
+        // NOT frame-count: the old shipped−acked lag conflated RTT with
+        // congestion (frames-in-flight = RTT × fps, so a clean 240 ms VPN link
+        // at 60 fps sat permanently over the frame threshold → the controller
+        // crater-climb oscillated between floor and ceiling; diagnosed live
+        // under a shaped 240 ms/2 Mbit link 2026-07-04). Queue delay is ~0 on a
+        // clean link at ANY RTT/fps and rises only when the pipe actually backs
+        // up. It rises the moment the client stops acking (each interval's
+        // sample keeps growing), so it keeps the fast pre-watchdog property on
+        // UDP too. Raw samples are spiky → EWMA + hysteresis + the 3-zone hold,
+        // unchanged. Exit at half the entry threshold.
         let ack_lag = ctx
             .last_shipped_frame_id
             .load(Ordering::Relaxed)
             .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
         let acks_usable = ctx.egfx_acks_seen && !ctx.acks_suspended && !in_warmup;
-        // Only fold real samples into the EWMA — during warmup/suspend the lag is the
-        // startup backlog, not congestion, and must not pre-load the average.
-        if acks_usable {
-            ctx.adaptive_lag_ewma = self.adaptive_ewma_alpha * ack_lag as f64
-                + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_lag_ewma;
+        // No-ack fallback: a TOTALLY choked pipe delivers so few frames that
+        // acks stop — or never start — entirely. No RTT samples means the
+        // sampled delay freezes (or stays) at 0 and the controller would read a
+        // drowning link as clean (observed live on a shaped 500 Kbit pipe:
+        // ack lag grew into the thousands, sampled delay pinned 0.0, ZERO acks
+        // the whole session). While frames are outstanding and we're actively
+        // shipping, the time since the last REAL ack (or since connect, if
+        // there's never been one) is a lower bound on the standing delay; on a
+        // healthy link it's just the tiny inter-ack gap.
+        let outstanding = ack_lag > 0;
+        let actively_shipping =
+            now.saturating_duration_since(ctx.last_ship_at) < Duration::from_secs(1);
+        let sample_ms = effective_queue_delay(
+            ctx.queue_delay_ms,
+            now.saturating_duration_since(ctx.last_ack_advance_at)
+                .as_secs_f64()
+                * 1000.0,
+            outstanding,
+            actively_shipping,
+        );
+        // Distress makes the signal usable even when acks aren't: shipping into
+        // outstanding frames past the connect grace with acks silent (never
+        // seen, or suspended mid-flood) IS the choked-pipe signature —
+        // `acks_usable` alone would blind the controller exactly then. mstsc's
+        // minimize suspend doesn't land here: SuppressOutput gates capture, so
+        // `actively_shipping` goes false. (A client that simply never sends
+        // FrameAcknowledge converges to the floor bitrate under this rule —
+        // with no feedback at all, conservatism beats flooding.)
+        let distress = outstanding
+            && actively_shipping
+            && !in_warmup
+            && now.saturating_duration_since(ctx.epoch) > Duration::from_secs(3);
+        let signal_usable = acks_usable || distress;
+        // Only fold real samples into the EWMA — during warmup (and idle
+        // no-ack periods) the delay is startup backlog / silence, not
+        // congestion, and must not pre-load the average.
+        if signal_usable {
+            ctx.adaptive_delay_ewma = self.adaptive_ewma_alpha * sample_ms
+                + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_delay_ewma;
         }
-        let high = if on_udp {
-            self.adaptive_lag_threshold
-        } else {
-            self.adaptive_tcp_lag_threshold
-        } as f64;
+        // Per-interval visibility even when the target doesn't change (the
+        // adjusted-line below only logs on a change; Hold periods were opaque).
+        trace!(
+            queue_ms = sample_ms,
+            ewma_queue_ms = ctx.adaptive_delay_ewma,
+            ack_lag,
+            acks_usable,
+            distress,
+            target_bps = ctx.adaptive_target_bps,
+            "EGFX adaptive controller interval"
+        );
+        let high = self.adaptive_queue_high_ms;
         let congested = congested_hysteresis(
-            ctx.adaptive_lag_ewma,
+            ctx.adaptive_delay_ewma,
             high,
             high * 0.5, // exit threshold (hysteresis low mark)
             retransmit_lossy,
-            acks_usable,
+            signal_usable,
             ctx.adaptive_congested,
         );
         ctx.adaptive_congested = congested;
@@ -1486,10 +1605,10 @@ impl Gfx {
         // once cleared. aimd_bitrate does the decrease/increase math (1 = decrease,
         // 0 = increase); Hold leaves the target untouched.
         let action = rate_action(
-            ctx.adaptive_lag_ewma,
+            ctx.adaptive_delay_ewma,
             high,
             retransmit_lossy,
-            acks_usable,
+            signal_usable,
             congested,
         );
         let new_target = match action {
@@ -1516,8 +1635,9 @@ impl Gfx {
             ctx.adaptive_target_bps = new_target;
             debug!(
                 transport = if on_udp { "udp" } else { "tcp" },
+                queue_ms = sample_ms,
+                ewma_queue_ms = ctx.adaptive_delay_ewma,
                 ack_lag,
-                ewma_lag = ctx.adaptive_lag_ewma,
                 retransmit_delta,
                 ?action,
                 prev_bps = prev,
@@ -1527,26 +1647,32 @@ impl Gfx {
             actions.bitrate_bps = Some(new_target);
         }
         // P2a IDR backoff: don't inject a big periodic keyframe into a congested
-        // tunnel. UDP-only — on TCP (reliable, no HOL-freeze) the periodic keyframe is
-        // cheap decode-glitch insurance and the false-suppress risk isn't worth it.
-        if on_udp {
-            match idr_backoff_decision(congested, new_target, ceiling, ctx.idr_backed_off) {
-                IdrBackoff::Stretch => {
-                    ctx.idr_backed_off = true;
-                    actions.keyframe_frames = Some(self.stretched_keyframe_frames);
-                    // info (not debug): fires at most once per congestion episode.
-                    info!("EGFX IDR backoff: suppressing periodic keyframe under congestion");
-                }
-                IdrBackoff::Restore => {
-                    ctx.idr_backed_off = false;
-                    actions.keyframe_frames = Some(self.normal_keyframe_frames);
-                    ctx.need_keyframe = true; // one clean recovery IDR now the link is clear
-                    info!(
-                        "EGFX IDR backoff: link recovered — restoring periodic keyframe + forcing recovery IDR"
-                    );
-                }
-                IdrBackoff::Hold => {}
+        // pipe. BOTH transports since the queue-delay signal landed: `congested`
+        // now means a genuinely backed-up link (not high RTT misread), and on a
+        // thin pipe the periodic IDR is the single biggest queue spike we inject
+        // (an IDR can be seconds of link time at floor bitrate) — on TCP it
+        // doesn't HOL-freeze but it stalls everything behind it just the same.
+        // The reliability argument is identical on both transports: no
+        // loss-corruption to heal, so the periodic IDR is only decode-glitch
+        // insurance, deferrable until the link clears (Restore then forces one
+        // clean recovery IDR). (Originally UDP-only because the frame-count
+        // signal false-positived on TCP; that calculus changed with the signal.)
+        match idr_backoff_decision(congested, new_target, ceiling, ctx.idr_backed_off) {
+            IdrBackoff::Stretch => {
+                ctx.idr_backed_off = true;
+                actions.keyframe_frames = Some(self.stretched_keyframe_frames);
+                // info (not debug): fires at most once per congestion episode.
+                info!("EGFX IDR backoff: suppressing periodic keyframe under congestion");
             }
+            IdrBackoff::Restore => {
+                ctx.idr_backed_off = false;
+                actions.keyframe_frames = Some(self.normal_keyframe_frames);
+                ctx.need_keyframe = true; // one clean recovery IDR now the link is clear
+                info!(
+                    "EGFX IDR backoff: link recovered — restoring periodic keyframe + forcing recovery IDR"
+                );
+            }
+            IdrBackoff::Hold => {}
         }
         actions
     }
@@ -1779,7 +1905,7 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle, last_shipped) = {
+            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -1791,9 +1917,10 @@ impl Gfx {
                 let epoch = ctx.epoch;
                 // Liveness for ack-driven IDR recovery: we're actively shipping.
                 ctx.last_ship_at = Instant::now();
-                // Clone the shipped-frame-id gauge so we can bump it in Phase 2
-                // (under server_handle) WITHOUT re-taking the ctx lock — preserving
-                // the never-hold-ctx-under-server_handle invariant.
+                // Clone the shipped-frame-id gauge + ship-time ring so we can
+                // bump them in Phase 2 (under server_handle) WITHOUT re-taking
+                // the ctx lock — preserving the never-hold-ctx-under-
+                // server_handle invariant.
                 (
                     surface_id,
                     width,
@@ -1801,6 +1928,7 @@ impl Gfx {
                     epoch,
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
+                    ctx.ship_times.clone(),
                 )
             };
 
@@ -1836,9 +1964,13 @@ impl Gfx {
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
                 let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
                 // Record the newest shipped frame id for the UDP frame-ack-lag
-                // backpressure gate (`submit_bgra`). Monotonic per connection.
+                // backpressure gate (`submit_bgra`), and stamp the ship time
+                // into the RTT ring so `on_frame_ack` can time this frame's
+                // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+                    ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
+                        (u64::from(frame_id), Instant::now());
                 }
                 match sent {
                     Some(frame_id) if f.is_keyframe => debug!(
@@ -1967,12 +2099,18 @@ impl GfxServerFactory for Gfx {
             shipped: Arc::new(AtomicU64::new(0)),
             dims: (0, 0),
             last_ack_at: Instant::now(),
+            last_ack_advance_at: Instant::now(),
             acks_suspended: false,
             last_ship_at: Instant::now(),
             last_recovery_at: Instant::now(),
             last_shipped_frame_id: Arc::new(AtomicU64::new(0)),
             last_acked_frame_id: Arc::new(AtomicU64::new(0)),
             egfx_acks_seen: false,
+            ship_times: Arc::new(Mutex::new(vec![(u64::MAX, Instant::now()); RTT_RING])),
+            rtt_min_cur_ms: f64::INFINITY,
+            rtt_min_prev_ms: f64::INFINITY,
+            rtt_bucket_started: Instant::now(),
+            queue_delay_ms: 0.0,
             last_throttle_ship: Instant::now(),
             demigrated: false,
             adaptive_target_bps: self.bitrate_bps,
@@ -1981,7 +2119,7 @@ impl GfxServerFactory for Gfx {
             idr_backed_off: false,
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
-            adaptive_lag_ewma: 0.0,
+            adaptive_delay_ewma: 0.0,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
             qoe_reports: 0,
@@ -2113,6 +2251,42 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.last_acked_frame_id
                     .store(u64::from(frame_id), Ordering::Relaxed);
                 ctx.egfx_acks_seen = true;
+                ctx.last_ack_advance_at = Instant::now();
+                // Ack-RTT sample for the adaptive controller's queue-delay
+                // signal: time since this exact frame left send_avc420_frame.
+                let (slot_id, shipped_at) =
+                    ctx.ship_times.lock().unwrap()[frame_id as usize % RTT_RING];
+                let sample_ms = if slot_id == u64::from(frame_id) {
+                    // Exact match: the frame's true ship→ack round trip.
+                    Some(shipped_at.elapsed().as_secs_f64() * 1000.0)
+                } else if slot_id != u64::MAX && slot_id > u64::from(frame_id) {
+                    // The slot was OVERWRITTEN by a newer ship — i.e. the ack
+                    // lag exceeds the ring depth (>RTT_RING frames behind).
+                    // That is itself unambiguous deep-backlog evidence, and
+                    // skipping it would blind the controller exactly when the
+                    // pipe is most backed up (the first shaped-link test did
+                    // exactly that: 60 fps into 2 Mbit, ack lag >128, zero
+                    // samples, controller silent). The acked frame shipped
+                    // BEFORE the frame now in its slot, so the newer frame's
+                    // age is a valid LOWER BOUND on the true RTT — feed that.
+                    Some(shipped_at.elapsed().as_secs_f64() * 1000.0)
+                } else {
+                    None // pre-ship ack (slot never written) — nothing to time
+                };
+                if let Some(sample_ms) = sample_ms {
+                    // Rotate the two-bucket windowed minimum so the base-RTT
+                    // estimate tracks route changes instead of latching the
+                    // all-time minimum.
+                    if ctx.rtt_bucket_started.elapsed() >= RTT_MIN_WINDOW {
+                        ctx.rtt_min_prev_ms = ctx.rtt_min_cur_ms;
+                        ctx.rtt_min_cur_ms = f64::INFINITY;
+                        ctx.rtt_bucket_started = Instant::now();
+                    }
+                    let (cur_min, delay) =
+                        queue_delay_fold(sample_ms, ctx.rtt_min_cur_ms, ctx.rtt_min_prev_ms);
+                    ctx.rtt_min_cur_ms = cur_min;
+                    ctx.queue_delay_ms = delay;
+                }
             }
         }
     }
@@ -2873,6 +3047,58 @@ mod tests {
         assert_eq!(blank_action(1, 3), BlankAction::Remap);
         assert_eq!(blank_action(2, 3), BlankAction::Remap);
         assert_eq!(blank_action(3, 3), BlankAction::Drop);
+    }
+
+    // ---- Queue-delay congestion signal (RTT-aware, replaces frame-count lag) ----
+
+    #[test]
+    fn queue_delay_is_zero_on_a_clean_high_rtt_link() {
+        // First-ever sample seeds the bucket: base == sample → delay 0, at ANY RTT.
+        let (cur, delay) = queue_delay_fold(240.0, f64::INFINITY, f64::INFINITY);
+        assert_eq!(cur, 240.0);
+        assert_eq!(delay, 0.0);
+        // Steady samples at the base RTT stay at ~0 delay — the fix for the
+        // VPN/ZeroTier crater-climb oscillation (RTT is not congestion).
+        let (cur, delay) = queue_delay_fold(241.0, cur, f64::INFINITY);
+        assert_eq!(cur, 240.0);
+        assert!((delay - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn queue_delay_rises_when_the_pipe_backs_up() {
+        // Base RTT 240 ms established; a sample at 400 ms = 160 ms standing queue.
+        let (cur, delay) = queue_delay_fold(400.0, 240.0, f64::INFINITY);
+        assert_eq!(cur, 240.0); // min unchanged
+        assert!((delay - 160.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_ack_fallback_floors_the_sample_when_acks_go_quiet() {
+        // Total saturation: acks silent 3 s while shipping with frames
+        // outstanding → the fallback dominates the stale sampled delay.
+        assert_eq!(effective_queue_delay(4.0, 3000.0, true, true), 3000.0);
+        // Healthy link: since-last-ack is the tiny inter-ack gap → no-op.
+        assert_eq!(effective_queue_delay(4.0, 16.0, true, true), 16.0);
+        assert_eq!(effective_queue_delay(40.0, 16.0, true, true), 40.0);
+        // Nothing outstanding (all acked, e.g. static screen): idle silence is
+        // NOT congestion.
+        assert_eq!(effective_queue_delay(4.0, 60_000.0, false, true), 4.0);
+        // Not actively shipping (suppressed/minimized): also not congestion.
+        assert_eq!(effective_queue_delay(4.0, 60_000.0, true, false), 4.0);
+    }
+
+    #[test]
+    fn queue_delay_rebaselines_via_the_previous_bucket() {
+        // After a bucket rotation cur resets to INF; the PREVIOUS bucket's min
+        // keeps the baseline so the first post-rotation sample isn't read as 0-
+        // delay-by-definition (which would mask a standing queue).
+        let (cur, delay) = queue_delay_fold(400.0, f64::INFINITY, 240.0);
+        assert_eq!(cur, 400.0); // new bucket min = this sample
+        assert!((delay - 160.0).abs() < 1e-9); // still measured against prev
+                                               // And a route IMPROVEMENT (samples drop below the old base) reads as 0.
+        let (cur2, delay2) = queue_delay_fold(100.0, f64::INFINITY, 240.0);
+        assert_eq!(cur2, 100.0);
+        assert_eq!(delay2, 0.0);
     }
 
     #[test]

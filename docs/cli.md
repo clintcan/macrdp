@@ -105,17 +105,25 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --adaptive-bitrate        # Opt-in (default OFF; ADAPTIVE_BITRATE=1 in config.env).
                           #   Congestion-responsive H.264 rate control on BOTH the UDP
                           #   tunnel AND the TCP path (only with --enable-h264): an
-                          #   AIMD controller reads the client's frame-ack lag
-                          #   (shipped-acked, EWMA-smoothed) + reliable-tunnel
-                          #   retransmits and live-adjusts the VideoToolbox bitrate
-                          #   within [floor, --bitrate ceiling] — multiplicative-
-                          #   decrease under sustained congestion, additive-increase
-                          #   when clear (hysteresis + a 3-zone hold so single ack-lag
-                          #   spikes don't pump the bitrate). Under congestion it also
-                          #   stretches the periodic IDR (UDP only) to avoid injecting
-                          #   a big keyframe into a congested tunnel. So --bitrate is a
-                          #   CEILING, not a fixed target. Lets you set a high ceiling
-                          #   (e.g. 8) and have it back off only when the link strains.
+                          #   AIMD controller reads the STANDING QUEUE DELAY — each
+                          #   frame's ship→ack round trip minus the windowed-minimum
+                          #   RTT, EWMA-smoothed — plus reliable-tunnel retransmits,
+                          #   and live-adjusts the VideoToolbox bitrate within
+                          #   [floor, --bitrate ceiling] — multiplicative-decrease
+                          #   under sustained congestion, additive-increase when clear
+                          #   (hysteresis + a 3-zone hold so single spikes don't pump
+                          #   the bitrate). The signal is RTT-aware: a long-but-clean
+                          #   pipe (VPN/ZeroTier at 200+ ms) reads as ~0 queue and
+                          #   keeps FULL quality (the pre-2026-07-04 frame-count
+                          #   signal misread RTT as congestion and oscillated); a
+                          #   genuinely thin pipe reads as real queue and degrades
+                          #   gracefully — including a no-ack distress fallback so a
+                          #   fully choked client (acks silent) still registers.
+                          #   Under congestion it also stretches the periodic IDR
+                          #   (BOTH transports) to avoid injecting a big keyframe
+                          #   into a congested pipe. So --bitrate is a CEILING, not a
+                          #   fixed target: set it high (e.g. 8) and it backs off
+                          #   only when the link strains.
                           #   P2b frame-rate floor: once bitrate is pinned at the floor
                           #   AND still congested (quality cuts exhausted), it caps the
                           #   effective fps (default 10) to shed packet load — on BOTH
@@ -123,11 +131,14 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   to present/ack). Video degrades to choppy-but-steady-and-in-
                           #   sync instead of freezing; fps + bitrate recover when clear.
                           #   Tunables: MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,
-                          #   DECREASE,INTERVAL_MS,RETX_TOLERANCE}, MACRDP_{UDP,TCP}_
-                          #   ADAPTIVE_LAG_THRESHOLD, MACRDP_ADAPTIVE_EWMA_ALPHA,
-                          #   MACRDP_ADAPTIVE_FLOOR_FPS. The RETX_TOLERANCE (default 2) is
-                          #   the per-interval reliable-retransmit count tolerated before
-                          #   treating loss as congestion — keeps sporadic wireless (WiFi)
+                          #   DECREASE,INTERVAL_MS,RETX_TOLERANCE},
+                          #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (congestion threshold,
+                          #   default 100 ms of standing queue; replaces the removed
+                          #   MACRDP_{UDP,TCP}_ADAPTIVE_LAG_THRESHOLD),
+                          #   MACRDP_ADAPTIVE_EWMA_ALPHA, MACRDP_ADAPTIVE_FLOOR_FPS.
+                          #   The RETX_TOLERANCE (default 2) is the per-interval
+                          #   reliable-retransmit count tolerated before treating loss
+                          #   as congestion — keeps sporadic wireless (WiFi)
                           #   retransmits from ratcheting the bitrate down (0 = any
                           #   retransmit counts, the old behaviour). macOS-only.
 --enable-lossy-audio      # EXPERIMENTAL, opt-in (default OFF; ENABLE_LOSSY_AUDIO=1
