@@ -200,6 +200,23 @@ mod macos {
             // the bitmap (and hotspot, which tracks it) purely for comfort.
             let (data, w, h, hot_x, hot_y) =
                 scale_cursor(data, w, h, hot_x, hot_y, self.cursor_scale);
+            // Oversized sprites (shake-to-locate at Retina backing pixels)
+            // would overflow the pointer PDU's u16 mask length and kill the
+            // client loop — shrink them to fit instead.
+            let (data, w, h, hot_x, hot_y) = {
+                let (pre_w, pre_h) = (w, h);
+                let clamped = clamp_pointer_size(data, w, h, hot_x, hot_y);
+                if (clamped.1, clamped.2) != (pre_w, pre_h) {
+                    tracing::debug!(
+                        pre_w,
+                        pre_h,
+                        w = clamped.1,
+                        h = clamped.2,
+                        "cursor sprite too large for the pointer PDU — downscaled to fit"
+                    );
+                }
+                clamped
+            };
             // One-shot diagnostic: the raw SkyLight size vs. the scaled output,
             // handy when tuning --cursor-scale against the local cursor.
             if !self.diag_logged {
@@ -345,6 +362,21 @@ mod macos {
     ) -> (Vec<u8>, u16, u16, u16, u16) {
         let new_w = ((f64::from(w) * scale).round() as i64).clamp(1, 256) as u16;
         let new_h = ((f64::from(h) * scale).round() as i64).clamp(1, 256) as u16;
+        resize_cursor(data, w, h, hot_x, hot_y, new_w, new_h)
+    }
+
+    /// Resample a tightly-packed top-down RGBA cursor bitmap (and its hotspot)
+    /// to exact target dimensions. Returns the input untouched when the
+    /// dimensions already match.
+    fn resize_cursor(
+        data: Vec<u8>,
+        w: u16,
+        h: u16,
+        hot_x: u16,
+        hot_y: u16,
+        new_w: u16,
+        new_h: u16,
+    ) -> (Vec<u8>, u16, u16, u16, u16) {
         if new_w == w && new_h == h {
             return (data, w, h, hot_x, hot_y);
         }
@@ -362,6 +394,35 @@ mod macos {
         let hot_y = ((f64::from(hot_y) * f64::from(new_h) / f64::from(h)).round() as i64)
             .clamp(0, i64::from(new_h - 1)) as u16;
         (resized, new_w, new_h, hot_x, hot_y)
+    }
+
+    /// Shrink an oversized cursor sprite so its 32-bpp bitmap fits the wire
+    /// format. `TS_COLORPOINTERATTRIBUTE` carries the bitmap as its XOR mask
+    /// with a u16 byte length, so `w*h*4` must stay ≤ 65535 (area ≤ 16383 px)
+    /// or the encode fails — and that error tears down the whole client loop.
+    /// Reachable in practice: macOS "shake mouse pointer to locate" enlarges
+    /// the cursor several-fold, and at Retina backing pixels even 128×128
+    /// (= 65536 bytes) is over the limit. Aspect ratio and hotspot are
+    /// preserved; normal-sized cursors pass through untouched.
+    fn clamp_pointer_size(
+        data: Vec<u8>,
+        w: u16,
+        h: u16,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> (Vec<u8>, u16, u16, u16, u16) {
+        const MAX_AREA: u32 = (u16::MAX / 4) as u32; // 16383 px at 4 bytes/px
+        let area = u32::from(w) * u32::from(h);
+        if area <= MAX_AREA || w == 0 || h == 0 {
+            return (data, w, h, hot_x, hot_y);
+        }
+        // Floor guarantees new_w*new_h <= shrink²*w*h = MAX_AREA; the extra
+        // per-axis min-clamp covers degenerate aspect ratios.
+        let shrink = (f64::from(MAX_AREA) / f64::from(area)).sqrt();
+        let new_h = (((f64::from(h) * shrink).floor() as u32).clamp(1, MAX_AREA)) as u16;
+        let new_w =
+            (((f64::from(w) * shrink).floor() as u32).clamp(1, MAX_AREA / u32::from(new_h))) as u16;
+        resize_cursor(data, w, h, hot_x, hot_y, new_w, new_h)
     }
 
     /// Area-average resample of a tightly-packed top-down RGBA buffer. RGB is
@@ -431,7 +492,7 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use super::{resample_rgba, scale_cursor};
+        use super::{clamp_pointer_size, resample_rgba, scale_cursor};
 
         #[test]
         fn scale_one_is_passthrough() {
@@ -453,6 +514,46 @@ mod macos {
             assert_eq!((hx, hy), (8, 8));
             // Solid opaque red must survive the downscale on every pixel.
             assert!(out.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        }
+
+        #[test]
+        fn clamp_leaves_normal_cursors_untouched() {
+            // 64×64 (Retina backing of a 32-pt cursor) is well under the
+            // 16383-px area limit and must pass through byte-identical.
+            let data = vec![7u8; 64 * 64 * 4];
+            let (out, w, h, hx, hy) = clamp_pointer_size(data.clone(), 64, 64, 10, 12);
+            assert_eq!((w, h, hx, hy), (64, 64, 10, 12));
+            assert_eq!(out, data);
+        }
+
+        #[test]
+        fn clamp_shrinks_oversized_cursor_under_u16_mask_limit() {
+            // 128×128×4 = 65536 bytes — exactly one byte over the u16 XOR-mask
+            // limit; the real-world shake-to-locate-at-Retina case.
+            let data = vec![255u8; 128 * 128 * 4];
+            let (out, w, h, hx, hy) = clamp_pointer_size(data, 128, 128, 64, 64);
+            assert!(u32::from(w) * u32::from(h) * 4 <= u32::from(u16::MAX));
+            assert_eq!(out.len(), usize::from(w) * usize::from(h) * 4);
+            // Hotspot stays centered and in-bounds.
+            assert!(hx < w && hy < h);
+            assert!((i32::from(hx) - i32::from(w) / 2).abs() <= 1);
+            assert!((i32::from(hy) - i32::from(h) / 2).abs() <= 1);
+        }
+
+        #[test]
+        fn clamp_handles_worst_case_and_extreme_aspect() {
+            // 256×256 (the scale_cursor output cap) and a degenerate 256×64
+            // strip both land under the limit with sane dims.
+            for (sw, sh) in [(256u16, 256u16), (256, 64), (64, 256)] {
+                let data = vec![1u8; usize::from(sw) * usize::from(sh) * 4];
+                let (out, w, h, _, _) = clamp_pointer_size(data, sw, sh, 0, 0);
+                assert!(
+                    u32::from(w) * u32::from(h) * 4 <= u32::from(u16::MAX),
+                    "{sw}x{sh} -> {w}x{h} still over the u16 mask limit"
+                );
+                assert!(w >= 1 && h >= 1);
+                assert_eq!(out.len(), usize::from(w) * usize::from(h) * 4);
+            }
         }
 
         #[test]
