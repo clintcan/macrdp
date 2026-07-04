@@ -161,8 +161,16 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   internet links on plain TCP until the tunnel
                           #   keepalive/clean-close fix lands (see TODO.md).
                           #   macOS-only.
---fork-workers            # EXPERIMENTAL, opt-in (default OFF; FORK_WORKERS=1 in
-                          #   config.env). xrdp's model on macOS: a thin supervisor
+--fork-workers            # Opt-in (default OFF; FORK_WORKERS=1 in config.env) —
+                          #   and staying opt-in by DECISION (2026-07-04, roadmap
+                          #   Tier 2.6): the production default is single-process +
+                          #   blank-recovery + the auto-reconnect cookie (field-
+                          #   proven, composes with every feature). Choose
+                          #   --fork-workers for mstsc-heavy, no-UDP deployments
+                          #   that want blip-free reconnects + per-connection
+                          #   isolation; it COMPOSES with blank-recovery (recovery
+                          #   drops land on a fresh worker = strongest combo).
+                          #   xrdp's model on macOS: a thin supervisor
                           #   binds the port and fork+execs a FRESH worker process
                           #   per connection (socket via MACRDP_WORKER_FD). The fresh
                           #   process dodges mstsc's reconnect-blank (it re-maps a

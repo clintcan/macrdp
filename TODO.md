@@ -238,8 +238,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
   log rotation + startup reaper (Tier 2.5, #103) and the **hung-but-alive health-check
   watchdog (`src/health.rs`) — DONE 2026-07-03** (probes the tokio runtime from a
   dedicated OS thread; exits code 70 on a sustained wedge → launchd/supervisor restarts;
-  on by default when headless, env-tunable). **Tier 2.5 now complete.** Still open beyond
-  the soak: the `--fork-workers`-as-default decision (Tier 2.6); Tier 3 polish. Hard
+  on by default when headless, env-tunable). **Tier 2.5 now complete.** Tier 2.6
+  (`--fork-workers` as default) **DECIDED 2026-07-04: NO** — single-process +
+  blank-recovery + ARC stays the default (field-proven, composes with everything);
+  fork-workers stays the documented opt-in for mstsc-heavy no-UDP profiles (see the
+  roadmap for the full rationale). Still open beyond the soak: Tier 3 polish. Hard
   ceiling (NO-GO): multi-user concurrent GUI sessions (macOS limit).
 
 ## Parked — scoped, low priority

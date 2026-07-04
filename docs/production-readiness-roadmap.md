@@ -107,9 +107,31 @@ are scope limits, not gaps to close.
      on an idle runtime. **Scope:** targets runtime-level hangs (deadlock / all workers blocked);
      a listener-level heartbeat for "accept loop silently stopped while the runtime is healthy"
      is a possible follow-up.
-6. **Make `--fork-workers` the production default.** It's what fixes the mstsc
-   reconnect-blank that bites real users; recommend (or default) it for unattended
-   deployments. Note it's mutually exclusive with `--enable-udp-multitransport`.
+6. **Make `--fork-workers` the production default — DECIDED 2026-07-04: NO.
+   Single-process + blank-recovery + ARC stays the default; `--fork-workers` stays a
+   documented opt-in.** This item was written when fork-workers was the *only* answer to
+   the mstsc reconnect-blank; that's no longer true, and the calculus settled against it:
+   - **Blank-recovery is field-proven; fork-workers isn't.** The v0.8.22 recovery +
+     v0.8.24 drop-first tuning healed real blanks repeatedly and unattended in the wild
+     (the 2026-07-04 ZeroTier cycle: detect → drop → ARC auto-reconnect → render, ×2,
+     zero false positives). fork-workers has demo-grade verification, zero soak hours,
+     and still leaves a residual ~1/7 blank that needs a reconnect — i.e. even under
+     fork-workers, **blank-recovery is what completes the story**; the reverse isn't true.
+   - **A default must compose with everything; fork-workers doesn't.** Mutually exclusive
+     with `--enable-udp-multitransport`, requires supervisor-owned persistent state
+     (virtual display / blanking / HUD / caffeinate), and adds a whole process-lifecycle
+     surface (fd passing, worker serialization, the SCK-exit trap — two non-obvious bugs
+     were fixed just getting it working).
+   - **Soak asymmetry.** Single-process has the 31 h clean Tier 2.4 foundation run;
+     defaulting to fork-workers would invalidate that evidence and demand a fresh soak of
+     the *more* complex model.
+   - **The motivating pain shrank.** The reconnect-blank is now ~6–8 s of self-healing on
+     LAN (detect window scales with QoE cadence on slow links), no user action.
+   **Recommendation stands in the docs:** `--fork-workers` for mstsc-heavy, no-UDP
+   deployments that want blip-free reconnects + per-connection isolation — and it
+   COMPOSES with blank-recovery (recovery drops land on a fresh worker process, the
+   strongest combination). Revisit only if the re-soak or field use surfaces a
+   single-process weakness that process isolation would fix.
 
 ## Tier 3 — Polish / nice-to-have
 
