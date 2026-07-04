@@ -55,16 +55,21 @@ then delete; promote a parked item to *In flight* when work actually starts.
   The reliable-tunnel retransmit counter barely fires in practice — ack-lag is the dominant
   signal. (Remove this line next prune.)
 
-- [ ] **Watchdog follow-up: keep the de-migrated UDP tunnel from timing out.** Found
-  2026-06-29 during P1 testing: under *sustained* heavy loss the watchdog de-migrates EGFX
-  to TCP (video keeps running), but ~60s later **mstsc resets the whole session**
-  (`Connection reset by peer`) — its multitransport dead-tunnel timeout, since the UDP
-  tunnel it Soft-Synced EGFX onto goes silent after de-migration. Fix: after de-migration,
-  either send RDPEUDP **keepalives** on the abandoned tunnel so mstsc doesn't time out, or
-  cleanly **close** the multitransport tunnel so mstsc stops expecting it. Must distinguish
-  "de-migrated, client still here" from "client gone" (interacts with the 60s idle-GC).
-  Still strictly better than the pre-watchdog permanent freeze; only bites under sustained
-  loss. See the v0.8.x test log (wedge 23:44:49 → reset 23:45:50, 2026-06-29).
+- [ ] **UDP-tunnel keepalive / clean close — mstsc's ~60s dead-tunnel session reset.
+  PRIORITY RAISED 2026-07-04: second live repro, now on the LOSSY-AUDIO path over
+  ZeroTier.** Original find (2026-06-29, P1 testing): after the watchdog de-migrates EGFX
+  to TCP, the abandoned reliable tunnel goes silent and ~60s later **mstsc resets the whole
+  session** (its multitransport dead-tunnel timeout). New repro (2026-07-04): with
+  `ENABLE_LOSSY_AUDIO=1` over **ZeroTier**, the lossy UDP/DTLS audio tunnel wedges on the
+  overlay network and the same ~60s reset fires **cyclically** — session up ~61s → reset →
+  auto-reconnect → reconnect-blank → blank-recovery drop → renders → repeat (audit log
+  2026-07-04T00:32–00:34; every stage behaved "correctly", the tunnel wedge was the driver).
+  Users on VPN/ZeroTier-class links must keep `ENABLE_UDP_MULTITRANSPORT=0` +
+  `ENABLE_LOSSY_AUDIO=0` until this is fixed (documented in cli.md/features.md). Fix:
+  RDPEUDP **keepalives** on an idle/wedged tunnel so mstsc doesn't time out, or cleanly
+  **close** the multitransport tunnel (and fall audio back to TCP) when it wedges. Must
+  distinguish "tunnel idle, client still here" from "client gone" (interacts with the 60s
+  idle-GC).
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
   video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)

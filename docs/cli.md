@@ -153,6 +153,13 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   5/10/15% loss where single-send glitches. Bridges the
                           #   MACRDP_UDP_{OFFER_FECL,LOSSY_DELIVERY,LOSSY_AUDIO,
                           #   LOSSY_AUDIO_DUP} env gates (still work standalone).
+                          #   CAVEAT (2026-07-04): LAN/WiFi only — do NOT enable over
+                          #   VPN/ZeroTier-class overlay links. If the UDP tunnel
+                          #   wedges there, mstsc's ~60s dead-tunnel timeout resets
+                          #   the whole session CYCLICALLY (up ~60s → reset →
+                          #   reconnect → repeat; live repro 2026-07-04). Keep
+                          #   internet links on plain TCP until the tunnel
+                          #   keepalive/clean-close fix lands (see TODO.md).
                           #   macOS-only.
 --fork-workers            # EXPERIMENTAL, opt-in (default OFF; FORK_WORKERS=1 in
                           #   config.env). xrdp's model on macOS: a thin supervisor
