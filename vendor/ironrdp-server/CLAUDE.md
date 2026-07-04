@@ -975,3 +975,24 @@ AND released — #1276 landing is NOT sufficient.
     unit-tested in macrdp's `src/multitransport.rs` (the vendored crate is
     test = false). Live verification of the listener path needs a real mstsc
     with a bound tunnel + UDP-only blockage — pending.
+
+(15) Kernel TCP RTT sampled at accept → shared cell (NOT upstreamed; added
+    2026-07-05). `RdpServer` gains `link_rtt_ms: Option<Arc<AtomicU32>>`
+    (default None) + setter `set_link_rtt_handle`, mirroring the
+    keyboard-layout cell (divergence 10). In the `run()` accept loop — the
+    ONLY point the concrete `TcpStream` (hence the raw fd) is reachable;
+    `run_connection` takes a generic stream and wraps it immediately — the
+    server reads the kernel's smoothed TCP RTT via
+    `getsockopt(TCP_CONNECTION_INFO)` (`tcp_srtt_ms`, macOS-only with a
+    None-returning stub elsewhere so Linux CI compiles; new
+    `[target.'cfg(target_os = "macos")'.dependencies] libc` in Cargo.toml)
+    and stores it (ms; 0 = unknown, sub-ms LAN maps to 1) into the cell
+    before `run_connection`. The kernel seeds srtt from the SYN/SYN-ACK
+    exchange so a meaningful value exists immediately at accept. macrdp's
+    h264.rs samples the cell per connection to drive link-aware behavior:
+    the blank-recovery RTT gate (evidence window scales with RTT; the drop
+    lever is withheld past MACRDP_BLANK_RECOVERY_MAX_RTT_MS — the ZeroTier
+    false-positive fix, see docs/known-quirks.md) and the adaptive-bitrate
+    seed (ceiling/3 start past MACRDP_ADAPTIVE_SEED_RTT_MS). Additive +
+    handle-setter pattern → upstreamable, though the libc dep and the
+    macOS-only sample make it less obviously general than (10)/(13).

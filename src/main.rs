@@ -2298,6 +2298,12 @@ async fn async_main() -> Result<()> {
     // on CI; only read on the macOS H.264 path.
     let congestion_retransmits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // Kernel-measured TCP RTT (ms) of the most recently accepted connection,
+    // written by the vendored server at accept (divergence 15). Drives the
+    // link-aware blank-recovery gate + the adaptive-bitrate seed in h264.rs.
+    // 0 = unknown.
+    let link_rtt_ms = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
@@ -2314,6 +2320,7 @@ async fn async_main() -> Result<()> {
             egfx_demigrate_flag.clone(),
             args.adaptive_bitrate,
             congestion_retransmits.clone(),
+            link_rtt_ms.clone(),
         )
     });
 
@@ -2451,6 +2458,11 @@ async fn async_main() -> Result<()> {
     // its Client Core Data; the server publishes it here so the input handler
     // can auto-select a matching non-US layout (when --keyboard-layout is unset).
     server.set_keyboard_layout_handle(keyboard_layout_klid);
+
+    // The server samples the kernel's smoothed TCP RTT for each accepted
+    // connection (divergence 15) into this cell; the H.264 pipeline reads it
+    // for link-aware blank-recovery gating + adaptive-bitrate seeding.
+    server.set_link_rtt_handle(link_rtt_ms);
 
     // Client-resolution auto-adopt: the vendored acceptor reads the desktop
     // size the client requests in its GCC Client Core Data and negotiates

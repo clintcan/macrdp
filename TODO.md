@@ -7,7 +7,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Make blank-recovery RTT-aware — it FALSE-POSITIVES on high-latency links.** Found
+- [x] **Make blank-recovery RTT-aware — DONE (PR pending merge; RTT gate + ceiling/3 bitrate seed; see known-quirks blank-recovery UPDATE 2026-07-05). Remove this item once deployed + live-verified over ZeroTier.** Original item: Found
   live 2026-07-05 (real mstsc over ZeroTier). The detector (`src/h264.rs`
   `should_blank_recover`) reads mstsc's QoE decode+render-time==0 as "not presenting" and
   drops the connection, expecting nonzero EDR within ~200 ms (a LAN assumption). Over

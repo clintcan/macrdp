@@ -329,6 +329,14 @@ struct ConnectionContext {
     /// connection epoch, which also serves as the arm-delay baseline).
     blank_recovery_attempts: u32,
     last_blank_recovery_at: Instant,
+    /// Kernel-measured TCP RTT (ms) for this connection, sampled at accept by
+    /// the vendored server (divergence 15) and frozen here at connection setup.
+    /// 0 = unknown. Drives the blank-detector RTT gate ([`blank_rtt_gate`]) and
+    /// the adaptive-bitrate seed ([`seeded_initial_bitrate`]).
+    link_rtt_ms: u32,
+    /// One-shot guard for the "blank recovery disarmed / scaled on this link"
+    /// log line (the detector check runs on every capture).
+    blank_gate_logged: bool,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -464,6 +472,17 @@ struct BlankRecoveryParams {
     /// reports a nonzero decode+render time (i.e. actually presents). 0 = no
     /// cap.
     max_consecutive_drops: u32,
+    /// RTT gate (link-aware detection, 2026-07-05): the kernel-measured TCP RTT
+    /// (ms) at or above which the DROP lever is withheld entirely for the
+    /// connection. The blank signature (`timeDiffEDR == 0` while acks flow) is
+    /// only trustworthy on fast links — live-verified over ZeroTier (~200 ms):
+    /// a session that IS visibly rendering reports zero EDR on every frame, so
+    /// the detector force-dropped a working session every ~5 s and the repeated
+    /// drops poisoned mstsc's surface into a REAL permanent black (the recovery
+    /// *caused* the blank). Below the gate the evidence window scales with RTT
+    /// (see [`blank_rtt_gate`]); at/above it the detector is disarmed for the
+    /// connection (log-only). 0 = no RTT gating (pre-2026-07-05 behavior).
+    max_rtt_ms: u32,
 }
 
 /// Which recovery lever to pull for a given (1-based) attempt number: every
@@ -547,6 +566,51 @@ fn should_blank_recover(
         && since_connect >= p.arm_delay
         && since_last_attempt >= p.retry_interval
         && attempts < p.max_attempts
+}
+
+/// RTT gate for the blank detector (see [`BlankRecoveryParams::max_rtt_ms`]).
+/// Returns the evidence-window multiplier for this connection's link RTT, or
+/// `None` when the link is slow enough that the detector must not drop at all
+/// (the EDR==0 signal is unreliable there — ZeroTier live finding 2026-07-05).
+/// `link_rtt_ms == 0` means "unknown" (non-macOS / sample failed) and keeps
+/// today's LAN behavior; `max_rtt_ms == 0` disables gating entirely. The
+/// multiplier grows linearly from 1× at ≤25 ms, capped at 4×, so a moderately
+/// distant client just needs a proportionally longer all-zero window. Pure,
+/// unit-tested.
+fn blank_rtt_gate(link_rtt_ms: u32, max_rtt_ms: u32) -> Option<f64> {
+    if max_rtt_ms == 0 || link_rtt_ms == 0 {
+        return Some(1.0);
+    }
+    if link_rtt_ms >= max_rtt_ms {
+        return None;
+    }
+    Some((f64::from(link_rtt_ms) / 25.0).clamp(1.0, 4.0))
+}
+
+/// Scale a [`BlankRecoveryParams`] evidence window by the RTT multiplier from
+/// [`blank_rtt_gate`]: more all-zero QoE reports required and a longer arm
+/// delay before the first evaluation. Attempt spacing/caps are unchanged.
+fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParams {
+    BlankRecoveryParams {
+        min_qoe_reports: ((p.min_qoe_reports as f64) * mult).ceil() as u64,
+        arm_delay: p.arm_delay.mul_f64(mult),
+        ..*p
+    }
+}
+
+/// RTT-seeded initial bitrate (2026-07-05): the encoder's starting target for a
+/// new connection. On a slow link (`link_rtt_ms >= seed_rtt_ms`), start at
+/// **ceiling / 3** (clamped to `[floor, ceiling]`) instead of slamming the full
+/// ceiling into a pipe we already know is distant — the adaptive controller
+/// then climbs toward the ceiling if the link has headroom (long-but-fat links
+/// recover full quality within seconds) or backs off if it strains. Fast /
+/// unknown links start at the ceiling exactly as before. `seed_rtt_ms == 0`
+/// disables seeding. Pure, unit-tested.
+fn seeded_initial_bitrate(ceiling: u32, floor: u32, link_rtt_ms: u32, seed_rtt_ms: u32) -> u32 {
+    if seed_rtt_ms == 0 || link_rtt_ms == 0 || link_rtt_ms < seed_rtt_ms {
+        return ceiling;
+    }
+    (ceiling / 3).clamp(floor.min(ceiling), ceiling.max(1))
 }
 
 /// Pure AIMD step for congestion-responsive bitrate (P1). Given the current target,
@@ -878,6 +942,15 @@ pub struct Gfx {
     /// time. Lives on the factory (not per-connection ctx) precisely because it
     /// must survive the drop → auto-reconnect cycle it guards against.
     consecutive_blank_drops: Arc<AtomicU32>,
+    /// Kernel-measured TCP RTT (ms) of the most recently accepted connection,
+    /// written by the vendored server at accept (divergence 15) and sampled
+    /// into each connection's context at setup. 0 = unknown. Drives the blank
+    /// detector's RTT gate and the adaptive-bitrate seed.
+    link_rtt_ms: Arc<AtomicU32>,
+    /// Link RTT (ms) at or above which a new connection's adaptive bitrate is
+    /// seeded at ceiling/3 instead of the full ceiling (the controller climbs
+    /// from there). `MACRDP_ADAPTIVE_SEED_RTT_MS`, default 50; 0 disables.
+    adaptive_seed_rtt_ms: u32,
 }
 
 impl Gfx {
@@ -893,6 +966,7 @@ impl Gfx {
         demigrate_request: Arc<AtomicBool>,
         adaptive_bitrate: bool,
         congestion_retransmits: Arc<AtomicU64>,
+        link_rtt_ms: Arc<AtomicU32>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
@@ -996,13 +1070,23 @@ impl Gfx {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true,
         };
+        // These two RTT knobs allow an explicit 0 (= "disable"), unlike env_u32
+        // whose zero-filter falls back to the default.
+        let env_u32_zero_ok = |name: &str, default: u32| -> u32 {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(default)
+        };
         let blank_params = BlankRecoveryParams {
             min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 24)),
             arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
             retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 5000),
             max_attempts: env_u32("MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS", 1),
             max_consecutive_drops: env_u32("MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS", 3),
+            max_rtt_ms: env_u32_zero_ok("MACRDP_BLANK_RECOVERY_MAX_RTT_MS", 80),
         };
+        let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -1064,6 +1148,8 @@ impl Gfx {
             blank_recovery_enabled,
             blank_params,
             consecutive_blank_drops: Arc::new(AtomicU32::new(0)),
+            link_rtt_ms,
+            adaptive_seed_rtt_ms,
         }
     }
 
@@ -1234,17 +1320,50 @@ impl Gfx {
                     self.consecutive_blank_drops.store(0, Ordering::Relaxed);
                     debug!("EGFX connection presented — consecutive blank-drop counter reset");
                 }
+                // RTT gate (2026-07-05): on a slow link the EDR==0 signal is
+                // unreliable (a rendering ZeroTier client reports zero), so the
+                // evidence window scales with RTT and past `max_rtt_ms` the
+                // drop lever is withheld entirely for this connection.
+                let gate = blank_rtt_gate(ctx.link_rtt_ms, self.blank_params.max_rtt_ms);
+                if !ctx.blank_gate_logged {
+                    match gate {
+                        None => {
+                            ctx.blank_gate_logged = true;
+                            info!(
+                                link_rtt_ms = ctx.link_rtt_ms,
+                                max_rtt_ms = self.blank_params.max_rtt_ms,
+                                "blank recovery DISARMED for this connection — link RTT too high for the \
+                                 zero-render-time signal to be trustworthy (a slow rendering client reports \
+                                 zero EDR; a false drop cycle is worse than an un-healed blank)"
+                            );
+                        }
+                        Some(mult) if mult > 1.0 => {
+                            ctx.blank_gate_logged = true;
+                            info!(
+                                link_rtt_ms = ctx.link_rtt_ms,
+                                window_multiplier = mult,
+                                "blank recovery evidence window scaled for link RTT"
+                            );
+                        }
+                        Some(_) => {} // LAN — nothing to say, keep checking cheaply
+                    }
+                }
+                let effective_params = gate.map(|m| blank_params_scaled(&self.blank_params, m));
                 let now = Instant::now();
-                if should_blank_recover(
-                    ctx.qoe_reports,
-                    ctx.qoe_render_seen,
-                    ctx.egfx_acks_seen,
-                    ctx.acks_suspended,
-                    now.saturating_duration_since(ctx.epoch),
-                    now.saturating_duration_since(ctx.last_blank_recovery_at),
-                    ctx.blank_recovery_attempts,
-                    &self.blank_params,
-                ) {
+                // `gate == None` (disarmed: link too slow) skips detection but
+                // never the frame path — this whole branch is decision-only.
+                if effective_params.as_ref().is_some_and(|p| {
+                    should_blank_recover(
+                        ctx.qoe_reports,
+                        ctx.qoe_render_seen,
+                        ctx.egfx_acks_seen,
+                        ctx.acks_suspended,
+                        now.saturating_duration_since(ctx.epoch),
+                        now.saturating_duration_since(ctx.last_blank_recovery_at),
+                        ctx.blank_recovery_attempts,
+                        p,
+                    )
+                }) {
                     let action = blank_action(
                         ctx.blank_recovery_attempts + 1,
                         self.blank_params.max_attempts,
@@ -1755,11 +1874,15 @@ impl Gfx {
             // Pass actual dims; VideoToolbox pads to 16-px macroblocks
             // internally and encodes the crop in the SPS, so the client
             // decodes back to actual dims.
+            // Start at the connection's current adaptive target, not the raw
+            // ceiling: equal to the ceiling unless the RTT seed lowered it
+            // (slow link) or the controller already adjusted it (encoder
+            // rebuild mid-connection).
             let mut encoder = Encoder::new(
                 width,
                 height,
                 self.fps,
-                self.bitrate_bps,
+                ctx.adaptive_target_bps,
                 self.keyframe_secs,
             )?;
             // Hand VT's output channel to a dedicated ship thread (push model),
@@ -2086,6 +2209,31 @@ impl GfxServerFactory for Gfx {
         // (set by on_ready for a no-AVC client) and its bridge (discards all
         // EGFX output while set). Per-connection: a reconnect starts fresh.
         let egfx_declined = Arc::new(AtomicBool::new(false));
+        // Link-aware setup (2026-07-05): freeze the kernel-measured TCP RTT the
+        // vendored server sampled at accept, and seed the encoder's starting
+        // bitrate from it — ceiling/3 on a slow link so the first seconds don't
+        // overshoot a distant pipe (the controller climbs back if there's
+        // headroom). Adaptive-off keeps the plain ceiling.
+        let link_rtt_ms = self.link_rtt_ms.load(Ordering::Relaxed);
+        let initial_target_bps = if self.adaptive_enabled {
+            let seeded = seeded_initial_bitrate(
+                self.bitrate_bps,
+                self.adaptive_floor_bps,
+                link_rtt_ms,
+                self.adaptive_seed_rtt_ms,
+            );
+            if seeded < self.bitrate_bps {
+                info!(
+                    link_rtt_ms,
+                    seed_bps = seeded,
+                    ceiling_bps = self.bitrate_bps,
+                    "slow link at connect — seeding adaptive bitrate at ceiling/3 (climbs back if the link has headroom)"
+                );
+            }
+            seeded
+        } else {
+            self.bitrate_bps
+        };
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
             server_handle: handle.clone(),
             encoder: None,
@@ -2113,7 +2261,7 @@ impl GfxServerFactory for Gfx {
             queue_delay_ms: 0.0,
             last_throttle_ship: Instant::now(),
             demigrated: false,
-            adaptive_target_bps: self.bitrate_bps,
+            adaptive_target_bps: initial_target_bps,
             adaptive_last_control: Instant::now(),
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
             idr_backed_off: false,
@@ -2126,6 +2274,8 @@ impl GfxServerFactory for Gfx {
             qoe_render_seen: false,
             blank_recovery_attempts: 0,
             last_blank_recovery_at: Instant::now(),
+            link_rtt_ms,
+            blank_gate_logged: false,
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -2893,7 +3043,86 @@ mod tests {
             retry_interval: ms(5000),
             max_attempts: 2,
             max_consecutive_drops: 3,
+            max_rtt_ms: 80,
         }
+    }
+
+    #[test]
+    fn blank_rtt_gate_lan_and_unknown_pass_through_unscaled() {
+        // LAN (≤25 ms) and unknown (0) keep the exact pre-RTT-gate behavior.
+        assert_eq!(blank_rtt_gate(2, 80), Some(1.0));
+        assert_eq!(blank_rtt_gate(25, 80), Some(1.0));
+        assert_eq!(blank_rtt_gate(0, 80), Some(1.0));
+        // Gate disabled entirely (max 0): even a huge RTT stays armed at 1×.
+        assert_eq!(blank_rtt_gate(500, 0), Some(1.0));
+    }
+
+    #[test]
+    fn blank_rtt_gate_scales_then_disarms() {
+        // Moderate WAN: window scales with RTT (50 ms → 2×), capped at 4×.
+        assert_eq!(blank_rtt_gate(50, 80), Some(2.0));
+        let just_under = blank_rtt_gate(79, 80).unwrap();
+        assert!(just_under > 3.0 && just_under <= 4.0);
+        // At/above the threshold (the ZeroTier case): drop lever withheld.
+        assert_eq!(blank_rtt_gate(80, 80), None);
+        assert_eq!(blank_rtt_gate(250, 80), None);
+    }
+
+    #[test]
+    fn blank_params_scaled_stretches_the_evidence_window_only() {
+        let p = blank_params();
+        let s = blank_params_scaled(&p, 2.0);
+        assert_eq!(s.min_qoe_reports, 240);
+        assert_eq!(s.arm_delay, ms(6000));
+        // Attempt spacing/caps untouched.
+        assert_eq!(s.retry_interval, p.retry_interval);
+        assert_eq!(s.max_attempts, p.max_attempts);
+        assert_eq!(s.max_consecutive_drops, p.max_consecutive_drops);
+        // A window that fires at 1× must NOT fire mid-window at 2×.
+        assert!(should_blank_recover(
+            150,
+            false,
+            true,
+            false,
+            ms(7000),
+            ms(7000),
+            0,
+            &p
+        ));
+        assert!(!should_blank_recover(
+            150,
+            false,
+            true,
+            false,
+            ms(7000),
+            ms(7000),
+            0,
+            &s
+        ));
+    }
+
+    #[test]
+    fn seeded_initial_bitrate_thirds_slow_links_only() {
+        // The user-specified contract: 6 Mbit ceiling on a slow link → 2 Mbit.
+        assert_eq!(
+            seeded_initial_bitrate(6_000_000, 750_000, 200, 50),
+            2_000_000
+        );
+        // Fast link and unknown RTT start at the ceiling, as before.
+        assert_eq!(seeded_initial_bitrate(6_000_000, 750_000, 3, 50), 6_000_000);
+        assert_eq!(seeded_initial_bitrate(6_000_000, 750_000, 0, 50), 6_000_000);
+        // Seeding disabled (threshold 0) → ceiling regardless of RTT.
+        assert_eq!(
+            seeded_initial_bitrate(6_000_000, 750_000, 200, 0),
+            6_000_000
+        );
+        // Seed never goes below the floor…
+        assert_eq!(seeded_initial_bitrate(1_200_000, 750_000, 200, 50), 750_000);
+        // …and never above the ceiling even with a floor misconfigured high.
+        assert_eq!(
+            seeded_initial_bitrate(1_200_000, 9_000_000, 200, 50),
+            1_200_000
+        );
     }
 
     #[test]

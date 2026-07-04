@@ -312,6 +312,41 @@ fn migrate_egfx_lossy() -> bool {
     *ENABLED.get_or_init(|| crate::multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX_LOSSY"))
 }
 
+/// (vendored, divergence 15) Read the kernel's smoothed TCP RTT for an accepted
+/// connection, in milliseconds, via `getsockopt(TCP_CONNECTION_INFO)` (macOS).
+/// The kernel seeds srtt from the SYN/SYN-ACK exchange, so a meaningful value is
+/// available immediately at accept. Returns `None` on error or on platforms
+/// without the option (Linux CI compiles the stub); a sub-ms LAN RTT maps to 1
+/// so 0 stays reserved for "unknown".
+#[cfg(target_os = "macos")]
+fn tcp_srtt_ms(stream: &tokio::net::TcpStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut info: libc::tcp_connection_info = unsafe { core::mem::zeroed() };
+    let mut len = core::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    // SAFETY: fd is a live TCP socket owned by `stream`; `info`/`len` describe a
+    // properly sized, writable out-buffer for this socket option.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            core::ptr::from_mut(&mut info).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // tcpi_srtt is already in milliseconds on macOS.
+    Some(info.tcpi_srtt.max(1))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tcp_srtt_ms(_stream: &tokio::net::TcpStream) -> Option<u32> {
+    None
+}
+
 pub struct RdpServer {
     opts: RdpServerOptions,
     // FIXME: replace with a channel and poll/process the handler?
@@ -363,6 +398,14 @@ pub struct RdpServer {
     /// `MacInputHandler`) holds a clone and auto-selects a matching layout, so
     /// non-US clients type correctly with no manual configuration. 0 = unknown.
     keyboard_layout: Option<Arc<AtomicU32>>,
+    /// (vendored, divergence 15) Optional shared cell the server writes with the
+    /// kernel's smoothed TCP round-trip time (milliseconds, from
+    /// `TCP_CONNECTION_INFO`) for each accepted connection, sampled in the
+    /// accept loop before the stream is wrapped (the only point the raw fd is
+    /// reachable). Link-adaptive consumers (macrdp's blank-recovery gating and
+    /// adaptive-bitrate seeding in `h264.rs`) hold a clone. 0 = unknown /
+    /// unsupported platform; a sub-millisecond LAN RTT stores as 1.
+    link_rtt_ms: Option<Arc<AtomicU32>>,
     /// (vendored, divergence 13) Optional Server Auto-Reconnect Cookie
     /// (MS-RDPBCGR 2.2.4.3 ARC_SC_PRIVATE_PACKET). When set, the server sends a
     /// Save Session Info PDU carrying it once per TCP connection, right after
@@ -569,6 +612,7 @@ impl RdpServer {
             connection_handler,
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
+            link_rtt_ms: None,
             auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
             honor_client_desktop_size: false,
@@ -667,6 +711,15 @@ impl RdpServer {
     /// called before any client connects.
     pub fn set_keyboard_layout_handle(&mut self, handle: Arc<AtomicU32>) {
         self.keyboard_layout = Some(handle);
+    }
+
+    /// (vendored, divergence 15) Share a cell the server fills with the
+    /// kernel's smoothed TCP RTT (ms) for each accepted connection, sampled
+    /// at accept time via `TCP_CONNECTION_INFO`. Link-adaptive consumers
+    /// (blank-recovery gating, adaptive-bitrate seeding) hold a clone.
+    /// 0 = unknown. Must be called before any client connects.
+    pub fn set_link_rtt_handle(&mut self, handle: Arc<AtomicU32>) {
+        self.link_rtt_ms = Some(handle);
     }
 
     /// (vendored) Install a UDP-multitransport provider (MS-RDPEMT). When set,
@@ -1058,6 +1111,17 @@ impl RdpServer {
                         debug!(?peer, "Connection rejected by handler");
                         drop(stream);
                     } else {
+                        // (vendored, divergence 15) Sample the kernel's smoothed TCP
+                        // RTT here — the accept loop is the only point the concrete
+                        // TcpStream (hence the raw fd) is reachable; run_connection
+                        // takes a generic stream and wraps it immediately. The
+                        // handshake-seeded srtt is available right away and is what
+                        // link-adaptive consumers key on. 0 = unknown (kept on error).
+                        if let Some(cell) = &self.link_rtt_ms {
+                            let rtt = tcp_srtt_ms(&stream).unwrap_or(0);
+                            cell.store(rtt, Ordering::Relaxed);
+                            debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
+                        }
                         let started = tokio::time::Instant::now();
                         let result = self.run_connection(stream).await;
                         let duration = started.elapsed();

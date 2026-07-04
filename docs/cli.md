@@ -130,6 +130,14 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   transports, never to zero (the client needs trailing frames
                           #   to present/ack). Video degrades to choppy-but-steady-and-in-
                           #   sync instead of freezing; fps + bitrate recover when clear.
+                          #   RTT-seeded start (2026-07-05): when the kernel-measured
+                          #   TCP RTT at accept is >= MACRDP_ADAPTIVE_SEED_RTT_MS
+                          #   (default 50; 0 disables), the encoder STARTS at
+                          #   ceiling/3 (clamped to the floor) instead of the full
+                          #   ceiling, so the first seconds don't overshoot a distant
+                          #   pipe; the controller climbs back within seconds if the
+                          #   link has headroom (long-but-fat links still reach full
+                          #   quality). Fast/unknown links start at the ceiling.
                           #   Tunables: MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,
                           #   DECREASE,INTERVAL_MS,RETX_TOLERANCE},
                           #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (congestion threshold,

@@ -1807,6 +1807,7 @@ dependencies = [
  "ironrdp-rdpsnd",
  "ironrdp-svc",
  "ironrdp-tokio",
+ "libc",
  "qoicoubeh",
  "rayon",
  "tokio",
