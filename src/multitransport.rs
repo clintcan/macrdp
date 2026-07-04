@@ -113,6 +113,42 @@ mod tests {
         assert!(reg.take(&other).is_none(), "removed cookie must not bind");
     }
 
+    // Tunnel-death handling (2026-07-04): take() hands the listener the SAME
+    // bound flag register() gave the server, so flipping it false on a dead
+    // tunnel is visible to the server's per-wave lossy_audio_target check; and
+    // the suppression cooldown gates multitransport offers for reconnects.
+    #[test]
+    fn cookie_registry_death_flow_flag_and_suppression() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let reg = CookieRegistry::new();
+        let cookie = [0x42u8; 16];
+        let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_flag = reg.register(cookie, in_tx);
+        let (_sink, listener_flag) = reg.take(&cookie).expect("cookie binds");
+        assert!(server_flag.load(Ordering::Relaxed), "bound after take");
+        // The listener's copy IS the server's flag: a death-flip is observed
+        // by the server side (audio falls back to TCP on the next wave).
+        listener_flag.store(false, Ordering::Relaxed);
+        assert!(!server_flag.load(Ordering::Relaxed), "death-flip visible");
+
+        // Suppression: off by default, on after suppress, extends not shrinks.
+        assert!(!reg.multitransport_suppressed());
+        reg.suppress_multitransport(Duration::from_secs(60));
+        assert!(reg.multitransport_suppressed());
+        let long = Duration::from_secs(120);
+        reg.suppress_multitransport(long);
+        reg.suppress_multitransport(Duration::from_millis(1)); // shorter: no-op
+        assert!(
+            reg.multitransport_suppressed(),
+            "a shorter re-suppress must not shrink the window"
+        );
+        // A clone shares the suppression state (server + listener hold clones).
+        let clone = reg.clone();
+        assert!(clone.multitransport_suppressed());
+    }
+
     // The Initiate Multitransport Request the server sends in M1 is the one bit
     // of new on-wire behavior that no real loopback client exercises (mstsc /
     // sdl-freerdp don't advertise UDP over 127.0.0.1). This round-trips the

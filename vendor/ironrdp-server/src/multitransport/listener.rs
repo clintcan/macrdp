@@ -122,6 +122,14 @@ struct Peer {
     dtls: Option<DtlsConn>,
     /// Whether we've logged DTLS-handshake completion (avoid log spam).
     dtls_done_logged: bool,
+    /// The owning connection's tunnel-bound flag, kept after a cookie-bound
+    /// CREATEREQUEST (`CookieRegistry::take` now returns it alongside the
+    /// sink). Lets tunnel-DEATH detection flip it back **false**: the server
+    /// re-checks the flag per audio wave (`lossy_audio_target`), so audio
+    /// falls back to the static TCP channel the moment a dead tunnel is
+    /// declared. `None` until bound / on the soft-bound test path / after the
+    /// peer has been declared dead (cleared so death fires once).
+    bound_flag: Option<Arc<core::sync::atomic::AtomicBool>>,
     /// (M3c) Wall-clock ms (listener `start.elapsed()`) of the last *inbound*
     /// datagram from this peer. Drives `gc_idle_peers`: a dead client (its RDP/TCP
     /// session gone) stops acking, so this stops advancing while the reliability SM
@@ -288,6 +296,56 @@ const PEER_IDLE_TIMEOUT_MS: u64 = 60_000;
 /// stops acking but the reliability SM keeps RTO-retransmitting unacked EGFX to it
 /// forever (`pump_peers_on_timer`), and over a long-running server dead peers
 /// accumulate unbounded. Activity-based, so it covers graceful, abrupt, and crashed
+/// Tunnel-death detection: a peer with a BOUND tunnel (`bound_flag` kept from
+/// the cookie bind) that has been inbound-silent past `dead_ms` has lost its
+/// UDP path — an overlay network (ZeroTier) dropping UDP, a NAT rebind, a
+/// de-migrated-and-abandoned tunnel. Two actions, both aimed at what the
+/// server CAN still fix (keepalives can't — if the path is dead they don't
+/// arrive either):
+/// - flip the connection's tunnel-bound flag **false** → the server's
+///   per-wave `lossy_audio_target` check fails → audio falls back to the
+///   static TCP channel immediately (EGFX has its own ack-silence watchdog);
+/// - start the multitransport-offer **cooldown** → when the client's own
+///   ~60 s dead-tunnel timeout resets the session and it auto-reconnects,
+///   the new connection gets NO multitransport offer and lands plain-TCP,
+///   breaking the observed reset→reconnect→reset cycle (live 2026-07-04
+///   over ZeroTier).
+/// The flag is cleared after firing so a peer is declared dead exactly once;
+/// the 60 s idle GC still evicts it later. O(peers) per tick.
+fn check_dead_tunnels(
+    peers: &mut HashMap<SocketAddr, Peer>,
+    cookie_registry: Option<&CookieRegistry>,
+    now_ms: u64,
+    dead_ms: u64,
+    cooldown_secs: u64,
+) {
+    if dead_ms == 0 {
+        return;
+    }
+    for (addr, peer) in peers.iter_mut() {
+        if peer.bound_flag.is_none() || now_ms.saturating_sub(peer.last_seen_ms) <= dead_ms {
+            continue;
+        }
+        let flag = peer.bound_flag.take().expect("checked is_none above");
+        flag.store(false, core::sync::atomic::Ordering::Relaxed);
+        if cooldown_secs > 0 {
+            if let Some(reg) = cookie_registry {
+                reg.suppress_multitransport(std::time::Duration::from_secs(cooldown_secs));
+            }
+        }
+        warn!(
+            peer_addr = %addr,
+            idle_ms = now_ms.saturating_sub(peer.last_seen_ms),
+            dead_ms,
+            cooldown_secs,
+            "UDP tunnel DEAD (bound peer inbound-silent past the threshold) — \
+             tunnel-dependent channels fall back to TCP now, and multitransport \
+             offers are suppressed for the cooldown so the client's likely \
+             dead-tunnel session reset reconnects as a stable plain-TCP session"
+        );
+    }
+}
+
 /// disconnects uniformly. O(peers) on each `retransmit_tick`; peers is a handful.
 fn gc_idle_peers(
     peers: &mut HashMap<SocketAddr, Peer>,
@@ -407,6 +465,7 @@ fn handle_emt_tunnel(
     tunnel_created: &mut bool,
     cookie_registry: Option<&CookieRegistry>,
     inbound: &mut Option<UnboundedSender<Vec<u8>>>,
+    bound_flag: &mut Option<Arc<core::sync::atomic::AtomicBool>>,
 ) -> EmtTunnelOutcome {
     use ironrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
 
@@ -433,7 +492,12 @@ fn handle_emt_tunnel(
                         // tunnel's client→server channel data (M5c step 3b).
                         let inbound_sink = match cookie_registry {
                             Some(reg) => match reg.take(&req.security_cookie) {
-                                Some(sink) => Some(sink),
+                                Some((sink, flag)) => {
+                                    // Keep the bound flag with the peer so
+                                    // tunnel-death detection can flip it false.
+                                    *bound_flag = Some(flag);
+                                    Some(sink)
+                                }
                                 None => {
                                     warn!(
                                         %peer_addr,
@@ -537,6 +601,20 @@ async fn run_recv_loop(
     // never sees the copy. Only meaningful with MACRDP_UDP_LOSSY_DELIVERY (it needs
     // the lossy SM); default OFF.
     let lossy_dup = super::env_truthy("MACRDP_UDP_LOSSY_AUDIO_DUP");
+    // Tunnel-death threshold: a BOUND peer with no inbound datagram for this
+    // long is declared dead (mstsc's idle keepalive cadence is ~15 s, so the
+    // 30 s default = two missed keepalives; must stay < the 60 s idle GC so
+    // death is detected before the peer is evicted). 0 disables detection.
+    let tunnel_dead_ms: u64 = std::env::var("MACRDP_UDP_TUNNEL_DEAD_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|s| s * 1000)
+        .unwrap_or(30_000);
+    // Multitransport-offer cooldown after a tunnel death (0 = no suppression).
+    let mt_cooldown_secs: u64 = std::env::var("MACRDP_UDP_MT_COOLDOWN_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(600);
     if lossy_dup {
         debug!(
             "MACRDP_UDP_LOSSY_AUDIO_DUP set — lossy flows will duplicate each source datagram (1+1 redundancy)"
@@ -586,6 +664,13 @@ async fn run_recv_loop(
                 // (M3c) Reap peers whose client has gone away (no inbound for
                 // PEER_IDLE_TIMEOUT_MS) so the dead-peer retransmits above stop and
                 // peers/bound_addrs don't leak. Same tick — cheap, peers is small.
+                check_dead_tunnels(
+                    &mut peers,
+                    cookie_registry.as_ref(),
+                    now_ms,
+                    tunnel_dead_ms,
+                    mt_cooldown_secs,
+                );
                 gc_idle_peers(&mut peers, &mut bound_addrs, now_ms);
                 continue;
             }
@@ -697,6 +782,7 @@ async fn run_recv_loop(
                 emt_inbound: Vec::new(),
                 tunnel_created: false,
                 inbound_sink: None,
+                bound_flag: None,
                 dtls_observed: false,
                 dtls: None,
                 dtls_done_logged: false,
@@ -800,6 +886,7 @@ async fn run_recv_loop(
                         emt_inbound,
                         tunnel_created,
                         inbound_sink,
+                        bound_flag,
                         ..
                     } = peer;
                     if let Some(conn) = dtls_opt.as_mut() {
@@ -854,6 +941,7 @@ async fn run_recv_loop(
                                 tunnel_created,
                                 cookie_registry.as_ref(),
                                 inbound_sink,
+                                bound_flag,
                             );
                             if let Some(cookie) = outcome.bound_cookie {
                                 bound_addrs.insert(cookie, peer_addr);
@@ -906,6 +994,7 @@ async fn run_recv_loop(
                     emt_inbound,
                     tunnel_created,
                     inbound_sink,
+                    bound_flag,
                     ..
                 } = peer;
 
@@ -955,6 +1044,7 @@ async fn run_recv_loop(
                         tunnel_created,
                         cookie_registry.as_ref(),
                         inbound_sink,
+                        bound_flag,
                     );
                     if let Some(cookie) = outcome.bound_cookie {
                         // (M5c) Record cookie -> this peer so server-originated

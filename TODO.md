@@ -55,9 +55,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
   The reliable-tunnel retransmit counter barely fires in practice — ack-lag is the dominant
   signal. (Remove this line next prune.)
 
-- [ ] **UDP-tunnel keepalive / clean close — mstsc's ~60s dead-tunnel session reset.
-  PRIORITY RAISED 2026-07-04: second live repro, now on the LOSSY-AUDIO path over
-  ZeroTier.** Original find (2026-06-29, P1 testing): after the watchdog de-migrates EGFX
+- [x] **UDP-tunnel death detection + offer cooldown — SHIPPED 2026-07-04** (the fix for
+  mstsc's ~60s dead-tunnel session reset; keepalives were REJECTED — in the overlay case
+  the UDP path itself is dead, so keepalives can't arrive either). The listener declares a
+  BOUND tunnel dead after `MACRDP_UDP_TUNNEL_DEAD_SECS` (30s) of inbound silence → audio
+  falls back to TCP immediately (per-wave `lossy_audio_target` re-check) + multitransport
+  offers are suppressed for `MACRDP_UDP_MT_COOLDOWN_SECS` (600s) so the client's reset
+  reconnects as a stable plain-TCP session — the cycle is broken after at most ONE reset.
+  Registry semantics unit-tested; **live verification of the listener path pending** (needs
+  real mstsc with a bound tunnel + UDP-only blockage — e.g. LAN mstsc with lossy audio on,
+  then a UDP-only pf block on 3390). ORIGINAL ITEM (kept for context):** Original find (2026-06-29, P1 testing): after the watchdog de-migrates EGFX
   to TCP, the abandoned reliable tunnel goes silent and ~60s later **mstsc resets the whole
   session** (its multitransport dead-tunnel timeout). New repro (2026-07-04): with
   `ENABLE_LOSSY_AUDIO=1` over **ZeroTier**, the lossy UDP/DTLS audio tunnel wedges on the

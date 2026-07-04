@@ -153,13 +153,17 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   5/10/15% loss where single-send glitches. Bridges the
                           #   MACRDP_UDP_{OFFER_FECL,LOSSY_DELIVERY,LOSSY_AUDIO,
                           #   LOSSY_AUDIO_DUP} env gates (still work standalone).
-                          #   CAVEAT (2026-07-04): LAN/WiFi only — do NOT enable over
-                          #   VPN/ZeroTier-class overlay links. If the UDP tunnel
-                          #   wedges there, mstsc's ~60s dead-tunnel timeout resets
-                          #   the whole session CYCLICALLY (up ~60s → reset →
-                          #   reconnect → repeat; live repro 2026-07-04). Keep
-                          #   internet links on plain TCP until the tunnel
-                          #   keepalive/clean-close fix lands (see TODO.md).
+                          #   CAVEAT (2026-07-04): prefer LAN/WiFi. Over VPN/ZeroTier-
+                          #   class overlays the UDP tunnel can wedge and mstsc's ~60s
+                          #   dead-tunnel timeout resets the session. Tunnel-death
+                          #   detection now bounds that: after MACRDP_UDP_TUNNEL_
+                          #   DEAD_SECS (30) of inbound silence on a bound tunnel,
+                          #   audio falls back to TCP and multitransport offers are
+                          #   suppressed for MACRDP_UDP_MT_COOLDOWN_SECS (600) — so
+                          #   the reset reconnects as a stable plain-TCP session
+                          #   (at most ONE reset instead of an endless cycle; live
+                          #   verification pending). Plain TCP (both flags off) is
+                          #   still the recommended config for such links.
                           #   macOS-only.
 --fork-workers            # Opt-in (default OFF; FORK_WORKERS=1 in config.env) —
                           #   and staying opt-in by DECISION (2026-07-04, roadmap

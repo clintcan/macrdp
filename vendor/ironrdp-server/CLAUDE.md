@@ -950,3 +950,28 @@ AND released — #1276 landing is NOT sufficient.
     Upstreamable as-is (additive), or better as a real decline hook on
     `GraphicsPipelineHandler` (e.g. `fn accept_pipeline(&caps) -> bool`
     consulted before queueing the confirm) — offer alongside the egfx work.
+
+    Tunnel-death detection + multitransport-offer cooldown (2026-07-04, extends
+    divergence (12)): the fix for mstsc's ~60 s dead-tunnel session reset
+    (two live repros: the 2026-06-29 watchdog de-migrate follow-up, and the
+    2026-07-04 ZeroTier lossy-audio cycle — session up ~60 s → reset →
+    reconnect → blank → recovery → repeat). Keepalives were evaluated and
+    REJECTED: in the overlay-network case the UDP path itself is dead, so
+    server keepalives can't reach the client either. What the server CAN fix:
+    (a) `CookieRegistry::take` now also returns the tunnel-bound flag, the
+    listener keeps it on the `Peer` (`bound_flag`), and `check_dead_tunnels`
+    (on the retransmit tick) declares a BOUND peer dead after
+    `MACRDP_UDP_TUNNEL_DEAD_SECS` (default 30 s ≈ two missed mstsc idle
+    keepalives; must stay < the 60 s idle GC; 0 disables) of inbound silence —
+    flipping the flag false so the server's per-wave `lossy_audio_target`
+    check fails and audio falls back to the static TCP channel immediately
+    (EGFX has its own ack-silence watchdog); (b) the same event starts a
+    multitransport-offer COOLDOWN (`CookieRegistry::{suppress_multitransport,
+    multitransport_suppressed}`, shared state inside the registry both ends
+    already hold — zero new wiring; `MACRDP_UDP_MT_COOLDOWN_SECS`, default
+    600, 0 disables), and `run_connection` skips the offer while suppressed —
+    so the client's dead-tunnel reset reconnects as a stable plain-TCP session
+    instead of re-establishing a doomed tunnel and cycling. Registry semantics
+    unit-tested in macrdp's `src/multitransport.rs` (the vendored crate is
+    test = false). Live verification of the listener path needs a real mstsc
+    with a bound tunnel + UDP-only blockage — pending.

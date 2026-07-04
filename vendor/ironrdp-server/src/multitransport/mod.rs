@@ -28,6 +28,7 @@ pub mod listener;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Result;
 use ironrdp_acceptor::MultitransportOffer;
@@ -123,7 +124,22 @@ struct CookieEntry {
 }
 
 #[derive(Clone, Default)]
-pub struct CookieRegistry(Arc<Mutex<HashMap<[u8; 16], CookieEntry>>>);
+pub struct CookieRegistry {
+    entries: Arc<Mutex<HashMap<[u8; 16], CookieEntry>>>,
+    /// Multitransport offer suppression deadline (tunnel-death cooldown).
+    /// Set by the UDP listener when a BOUND tunnel goes inbound-silent past
+    /// the death threshold — evidence the client's UDP path is broken (an
+    /// overlay network like ZeroTier dropping UDP, a NAT rebind, …). While
+    /// set, `RdpServer` skips the multitransport offer on new connections, so
+    /// the reconnect that typically follows (mstsc resets the session ~60 s
+    /// after its tunnel dies) lands as a plain-TCP session instead of
+    /// re-establishing a doomed tunnel and repeating the reset — this is what
+    /// breaks the observed reconnect CYCLE (live 2026-07-04 over ZeroTier:
+    /// up ~60 s → reset → reconnect → blank → recovery → repeat). Keepalives
+    /// can't fix that case: the network path itself is dead, so server
+    /// keepalives wouldn't reach the client either.
+    suppressed_until: Arc<Mutex<Option<Instant>>>,
+}
 
 impl CookieRegistry {
     /// A fresh, empty registry. Create one in `main` and share it (clone) with
@@ -140,7 +156,7 @@ impl CookieRegistry {
     /// connection is up (the cue to send the Soft-Sync request).
     pub fn register(&self, cookie: [u8; 16], inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> Arc<AtomicBool> {
         let bound = Arc::new(AtomicBool::new(false));
-        if let Ok(mut map) = self.0.lock() {
+        if let Ok(mut map) = self.entries.lock() {
             map.insert(
                 cookie,
                 CookieEntry {
@@ -154,7 +170,7 @@ impl CookieRegistry {
 
     /// Drop a cookie (evicted on teardown / TCP fallback).
     pub fn remove(&self, cookie: &[u8; 16]) {
-        if let Ok(mut map) = self.0.lock() {
+        if let Ok(mut map) = self.entries.lock() {
             map.remove(cookie);
         }
     }
@@ -164,14 +180,41 @@ impl CookieRegistry {
     /// listener can forward this tunnel's client→server channel data). Returns
     /// `None` for an unknown cookie. One-time use — a retransmitted/replayed
     /// CREATEREQUEST with the same cookie won't bind a second tunnel.
-    pub fn take(&self, cookie: &[u8; 16]) -> Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> {
-        let removed = match self.0.lock() {
+    pub fn take(
+        &self,
+        cookie: &[u8; 16],
+    ) -> Option<(tokio::sync::mpsc::UnboundedSender<Vec<u8>>, Arc<AtomicBool>)> {
+        let removed = match self.entries.lock() {
             Ok(mut map) => map.remove(cookie),
             Err(_) => None,
         };
         let entry = removed?;
         entry.bound.store(true, Ordering::Relaxed);
-        Some(entry.inbound)
+        // The listener keeps the flag alongside the peer so tunnel DEATH can
+        // flip it back false — the server re-checks it per audio wave
+        // (`lossy_audio_target`), so audio falls back to the static TCP
+        // channel on the next wave after a dead tunnel is detected.
+        Some((entry.inbound, entry.bound))
+    }
+
+    /// Suppress multitransport offers until `cooldown` from now (tunnel-death
+    /// cooldown — see the field note). Extends any existing suppression.
+    pub fn suppress_multitransport(&self, cooldown: core::time::Duration) {
+        if let Ok(mut until) = self.suppressed_until.lock() {
+            let new_until = Instant::now() + cooldown;
+            *until = Some(match *until {
+                Some(cur) if cur > new_until => cur,
+                _ => new_until,
+            });
+        }
+    }
+
+    /// True while multitransport offers are suppressed (see the field note).
+    pub fn multitransport_suppressed(&self) -> bool {
+        match self.suppressed_until.lock() {
+            Ok(until) => until.is_some_and(|t| Instant::now() < t),
+            Err(_) => false,
+        }
     }
 }
 

@@ -893,8 +893,26 @@ impl RdpServer {
         // ONLY point clients honor it — after licensing, before Demand Active.
         // (Sending it post-finalization, once the client is ACTIVE, makes both
         // mstsc and FreeRDP misparse it as a share-control PDU and disconnect.)
+        // Tunnel-death cooldown: after the UDP listener declares a bound tunnel
+        // dead (peer inbound-silent — e.g. an overlay network like ZeroTier
+        // dropping UDP), it suppresses multitransport offers for a cooldown so
+        // the client's reconnect (mstsc resets the session ~60 s after its
+        // tunnel dies) lands as a stable plain-TCP session instead of
+        // re-establishing a doomed tunnel and repeating the reset cycle.
         #[cfg(feature = "multitransport")]
-        if let Some(provider) = self.multitransport.as_ref() {
+        let mt_suppressed = self
+            .multitransport_cookies
+            .as_ref()
+            .is_some_and(|reg| reg.multitransport_suppressed());
+        #[cfg(feature = "multitransport")]
+        if mt_suppressed && self.multitransport.is_some() {
+            tracing::info!(
+                "multitransport offer SUPPRESSED (tunnel-death cooldown) — this \
+                 connection runs plain TCP"
+            );
+        }
+        #[cfg(feature = "multitransport")]
+        if let Some(provider) = self.multitransport.as_ref().filter(|_| !mt_suppressed) {
             let offer = crate::multitransport::new_offer(provider.requested_protocol());
             // Register this connection's cookie so the UDP listener can bind an
             // inbound tunnel to it. Evict the previous connection's cookie first
