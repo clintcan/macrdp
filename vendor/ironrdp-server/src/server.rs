@@ -431,6 +431,18 @@ pub struct RdpServer {
     /// adaptive-bitrate seeding in `h264.rs`) hold a clone. 0 = unknown /
     /// unsupported platform; a sub-millisecond LAN RTT stores as 1.
     link_rtt_ms: Option<Arc<AtomicU32>>,
+    /// (vendored, extends divergence 12) The cookie registered for the CURRENT
+    /// connection's multitransport offer, so the post-connection reset can
+    /// evict it from the registry no matter how the connection ended. Without
+    /// this, eviction keyed off `MigrationState` (set only in `client_accepted`)
+    /// — so any connection dying between the offer and activation (mstsc's
+    /// cert-prompt broken pipe, CredSSP failures, port scans) leaked its
+    /// registry entry forever, and a client's LATE tunnel bind (UDP handshake
+    /// completing after a fast session end) could consume the stale cookie and
+    /// re-raise a retired bound flag → zombie peer → spurious death + 10-min
+    /// offer cooldown.
+    #[cfg(feature = "multitransport")]
+    current_offer_cookie: Option<[u8; 16]>,
     /// (vendored, divergence 13) Optional Server Auto-Reconnect Cookie
     /// (MS-RDPBCGR 2.2.4.3 ARC_SC_PRIVATE_PACKET). When set, the server sends a
     /// Save Session Info PDU carrying it once per TCP connection, right after
@@ -638,6 +650,8 @@ impl RdpServer {
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
             link_rtt_ms: None,
+            #[cfg(feature = "multitransport")]
+            current_offer_cookie: None,
             auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
             honor_client_desktop_size: false,
@@ -1060,6 +1074,7 @@ impl RdpServer {
                 // match, and the EGFX dispatch path reads it to fire Soft-Sync.
                 self.udp_tunnel_bound = Some(registry.register(offer.cookie, in_tx));
             }
+            self.current_offer_cookie = Some(offer.cookie);
             acceptor.set_advertise_extended_client_data(true);
             acceptor.set_multitransport_offer(Some(offer));
         }
@@ -1251,6 +1266,21 @@ impl RdpServer {
                             // as before (its flag is still up when the check runs).
                             if let Some(flag) = &self.udp_tunnel_bound {
                                 flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            // Evict the connection's offer cookie no matter how it
+                            // ended. Eviction used to be keyed off `MigrationState`
+                            // (set only at activation), so a connection dying
+                            // earlier — mstsc's cert-prompt broken pipe, CredSSP
+                            // failures, probes — leaked one registry entry per
+                            // attempt forever, and a LATE tunnel bind (the client's
+                            // UDP handshake outliving a fast session end) could
+                            // still consume the stale cookie and re-raise the
+                            // retired flag → zombie peer → spurious death + a
+                            // 10-min offer cooldown on a healthy setup.
+                            if let Some(cookie) = self.current_offer_cookie.take() {
+                                if let Some(registry) = self.multitransport_cookies.as_ref() {
+                                    registry.remove(&cookie);
+                                }
                             }
                         }
 

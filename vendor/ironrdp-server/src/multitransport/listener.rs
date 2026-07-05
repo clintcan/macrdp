@@ -324,19 +324,51 @@ fn check_dead_tunnels(
         return;
     }
     for (addr, peer) in peers.iter_mut() {
-        if peer.bound_flag.is_none() || now_ms.saturating_sub(peer.last_seen_ms) <= dead_ms {
+        let Some(flag_ref) = peer.bound_flag.as_ref() else {
+            continue;
+        };
+        let idle_ms = now_ms.saturating_sub(peer.last_seen_ms);
+        if !flag_ref.load(core::sync::atomic::Ordering::Relaxed) {
+            // The server retired this tunnel (its TCP session ended). Adjudicate
+            // AT THE FIRST TICK we observe the lowering — idle time then tells
+            // wedge from teardown: a tunnel that was already inbound-silent past
+            // the death threshold when its session ended had wedged BEFORE the
+            // end (the end was likely a casualty: TCP error on the same dying
+            // link, a recovery drop), so death + cooldown still apply — without
+            // this, any session end within the detection window laundered a
+            // real wedge into "benign teardown" and the reset cycle could
+            // recur cooldown-free. A tunnel that was recently active when the
+            // session ended is normal teardown: retire quietly, no cooldown.
+            // (A wedge younger than the threshold at session end is inherently
+            // ambiguous and intentionally reads as teardown.)
+            let _ = peer.bound_flag.take();
+            if idle_ms > dead_ms {
+                if cooldown_secs > 0 {
+                    if let Some(reg) = cookie_registry {
+                        reg.suppress_multitransport(std::time::Duration::from_secs(cooldown_secs));
+                    }
+                }
+                warn!(
+                    peer_addr = %addr,
+                    idle_ms,
+                    dead_ms,
+                    cooldown_secs,
+                    "UDP tunnel DEAD (wedged before its session ended) — multitransport \
+                     offers are suppressed for the cooldown"
+                );
+            } else {
+                debug!(
+                    peer_addr = %addr,
+                    idle_ms,
+                    "abandoned UDP tunnel from an ended session — retiring quietly (no cooldown)"
+                );
+            }
             continue;
         }
-        let flag = peer.bound_flag.take().expect("checked is_none above");
-        if !flag.load(core::sync::atomic::Ordering::Relaxed) {
-            // Already retired by the server (session over) — benign, not a wedge.
-            debug!(
-                peer_addr = %addr,
-                idle_ms = now_ms.saturating_sub(peer.last_seen_ms),
-                "abandoned UDP tunnel from an ended session — retiring quietly (no cooldown)"
-            );
+        if idle_ms <= dead_ms {
             continue;
         }
+        let flag = peer.bound_flag.take().expect("checked is_some above");
         flag.store(false, core::sync::atomic::Ordering::Relaxed);
         if cooldown_secs > 0 {
             if let Some(reg) = cookie_registry {
@@ -640,6 +672,22 @@ async fn run_recv_loop(
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|s| s * 1000)
         .unwrap_or(30_000);
+    // Clamp below the idle GC: at >= PEER_IDLE_TIMEOUT_MS the GC would evict the
+    // peer before death is ever declared — audio would still fall back (the GC
+    // lowers the flag) but the offer COOLDOWN would silently never engage,
+    // resurrecting the dead-tunnel reset cycle the detection exists to break.
+    let tunnel_dead_ms = if tunnel_dead_ms >= PEER_IDLE_TIMEOUT_MS {
+        let clamped = PEER_IDLE_TIMEOUT_MS - 5_000;
+        warn!(
+            requested_ms = tunnel_dead_ms,
+            clamped_ms = clamped,
+            "MACRDP_UDP_TUNNEL_DEAD_SECS must stay below the {}s idle GC — clamped",
+            PEER_IDLE_TIMEOUT_MS / 1000
+        );
+        clamped
+    } else {
+        tunnel_dead_ms
+    };
     // Multitransport-offer cooldown after a tunnel death (0 = no suppression).
     let mt_cooldown_secs: u64 = std::env::var("MACRDP_UDP_MT_COOLDOWN_SECS")
         .ok()
@@ -773,7 +821,17 @@ async fn run_recv_loop(
         // binds cleanly. (A SYN on a still-HANDSHAKING peer is a normal SYN
         // retransmit — `is_established()` gates that out.)
         if is_syn_family(data) && peers.get(&peer_addr).is_some_and(|p| p.sm.is_established()) {
-            peers.remove(&peer_addr);
+            if let Some(stale) = peers.remove(&peer_addr) {
+                // Third Peer-removal site (after tunnel-death and the idle GC):
+                // lower a surviving bound flag so the server's per-wave
+                // `lossy_audio_target` check falls audio back to TCP instead of
+                // routing waves at a peer that no longer exists (a mid-session
+                // re-SYN from a reused source port would otherwise leave the
+                // server-side flag stranded true = permanent silence).
+                if let Some(flag) = stale.bound_flag {
+                    flag.store(false, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
             bound_addrs.retain(|_, a| *a != peer_addr);
             debug!(%peer_addr, "RDPEUDP SYN on an established peer — replacing stale peer (port reuse / reconnect)");
         }

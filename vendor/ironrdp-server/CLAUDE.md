@@ -1044,3 +1044,31 @@ AND released — #1276 landing is NOT sufficient.
     every worker connection as LAN, re-arming the #135 false positive for
     FORK_WORKERS-over-VPN deployments. Also fixed the interleaved
     check_dead_tunnels/gc_idle_peers doc blocks (cosmetic).
+
+    Tunnel-state lifecycle fixes (2026-07-06, from the second sweep's
+    concurrency audit — extends the #138 hardening): (F1) the offer-site
+    cookie registration leaked one registry entry per connection that died
+    before activation (mstsc cert-prompt broken pipe, CredSSP failures,
+    probes) because eviction was keyed off MigrationState, set only in
+    client_accepted. New `current_offer_cookie` field, set at the offer site
+    and evicted in the post-connection reset (runs on every run_connection
+    return path) — which also closes (F3): a client's LATE tunnel bind (UDP
+    handshake outliving a fast session end) could consume the stale cookie,
+    re-raise the retired bound flag, and produce a zombie peer whose eventual
+    "death" started a spurious 10-min cooldown. (F2) the SYN stale-peer
+    replacement is the THIRD Peer-removal site and now also lowers a
+    surviving bound flag (mid-session re-SYN from a reused port stranded the
+    server flag true = permanent audio silence — same class as the #138 GC
+    fix). (F4) check_dead_tunnels now adjudicates retired flags AT the first
+    tick the lowering is observed: already-silent-past-threshold at
+    retirement = the wedge predated the session end → death + cooldown still
+    fire (an early session end no longer launders a real wedge into "benign
+    teardown", which could have resurrected the reset cycle cooldown-free on
+    sub-80ms flapping links); recently-active at retirement = quiet retire.
+    A wedge younger than the threshold at session end intentionally reads as
+    teardown (inherently ambiguous). (F5) MACRDP_UDP_TUNNEL_DEAD_SECS is
+    clamped below the 60 s idle GC with a warn — at/above it the GC won the
+    race and the cooldown protection silently never engaged. Audit also
+    confirmed clean: per-offer flag Arc identity (no cross-connection
+    retirement), CookieRegistry lock ordering/poisoning, inbound-sink
+    lifetime, Relaxed ordering adequacy.
