@@ -172,9 +172,13 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   (at most ONE reset instead of an endless cycle;
                           #   LIVE-VERIFIED 2026-07-04 on real mstsc/ZeroTier:
                           #   3x tunnel-DEAD at ~30s, audio kept playing, all
-                          #   reconnects offer-SUPPRESSED plain TCP). Plain TCP
-                          #   (both flags off) is
-                          #   still the recommended config for such links.
+                          #   reconnects offer-SUPPRESSED plain TCP). And the offer
+                          #   is now RTT-GATED at connect: links at/above
+                          #   MACRDP_UDP_OFFER_MAX_RTT_MS (80; 0 disables) are never
+                          #   offered UDP at all — they run plain TCP from the first
+                          #   byte — so this flag is safe to leave on for a roaming
+                          #   client. Plain TCP (both flags off) remains the
+                          #   zero-risk config for overlay-only setups.
                           #   macOS-only.
 --fork-workers            # Opt-in (default OFF; FORK_WORKERS=1 in config.env) —
                           #   and staying opt-in by DECISION (2026-07-04, roadmap

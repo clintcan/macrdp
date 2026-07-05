@@ -297,6 +297,31 @@ fn migrate_egfx_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::multitransport::env_truthy("MACRDP_UDP_MIGRATE_EGFX"))
 }
 
+/// (vendored, extends divergences 12+15) Link-RTT gate for the multitransport
+/// offer: a connection whose kernel-measured TCP RTT at accept is at or above
+/// `MACRDP_UDP_OFFER_MAX_RTT_MS` (ms; default 80; 0 disables the gate) is not
+/// offered UDP at all — it runs plain TCP from the first byte. On overlay
+/// links (VPN/ZeroTier/mobile) the UDP tunnel is prone to wedging, and the
+/// reactive tunnel-death detection only bounds the damage (up to ~30 s of dead
+/// tunnel + possibly one client-side session reset per wedge); withholding the
+/// offer avoids the predictably bad case entirely, so the lossy-audio /
+/// EGFX-over-UDP switches are safe to leave enabled on a roaming client —
+/// LAN/WiFi sessions get UDP, distant sessions silently stay pure TCP. The
+/// residual case (a link that degrades after connect) stays covered by the
+/// tunnel-death detection. Threshold read once and cached; the RTT is
+/// per-connection (divergence 15 cell).
+#[cfg(feature = "multitransport")]
+fn multitransport_offer_max_rtt_ms() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MACRDP_UDP_OFFER_MAX_RTT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(80)
+    })
+}
+
 /// (P2.4b diagnostic) EXPERIMENTAL: migrate EGFX onto the LOSSY (UdpFecL/DTLS)
 /// tunnel instead of the reliable (UdpFecR/rustls) one. This is an *isolation
 /// test* for the DTLS `RDP_TUNNEL_DATA` egress path (`ship_outbound`'s DTLS
@@ -964,8 +989,33 @@ impl RdpServer {
                  connection runs plain TCP"
             );
         }
+        // Link-RTT offer gate (see `multitransport_offer_max_rtt_ms`): don't
+        // even offer UDP to a connection whose accept-time RTT marks it as an
+        // overlay-class link where the tunnel predictably wedges.
         #[cfg(feature = "multitransport")]
-        if let Some(provider) = self.multitransport.as_ref().filter(|_| !mt_suppressed) {
+        let mt_rtt_gated = {
+            let max = multitransport_offer_max_rtt_ms();
+            let rtt = self
+                .link_rtt_ms
+                .as_ref()
+                .map_or(0, |c| c.load(Ordering::Relaxed));
+            let gated = max > 0 && rtt >= max && self.multitransport.is_some();
+            if gated && !mt_suppressed {
+                tracing::info!(
+                    link_rtt_ms = rtt,
+                    max_rtt_ms = max,
+                    "multitransport offer WITHHELD (link RTT above the offer gate) — this \
+                     connection runs plain TCP; UDP tunnels wedge on high-latency overlay links"
+                );
+            }
+            gated
+        };
+        #[cfg(feature = "multitransport")]
+        if let Some(provider) = self
+            .multitransport
+            .as_ref()
+            .filter(|_| !mt_suppressed && !mt_rtt_gated)
+        {
             let offer = crate::multitransport::new_offer(provider.requested_protocol());
             // Register this connection's cookie so the UDP listener can bind an
             // inbound tunnel to it. Evict the previous connection's cookie first

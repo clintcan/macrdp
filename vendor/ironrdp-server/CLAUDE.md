@@ -996,3 +996,15 @@ AND released — #1276 landing is NOT sufficient.
     seed (ceiling/3 start past MACRDP_ADAPTIVE_SEED_RTT_MS). Additive +
     handle-setter pattern → upstreamable, though the libc dep and the
     macOS-only sample make it less obviously general than (10)/(13).
+
+    RTT-gated multitransport offer (2026-07-05, extends divergences 12+15): the
+    offer site in `run_connection` now also withholds the offer when the
+    connection's accept-time kernel TCP RTT (the divergence-15 cell) is at or
+    above `MACRDP_UDP_OFFER_MAX_RTT_MS` (default 80; 0 disables) — an
+    overlay-class link (VPN/ZeroTier/mobile) runs plain TCP from the first byte
+    with no tunnel to wedge, making the UDP switches safe to leave enabled on a
+    roaming client. Composes with the tunnel-death cooldown (predictable case
+    avoided up front; post-connect degradation still caught reactively). Log
+    marker: "multitransport offer WITHHELD (link RTT above the offer gate)".
+    Verified live: threshold-1 loopback trips the gate (link_rtt_ms=1), default
+    80 leaves loopback offering normally.
