@@ -344,7 +344,7 @@ fn migrate_egfx_lossy() -> bool {
 /// without the option (Linux CI compiles the stub); a sub-ms LAN RTT maps to 1
 /// so 0 stays reserved for "unknown".
 #[cfg(target_os = "macos")]
-fn tcp_srtt_ms(stream: &tokio::net::TcpStream) -> Option<u32> {
+pub fn tcp_srtt_ms(stream: &tokio::net::TcpStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut info: libc::tcp_connection_info = unsafe { core::mem::zeroed() };
@@ -368,7 +368,7 @@ fn tcp_srtt_ms(stream: &tokio::net::TcpStream) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn tcp_srtt_ms(_stream: &tokio::net::TcpStream) -> Option<u32> {
+pub fn tcp_srtt_ms(_stream: &tokio::net::TcpStream) -> Option<u32> {
     None
 }
 
@@ -1237,6 +1237,20 @@ impl RdpServer {
                             // newly-migrated EGFX straight back to TCP.
                             if let Some(handle) = &self.demigrate_request {
                                 handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            // Retire this connection's tunnel: lower the shared bound
+                            // flag so the listener's tunnel-death check (which skips
+                            // lowered flags) treats the now-abandoned tunnel as benign
+                            // teardown — it just ages out via the idle GC. Without
+                            // this, every ended session's tunnel "dies" ~30 s later
+                            // and starts the multitransport-offer COOLDOWN, silently
+                            // downgrading the next 10 min of healthy-LAN connections
+                            // to plain TCP (observed live 2026-07-06 after a
+                            // blank-recovery drop). A tunnel that wedges while its
+                            // session is ALIVE still declares death + cooldown exactly
+                            // as before (its flag is still up when the check runs).
+                            if let Some(flag) = &self.udp_tunnel_bound {
+                                flag.store(false, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
 

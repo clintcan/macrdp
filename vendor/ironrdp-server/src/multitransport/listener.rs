@@ -289,13 +289,6 @@ async fn pump_peers_on_timer(
 /// activity-based backstop must be generous enough not to reap an idle-but-live client.
 const PEER_IDLE_TIMEOUT_MS: u64 = 60_000;
 
-/// (M3c) Idle-timeout garbage collection. Drop every peer whose last *inbound*
-/// datagram is older than `PEER_IDLE_TIMEOUT_MS`, along with any `bound_addrs`
-/// cookie→addr mapping pointing at it. Without this, peers inserted by
-/// `run_recv_loop` are never removed: a client whose RDP/TCP session has gone away
-/// stops acking but the reliability SM keeps RTO-retransmitting unacked EGFX to it
-/// forever (`pump_peers_on_timer`), and over a long-running server dead peers
-/// accumulate unbounded. Activity-based, so it covers graceful, abrupt, and crashed
 /// Tunnel-death detection: a peer with a BOUND tunnel (`bound_flag` kept from
 /// the cookie bind) that has been inbound-silent past `dead_ms` has lost its
 /// UDP path — an overlay network (ZeroTier) dropping UDP, a NAT rebind, a
@@ -312,6 +305,14 @@ const PEER_IDLE_TIMEOUT_MS: u64 = 60_000;
 ///   over ZeroTier).
 /// The flag is cleared after firing so a peer is declared dead exactly once;
 /// the 60 s idle GC still evicts it later. O(peers) per tick.
+///
+/// A peer whose shared flag has ALREADY been lowered by the server (the
+/// post-connection reset retires the tunnel when its owning TCP session ends)
+/// is benign teardown, not a wedge: the marker is dropped silently and the
+/// peer just ages out via the idle GC — no death declaration, no cooldown.
+/// Without that distinction every ended session's abandoned tunnel "died"
+/// ~30 s later and put healthy links into the 10-min offer cooldown (observed
+/// live 2026-07-06 on LAN after a blank-recovery drop).
 fn check_dead_tunnels(
     peers: &mut HashMap<SocketAddr, Peer>,
     cookie_registry: Option<&CookieRegistry>,
@@ -327,6 +328,15 @@ fn check_dead_tunnels(
             continue;
         }
         let flag = peer.bound_flag.take().expect("checked is_none above");
+        if !flag.load(core::sync::atomic::Ordering::Relaxed) {
+            // Already retired by the server (session over) — benign, not a wedge.
+            debug!(
+                peer_addr = %addr,
+                idle_ms = now_ms.saturating_sub(peer.last_seen_ms),
+                "abandoned UDP tunnel from an ended session — retiring quietly (no cooldown)"
+            );
+            continue;
+        }
         flag.store(false, core::sync::atomic::Ordering::Relaxed);
         if cooldown_secs > 0 {
             if let Some(reg) = cookie_registry {
@@ -346,6 +356,13 @@ fn check_dead_tunnels(
     }
 }
 
+/// (M3c) Idle-timeout garbage collection. Drop every peer whose last *inbound*
+/// datagram is older than `PEER_IDLE_TIMEOUT_MS`, along with any `bound_addrs`
+/// cookie→addr mapping pointing at it. Without this, peers inserted by
+/// `run_recv_loop` are never removed: a client whose RDP/TCP session has gone away
+/// stops acking but the reliability SM keeps RTO-retransmitting unacked EGFX to it
+/// forever (`pump_peers_on_timer`), and over a long-running server dead peers
+/// accumulate unbounded. Activity-based, so it covers graceful, abrupt, and crashed
 /// disconnects uniformly. O(peers) on each `retransmit_tick`; peers is a handful.
 fn gc_idle_peers(
     peers: &mut HashMap<SocketAddr, Peer>,
@@ -358,10 +375,23 @@ fn gc_idle_peers(
         .map(|(addr, _)| *addr)
         .collect();
     for addr in gone {
-        let idle_ms = peers
-            .remove(&addr)
-            .map(|p| now_ms.saturating_sub(p.last_seen_ms))
-            .unwrap_or(0);
+        let idle_ms = match peers.remove(&addr) {
+            Some(p) => {
+                // Defensive: lower the shared tunnel-bound flag on eviction. With
+                // the default thresholds tunnel-death (30 s) always fires before
+                // this GC (60 s) and takes the flag itself — but if an operator
+                // raises MACRDP_UDP_TUNNEL_DEAD_SECS to >= the GC timeout, the
+                // eviction would otherwise strand the server-side flag TRUE
+                // forever: no death declared, no cooldown, and lossy audio keeps
+                // routing into a tunnel that no longer exists (permanent silence
+                // with no TCP fallback).
+                if let Some(flag) = p.bound_flag {
+                    flag.store(false, core::sync::atomic::Ordering::Relaxed);
+                }
+                now_ms.saturating_sub(p.last_seen_ms)
+            }
+            None => 0,
+        };
         // Drop any cookie→addr bindings for the evicted peer so a stale cookie can't
         // route server tunnel data to it (or to a later peer that reuses the addr).
         bound_addrs.retain(|_, a| *a != addr);

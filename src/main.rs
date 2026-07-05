@@ -2462,7 +2462,7 @@ async fn async_main() -> Result<()> {
     // The server samples the kernel's smoothed TCP RTT for each accepted
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
-    server.set_link_rtt_handle(link_rtt_ms);
+    server.set_link_rtt_handle(link_rtt_ms.clone());
 
     // Client-resolution auto-adopt: the vendored acceptor reads the desktop
     // size the client requests in its GCC Client Core Data and negotiates
@@ -2668,7 +2668,22 @@ async fn async_main() -> Result<()> {
             .context("set inherited worker socket non-blocking")?;
         let stream = tokio::net::TcpStream::from_std(std_stream)
             .context("adopt inherited worker socket into tokio")?;
-        info!(fd, user = %username, "worker: serving one connection on inherited socket");
+        // Divergence-15 RTT sample for the worker path: the accept-loop sample
+        // site never runs here (the supervisor accepted the socket), so without
+        // this the shared cell stays 0 = "unknown" and every link-aware feature
+        // (blank-recovery RTT gate, bitrate seed, offer gate) treats a slow link
+        // as LAN — re-arming the exact blank-recovery false positive #135 fixed
+        // for fork-workers deployments reached over VPN/ZeroTier.
+        link_rtt_ms.store(
+            ironrdp_server::tcp_srtt_ms(&stream).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        info!(
+            fd,
+            user = %username,
+            link_rtt_ms = link_rtt_ms.load(std::sync::atomic::Ordering::Relaxed),
+            "worker: serving one connection on inherited socket"
+        );
         let res = server.run_connection(stream).await;
         // CRITICAL (fork-workers): force-exit the worker PROCESS here instead of
         // returning and letting the runtime unwind. Once an SCStream is live,

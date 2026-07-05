@@ -1020,3 +1020,27 @@ AND released — #1276 landing is NOT sufficient.
     a tunnel-death event that already lowered the flag); the RTT gate made the
     window genuinely reachable (e.g. a WiFi session with a bound tunnel followed
     within seconds by an auto-reconnect over a high-latency link).
+
+    Final-check hardening (2026-07-06, from the post-#136 regression sweep —
+    one live finding + two review findings): (a) **abandoned-tunnel false
+    cooldown (LIVE, the big one):** every ended session's tunnel went
+    inbound-silent and 30 s later `check_dead_tunnels` declared it DEAD +
+    started the 10-min offer cooldown — downgrading subsequent healthy-LAN
+    connections to plain TCP (observed twice in the deploy-night log after a
+    blank-recovery drop). Fix: the post-connection reset now RETIRES the
+    tunnel (lowers the shared `udp_tunnel_bound` flag), and the death check
+    treats an already-lowered flag as benign teardown (debug "retiring
+    quietly", no cooldown; peer ages out via the 60 s GC). A tunnel that
+    wedges while its session is ALIVE still fires death + cooldown unchanged.
+    (b) **GC flag strand (review):** `gc_idle_peers` now lowers a surviving
+    `bound_flag` on eviction — otherwise `MACRDP_UDP_TUNNEL_DEAD_SECS >= 60`
+    (the GC timeout) let eviction win the race and strand the server-side
+    flag true forever (no cooldown ever + lossy audio routed into a
+    nonexistent tunnel with no TCP fallback). (c) **fork-workers RTT gap
+    (review):** `tcp_srtt_ms` is now `pub` (re-exported) and macrdp's worker
+    branch samples the inherited socket into the shared cell before
+    `run_connection` — the accept-loop sample site never runs in a worker, so
+    the link-aware features (blank gate / seed / offer gate) silently treated
+    every worker connection as LAN, re-arming the #135 false positive for
+    FORK_WORKERS-over-VPN deployments. Also fixed the interleaved
+    check_dead_tunnels/gc_idle_peers doc blocks (cosmetic).
