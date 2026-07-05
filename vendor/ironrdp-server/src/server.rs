@@ -1010,6 +1010,31 @@ impl RdpServer {
             }
             gated
         };
+        // No offer for this connection (cooldown or RTT gate): explicitly clear
+        // the per-connection multitransport state so nothing STALE from the
+        // previous connection can act. These fields are otherwise only refreshed
+        // at the offer site below, so a skipped offer would inherit the prior
+        // session's `udp_tunnel_bound` flag (which stays true for up to ~30 s
+        // after that session's tunnel goes silent, until tunnel-death flips it)
+        // and its `MigrationState` — enough for this connection to route lossy
+        // audio waves into a dead tunnel or fire a Soft-Sync naming a tunnel
+        // this client never created. The cooldown path was previously safe only
+        // by accident (suppression follows a tunnel-death event that already
+        // lowered the flag); the RTT gate has no such guarantee — e.g. a WiFi
+        // session with a bound tunnel followed within seconds by the client
+        // auto-reconnecting over a high-latency link.
+        #[cfg(feature = "multitransport")]
+        if self.multitransport.is_some() && (mt_suppressed || mt_rtt_gated) {
+            if let (Some(registry), Some(prev)) = (
+                self.multitransport_cookies.as_ref(),
+                self.multitransport_migration.as_ref(),
+            ) {
+                registry.remove(&prev.cookie);
+            }
+            self.multitransport_migration = None;
+            self.udp_tunnel_bound = None;
+            self.multitransport_tunnel_inbound_rx = None;
+        }
         #[cfg(feature = "multitransport")]
         if let Some(provider) = self
             .multitransport

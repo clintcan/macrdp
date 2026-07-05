@@ -1008,3 +1008,15 @@ AND released — #1276 landing is NOT sufficient.
     marker: "multitransport offer WITHHELD (link RTT above the offer gate)".
     Verified live: threshold-1 loopback trips the gate (link_rtt_ms=1), default
     80 leaves loopback offering normally.
+    **No-offer state reset (2026-07-06, found by the #136 double-check):** when
+    the offer is skipped (cooldown OR RTT gate), `run_connection` now explicitly
+    clears `multitransport_migration` / `udp_tunnel_bound` / the inbound rx and
+    evicts the previous cookie from the registry. Those fields were otherwise
+    only refreshed AT the offer site, so a skipped offer inherited the PREVIOUS
+    connection's state — including a bound-tunnel flag that stays true for up to
+    ~30 s after that session ends (until tunnel-death lowers it), enough for the
+    new connection to route lossy audio into a dead tunnel or fire a bogus
+    Soft-Sync. The cooldown path was safe only by accident (suppression follows
+    a tunnel-death event that already lowered the flag); the RTT gate made the
+    window genuinely reachable (e.g. a WiFi session with a bound tunnel followed
+    within seconds by an auto-reconnect over a high-latency link).
