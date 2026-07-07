@@ -841,6 +841,23 @@ mod macos {
     impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
         async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
+                // EXPERIMENTAL blank-recovery: if the H.264 blank detector armed
+                // a bare core reactivation (BlankAction::Reactivate), emit a
+                // no-op DisplayUpdate::Resize to the same size. The vendored
+                // server turns that into Server Deactivate All → new Demand
+                // Active while preserving the static channels, so the EGFX DVC
+                // and its surface survive (no resize_with_monitors/DeleteSurface)
+                // — the one untested lever for the mstsc reconnect-blank. A
+                // forced IDR was already armed on the ctx.
+                if let Some(gfx) = self.gfx.as_ref() {
+                    if let Some((w, h)) = gfx.take_reactivate_request() {
+                        return Ok(Some(DisplayUpdate::Resize(DesktopSize {
+                            width: w,
+                            height: h,
+                        })));
+                    }
+                }
+
                 // Poll cursor at loop top — preempts queued bitmap rects so
                 // pointer shape updates keep up instead of batching behind the
                 // bitmap drain of the previous SCK sample. Throttled to

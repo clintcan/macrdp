@@ -461,6 +461,31 @@ struct BlankRecoveryParams {
     /// `MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS` to re-enable remap-first
     /// experimentation (e.g. against a non-mstsc QoE-reporting client).
     max_attempts: u32,
+    /// EXPERIMENTAL (`MACRDP_BLANK_RECOVERY_REACTIVATE=1`, default off): make
+    /// the FIRST recovery attempt a bare core Deactivation–Reactivation
+    /// ([`BlankAction::Reactivate`]) instead of the normal remap/drop; if it
+    /// doesn't heal, the second attempt drops. Forces `max_attempts` to ≥2 so
+    /// the fallback drop can fire.
+    reactivate: bool,
+    /// Wall-clock fast-path for detection on a STATIC blank. A blank desktop
+    /// changes little, so QoE reports trickle in slowly (~0.3/s vs ~8/s on an
+    /// active screen) and the `min_qoe_reports` count alone can take ~70 s to
+    /// accumulate. Once this much wall-clock has elapsed with acks flowing and a
+    /// small handful of all-zero reports (enough to rule out a client that sends
+    /// no QoE at all), the session is conclusively blank — fire without waiting
+    /// for the full count. Safe to be prompt because the reactivation heal is
+    /// non-destructive: an occasional early fire costs a brief re-handshake, not
+    /// a dropped session. `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
+    blank_max_wait: Duration,
+    /// Minimum all-zero QoE reports for the wall-clock fast-path (above). Its
+    /// only job is to rule out a client that sends NO QoE (e.g. FreeRDP, which
+    /// would otherwise satisfy `!qoe_render_seen` forever) — so the default is a
+    /// low **1**: a single all-zero report after `arm_delay` (by which a
+    /// rendering session has already presented and disarmed via
+    /// `qoe_render_seen`, ~1-2 s on LAN) is conclusive on a trustworthy-RTT
+    /// link. Raise it (`MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS`) if a
+    /// slow-to-first-present client trips a spurious (cheap) reactivation.
+    blank_min_reports: u64,
     /// Reconnect-storm guard: if this many CONSECUTIVE connections all ended in
     /// a blank-recovery drop (no connection in between ever presented a frame),
     /// stop dropping — the client is truly stuck (mstsc retains surfaces for
@@ -504,6 +529,25 @@ enum BlankAction {
     /// and auto-reconnects with its reconnect cookie; a fresh connection
     /// renders with high probability and the detector re-checks it.
     Drop,
+    /// EXPERIMENTAL (`MACRDP_BLANK_RECOVERY_REACTIVATE=1`): trigger a bare
+    /// core RDP **Deactivation–Reactivation** (Server Deactivate All → new
+    /// Demand Active) WITHOUT touching the EGFX pipeline. Injected as a no-op
+    /// `DisplayUpdate::Resize(current_size)` (see `capture.rs`), which the
+    /// vendored server turns into `deactivate_all` +
+    /// `Acceptor::new_deactivation_reactivation` — and that call PRESERVES the
+    /// static channels, so the EGFX DVC (and our `ConnectionContext`/surface)
+    /// survive: `build_server_with_handle` is not re-run, `setup_locked` skips
+    /// (`surface_id` already `Some`), so NO `resize_with_monitors` / NO
+    /// DeleteSurface fires. A forced IDR follows. **LIVE-VERIFIED 2026-07-07 to
+    /// HEAL the mstsc reconnect-blank** — 5/5 blanks on real mstsc/WiFi went
+    /// EDR=0 → presenting in ~1-2 s with zero drops (frame ids mid-stream, so
+    /// the same connection healed in place, no reconnect). This is the DEFAULT
+    /// first recovery action and overturns the long-held "layer-2 is
+    /// client-fatal / not server-fixable" conclusion: prior attempts all
+    /// bundled a surface delete or DVC close (which ARE client-fatal); a bare
+    /// core reactivation, uniquely, is not. If it ever fails to heal, the
+    /// detector re-fires and attempt 2 falls through to [`BlankAction::Drop`].
+    Reactivate,
 }
 
 fn blank_action(attempt: u32, max_attempts: u32) -> BlankAction {
@@ -559,7 +603,16 @@ fn should_blank_recover(
     attempts: u32,
     p: &BlankRecoveryParams,
 ) -> bool {
-    qoe_reports >= p.min_qoe_reports
+    // Blank evidence: EITHER the full all-zero report count (fast on an active
+    // screen) OR — for a STATIC blank whose QoE trickles in slowly — enough
+    // wall-clock elapsed with at least `blank_min_reports` all-zero reports
+    // (which rules out a client that sends no QoE, e.g. FreeRDP, from ever
+    // firing on the wall-clock branch). That floor plus `!qoe_render_seen`
+    // means "a QoE client that has reported only zero decode+render time" — a
+    // real blank on a trustworthy-RTT link (the RTT gate handles the rest).
+    let blank_evidence = qoe_reports >= p.min_qoe_reports
+        || (since_connect >= p.blank_max_wait && qoe_reports >= p.blank_min_reports);
+    blank_evidence
         && !qoe_render_seen
         && egfx_acks_seen
         && !acks_suspended
@@ -594,6 +647,7 @@ fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParam
     BlankRecoveryParams {
         min_qoe_reports: ((p.min_qoe_reports as f64) * mult).ceil() as u64,
         arm_delay: p.arm_delay.mul_f64(mult),
+        blank_max_wait: p.blank_max_wait.mul_f64(mult),
         ..*p
     }
 }
@@ -951,6 +1005,14 @@ pub struct Gfx {
     /// seeded at ceiling/3 instead of the full ceiling (the controller climbs
     /// from there). `MACRDP_ADAPTIVE_SEED_RTT_MS`, default 50; 0 disables.
     adaptive_seed_rtt_ms: u32,
+    /// EXPERIMENTAL blank-recovery reactivation request (see
+    /// [`BlankAction::Reactivate`]). Packed `(width << 16) | height`; `0` = no
+    /// request. Set by [`Gfx::perform_blank_reactivate`] and drained by the
+    /// capture loop (`ScreenCaptureUpdates::next_update`), which emits a no-op
+    /// `DisplayUpdate::Resize` to that size to drive the core
+    /// deactivation–reactivation. Shared across `Gfx` clones (the capture loop
+    /// holds one).
+    reactivate_request: Arc<AtomicU32>,
 }
 
 impl Gfx {
@@ -1078,13 +1140,34 @@ impl Gfx {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(default)
         };
+        // DEFAULT ON (2026-07-07): the bare core Deactivation–Reactivation is
+        // live-verified to HEAL the mstsc reconnect-blank in place — 5/5 blanks
+        // on real mstsc/WiFi went EDR=0 → presenting in ~1-2 s with zero drops,
+        // overturning the long-held "layer-2 is client-fatal / not
+        // server-fixable" conclusion. It's strictly better than the old
+        // remap-first (never healed) and the drop (kills the session): it
+        // re-maps the client's retained surface with no disconnect. Set
+        // `MACRDP_BLANK_RECOVERY_REACTIVATE=0` to fall back to the drop path.
+        let blank_reactivate = std::env::var("MACRDP_BLANK_RECOVERY_REACTIVATE")
+            .ok()
+            .map(|s| !matches!(s.trim(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
         let blank_params = BlankRecoveryParams {
             min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 24)),
             arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
-            retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 5000),
-            max_attempts: env_u32("MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS", 1),
+            retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 4000),
+            // Reactivate-first needs ≥2 attempts so, if the reactivation ever
+            // fails to heal, the fallback drop can still fire on the next window.
+            max_attempts: if blank_reactivate {
+                env_u32("MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS", 1).max(2)
+            } else {
+                env_u32("MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS", 1)
+            },
             max_consecutive_drops: env_u32("MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS", 3),
             max_rtt_ms: env_u32_zero_ok("MACRDP_BLANK_RECOVERY_MAX_RTT_MS", 80),
+            blank_max_wait: watchdog_ms("MACRDP_BLANK_RECOVERY_MAX_WAIT_MS", 4000),
+            blank_min_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS", 1)),
+            reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
         let (width, height) = desktop_size.get();
@@ -1150,6 +1233,7 @@ impl Gfx {
             consecutive_blank_drops: Arc::new(AtomicU32::new(0)),
             link_rtt_ms,
             adaptive_seed_rtt_ms,
+            reactivate_request: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -1364,10 +1448,18 @@ impl Gfx {
                         p,
                     )
                 }) {
-                    let action = blank_action(
-                        ctx.blank_recovery_attempts + 1,
-                        self.blank_params.max_attempts,
-                    );
+                    let attempt_no = ctx.blank_recovery_attempts + 1;
+                    let action = if self.blank_params.reactivate {
+                        // Experimental: first fire = bare core reactivation;
+                        // later fires fall through to the drop.
+                        if attempt_no == 1 {
+                            BlankAction::Reactivate
+                        } else {
+                            BlankAction::Drop
+                        }
+                    } else {
+                        blank_action(attempt_no, self.blank_params.max_attempts)
+                    };
                     let drops_so_far = self.consecutive_blank_drops.load(Ordering::Relaxed);
                     if action == BlankAction::Drop
                         && blank_drop_capped(drops_so_far, self.blank_params.max_consecutive_drops)
@@ -1394,6 +1486,13 @@ impl Gfx {
                         let evidence = ctx.qoe_reports;
                         ctx.qoe_reports = 0;
                         let (w, h) = ctx.dims;
+                        if action == BlankAction::Reactivate {
+                            // The surface survives the core reactivation, so the
+                            // first frame after it must be a fresh IDR (the
+                            // client's reference is stale) — arm it now while we
+                            // still hold ctx.
+                            ctx.need_keyframe = true;
+                        }
                         if action == BlankAction::Drop {
                             // Count the drop toward the storm guard now (arming
                             // time): the connection is ending either way.
@@ -1526,6 +1625,7 @@ impl Gfx {
             let result = match action {
                 BlankAction::Remap => self.perform_blank_remap(&server_handle, width, height),
                 BlankAction::Drop => self.perform_blank_drop(),
+                BlankAction::Reactivate => self.perform_blank_reactivate(width, height),
             };
             if let Err(e) = result {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
@@ -1982,6 +2082,41 @@ impl Gfx {
             _ => warn!("EGFX blank remap finished on a stale connection — result discarded"),
         }
         Ok(())
+    }
+
+    /// EXPERIMENTAL blank-recovery — request a bare core
+    /// Deactivation–Reactivation ([`BlankAction::Reactivate`]). Does NOT touch
+    /// the EGFX pipeline: it just stashes the current desktop size (packed) in
+    /// `reactivate_request`; the capture loop drains it and emits a no-op
+    /// `DisplayUpdate::Resize` to that size, which the vendored server turns
+    /// into Server Deactivate All → new Demand Active while PRESERVING the
+    /// static channels (so the EGFX DVC + our surface survive; `setup_locked`
+    /// skips, no `resize_with_monitors`/DeleteSurface). The post-reactivation
+    /// IDR was already armed under ctx in the decision block.
+    fn perform_blank_reactivate(&self, width: u16, height: u16) -> Result<()> {
+        let packed = (u32::from(width) << 16) | u32::from(height);
+        self.reactivate_request.store(packed, Ordering::Relaxed);
+        warn!(
+            width,
+            height,
+            "EGFX blank recovery: requesting a bare core deactivation–reactivation \
+             (no EGFX surface touch) — does re-running the capability handshake make \
+             the client re-map its retained surface?"
+        );
+        Ok(())
+    }
+
+    /// Drain a pending [`perform_blank_reactivate`] request. Called by the
+    /// capture loop each poll; returns `Some((width, height))` exactly once per
+    /// request (the size to emit a no-op `DisplayUpdate::Resize` to), else
+    /// `None`. Shared across `Gfx` clones.
+    pub(crate) fn take_reactivate_request(&self) -> Option<(u16, u16)> {
+        let packed = self.reactivate_request.swap(0, Ordering::Relaxed);
+        if packed == 0 {
+            None
+        } else {
+            Some(((packed >> 16) as u16, (packed & 0xffff) as u16))
+        }
     }
 
     /// Blank-recovery attempt B — drop the connection
@@ -3044,6 +3179,14 @@ mod tests {
             max_attempts: 2,
             max_consecutive_drops: 3,
             max_rtt_ms: 80,
+            // High so existing count-based tests (which use small
+            // `since_connect`) don't trip the wall-clock fast-path; the
+            // wall-clock branch has its own dedicated tests.
+            blank_max_wait: ms(60000),
+            // 3 for the tests (the production default is a more aggressive 1);
+            // the wall-clock test asserts against this value.
+            blank_min_reports: 3,
+            reactivate: false,
         }
     }
 
@@ -3258,6 +3401,63 @@ mod tests {
             ms(10_000),
             ms(5000),
             1,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_wall_clock_fast_path_fires_on_static_blank() {
+        // A STATIC blank trickles QoE (few reports) but has been up long enough:
+        // fewer than min_qoe_reports, yet >= 3 reports and past blank_max_wait
+        // with acks flowing and no render → the wall-clock branch fires.
+        let p = BlankRecoveryParams {
+            blank_max_wait: ms(8000),
+            ..blank_params()
+        };
+        assert!(p.min_qoe_reports > 3, "test assumes a high count threshold");
+        assert!(should_blank_recover(
+            4,          // few reports (< min_qoe_reports), but >= 3
+            false,      // never rendered
+            true,       // acks flowing
+            false,      // not suspended
+            ms(8000),   // == blank_max_wait
+            ms(60_000), // long since last attempt
+            0,
+            &p
+        ));
+        // Same but only 2 reports → the >=3 floor blocks it (guards a client
+        // that sends no / almost no QoE, e.g. FreeRDP, from ever firing here).
+        assert!(!should_blank_recover(
+            2,
+            false,
+            true,
+            false,
+            ms(8000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // Zero reports (QoE-less client) never fires on the wall-clock path.
+        assert!(!should_blank_recover(
+            0,
+            false,
+            true,
+            false,
+            ms(30_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // Before blank_max_wait, with a low count → still holds (neither path
+        // is satisfied yet).
+        assert!(!should_blank_recover(
+            4,
+            false,
+            true,
+            false,
+            ms(7999),
+            ms(60_000),
+            0,
             &p
         ));
     }

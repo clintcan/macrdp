@@ -342,19 +342,27 @@ runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
 exiting.
 
 Blank recovery + auto-reconnect (env-only; on by default with `--enable-h264`).
-The mstsc reconnect-blank auto-heal is link-aware: the server measures each
-connection's TCP RTT at accept, scales the evidence window with it, and
-withholds the drop entirely on slow links where the signal is unreliable (see
-the blank-recovery notes in `docs/known-quirks.md`):
+The mstsc reconnect-blank auto-heal now **reactivates the RDP core in place** —
+on a detected blank the server sends a bare Deactivation–Reactivation (Server
+Deactivate All → new Demand Active) that preserves the EGFX channel/surface, and
+mstsc re-maps its retained surface and presents again with NO disconnect
+(live-verified: 5/5 blanks healed EDR=0 → presenting in ~1-2 s, zero drops). This
+is the default first action; a drop is the fallback only if the reactivation ever
+fails to heal. Detection is link-aware (RTT-gated) and has a wall-clock fast-path
+so a static blank heals in ~4 s (see the blank-recovery notes in
+`docs/known-quirks.md`):
 ```
 MACRDP_BLANK_RECOVERY=1                # 0 disables the detector entirely
-MACRDP_BLANK_RECOVERY_MAX_RTT_MS=80    # withhold the drop at/above this link RTT (0 = no gate)
-MACRDP_BLANK_RECOVERY_MIN_QOE=24       # all-zero QoE reports required (~3 s on LAN)
+MACRDP_BLANK_RECOVERY_REACTIVATE=1     # 1 = reactivate-in-place (heals mstsc); 0 = fall back to drop
+MACRDP_BLANK_RECOVERY_MAX_RTT_MS=80    # withhold recovery at/above this link RTT (0 = no gate)
+MACRDP_BLANK_RECOVERY_MIN_QOE=24       # all-zero QoE reports for the count path (~3 s of active decode)
+MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank
+MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS=1  # min all-zero reports the fast-path needs (rules out QoE-less clients)
 MACRDP_BLANK_RECOVERY_ARM_MS=3000      # skip the connect-time churn window
-MACRDP_BLANK_RECOVERY_RETRY_MS=5000    # spacing between attempts
-MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # 1 = drop-first; >=2 re-enables remap-first
-MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = uncapped)
-MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie
+MACRDP_BLANK_RECOVERY_RETRY_MS=4000    # spacing between attempts
+MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # forced to >=2 when REACTIVATE=1 so the fallback drop can fire
+MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = uncapped; only the drop fallback counts)
+MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie (only the drop fallback needs it)
 ```
 
 Testing against the server:

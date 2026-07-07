@@ -10,7 +10,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest release: [v0.8.26](https://github.com/clintcan/macrdp/releases/latest)** — the *roaming-client release*: the server now measures each connection's round-trip time and configures itself per link — slow links get a gentle starting bitrate and are never offered the UDP transport, fast links get everything — so one config works whether you connect from the same WiFi or from a phone hotspot across the country.
+v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest release: [v0.8.27](https://github.com/clintcan/macrdp/releases/latest)** — the *reconnect-blank-cracked release*: the long-standing mstsc blank-on-reconnect (a client-side surface-retention bug documented as "not server-fixable" for months) now **self-heals in ~4 s with no disconnect** — the server detects the blank and reactivates the RDP core in place, and mstsc re-maps its stale surface and presents again. No more close-and-reopen.
 
 Full per-release notes (what shipped, what was verified live, and the war stories): **[docs/release-history.md](docs/release-history.md)**.
 
@@ -20,7 +20,7 @@ Short version: **a polished v0 daily-driver for trusted LANs and your own VPN �
 
 **Solid (verified on real mstsc / Microsoft Remote Desktop / FreeRDP):** TLS + NLA/CredSSP auth against your Mac account (Keychain-backed, real CA certs supported, per-IP rate-limiting + lockout + audit log); the full daily workflow (display, input incl. non-US layouts, clipboard/files both ways, audio, drive + smart-card redirection, headless virtual displays); H.264 with congestion-responsive rate control that degrades gracefully instead of freezing; signed/notarized packaging with a LaunchAgent, menu-bar controller, and a health-check watchdog; 160+ tests in CI.
 
-**Know before relying on it:** single session/single user; no multi-monitor or printer redirection; DRM video and password-manager windows capture black (macOS policy, not fixable); synthetic input can't reach the login window/secure fields (same); reconnecting *mstsc* can show a blank screen (client quirk — auto-recovery is built in, `--fork-workers` is the strong fix); the UDP paths are opt-in and newer than the TCP core; it's a solo v0 on vendored [IronRDP] forks, no SLA. **Never expose any RDP server on a raw public IP — reach it over a VPN or RD Gateway.**
+**Know before relying on it:** single session/single user; no multi-monitor or printer redirection; DRM video and password-manager windows capture black (macOS policy, not fixable); synthetic input can't reach the login window/secure fields (same); reconnecting *mstsc* can briefly show a blank screen (client quirk — the server now auto-heals it in ~4 s by reactivating the RDP core in place, no user action); the UDP paths are opt-in and newer than the TCP core; it's a solo v0 on vendored [IronRDP] forks, no SLA. **Never expose any RDP server on a raw public IP — reach it over a VPN or RD Gateway.**
 
 Details and the path to closing the gaps: [docs/production-readiness-roadmap.md](docs/production-readiness-roadmap.md).
 

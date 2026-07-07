@@ -19,7 +19,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.26** (the roaming-client release —
+(VPN/ZeroTier). **Latest release: v0.8.27** (the reconnect-blank-cracked
+release — the mstsc reconnect-blank, documented for months as a not-server-
+fixable client surface-retention bug, now **self-heals in place in ~4 s with no
+disconnect**: on a detected blank the server sends a bare core RDP
+Deactivation–Reactivation (Server Deactivate All → new Demand Active) that
+**preserves the EGFX channel/surface** — no DeleteSurface, no DYNVC close, no
+RESET_GRAPHICS, all of which were exhaustively proven client-fatal — and
+mstsc re-maps its retained surface 0 and presents again. Live-verified 9/9
+blanks healed on real mstsc/WiFi, EDR=0 → presenting in ~1-2 s, zero drops.
+Default recovery action (`BlankAction::Reactivate`); the old connection-drop is
+now only the fallback. Detection sped up via a wall-clock fast-path (~70 s →
+~4 s on a static blank). Still RTT/QoE-gated so FreeRDP + high-latency links are
+untouched. Zero vendored-server change — a no-op `DisplayUpdate::Resize` reuses
+the existing reactivation path. See the reconnect-blank quirk note. Earlier:
+**v0.8.26** (the roaming-client release —
 UDP multitransport now configures and cleans up after itself, making
 `ENABLE_LOSSY_AUDIO`/`ENABLE_UDP_MULTITRANSPORT` safe to leave permanently on
 for a client that moves between networks: **RTT-gated offer** — links measured
