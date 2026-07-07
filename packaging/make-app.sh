@@ -16,7 +16,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_DIR="$REPO_ROOT/packaging"
 APP_DIR="${APP_DIR:-/Applications}"
-IDENTITY="${CODESIGN_IDENTITY:--}"
+# Signing identity. Ad-hoc ("-") keys TCC to the binary's cdhash, so the
+# Screen Recording / Accessibility grants die on EVERY rebuild — the "grants
+# survive rebuilds" promise needs a stable certificate identity. When no
+# CODESIGN_IDENTITY is given, prefer a local self-signed code-signing cert
+# named "macrdp-dev" if one exists (create once via Keychain Access →
+# Certificate Assistant, or openssl + `security import`), falling back to
+# ad-hoc only when there's nothing better.
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    IDENTITY="$CODESIGN_IDENTITY"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -q '"macrdp-dev"'; then
+    IDENTITY="macrdp-dev"
+else
+    IDENTITY="-"
+fi
 # Bundle-ID prefix (reverse-DNS of the publishing entity). MUST match what
 # install-launchagent.sh and gui/make-tray-app.sh use, or the controller will
 # target the wrong LaunchAgent label.
@@ -64,9 +77,12 @@ if [ -n "$ICON_SRC" ]; then
     echo "==> app icon: $(basename "$ICON_SRC")"
 fi
 
-# Signing timestamp flag: ad-hoc ("-") can't use a secure timestamp; a real
-# Developer ID must (notarization requires it). Shared by the IFD bundle + app.
-if [ "$IDENTITY" = "-" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi
+# Signing timestamp flag: ad-hoc ("-") can't use a secure timestamp, and the
+# local self-signed "macrdp-dev" identity doesn't need one (it's a network
+# round-trip per sign and notarization is off the table anyway); a real
+# Developer ID must have it (notarization requires it). Shared by the IFD
+# bundle + app.
+if [ "$IDENTITY" = "-" ] || [ "$IDENTITY" = "macrdp-dev" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi
 
 # Optional: provisioning profile + entitlements (USB-redirection builds only).
 # PROVISION_PROFILE=<path.provisionprofile> embeds the profile and signs the main

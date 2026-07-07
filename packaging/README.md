@@ -170,6 +170,30 @@ reader registered with `system_profiler SPSmartCardsDataType`.
   process launchd now runs. Keep the install path stable and the grants persist.
 - **Re-signing on rebuild** keeps the same identity as long as the bundle ID,
   install path, and signing identity are unchanged — so re-running
-  `make-app.sh` for an update does not reset permissions.
+  `make-app.sh` for an update does not reset permissions. **CAVEAT: this is
+  only true with a real certificate identity — ad-hoc signing (`-`) can NOT
+  keep TCC grants across rebuilds.** An ad-hoc signature has no certificate,
+  so its designated requirement degrades to `cdhash H"<hash of the binary>"`
+  (verify with `codesign -d -r- macrdp.app`) — TCC keys the grant to that
+  exact binary hash, and every rebuild changes it, invalidating the grant
+  (confirmed live 2026-07-05: three consecutive ad-hoc rebuilds each required
+  re-granting Screen Recording + Accessibility). The zero-cost fix is a
+  **self-signed code-signing certificate named `macrdp-dev`** in the login
+  keychain — `make-app.sh` auto-prefers it when `CODESIGN_IDENTITY` is unset —
+  which makes the requirement `identifier "com.clintcan.macrdp" and
+  certificate leaf = H"<cert hash>"`, stable across rebuilds. Create it once
+  via Keychain Access → Certificate Assistant → Create a Certificate →
+  type "Code Signing", or scripted:
+  ```bash
+  openssl req -x509 -newkey rsa:2048 -keyout k.pem -out c.pem -days 3650 -nodes \
+    -subj "/CN=macrdp-dev" -addext "keyUsage=critical,digitalSignature" \
+    -addext "extendedKeyUsage=critical,codeSigning" -addext "basicConstraints=critical,CA:FALSE"
+  openssl pkcs12 -export -legacy -out d.p12 -inkey k.pem -in c.pem -passout pass:tmp
+  security import d.p12 -k ~/Library/Keychains/login.keychain-db -P tmp -T /usr/bin/codesign
+  security add-trusted-cert -p codeSign -k ~/Library/Keychains/login.keychain-db c.pem
+  rm k.pem c.pem d.p12   # the key lives in the keychain now
+  ```
+  (`-legacy` matters: macOS `security` can't read OpenSSL 3's default PKCS12.)
+  One re-grant after switching identities, then grants persist.
 - Login-window / lock-screen / secure-input contexts still can't receive
   synthetic input — an OS limitation, unchanged by packaging.
