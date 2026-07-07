@@ -556,6 +556,13 @@ mod macos {
         click_left: Option<ClickState>,
         click_right: Option<ClickState>,
         click_middle: Option<ClickState>,
+        // Running remainder of raw wheel units not yet converted to a whole
+        // line, carried across calls. See `scroll()` — without this, a
+        // client that slices a gesture into many small per-event deltas
+        // (observed: magnitude ~2-40, not one 120-per-notch value) has
+        // nearly every event truncated to zero and the scroll never moves.
+        scroll_v_accum: i32,
+        scroll_h_accum: i32,
         // Virtual keycodes whose key-down we intercepted as a symbolic
         // hotkey (Cmd+Tab, Cmd+Space, screencapture combos). The matching
         // key-up gets swallowed too so the focused app doesn't see a bare
@@ -644,6 +651,8 @@ mod macos {
                 click_left: None,
                 click_right: None,
                 click_middle: None,
+                scroll_v_accum: 0,
+                scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
                 remapped_keys: HashSet::new(),
                 layout,
@@ -1213,11 +1222,25 @@ mod macos {
             }
         }
 
-        fn scroll(&self, vertical: i32, horizontal: i32) {
-            // RDP wheel rotation units are 120 per "tick"; macOS wheel deltas
-            // are unit-less but ~1-3 per tick feels normal. Divide by 40.
-            let v = (vertical / 40).clamp(-10, 10);
-            let h = (horizontal / 40).clamp(-10, 10);
+        fn scroll(&mut self, vertical: i32, horizontal: i32) {
+            // RDP wheel rotation units are 120 per "tick", but this client
+            // slices a single gesture into many small legacy MOUSE PDU
+            // events (observed raw magnitude ~2-40 per event, not one
+            // 120-per-notch value). A flat `delta / SCALE` per event
+            // truncates almost every one of those to zero — scroll never
+            // moves at all. Accumulate the raw delta across calls instead,
+            // and only emit whole lines once the running total crosses
+            // SCALE, carrying the remainder forward so no motion is lost.
+            const SCALE: i32 = 60;
+            self.scroll_v_accum += vertical;
+            self.scroll_h_accum += horizontal;
+            let v = (self.scroll_v_accum / SCALE).clamp(-5, 5);
+            let h = (self.scroll_h_accum / SCALE).clamp(-5, 5);
+            self.scroll_v_accum -= v * SCALE;
+            self.scroll_h_accum -= h * SCALE;
+            if v == 0 && h == 0 {
+                return;
+            }
             let Ok(ev) =
                 CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::LINE, 2, v, h, 0)
             else {
