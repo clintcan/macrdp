@@ -1278,3 +1278,14 @@ AND released — #1276 landing is NOT sufficient.
     (`WITH_URBDRC=ON` + libusb) redirecting a real USB-3 flash drive: full handshake
     → per-device channel opened → `ADD_DEVICE` received (GO), session stays up
     (decode error tolerated). Off-path (`--enable-usb-redirection` absent) unchanged.
+
+(17) Wheel-rotation two's-complement decode fix (macrdp issue #113; NOT
+    upstreamed, real fix belongs in `ironrdp-pdu`). `From<MousePdu> for
+    MouseEvent` in `handler.rs` re-decodes `number_of_wheel_rotation_units`
+    as 9-bit two's complement (`WHEEL_NEGATIVE` is the sign bit); upstream's
+    decode does sign-magnitude instead (`-(byte)`), so a byte meaning -1
+    comes out as -255 — its own encode/decode don't round-trip. Recover:
+    `if v < 0 { -v - 256 } else { v }`. Found via live trace on the macOS
+    Windows App client, whose fine-grained ±1..±3 deltas exposed it; mstsc's
+    whole ±120 notches masked it. Delete once ironrdp-pdu's decode is fixed
+    upstream and the pin moves past it.
