@@ -403,6 +403,10 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
         .map(ProtocolObject::from_retained)
         .collect();
     let array = NSArray::from_vec(writers);
+    // Serialize against the advertise poller + every other pasteboard toucher
+    // (NSPasteboard is not thread-safe). The changeCount read stays inside the
+    // guard so no other writer can bump it between our write and the capture.
+    let _pb_guard = crate::clipboard::pasteboard_guard();
     let new_change_count = unsafe {
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();

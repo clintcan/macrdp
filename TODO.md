@@ -94,14 +94,23 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `cursor/mod.rs::clamp_pointer_size` downscales aspect-preserving (hotspot-exact) via the
   existing resampler; unit-tested.
 
-- [ ] **NSPasteboard SIGSEGV crash (main thread) — investigate.** 2026-07-04 19:47:58,
-  crash report `macrdp-2026-07-04-194758.ips`: `objc_msgSend` under
+- [x] **NSPasteboard SIGSEGV crash — FIXED via a global pasteboard mutex (2026-07-07).**
+  2026-07-04 19:47:58 crash `macrdp-2026-07-04-194758.ips`: `objc_msgSend` under
   `-[NSPasteboard _updateTypeCacheIfNeeded]` ← `_typesAtIndex:combinesItems:` during
-  connection churn (~13 s after a client-loop failure + a fresh accept). Suspect the
-  clipboard change-count poller reading a pasteboard item freed under it. Restarted the
-  server via launchd (and wiped the in-process #133 cooldown). Different signature from
-  the 2026-06-28 crash (`UNKNOWN_0x32` on a pthread). One-off so far — gather more
-  occurrences before chasing; keep the .ips files.
+  connection churn (~13 s after a client-loop failure + a fresh accept). **Root cause
+  confirmed:** the process-global `NSPasteboard` (AppKit, NOT thread-safe) was accessed
+  from multiple threads with ZERO serialization — the advertise poller (a tokio worker)
+  walking `pasteboardItems()`/`types()` overlapped a concurrent writer
+  (`clearContents`/`writeObjects`/`setData` from the paste, download, or disconnect-Drop
+  paths, each on its own thread), which corrupts the pasteboard's internal type cache →
+  use-after-free → segfault. The disconnect-Drop clear racing the poller is the churn
+  window. **Fix:** `clipboard::pasteboard_guard()` — a process-global `Mutex<()>` that
+  every `pb::` accessor and every `file_promise*` pasteboard touch holds for the span of
+  its objc calls (poison-recovering, since the guarded data is `()`); the check-then-clear
+  cleanup paths hold it across the changeCount read + the clear so that's atomic too.
+  Serializes reader vs. writer and closes the race. Rare, so unproven-by-repro — keep the
+  `.ips` files and watch for a DIFFERENT signature (the 2026-06-28 `UNKNOWN_0x32` pthread
+  crash is a separate, still-open one-off).
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
   video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)

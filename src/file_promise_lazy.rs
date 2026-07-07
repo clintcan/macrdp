@@ -503,6 +503,10 @@ pub fn clear_pasteboard_if_stale(self_change_count: &SelfChangeCount) {
     if our_cc < 0 {
         return;
     }
+    // Hold the pasteboard guard across the changeCount check AND the clear so
+    // it's atomic (no other writer can bump changeCount between them) and race-
+    // free against the advertise poller (NSPasteboard is not thread-safe).
+    let _pb_guard = crate::clipboard::pasteboard_guard();
     let current_cc = unsafe { NSPasteboard::generalPasteboard().changeCount() } as i64;
     if current_cc != our_cc {
         // Something else owns the clipboard now — leave it alone.
@@ -551,6 +555,9 @@ pub fn cleanup_on_disconnect(
         // We never published; nothing to clear.
         return;
     }
+    // Atomic check-then-clear under the shared pasteboard guard (NSPasteboard is
+    // not thread-safe; this Drop path races the advertise poller during churn).
+    let _pb_guard = crate::clipboard::pasteboard_guard();
     let current_cc = unsafe { NSPasteboard::generalPasteboard().changeCount() } as i64;
     if current_cc == our_cc {
         unsafe {
@@ -613,6 +620,9 @@ fn publish_to_pasteboard(urls: &[SendRetained<NSURL>], self_change_count: &SelfC
         .map(|u| ProtocolObject::from_retained(u.0.clone()))
         .collect();
     let array = NSArray::from_vec(writers);
+    // Serialize against the advertise poller + other pasteboard writers, and
+    // keep the changeCount capture inside the guard so it's our write's count.
+    let _pb_guard = crate::clipboard::pasteboard_guard();
     let new_change_count = unsafe {
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();

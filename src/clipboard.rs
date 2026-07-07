@@ -928,6 +928,23 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 }
 
+/// Serializes every access to the process-global `NSPasteboard`. AppKit's
+/// pasteboard is NOT thread-safe — its internal type cache
+/// (`_updateTypeCacheIfNeeded`) corrupts if a reader (the advertise poller
+/// walking `pasteboardItems()`/`types()`) overlaps a writer (`clearContents` /
+/// `writeObjects` / `setData` from the paste, download, or disconnect-Drop
+/// paths, all on different threads), which segfaulted `objc_msgSend` during
+/// connection churn. Every `pb::` accessor and every `file_promise*`
+/// pasteboard touch holds this for the span of its raw objc calls; results are
+/// copied into owned Rust types before the guard drops, so the lock only spans
+/// the unsafe access. Poison is recovered (the guarded data is `()` — there is
+/// no state to corrupt) so one panicking access can't cascade-poison the rest.
+#[cfg(target_os = "macos")]
+pub(crate) fn pasteboard_guard() -> std::sync::MutexGuard<'static, ()> {
+    static PB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    PB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(target_os = "macos")]
 mod pb {
     use objc2::rc::autoreleasepool;
@@ -938,6 +955,7 @@ mod pb {
     use objc2_foundation::{NSData, NSString, NSURL};
 
     pub fn change_count() -> i64 {
+        let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.changeCount() as i64
@@ -985,6 +1003,7 @@ mod pb {
     /// to prevent cycles. Unreadable paths or directories we can't open are
     /// logged but don't abort the rest of the walk.
     pub fn read_files() -> Vec<FileEntry> {
+        let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let Some(items) = pb.pasteboardItems() else {
@@ -1114,6 +1133,7 @@ mod pb {
     }
 
     fn has_type(target: &objc2_app_kit::NSPasteboardType) -> bool {
+        let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let Some(types) = pb.types() else {
@@ -1130,6 +1150,7 @@ mod pb {
     }
 
     pub fn read_string() -> Option<String> {
+        let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.stringForType(NSPasteboardTypeString)
@@ -1138,6 +1159,7 @@ mod pb {
     }
 
     pub fn write_string(s: &str) {
+        let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
@@ -1150,6 +1172,7 @@ mod pb {
     /// PNG first, falls back to TIFF (which we re-encode in clipboard.rs
     /// via the `image` crate so this returns PNG either way).
     pub fn read_image_bytes() -> Option<(ImageEncoding, Vec<u8>)> {
+        let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
@@ -1163,6 +1186,7 @@ mod pb {
     }
 
     pub fn write_png(bytes: &[u8]) {
+        let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
