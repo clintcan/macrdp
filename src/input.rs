@@ -329,6 +329,7 @@ mod macos {
     const VK_5: u16 = 0x17;
     const VK_GRAVE: u16 = 0x32;
     const VK_CAPS_LOCK: u16 = 0x39;
+    const VK_G: u16 = 0x05; // kVK_ANSI_G — the on-demand "gather windows" chord
 
     // macOS virtual keycodes for the left/right halves of each modifier.
     // Used by ModifierState to track which physical key is held so we can
@@ -991,6 +992,29 @@ mod macos {
             let shift = f.contains(CGEventFlags::CGEventFlagShift);
             let ctrl = f.contains(CGEventFlags::CGEventFlagControl);
             let opt = f.contains(CGEventFlags::CGEventFlagAlternate);
+
+            // Ctrl+Option+G: on-demand "gather windows" — sweep any window stranded
+            // off the session display (e.g. an app opened on the now-blanked
+            // physical panel under --capture-primary) back onto the display the RDP
+            // client sees. From a Windows client this is Ctrl+Alt+G — deliberately
+            // Win-key-free so mstsc forwards it, and it's not a system shortcut on
+            // either OS. Only acts when there's a virtual display to gather onto;
+            // runs off-thread so input never stalls.
+            if ctrl && opt && !cmd && vk == VK_G {
+                if let Some(id) = self.target_display_id {
+                    std::thread::spawn(move || {
+                        let moved = gather_windows_onto_display(id);
+                        tracing::info!(
+                            moved,
+                            display_id = id,
+                            "on-demand gather-windows hotkey (Ctrl+Option+G)"
+                        );
+                    });
+                    return true;
+                }
+                // No virtual display — nothing to gather onto; let the key through.
+                return false;
+            }
 
             // Opt+Tab / Opt+Shift+Tab as an alternative app-cycle trigger
             // (opt-in via --alt-tab-switch). Only plain Option (no Cmd/Ctrl) so
@@ -2347,6 +2371,10 @@ mod macos {
             the_type: u32,
             value_ptr: *mut std::ffi::c_void,
         ) -> u8;
+        fn AXValueCreate(
+            the_type: u32,
+            value_ptr: *const std::ffi::c_void,
+        ) -> core_foundation::base::CFTypeRef;
         fn CFRelease(cf: *const std::ffi::c_void);
         fn CFEqual(a: *const std::ffi::c_void, b: *const std::ffi::c_void) -> u8;
         fn CFBooleanGetValue(boolean: core_foundation::base::CFTypeRef) -> u8;
@@ -2355,6 +2383,133 @@ mod macos {
             arr: *const std::ffi::c_void,
             idx: isize,
         ) -> *const std::ffi::c_void;
+    }
+
+    /// Gather "stranded" windows — ones sitting entirely off the display the RDP
+    /// client sees — back onto that display. Under `--capture-primary` (and the
+    /// other headless modes) a window opened on the physical panel keeps its old
+    /// global coordinates, which fall outside the virtual display's region, so
+    /// it's invisible/unclickable over RDP. Triggered on demand by Ctrl+Option+G,
+    /// this moves every such window's top-left just inside the target display.
+    /// Windows that (even partly) overlap the target are left untouched,
+    /// so a window the user positioned on the virtual display is never disturbed;
+    /// only *regular* (Dock) GUI apps are considered, so menu-extras / system
+    /// panels are never yanked around. Best-effort AX — macrdp already holds the
+    /// Accessibility grant (for `CGEventPost`), so no extra permission/prompt.
+    /// Returns how many windows were moved. Triggered on demand by the
+    /// Ctrl+Option+G hotkey (see `try_symbolic_hotkey`).
+    fn gather_windows_onto_display(display_id: u32) -> usize {
+        // CFRelease + CGPoint are already in scope (the mod-level extern block /
+        // `use` above); importing them here would shadow.
+        use core_foundation::base::{CFTypeRef, TCFType};
+        use core_foundation::string::CFString;
+        use std::ffi::c_void;
+        use std::ptr;
+
+        // AXValue type tags (AXValue.h): CGPoint = 1, CGSize = 2.
+        const K_AX_VALUE_CGPOINT_TYPE: u32 = 1;
+        const K_AX_VALUE_CGSIZE_TYPE: u32 = 2;
+
+        // Target rect in global top-left-origin coords (the display's live bounds).
+        let b = CGDisplay::new(display_id).bounds();
+        let (tx, ty, tw, th) = (b.origin.x, b.origin.y, b.size.width, b.size.height);
+        if tw <= 0.0 || th <= 0.0 {
+            return 0;
+        }
+        // Land stranded windows a little inside the top-left so the title bar is
+        // grabbable.
+        let (nx, ny) = (tx + 40.0, ty + 40.0);
+
+        // Read an AXValue-typed attribute (AXPosition/AXSize) as a coordinate pair.
+        let read_pair = |win: *const c_void, attr: &CFString, tag: u32| -> Option<(f64, f64)> {
+            unsafe {
+                let mut v: CFTypeRef = ptr::null();
+                if AXUIElementCopyAttributeValue(
+                    win as *mut c_void,
+                    attr.as_concrete_TypeRef().cast(),
+                    &mut v,
+                ) != AX_ERROR_SUCCESS
+                    || v.is_null()
+                {
+                    return None;
+                }
+                let mut pair = [0f64; 2];
+                let ok = AXValueGetValue(v, tag, pair.as_mut_ptr().cast());
+                CFRelease(v.cast());
+                (ok != 0).then_some((pair[0], pair[1]))
+            }
+        };
+
+        let pos_attr = CFString::from_static_string("AXPosition");
+        let size_attr = CFString::from_static_string("AXSize");
+        let windows_attr = CFString::from_static_string("AXWindows");
+
+        let mut moved = 0usize;
+        for pid in list_all_pids() {
+            // Only regular (Dock) GUI apps — skip agents/daemons/accessory apps.
+            let is_regular = unsafe {
+                NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                    .map(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+                    .unwrap_or(false)
+            };
+            if !is_regular {
+                continue;
+            }
+            unsafe {
+                let app = AXUIElementCreateApplication(pid);
+                if app.is_null() {
+                    continue;
+                }
+                let mut arr: CFTypeRef = ptr::null();
+                if AXUIElementCopyAttributeValue(
+                    app,
+                    windows_attr.as_concrete_TypeRef().cast(),
+                    &mut arr,
+                ) == AX_ERROR_SUCCESS
+                    && !arr.is_null()
+                {
+                    let n = CFArrayGetCount(arr.cast());
+                    for i in 0..n {
+                        // Array elements are borrowed (not retained).
+                        let win = CFArrayGetValueAtIndex(arr.cast(), i);
+                        if win.is_null() {
+                            continue;
+                        }
+                        let Some((px, py)) = read_pair(win, &pos_attr, K_AX_VALUE_CGPOINT_TYPE)
+                        else {
+                            continue;
+                        };
+                        // Default a missing size to a point, so a window still
+                        // counts as stranded by its origin alone.
+                        let (sw, sh) = read_pair(win, &size_attr, K_AX_VALUE_CGSIZE_TYPE)
+                            .unwrap_or((1.0, 1.0));
+                        // Overlaps the target display at all? Leave it be.
+                        let overlaps = px < tx + tw && px + sw > tx && py < ty + th && py + sh > ty;
+                        if overlaps {
+                            continue;
+                        }
+                        // Stranded — move its top-left onto the target display.
+                        let np = CGPoint::new(nx, ny);
+                        let val =
+                            AXValueCreate(K_AX_VALUE_CGPOINT_TYPE, (&np as *const CGPoint).cast());
+                        if !val.is_null() {
+                            if AXUIElementSetAttributeValue(
+                                win as *mut c_void,
+                                pos_attr.as_concrete_TypeRef().cast(),
+                                val,
+                            ) == AX_ERROR_SUCCESS
+                            {
+                                moved += 1;
+                            }
+                            CFRelease(val.cast());
+                        }
+                    }
+                    CFRelease(arr.cast());
+                }
+                CFRelease(app.cast());
+            }
+        }
+        moved
     }
 
     /// Activate the target app via AX (kAXFrontmost) AND explicitly
