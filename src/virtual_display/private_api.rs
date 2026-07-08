@@ -153,7 +153,12 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         let _: () = msg_send![desc, setSizeInMillimeters: CGSize { width: 600.0, height: 338.0 }];
         let _: () = msg_send![desc, setProductID: 0x6D616372u32]; // "macr"
         let _: () = msg_send![desc, setVendorID: 0x6D616372u32];
-        let _: () = msg_send![desc, setSerialNum: 1u32];
+        // Was hardcoded to 1: a second macrdp process (e.g. --fork-workers
+        // dev testing alongside a running instance) registering a display
+        // with an identical vendor/product/serial triple gets its descriptor
+        // rejected by CGVirtualDisplay initWithDescriptor: outright (returns
+        // nil). Per-process id keeps concurrent instances from colliding.
+        let _: () = msg_send![desc, setSerialNum: std::process::id()];
 
         // 2. CGVirtualDisplay instance from the descriptor.
         let display: *mut AnyObject = msg_send![display_class, alloc];
