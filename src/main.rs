@@ -579,6 +579,15 @@ struct Args {
     #[arg(long = "alt-tab-switch")]
     alt_tab_switch: bool,
 
+    /// Also accept Option+` (Alt+backtick from the client) as a trigger for the
+    /// within-app window cycle, in addition to Cmd+`. Off by default. Mirrors
+    /// --alt-tab-switch's relationship to Cmd+Tab, for clients/configs that
+    /// forward Alt+` but gate the Windows-key combo. Option+Shift+` cycles
+    /// backward. When off, Option+` reaches remote apps as a normal key.
+    /// macOS-only.
+    #[arg(long = "alt-backtick-switch")]
+    alt_backtick_switch: bool,
+
     /// Show a visual app-switcher overlay (icon row) on the remote during Cmd+Tab
     /// / Option+Tab, like macOS's native switcher. Off by default. macrdp spawns a
     /// small helper process that draws a real on-screen panel; ScreenCaptureKit
@@ -1580,6 +1589,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ALT_TAB_SWITCH", false) {
         argv.push("--alt-tab-switch".into());
     }
+    if on("ALT_BACKTICK_SWITCH", false) {
+        argv.push("--alt-backtick-switch".into());
+    }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
     }
@@ -2282,6 +2294,7 @@ async fn async_main() -> Result<()> {
     ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
+    crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());

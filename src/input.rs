@@ -254,6 +254,21 @@ pub fn set_alt_tab_switch(on: bool) {
     ALT_TAB_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, Option+` (i.e. Alt+backtick forwarded from the client) is
+/// accepted as an *additional* trigger for the same within-app window-cycle
+/// that Cmd+` drives — mirrors `ALT_TAB_SWITCH`'s relationship to Cmd+Tab,
+/// but for the window cycle instead of the app cycle. Opt-in via
+/// `--alt-backtick-switch`; off by default so Option+` otherwise reaches
+/// remote apps as a normal key. Cmd+` is unaffected and always works. Unlike
+/// Opt+Tab there is no release-commit bookkeeping —
+/// `ax_cycle_windows_of_front` acts immediately on each press.
+static ALT_BACKTICK_SWITCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_alt_backtick_switch(on: bool) {
+    ALT_BACKTICK_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// When true, drive the `macrdphud` overlay helper so the remote client sees a
 /// visual app switcher during Cmd+Tab / Option+Tab. Opt-in via
 /// `--app-switcher-hud`; off by default. The switch itself works the same either
@@ -1036,6 +1051,20 @@ mod macos {
                 && vk == VK_TAB
             {
                 cycle_apps(shift);
+                return true;
+            }
+
+            // Opt+` / Opt+Shift+` as an alternative within-app window-cycle
+            // trigger (opt-in via --alt-backtick-switch), mirroring Cmd+`/Cmd+Shift+`.
+            // No release-session bookkeeping needed here (unlike Opt+Tab above) —
+            // ax_cycle_windows_of_front acts immediately on each press.
+            if super::ALT_BACKTICK_SWITCH.load(std::sync::atomic::Ordering::Relaxed)
+                && opt
+                && !cmd
+                && !ctrl
+                && vk == VK_GRAVE
+            {
+                ax_cycle_windows_of_front(shift);
                 return true;
             }
 
@@ -2753,21 +2782,29 @@ mod macos {
         use std::ffi::c_void;
         use std::ptr;
 
-        // Source-of-truth for "what app is the user actually in":
-        // delegate to `effective_front_pid`, which reconciles
-        // `NSWorkspace.frontmostApplication` against the
-        // LAST_AX_ACTIVATED_PID / WORKSPACE_LIE_FRONT tracking that
-        // cycle_apps maintains. Without this reconciliation, Cmd+`
-        // would key off the stale workspace value and try to cycle
-        // windows of whatever app we *used to* be in, not the one we
-        // just landed on via Cmd+Tab.
+        // Source-of-truth for "what app is the user actually in": prefer the
+        // AX system-wide focused-application pid (`ax_focused_application_pid`,
+        // the same primitive the MRU poller uses) over
+        // `NSWorkspace.frontmostApplication`. NSWorkspace stops tracking
+        // plain click-driven focus changes (Dock/window clicks) under
+        // `--virtual-display`/`--capture-primary` — it pins to whatever was
+        // front when headless engaged — while AX's system-wide focus follows
+        // real WindowServer focus (and our own AX activations) directly. Fall
+        // back to workspace + the LAST_AX_ACTIVATED_PID/WORKSPACE_LIE_FRONT
+        // reconciliation (`effective_front_pid`) only if AX can't resolve a
+        // focused app at all (e.g. a transient AX hiccup).
         let pid = unsafe {
-            let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
-            let workspace_pid = match ws.frontmostApplication() {
-                Some(app) => app.processIdentifier(),
-                None => return false,
-            };
-            effective_front_pid(workspace_pid, |p| libc::kill(p, 0) == 0)
+            match ax_focused_application_pid() {
+                Some(ax_pid) => ax_pid,
+                None => {
+                    let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
+                    let workspace_pid = match ws.frontmostApplication() {
+                        Some(app) => app.processIdentifier(),
+                        None => return false,
+                    };
+                    effective_front_pid(workspace_pid, |p| libc::kill(p, 0) == 0)
+                }
+            }
         };
         let app_ref = unsafe { AXUIElementCreateApplication(pid) };
         if app_ref.is_null() {
