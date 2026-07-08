@@ -43,7 +43,12 @@ impl Decode<'_> for TsUrbResult {
         if urb_size < ACTUAL_HEADER_SIZE {
             return Err(invalid_field_err!("TS_URB_RESULT_HEADER::Size", "is smaller than 8"));
         }
-        let payload = TsUrbResultPayload::decode(&mut ReadCursor::new(src.read_slice(urb_size - ACTUAL_HEADER_SIZE)))?;
+        // `urb_size` is attacker-controlled (read off the wire); guard the cursor
+        // before slicing, or `read_slice` panics on a truncated PDU instead of
+        // returning a clean decode error.
+        let payload_size = urb_size - ACTUAL_HEADER_SIZE;
+        ensure_size!(in: src, size: payload_size);
+        let payload = TsUrbResultPayload::decode(&mut ReadCursor::new(src.read_slice(payload_size)))?;
         Ok(Self { header, payload })
     }
 }
@@ -426,6 +431,9 @@ impl Decode<'_> for TsUsbdInterfaceInfoResult {
                 "is less than min reqd value of 16"
             ));
         };
+        // `length` is attacker-controlled; guard before slicing (the `16..`
+        // pattern above rules out underflow, not over-read).
+        ensure_size!(in: src, size: usize::from(length) - 2);
         let mut src = ReadCursor::new(src.read_slice(usize::from(length) - 2));
         let interface_number = src.read_u8();
         let alternate_setting = src.read_u8();

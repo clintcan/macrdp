@@ -1,0 +1,39 @@
+[package]
+name = "ironrdp-rdpeusb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironrdp-rdpeusb = { path = ".." }
+# For the free `decode::<T>` helper.
+ironrdp-core = { version = "0.1", features = ["alloc"] }
+
+# This fuzz crate is its own workspace root (see [workspace] below), so the root
+# macrdp Cargo.toml's [patch.crates-io] does NOT apply. ironrdp-rdpeusb itself
+# carries NO patch block (it relies on the root's), so replicate the full git
+# pin set here — otherwise its ironrdp-* deps resolve to mismatched crates.io
+# versions. Keep the rev in sync with the root macrdp Cargo.toml on a pin bump.
+# (Unused entries just warn; included wholesale so the transitive graph resolves
+# to one consistent git rev, matching the macrdp build.)
+[patch.crates-io]
+ironrdp-str            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-error          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-core           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-pdu            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-graphics       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+
+[[bin]]
+name = "client_pdu"
+path = "fuzz_targets/client_pdu.rs"
+test = false
+doc = false
+bench = false
+
+# Isolate from any parent workspace so it never enters the macrdp build or the
+# standalone-crate CI.
+[workspace]

@@ -88,3 +88,21 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     server's `parse_configuration` fills it from the fetched config descriptor. Verified
     live: mstsc `SelectConfiguration` succeeds (pipe handles returned) for a camera +
     audio/HID device; FreeRDP mass storage unaffected. Upstreamable with (1)/(2).
+
+(4) **Panic-hardening: bound wire-controlled `read_slice` lengths in the
+    completion decoders** (`src/pdu/completion/mod.rs`, `src/pdu/completion/
+    ts_urb_result.rs`). Found 2026-07-09 by `cargo fuzz` (the `client_pdu` target
+    in `fuzz/`, over `UrbdrcClientPdu::decode` — the client→server PDUs the macrdp
+    server parses). Three decode sites read a length field off the wire and passed
+    it straight to `ReadCursor::read_slice(n)` **without an `ensure_size!` guard**,
+    so a truncated PDU panicked (`range end index N out of range`) instead of
+    returning a clean `DecodeError` — an attacker-influenced panic (the URBDRC DVC
+    is post-NLA + opt-in + entitled-only, so low severity, but a decode path must
+    never panic): (a) `TsUrbResult::decode` — `read_slice(urb_size - 8)`;
+    (b) `IoControlCompletion::decode` — `read_slice(information)`;
+    (c) `TsUsbdInterfaceInfoResult::decode` — `read_slice(length - 2)`. Fix: an
+    `ensure_size!(in: src, size: n)` before each slice (the exact idiom the sibling
+    `UrbCompletion::decode` already uses for `cb_ts_urb_result` / `output_buffer_size`).
+    After the fix, 107M fuzz execs clean. This is an **upstream bug** (not
+    macrdp-specific) — offer the guards upstream alongside (1)/(2)/(3); the
+    regression guard is the `fuzz/` harness (needs nightly + cargo-fuzz; not in CI).

@@ -111,6 +111,10 @@ impl IoControlCompletion {
             // #[expect(clippy::as_conversions)]
             0 | HRESULT_FROM_WIN32_ERROR_INSUFFICIENT_BUFFER => {
                 let n = information.try_into().map_err(|e| other_err!(source: e))?;
+                // `information` is attacker-controlled; guard before slicing or
+                // `read_slice` panics on a truncated PDU (matches the guarded
+                // `output_buffer_size` read in UrbCompletion::decode below).
+                ensure_size!(in: src, size: n);
                 Vec::from(src.read_slice(n))
             }
             // > For any other case [OutputBufferSize] MUST be set to 0
