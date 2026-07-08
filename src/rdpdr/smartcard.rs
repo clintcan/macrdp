@@ -44,6 +44,14 @@ const CMD_POWER_OFF: u8 = 2;
 const CMD_TRANSMIT: u8 = 3;
 const CMD_PRESENCE: u8 = 4;
 
+/// Upper bound on a `CMD_TRANSMIT` command-APDU length. The bridge listens on
+/// loopback with no authentication (see the unauthenticated-loopback-IPC note in
+/// `docs/macos-gotchas.md`), so an untrusted local process could send an
+/// arbitrary 32-bit `send_len`; cap it before allocating so a bogus length can't
+/// force a multi-gigabyte allocation. No real APDU exceeds the ISO 7816
+/// extended-APDU maximum (4-byte header + 3-byte Lc + 65535 data + 2-byte Le).
+const MAX_APDU_LEN: usize = 65_544;
+
 fn port() -> u16 {
     std::env::var("MACRDP_SCARD_PORT")
         .ok()
@@ -181,6 +189,16 @@ impl Session {
                 },
                 CMD_TRANSMIT => {
                     let send_len = stream.read_u32().await? as usize;
+                    // Bound the wire-supplied length before allocating — an
+                    // unauthenticated local process could otherwise request a
+                    // huge allocation. Anything over a real APDU is bogus.
+                    if send_len > MAX_APDU_LEN {
+                        warn!(
+                            send_len,
+                            "smart card: TRANSMIT length exceeds the APDU cap; closing"
+                        );
+                        return Ok(());
+                    }
                     let mut apdu = vec![0u8; send_len];
                     stream.read_exact(&mut apdu).await?;
                     let recv_len = stream.read_u32().await?; // caller's recv-buffer size
