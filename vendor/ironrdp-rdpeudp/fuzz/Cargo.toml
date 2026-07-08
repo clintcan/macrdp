@@ -1,0 +1,45 @@
+[package]
+name = "ironrdp-rdpeudp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironrdp-rdpeudp = { path = ".." }
+# For the free `decode::<T>` helper + ReadCursor in the EMT target.
+ironrdp-core = { version = "0.1", features = ["alloc"] }
+
+# This fuzz crate is its own workspace root (see [workspace] below), so the
+# parent's [patch.crates-io] does NOT apply — replicate it. Keep the rev in sync
+# with the root macrdp Cargo.toml and vendor/ironrdp-rdpeudp/Cargo.toml.
+[patch.crates-io]
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+
+[[bin]]
+name = "datagram_decode"
+path = "fuzz_targets/datagram_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "eudp2_packet"
+path = "fuzz_targets/eudp2_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emt_tunnel"
+path = "fuzz_targets/emt_tunnel.rs"
+test = false
+doc = false
+bench = false
+
+# Isolate this crate from any parent workspace so it never gets swept into the
+# macrdp root build or the standalone-crate CI test.
+[workspace]
