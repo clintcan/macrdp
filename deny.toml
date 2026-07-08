@@ -1,0 +1,92 @@
+# cargo-deny configuration.
+#
+# Primary purpose: scheduled SUPPLY-CHAIN / VULNERABILITY scanning. macrdp pins
+# IronRDP at a deliberately old git rev and freezes releases for weeks, so a new
+# RustSec advisory can land against a dependency version we already shipped with
+# NO code change on our side. The scheduled `security` workflow re-scans this
+# frozen tree daily against a fresh advisory DB to catch exactly that.
+#
+# The CI gate runs `check advisories bans sources` (see .github/workflows/
+# security.yml). The `licenses` check is intentionally NOT in the daily gate —
+# ring / aws-lc-rs (pulled in via rustls) carry non-SPDX / OpenSSL license
+# expressions that would red the build for a non-security reason and drown the
+# vulnerability signal. Run `cargo deny check licenses` locally when you want a
+# license review; the allow-list below makes that run meaningful.
+
+[graph]
+# Scan with every feature enabled (multitransport, egfx, …) so feature-gated
+# deps like ironrdp-rdpeudp are in the graph. Leave `targets` unset so
+# macOS-only deps are scanned too — a vuln in a macOS-gated crate must still
+# surface even though CI runs on Linux.
+all-features = true
+
+[advisories]
+version = 2
+# A yanked crate in the lockfile fails the scan (it was pulled for a reason —
+# often a security or soundness issue).
+yanked = "deny"
+# The gate fails on security VULNERABILITIES and yanked crates. "Unmaintained"
+# advisories are informational (an abandoned-but-not-vulnerable crate) and would
+# otherwise red the daily build on common transitive crates — handle those by
+# review, not by blocking unrelated work. Flip to "all" if you want the
+# maintenance signal to gate too.
+unmaintained = "none"
+# Suppress a specific advisory ONLY with a written justification here (why it's
+# not fixable now AND why it's assessed as not-exploitable in macrdp's usage).
+# Format: "RUSTSEC-XXXX-NNNN". cargo-deny still prints an ignored advisory as a
+# note, so it stays visible; ignoring keeps the daily gate GREEN so it still
+# fires on every OTHER (new) advisory instead of being permanently red on a
+# known-and-triaged one. Re-review these whenever the IronRDP pin is bumped.
+ignore = [
+  # RUSTSEC-2023-0071 — "Marvin Attack": RSA PKCS#1 v1.5 decryption in the `rsa`
+  # crate is not constant-time, leaking key bits via network-observable timing.
+  # Reached transitively through picky -> ironrdp-connector / sspi / winscard
+  # (the CredSSP/NLA + smart-card auth stack), shared by ALL of IronRDP and every
+  # downstream server. Accepted risk because: (1) NO fix exists upstream — the
+  # advisory states "no safe upgrade is available" pending a constant-time
+  # rewrite; (2) it's not droppable without dropping CredSSP/NLA; (3) macrdp's
+  # documented posture is VPN / trusted-LAN only (never a public IP), and TLS is
+  # rustls/aws-lc-rs — unaffected — so an attacker is not positioned to time the
+  # server's RSA private-key operations. Revisit on each IronRDP pin bump.
+  "RUSTSEC-2023-0071",
+]
+
+[bans]
+# Duplicate versions are normal in a large Rust tree — surface them but don't
+# fail the security gate on them.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Catch a dependency sneaking in from an unexpected registry or git remote — a
+# supply-chain tripwire. Any crate NOT from crates.io or the allow-listed git
+# remote below fails the scan.
+unknown-registry = "deny"
+unknown-git = "deny"
+# The only git remote macrdp intentionally pulls from is the pinned IronRDP fork
+# (both the root tree and the standalone vendor/ironrdp-rdpeudp crate resolve
+# ironrdp-* from here via [patch.crates-io]).
+allow-git = [
+  "https://github.com/Devolutions/IronRDP.git",
+]
+
+[licenses]
+# NOT run in the daily CI gate (see the header note); kept so a local
+# `cargo deny check licenses` is meaningful. macrdp itself is MIT OR Apache-2.0;
+# this is the permissive set its dependency tree uses.
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "0BSD",
+]

@@ -1,0 +1,122 @@
+name: security
+
+# Dependency vulnerability / supply-chain scanning (cargo-deny against the
+# RustSec advisory DB). This is SEPARATE from ci.yml on purpose:
+#
+#   * It runs on a daily SCHEDULE, not just on push/PR. macrdp pins IronRDP at a
+#     deliberately old rev and ships frozen releases for weeks, so a newly
+#     published advisory against a version we already froze must be caught
+#     WITHOUT a code change triggering it. Only a scheduled re-scan of the
+#     unchanged Cargo.lock does that — the whole point of the job.
+#   * Keeping it out of ci.yml avoids dragging the full macOS test matrix into
+#     the daily cron.
+#
+# A failed scheduled run emails the repo owner (GitHub's default for scheduled
+# workflow failures), so no extra notification wiring is needed.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vendor/**/Cargo.toml'
+      - 'vendor/**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/security.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vendor/**/Cargo.toml'
+      - 'vendor/**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/security.yml'
+  schedule:
+    # 07:12 UTC daily. Off the hour so it isn't in the top-of-hour runner surge.
+    - cron: '12 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: '10'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories / sources / bans)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # This job installs + runs third-party tooling (cargo-deny) UNATTENDED on a
+      # schedule, so it's the most justified place for a real egress FIREWALL, not
+      # just audit. block = deny all egress except the allow-list below, so a
+      # compromised cargo-deny (or one of its build deps) can't exfiltrate the
+      # token or phone home. The list is deterministic because this job pulls no
+      # GitHub Actions cache (no rust-cache step — see below), whose dynamic Azure
+      # blob endpoints are hard to pin. If a future run FAILS on a blocked
+      # endpoint, the harden-runner run summary names it — add it here.
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            crates.io:443
+            index.crates.io:443
+            static.crates.io:443
+            static.rust-lang.org:443
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: '1.95.0'
+
+      # No rust-cache here on purpose: it wouldn't cache the `cargo install`
+      # (that lands in ~/.cargo/bin), only the registry, so the payoff is tiny —
+      # and it's what would force the hard-to-allowlist GitHub Actions cache
+      # endpoints into the block-mode egress policy. A ~1 min fresh compile on a
+      # daily job is the cheaper trade.
+
+      # VERSION-PINNED (not float-to-latest): the tool you add to DETECT
+      # supply-chain issues shouldn't itself auto-run whatever crates.io serves as
+      # "latest" on an unattended schedule. Bump this pin deliberately in a
+      # reviewed commit (it's a `run:` line, so Dependabot does NOT auto-track it —
+      # swap to a SHA-pinned install-action if you want that). Built from source
+      # via the already-SHA-pinned toolchain to keep the repo's no-unpinned-actions
+      # convention.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version '=0.19.9' --locked
+
+      # Root scan: the macrdp package resolves the vendored ironrdp-* forks and
+      # every transitive dep through [patch.crates-io] path deps, so this one
+      # Cargo.lock covers the whole shipped tree.
+      - name: cargo-deny — root tree
+        run: cargo deny check advisories bans sources
+
+      # vendor/ironrdp-rdpeudp is a STANDALONE crate (its own Cargo.lock, not a
+      # workspace member — see ci.yml). Scan it separately against the same
+      # deny.toml so an advisory that only appears in its independent lock is
+      # still caught.
+      - name: cargo-deny — vendored ironrdp-rdpeudp
+        run: >
+          cargo deny
+          --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml
+          check --config deny.toml advisories bans sources
