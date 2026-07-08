@@ -103,6 +103,12 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     (c) `TsUsbdInterfaceInfoResult::decode` — `read_slice(length - 2)`. Fix: an
     `ensure_size!(in: src, size: n)` before each slice (the exact idiom the sibling
     `UrbCompletion::decode` already uses for `cb_ts_urb_result` / `output_buffer_size`).
-    After the fix, 107M fuzz execs clean. This is an **upstream bug** (not
-    macrdp-specific) — offer the guards upstream alongside (1)/(2)/(3); the
-    regression guard is the `fuzz/` harness (needs nightly + cargo-fuzz; not in CI).
+    After the fix, 107M fuzz execs clean. The regression guard is the `fuzz/`
+    harness (needs nightly + cargo-fuzz; not in CI).
+    **ALREADY FIXED UPSTREAM — DROP ON PIN BUMP, do NOT file a PR (verified
+    2026-07-09):** upstream `master` added these exact guards (same `payload_size`/
+    `remaining_length` + `ensure_size!` shape) in the `refactor(rdpeusb): split PDU
+    and TS_URB enum wrapper` commit (`#1321`), which our pin `879ffed` **predates**
+    (`879ffed` is an ancestor of master and has the unguarded code). So this
+    divergence exists ONLY in macrdp's old vendored copy and vanishes when the pin
+    is bumped past `#1321` — no upstream contribution is needed (unlike (1)/(2)/(3)).
