@@ -25,8 +25,9 @@ src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
                   (Cmd+Tab app cycle, Cmd+` window cycle, Spotlight,
                   screencapture) since WindowServer's symbolic-hotkey
                   dispatcher won't fire for CGEventPost. The Cmd+Tab cycle
-                  (also Option+Tab with --alt-tab-switch) makes the landing
-                  app always surface — un-minimize / reopen-windowless
+                  (also Option+Tab with --alt-tab-switch), and the Cmd+`
+                  window cycle (also Option+` with --alt-backtick-switch),
+                  make the landing app always surface — un-minimize / reopen-windowless
                   (open -b) / unhide, gated to the committed app — and, with
                   --app-switcher-hud, drives the macrdphud overlay via
                   src/switcher_hud.rs. Also the optional Ctrl→Cmd

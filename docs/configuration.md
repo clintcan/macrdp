@@ -46,6 +46,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           gate Win+Tab (e.g. mstsc's "Apply Windows key
                           combinations" when windowed). Option+Shift+Tab cycles
                           backward. macOS-only.
+--alt-backtick-switch     Also accept Option+` (Alt+` from the client) as a
+                          window-cycle trigger for the current app, in addition
+                          to Cmd+`. Off by default. The Option+Tab analogue of
+                          --alt-tab-switch, for clients that forward Alt+` but
+                          gate Win-key combos. Option+Shift+` cycles backward.
+                          macOS-only.
 --app-switcher-hud        Show a visual app-switcher overlay (icon row, like
                           macOS's native Cmd+Tab) on the remote during Cmd+Tab /
                           Option+Tab. Off by default. macrdp spawns a small helper
