@@ -345,7 +345,9 @@ each interval and waits `TIMEOUT_SECS` for it to run; a deadlocked runtime never
 runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
 exiting.
 
-Blank recovery + auto-reconnect (env-only; on by default with `--enable-h264`).
+Blank recovery + auto-reconnect (env-tunable, **settable through `config.env`**
+— the matching keys are the same names minus the `MACRDP_` prefix, e.g.
+`BLANK_RECOVERY=0`; on by default with `--enable-h264`).
 The mstsc reconnect-blank auto-heal now **reactivates the RDP core in place** —
 on a detected blank the server sends a bare Deactivation–Reactivation (Server
 Deactivate All → new Demand Active) that preserves the EGFX channel/surface, and

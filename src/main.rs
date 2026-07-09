@@ -1669,10 +1669,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(path.clone());
         }
     }
-    // Auth-guard tunables are env-only (read at startup by auth_guard::*_from_env).
-    // Bridge the friendly config.env keys to their MACRDP_* env vars here so
-    // menu-bar / LaunchAgent users can tune them via config.env without editing
-    // the plist's EnvironmentVariables. Unset keys keep the on-by-default defaults.
+    // Env-only tunables (auth guard, health-check watchdog, blank recovery,
+    // auto-reconnect cookie — each read lazily after this point). Bridge the
+    // friendly config.env keys to their MACRDP_* env vars here so menu-bar /
+    // LaunchAgent users can tune them via config.env without editing the
+    // plist's EnvironmentVariables. Unset keys keep the on-by-default defaults.
     for (cfg_key, env_var) in [
         ("CONN_GUARD", "MACRDP_CONN_GUARD"),
         ("AUDIT_LOG", "MACRDP_AUDIT_LOG"),
@@ -1697,6 +1698,41 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_HEALTHCHECK_TIMEOUT_SECS",
         ),
         ("HEALTHCHECK_FAILURES", "MACRDP_HEALTHCHECK_FAILURES"),
+        // Blank recovery (the mstsc reconnect-blank auto-heal, needs
+        // --enable-h264) + the auto-reconnect cookie. Env-driven like the
+        // guard (read in h264.rs per connection / main.rs at server build,
+        // both after this bridge runs). BLANK_RECOVERY=0 is the ask that
+        // motivated bridging: disabling the detector for an overlay-link
+        // profile used to need a plist EnvironmentVariables edit.
+        ("BLANK_RECOVERY", "MACRDP_BLANK_RECOVERY"),
+        (
+            "BLANK_RECOVERY_REACTIVATE",
+            "MACRDP_BLANK_RECOVERY_REACTIVATE",
+        ),
+        (
+            "BLANK_RECOVERY_MAX_RTT_MS",
+            "MACRDP_BLANK_RECOVERY_MAX_RTT_MS",
+        ),
+        ("BLANK_RECOVERY_MIN_QOE", "MACRDP_BLANK_RECOVERY_MIN_QOE"),
+        (
+            "BLANK_RECOVERY_MAX_WAIT_MS",
+            "MACRDP_BLANK_RECOVERY_MAX_WAIT_MS",
+        ),
+        (
+            "BLANK_RECOVERY_MIN_WALL_REPORTS",
+            "MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS",
+        ),
+        ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
+        ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
+        (
+            "BLANK_RECOVERY_MAX_ATTEMPTS",
+            "MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS",
+        ),
+        (
+            "BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS",
+            "MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS",
+        ),
+        ("AUTO_RECONNECT", "MACRDP_AUTO_RECONNECT"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {

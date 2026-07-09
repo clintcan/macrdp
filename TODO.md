@@ -7,22 +7,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [x] **mstsc reconnect-blank SOLVED — in-place self-heal shipped (v0.8.27, #142 merged + released 2026-07-07; LIVE-VERIFIED real mstsc/WiFi 9/9 blanks healed, zero drops). (Remove this item next prune.)** The nine-pass "not server-fixable" saga is over. Root cause was mstsc retaining EGFX **surface id 0** across an in-process reconnect and compositing the stale surface (black). Every prior dislodge attempt bundled a surface delete or DVC/channel close (`resize_with_monitors` DeleteSurface, xrdp's DELETE_SURFACE+DYNVC_CLOSE) — all proven client-fatal. **Fix:** on a detected blank, send a **bare core Deactivation–Reactivation** (Server Deactivate All → new Demand Active) that touches NOTHING in the EGFX pipeline → mstsc re-maps surface 0 and presents again in place, ~1–2 s, no disconnect. Zero vendored-server change: `h264.rs` (`BlankAction::Reactivate` → `perform_blank_reactivate` stashes size in `Gfx::reactivate_request`) → `capture.rs::next_update` emits a no-op `DisplayUpdate::Resize(current)` → the server's existing `deactivate_all`+`new_deactivation_reactivation` preserves static channels so `setup_locked` skips (no resize_with_monitors/DeleteSurface). Now the **default** recovery action; the old connection-drop is only the fallback (`max_attempts` forced ≥2). Detection sped **~70 s → ~4 s** via a wall-clock fast-path (`MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`/`MIN_WALL_REPORTS`); still RTT+QoE gated (FreeRDP/high-RTT untouched). `--fork-workers` no longer needed for reconnect reliability. Detail: [[project_h264_reconnect_blank]] TENTH PASS + the reconnect-blank quirk note. **DON'T re-add any surface-delete to the recovery path.**
-
-- [x] **Make blank-recovery RTT-aware — DONE, #135 merged + deployed + LIVE-VERIFIED 2026-07-05 (real mstsc over ZeroTier-on-MOBILE, link_rtt 142–161 ms: `seeding adaptive bitrate at ceiling/3` seed_bps=2000000 + `blank recovery DISARMED` both fired; session stable, user-confirmed working; config now clean — no plist override, --bitrate 6 restored). (Remove this item next prune.)** Original item: Found
-  live 2026-07-05 (real mstsc over ZeroTier). The detector (`src/h264.rs`
-  `should_blank_recover`) reads mstsc's QoE decode+render-time==0 as "not presenting" and
-  drops the connection, expecting nonzero EDR within ~200 ms (a LAN assumption). Over
-  ZeroTier a session that IS visibly rendering reports EDR=0 → it force-drops a WORKING
-  session every ~5 s, and the repeated drops poison mstsc's surface into a REAL permanent
-  black — i.e. the recovery *causes* the blank it's meant to fix. **Worked around** for the
-  ZeroTier user by `MACRDP_BLANK_RECOVERY=0` in the deployed LaunchAgent plist, but that
-  globally loses the LAN reconnect-blank protection. Proper fix (analogous to the #130
-  RTT-aware adaptive-bitrate signal): gate/scale the detector by link RTT, or require a
-  stronger signal (e.g. also-no-frame-acks, not just EDR==0) before dropping. Also worth
-  bridging `BLANK_RECOVERY` as a friendly `config.env` key (today it's env-only, not in the
-  `args_from_config` bridge list). Detail: [[project_zerotier_mstsc_tuning]].
-
 - [ ] **Tier 2.4 — multi-day soak (foundation core PASSED 31 h 2026-07-03; full 48–72 h on
   v0.8.24 still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
   #105). Tooling: `scripts/soak-monitor.sh monitor` samples a resource CSV; `… analyze`
@@ -71,57 +55,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
   rect (`encoder/mod.rs:520,337`) — reuse a scratch buffer + one `spawn_blocking` per update;
   legacy-clients-only, clean upstream PRs. NOT worth doing: RDPEUDP per-datagram allocs
   (inherent to sans-I/O design), NFS readdir pagination cache, UDP idle tick suppression.
-- [x] **Softer UDP adaptive-bitrate signal over WiFi (retransmit tolerance).** SHIPPED
-  2026-06-29 (#100): `MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE` (default 2) so sporadic wireless
-  retransmits don't ratchet the bitrate down. BUT the live mstsc/WiFi6 test disproved the
-  hypothesis for that link — the degradation was **ack-lag-driven** (tunnel wedging /
-  HOL-block, `retransmit_delta=0` on every decrease), not retransmit-driven, so the
-  tolerance never engaged and the watchdog de-migrated to TCP. Kept as a correct low-risk
-  improvement for links that *do* retransmit; the WiFi6 answer stays `UDP_MIGRATE_EGFX=0`.
-  The reliable-tunnel retransmit counter barely fires in practice — ack-lag is the dominant
-  signal. (Remove this line next prune.)
-
-- [x] **UDP-tunnel death detection + offer cooldown — SHIPPED (#133) + LIVE-VERIFIED
-  2026-07-04** (the fix for mstsc's ~60s dead-tunnel session reset; keepalives were
-  REJECTED — in the overlay case the UDP path itself is dead, so keepalives can't arrive
-  either). The listener declares a BOUND tunnel dead after `MACRDP_UDP_TUNNEL_DEAD_SECS`
-  (30s) of inbound silence → audio falls back to TCP immediately + multitransport offers
-  are suppressed for `MACRDP_UDP_MT_COOLDOWN_SECS` (600s). **Live verification (real
-  mstsc over ZeroTier, natural wedge):** 3× `UDP tunnel DEAD` at `idle_ms≈30s`, audio
-  kept playing through the fallback (user-confirmed), every reconnect logged
-  `multitransport offer SUPPRESSED` and ran plain TCP — cycle broken. Known limit: the
-  cooldown is in-process state, so a server crash/restart wipes it (observed once via the
-  NSPasteboard SIGSEGV below — one fresh offer followed). The verify run also surfaced the
-  oversized-cursor session-killer (PR #134) and that crash. Docs updated
-  (features.md/cli.md). Blockage tool for future re-tests: `scripts/udp-block.sh`
-  (pf-anchor UDP-only block on :3390). (Remove this item next prune.)
-
-- [x] **Oversized-cursor sprite kills the session — FIXED (#134, in v0.8.25, deployed; field-verified through hours of live use that previously crashed every ~45 s). (Remove next prune.)**
-  `TS_COLORPOINTERATTRIBUTE`'s XOR mask length is u16, so `w*h*4 > 65535` (e.g. macOS
-  shake-to-locate at Retina backing pixels, 128×128 = 65536) makes the encode error tear
-  down the whole client loop — killed 6 straight ZeroTier sessions at ~45 s during the
-  #133 verify (and fired at 00:43 that morning on the previous build). Fix:
-  `cursor/mod.rs::clamp_pointer_size` downscales aspect-preserving (hotspot-exact) via the
-  existing resampler; unit-tested.
-
-- [x] **NSPasteboard SIGSEGV crash — FIXED via a global pasteboard mutex (2026-07-07).**
-  2026-07-04 19:47:58 crash `macrdp-2026-07-04-194758.ips`: `objc_msgSend` under
-  `-[NSPasteboard _updateTypeCacheIfNeeded]` ← `_typesAtIndex:combinesItems:` during
-  connection churn (~13 s after a client-loop failure + a fresh accept). **Root cause
-  confirmed:** the process-global `NSPasteboard` (AppKit, NOT thread-safe) was accessed
-  from multiple threads with ZERO serialization — the advertise poller (a tokio worker)
-  walking `pasteboardItems()`/`types()` overlapped a concurrent writer
-  (`clearContents`/`writeObjects`/`setData` from the paste, download, or disconnect-Drop
-  paths, each on its own thread), which corrupts the pasteboard's internal type cache →
-  use-after-free → segfault. The disconnect-Drop clear racing the poller is the churn
-  window. **Fix:** `clipboard::pasteboard_guard()` — a process-global `Mutex<()>` that
-  every `pb::` accessor and every `file_promise*` pasteboard touch holds for the span of
-  its objc calls (poison-recovering, since the guarded data is `()`); the check-then-clear
-  cleanup paths hold it across the changeCount read + the clear so that's atomic too.
-  Serializes reader vs. writer and closes the race. Rare, so unproven-by-repro — keep the
-  `.ips` files and watch for a DIFFERENT signature (the 2026-06-28 `UNKNOWN_0x32` pthread
-  crash is a separate, still-open one-off).
-
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
   video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)
   SHIPPED as #94; P2a (IDR backoff + ack-lag signal switch) SHIPPED 2026-06-29;
@@ -421,6 +354,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
   ceiling (NO-GO): multi-user concurrent GUI sessions (macOS limit).
 
 ## Parked — scoped, low priority
+
+- [ ] **Crash-report watch (post NSPasteboard-mutex fix).** The rare churn-time
+  NSPasteboard use-after-free SIGSEGV was fixed 2026-07-07 via a process-global
+  pasteboard mutex (`clipboard::pasteboard_guard()`, released in v0.8.29) — but it was
+  rare, so it's unproven-by-repro. Keep the `.ips` files and watch new crash reports for
+  a DIFFERENT signature. The 2026-06-28 `UNKNOWN_0x32` pthread crash is a separate,
+  still-open one-off.
 
 - [ ] **Auto-sized virtual display.** Resize the vdisplay to the client's resolution on
   connect (avoids the mirror-primary scaling lag). Risk: does `CGVirtualDisplay applySettings`

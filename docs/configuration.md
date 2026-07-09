@@ -265,6 +265,29 @@ retry-after.
 (Log rotation is likewise env-tunable: `MACRDP_LOG_MAX_BYTES` (default 10 MiB) and
 `MACRDP_LOG_MAX_FILES` (default 5); see `--log-dir`.)
 
+### Blank recovery + auto-reconnect (on by default with `--enable-h264`)
+
+The mstsc reconnect-blank auto-heal: on a detected blank the server sends a bare
+core Deactivation–Reactivation that makes mstsc re-map its retained surface and
+present again **in place** (~1-2 s, no disconnect); a connection drop — healed by
+the client's auto-reconnect cookie — is only the fallback. Detection is
+**link-aware**: the server measures each connection's TCP RTT and, on slow links
+(≥ 80 ms) where the detection signal is unreliable, stands down instead of
+dropping a working session. The defaults are right for almost everyone; tune via
+`config.env` (keys shown) or the matching `MACRDP_*` env vars:
+
+```
+BLANK_RECOVERY=1              # master switch (0 = disable the detector entirely)   [env: MACRDP_BLANK_RECOVERY]
+BLANK_RECOVERY_REACTIVATE=1   # 1 = reactivate-in-place (heals mstsc); 0 = drop-only  [MACRDP_BLANK_RECOVERY_REACTIVATE]
+BLANK_RECOVERY_MAX_RTT_MS=80  # stand down at/above this link RTT (0 = always armed)  [MACRDP_BLANK_RECOVERY_MAX_RTT_MS]
+AUTO_RECONNECT=1              # 0 = don't provision the auto-reconnect cookie         [MACRDP_AUTO_RECONNECT]
+```
+
+Expert window tunables follow the same pattern (`BLANK_RECOVERY_{MIN_QOE,
+MAX_WAIT_MS,MIN_WALL_REPORTS,ARM_MS,RETRY_MS,MAX_ATTEMPTS,MAX_CONSECUTIVE_DROPS}`);
+QoE-less clients (FreeRDP) and high-RTT links are never touched. See the
+blank-recovery notes in `docs/known-quirks.md` for the full story.
+
 ## Headless mode
 
 `--virtual-display --width W --height H` allocates a headless display via undocumented `CGVirtualDisplay*` private API and serves it over RDP instead of mirroring the Mac's panel. Behaves like plugging in an external monitor — the remote session gets its own desktop at the requested resolution, and you keep using the Mac locally as normal. Add `--make-primary` to give the virtual display the menu bar so new app windows open there.
