@@ -420,6 +420,10 @@ pub struct RdpServer {
     /// before Demand Active is sent. See
     /// [`Self::set_honor_client_desktop_size`].
     honor_client_desktop_size: bool,
+    /// (vendored) Optional operator ceiling for the honored client size,
+    /// forwarded to each connection's `Acceptor` and clamped per-dimension
+    /// there. See [`Self::set_honor_client_desktop_size_max`].
+    honor_client_desktop_size_max: Option<DesktopSize>,
     /// (vendored) Optional shared cell the server writes with the client's
     /// announced keyboard-layout identifier (KLID, from the acceptor result)
     /// when a client connects. The input backend (e.g. `macrdp`'s
@@ -666,6 +670,7 @@ impl RdpServer {
             auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
             honor_client_desktop_size: false,
+            honor_client_desktop_size_max: None,
             #[cfg(feature = "multitransport")]
             multitransport: None,
             #[cfg(feature = "multitransport")]
@@ -740,6 +745,16 @@ impl RdpServer {
     /// client connects.
     pub fn set_honor_client_desktop_size(&mut self, honor: bool) {
         self.honor_client_desktop_size = honor;
+    }
+
+    /// (vendored) Cap the honored client desktop size at an operator
+    /// maximum, clamped per-dimension in the acceptor (defense-in-depth
+    /// resource bound — an 8192\u{d7}8192 request is ~256 MB of BGRA per frame).
+    /// No effect unless [`Self::set_honor_client_desktop_size`] is also set.
+    /// Must be called before any client connects. Mirrors upstream PR #1404;
+    /// swap to that API on the pin bump past it.
+    pub fn set_honor_client_desktop_size_max(&mut self, max: Option<DesktopSize>) {
+        self.honor_client_desktop_size_max = max;
     }
 
     /// (vendored, divergence 13) Provision the Server Auto-Reconnect Cookie
@@ -997,6 +1012,7 @@ impl RdpServer {
         // (vendored) Let the acceptor adopt the client's requested desktop
         // size from Client Core Data before Demand Active goes out.
         acceptor.set_honor_client_desktop_size(self.honor_client_desktop_size);
+        acceptor.set_honor_client_desktop_size_max(self.honor_client_desktop_size_max);
 
         // (vendored, feature=multitransport) When offering UDP multitransport:
         // (1) advertise EXTENDED_CLIENT_DATA_SUPPORTED so the client actually

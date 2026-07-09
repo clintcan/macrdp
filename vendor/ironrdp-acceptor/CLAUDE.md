@@ -46,6 +46,23 @@ vendor dir until divergence (1) is upstreamed AND released.
     builder method). Verified redundant vs upstream/master 2026-07-08. (Follow-up
     #1404 — clamp the honored size to an operator max — is still OPEN.)
 
+    **Extension (2026-07-09): operator ceiling for the honored size**
+    (`honor_client_desktop_size_max: Option<DesktopSize>`, setter
+    `set_honor_client_desktop_size_max`, carried across
+    `new_deactivation_reactivation`). Mirrors upstream PR #1404's semantics
+    locally as defense-in-depth: an in-band client request is clamped
+    per-dimension to the operator maximum before adoption (an 8192×8192
+    request is ~256 MB of BGRA per frame), while an out-of-band (garbage)
+    request stays refused outright by the existing 200..=8192 band check on
+    the RAW request — the clamp bounds legit requests, it doesn't launder
+    garbage. `None` (the default) is byte-identical to the pre-extension
+    behavior. Wired from macrdp's `--max-client-size WxH` via the vendored
+    server (divergence (9) extension); end-to-end tested in macrdp's
+    `src/conn_test.rs` (`client_resolution_clamped_to_operator_max` +
+    `operator_max_does_not_touch_in_bounds_request`, a real IronRDP client
+    over duplex). On the pin bump past #1404, delete this and pass the max
+    through the upstream `Option<DesktopSize>` honor-size API instead.
+
 (2) Expose the client's keyboard-layout id from Client Core Data (UPSTREAMED
     as #1397, MERGED 2026-07-01 — DROP ON PIN BUMP; added 2026-06-16): `Acceptor` gains a private
     `client_keyboard_layout: u32` (captured in `BasicSettingsWaitInitial`

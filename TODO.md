@@ -427,7 +427,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (a) past `2d3bdef` → `src/audio.rs` adopts the new rdpsnd handler API (`choose_format` + fallible
   `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic; (b) past `d471bd06`
   → `main.rs` switches `set_honor_client_desktop_size(bool)` to the builder `with_honor_client_desktop_size`
-  (and, once #1404 lands, to `Some(max)` capped to the Mac's native res — see the honor-size counterpart below).
+  (and, once #1404 lands, re-route the shipped `--max-client-size` clamp — currently a local acceptor/server divergence extension, 2026-07-09 — through the upstream `Option<DesktopSize>` honor-size API).
 - [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
@@ -453,8 +453,3 @@ then delete; promote a parked item to *In flight* when work actually starts.
   in `project_upstream_ironrdp_open_prs` memory). The other "quick" items (RDPDR decode halves,
   AudioWave `duration_ms`, keyboard-layout handle) are **held** — no upstream consumer yet, so they
   belong with their larger feature (server-RDPDR processor, audio-lag model), not standalone PRs.
-- [ ] **macrdp-side honor-size counterpart to #1404 (defense-in-depth, deferred).** macrdp sanity-bands
-  the client-requested size to [200, 8192] but has no operator max, so the same 8192×8192 (~256 MB/frame)
-  allocation vector exists locally. Add a `--max-client-size` flag (or cap to the Mac's native resolution)
-  and, when the pin bumps past #1404, pass it through the new `Option<DesktopSize>` honor-size API. Not
-  urgent; pairs with pin-bump follow-up (b) above.

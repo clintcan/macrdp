@@ -563,6 +563,17 @@ struct Args {
     #[arg(long)]
     stretch: bool,
 
+    /// Cap the resolution a client can request on the auto-adopt path
+    /// (defense-in-depth resource bound; e.g. 2560x1440). A request above the
+    /// cap is clamped per-dimension and the session is served at the clamped
+    /// size. Without it, an authenticated client can request up to the
+    /// protocol maximum 8192x8192 — a ~256 MB BGRA framebuffer per frame.
+    /// Each dimension must be in the RDP band [200, 8192]. No effect with
+    /// --no-client-resolution or an explicit --width/--height/--hidpi/
+    /// --virtual-display (those pin the size). Config: MAX_CLIENT_SIZE.
+    #[arg(long = "max-client-size", value_name = "WxH", value_parser = parse_max_client_size)]
+    max_client_size: Option<(u16, u16)>,
+
     /// On Cmd+Tab, un-minimize the target app's window (bring it back from the
     /// Dock) instead of just activating the app. Off by default, which matches
     /// native macOS — Cmd+Tab activates a minimized app but doesn't restore its
@@ -1526,6 +1537,30 @@ fn main() -> Result<()> {
 /// identity to approve once — instead of going through an unsigned wrapper
 /// script that BTM re-flags on every rebuild. Mirrors the old
 /// `packaging/macrdp-launch` translation exactly (same keys, same defaults).
+/// Parse a `--max-client-size` spec ("WxH", e.g. "2560x1440") into a
+/// per-dimension cap, validating each dimension against the RDP desktop band
+/// [200, 8192] (MS-RDPBCGR) — the same band the acceptor's sanity check uses,
+/// so a clamped size can never fall below the protocol minimum.
+fn parse_max_client_size(spec: &str) -> Result<(u16, u16), String> {
+    let lower = spec.trim().to_ascii_lowercase();
+    let (w, h) = lower
+        .split_once('x')
+        .ok_or_else(|| format!("expected WxH (e.g. 2560x1440), got '{spec}'"))?;
+    let parse_dim = |s: &str, name: &str| -> Result<u16, String> {
+        let v: u16 = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("{name} '{}' is not a number in 0..=65535", s.trim()))?;
+        if !(200..=8192).contains(&v) {
+            return Err(format!(
+                "{name} {v} is outside the RDP desktop band 200..=8192 (MS-RDPBCGR)"
+            ));
+        }
+        Ok(v)
+    };
+    Ok((parse_dim(w, "width")?, parse_dim(h, "height")?))
+}
+
 fn args_from_config(path: &Path) -> Result<Args> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
@@ -1667,6 +1702,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
         if !path.is_empty() {
             argv.push("--key".into());
             argv.push(path.clone());
+        }
+    }
+    if let Some(sz) = cfg.get("MAX_CLIENT_SIZE") {
+        if !sz.is_empty() {
+            argv.push("--max-client-size".into());
+            argv.push(sz.clone());
         }
     }
     // Env-only tunables (auth guard, health-check watchdog, blank recovery,
@@ -2569,6 +2610,27 @@ async fn async_main() -> Result<()> {
     // shared `desktop_size` that capture, input scaling, and the H.264
     // pipeline all read.
     server.set_honor_client_desktop_size(auto_size);
+    // Optional operator ceiling for the adopted size (--max-client-size,
+    // defense-in-depth): a request above the cap is clamped per-dimension in
+    // the acceptor. Meaningless off the auto-adopt path (nothing is adopted),
+    // so warn rather than silently ignore.
+    if let Some((max_w, max_h)) = args.max_client_size {
+        if auto_size {
+            server.set_honor_client_desktop_size_max(Some(ironrdp_server::DesktopSize {
+                width: max_w,
+                height: max_h,
+            }));
+            info!(
+                max_w,
+                max_h, "client-requested session size capped at the operator maximum"
+            );
+        } else {
+            warn!(
+                "--max-client-size has no effect: client-resolution auto-adopt is off \
+                 (--no-client-resolution or an explicit --width/--height/--hidpi/--virtual-display)"
+            );
+        }
+    }
 
     // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
     // (mstsc) auto-reconnects on an ungraceful drop instead of showing
@@ -2850,6 +2912,34 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
+mod max_client_size_tests {
+    use super::parse_max_client_size;
+
+    #[test]
+    fn parses_wxh() {
+        assert_eq!(parse_max_client_size("2560x1440"), Ok((2560, 1440)));
+        // Case-insensitive separator + surrounding whitespace tolerated.
+        assert_eq!(parse_max_client_size(" 1920X1080 "), Ok((1920, 1080)));
+        // Band edges are inclusive.
+        assert_eq!(parse_max_client_size("200x200"), Ok((200, 200)));
+        assert_eq!(parse_max_client_size("8192x8192"), Ok((8192, 8192)));
+    }
+
+    #[test]
+    fn rejects_out_of_band_and_garbage() {
+        // Below the protocol minimum (would let the clamp produce an
+        // un-servable size) and above the protocol maximum (meaningless).
+        assert!(parse_max_client_size("199x1080").is_err());
+        assert!(parse_max_client_size("1920x8193").is_err());
+        // Not WxH at all.
+        assert!(parse_max_client_size("1920").is_err());
+        assert!(parse_max_client_size("axb").is_err());
+        assert!(parse_max_client_size("1920x").is_err());
+        assert!(parse_max_client_size("-1x1080").is_err());
+    }
+}
+
+#[cfg(test)]
 mod config_tests {
     use super::*;
 
@@ -2882,6 +2972,7 @@ mod config_tests {
              FORK_WORKERS=1\n\
              ENABLE_UDP_MULTITRANSPORT=1\n\
              UDP_MIGRATE_EGFX=1\n\
+             MAX_CLIENT_SIZE=2560x1440\n\
              EXTRA_FLAGS=\"--fps 30\"\n",
         );
         let args = args_from_config(&path).unwrap();
@@ -2901,6 +2992,7 @@ mod config_tests {
         assert!(args.fork_workers);
         assert!(args.enable_udp_multitransport);
         assert!(args.udp_migrate_egfx);
+        assert_eq!(args.max_client_size, Some((2560, 1440)));
         // USE_KEYCHAIN defaults on (matches the old wrapper).
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.

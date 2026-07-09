@@ -49,6 +49,14 @@ pub struct Acceptor {
     /// usual `RdpServerDisplay::request_initial_size` call (the echoed
     /// Confirm Active size now equals the adopted size).
     honor_client_desktop_size: bool,
+    /// (vendored) Optional operator ceiling for the honored client size,
+    /// clamped per-dimension (mirrors upstream PR #1404's semantics) —
+    /// defense-in-depth so a client request can't size the session
+    /// framebuffer beyond what the operator allows (an 8192×8192 request
+    /// is ~256 MB of BGRA per frame). `None` = no ceiling beyond the
+    /// protocol band. Only consulted when `honor_client_desktop_size` is
+    /// set. Swap to the upstream API when the pin bumps past #1404.
+    honor_client_desktop_size_max: Option<DesktopSize>,
     /// (vendored) The Windows keyboard-layout identifier (KLID) the client
     /// announced in its GCC Client Core Data, captured in
     /// `BasicSettingsWaitInitial` and surfaced on `AcceptorResult` so the
@@ -157,6 +165,7 @@ impl Acceptor {
             received_credentials: None,
             reactivation: false,
             honor_client_desktop_size: false,
+            honor_client_desktop_size_max: None,
             client_keyboard_layout: 0,
             client_multitransport: gcc::MultiTransportFlags::empty(),
             advertise_extended_client_data: false,
@@ -171,6 +180,13 @@ impl Acceptor {
     /// `honor_client_desktop_size` field for the rationale.
     pub fn set_honor_client_desktop_size(&mut self, honor: bool) {
         self.honor_client_desktop_size = honor;
+    }
+
+    /// (vendored) Cap the honored client desktop size at an operator maximum,
+    /// clamped per-dimension. No effect unless `set_honor_client_desktop_size`
+    /// is also set. See the `honor_client_desktop_size_max` field.
+    pub fn set_honor_client_desktop_size_max(&mut self, max: Option<DesktopSize>) {
+        self.honor_client_desktop_size_max = max;
     }
 
     /// (vendored) Advertise `EXTENDED_CLIENT_DATA_SUPPORTED` so the client sends
@@ -229,6 +245,7 @@ impl Acceptor {
             received_credentials: consumed.received_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
+            honor_client_desktop_size_max: consumed.honor_client_desktop_size_max,
             client_keyboard_layout: consumed.client_keyboard_layout,
             client_multitransport: consumed.client_multitransport,
             advertise_extended_client_data: consumed.advertise_extended_client_data,
@@ -580,12 +597,30 @@ impl Sequence for Acceptor {
                 // and 8192 the maximum desktop dimension (MS-RDPBCGR);
                 // anything outside that band is garbage we refuse to honor.
                 if self.honor_client_desktop_size {
-                    let width = gcc_blocks.core.desktop_width;
-                    let height = gcc_blocks.core.desktop_height;
-                    if (200..=8192).contains(&width)
-                        && (200..=8192).contains(&height)
-                        && (width != self.desktop_size.width || height != self.desktop_size.height)
-                    {
+                    let req_width = gcc_blocks.core.desktop_width;
+                    let req_height = gcc_blocks.core.desktop_height;
+                    let in_band = (200..=8192).contains(&req_width) && (200..=8192).contains(&req_height);
+                    // (vendored) Operator ceiling: clamp a LEGIT (in-band)
+                    // request per-dimension to the operator maximum (mirrors
+                    // upstream PR #1404's semantics). The band check runs on
+                    // the RAW request so out-of-band garbage stays refused
+                    // outright rather than being "helpfully" clamped.
+                    let (width, height) = match self.honor_client_desktop_size_max {
+                        Some(max) if in_band => {
+                            if req_width > max.width || req_height > max.height {
+                                debug!(
+                                    req_width,
+                                    req_height,
+                                    max_width = max.width,
+                                    max_height = max.height,
+                                    "Clamping client-requested desktop size to the operator maximum"
+                                );
+                            }
+                            (req_width.min(max.width), req_height.min(max.height))
+                        }
+                        _ => (req_width, req_height),
+                    };
+                    if in_band && (width != self.desktop_size.width || height != self.desktop_size.height) {
                         debug!(
                             client_width = width,
                             client_height = height,

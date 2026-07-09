@@ -53,6 +53,14 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --stretch                 # On the auto-size path, fill the client frame instead
                           #   of the default aspect-preserving letterbox/pillarbox.
                           #   No effect with --width/--height or matching aspect.
+--max-client-size WxH     # Cap the resolution a client can request on the
+                          #   auto-adopt path (defense-in-depth resource bound;
+                          #   e.g. 2560x1440 — without it a client can request up
+                          #   to the protocol max 8192x8192 ≈ 256 MB of BGRA per
+                          #   frame). Requests above the cap are clamped
+                          #   per-dimension. Each dimension must be in [200,
+                          #   8192]. No effect off the auto-adopt path. Config:
+                          #   MAX_CLIENT_SIZE. Mirrors upstream IronRDP #1404.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain

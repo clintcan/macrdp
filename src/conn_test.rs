@@ -206,7 +206,13 @@ fn init_tracing() {
 /// `codecs`) whose display is fixed at `server_w`×`server_h`. The returned
 /// server can serve **many** sequential connections via `run_connection` — that
 /// reuse is what the reconnect soak test exercises.
-fn build_test_server(server_w: u16, server_h: u16, honor: bool, codecs: BitmapCodecs) -> RdpServer {
+fn build_test_server(
+    server_w: u16,
+    server_h: u16,
+    honor: bool,
+    max: Option<(u16, u16)>,
+    codecs: BitmapCodecs,
+) -> RdpServer {
     let display = TestDisplay {
         size: ServerDesktopSize {
             width: server_w,
@@ -221,6 +227,9 @@ fn build_test_server(server_w: u16, server_h: u16, honor: bool, codecs: BitmapCo
         .with_bitmap_codecs(codecs)
         .build();
     server.set_honor_client_desktop_size(honor);
+    server.set_honor_client_desktop_size_max(
+        max.map(|(width, height)| ServerDesktopSize { width, height }),
+    );
     server
 }
 
@@ -282,11 +291,12 @@ async fn negotiate(
     client_w: u16,
     client_h: u16,
     honor: bool,
+    max: Option<(u16, u16)>,
     codecs: BitmapCodecs,
 ) -> anyhow::Result<(u16, u16)> {
     init_tracing();
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let mut server = build_test_server(server_w, server_h, honor, codecs);
+    let mut server = build_test_server(server_w, server_h, honor, max, codecs);
 
     // The server's `run_connection` future is `!Send` (the vendored server uses
     // `Rc` internally), so it can't be `tokio::spawn`ed. Run it as a background
@@ -313,7 +323,7 @@ async fn negotiate(
 async fn client_resolution_adopted_when_honored() -> anyhow::Result<()> {
     // Server display is 1024×768; client asks for 1920×1080. With honoring on,
     // the vendored acceptor negotiates the client's size in Demand Active.
-    let (w, h) = negotiate(1024, 768, 1920, 1080, true, crate::bitmap_codecs()).await?;
+    let (w, h) = negotiate(1024, 768, 1920, 1080, true, None, crate::bitmap_codecs()).await?;
     assert_eq!(
         (w, h),
         (1920, 1080),
@@ -323,10 +333,55 @@ async fn client_resolution_adopted_when_honored() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn client_resolution_clamped_to_operator_max() -> anyhow::Result<()> {
+    // --max-client-size defense-in-depth: client asks for 1920x1080 but the
+    // operator caps at 1280x800 -> the session is negotiated at the clamped
+    // size (per-dimension), not the request and not the server's own size.
+    let (w, h) = negotiate(
+        1024,
+        768,
+        1920,
+        1080,
+        true,
+        Some((1280, 800)),
+        crate::bitmap_codecs(),
+    )
+    .await?;
+    assert_eq!(
+        (w, h),
+        (1280, 800),
+        "request above the operator max should be clamped per-dimension"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_max_does_not_touch_in_bounds_request() -> anyhow::Result<()> {
+    // A request at/below the cap is adopted verbatim - the clamp only ever
+    // lowers, it never alters a legit in-bounds request.
+    let (w, h) = negotiate(
+        1024,
+        768,
+        1920,
+        1080,
+        true,
+        Some((2560, 1440)),
+        crate::bitmap_codecs(),
+    )
+    .await?;
+    assert_eq!(
+        (w, h),
+        (1920, 1080),
+        "request within the operator max should be adopted unchanged"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn server_size_kept_when_not_honored() -> anyhow::Result<()> {
     // Same request, honoring off → the client gets the server's own size,
     // proving the adopt is gated by the flag (not incidental).
-    let (w, h) = negotiate(1024, 768, 1920, 1080, false, crate::bitmap_codecs()).await?;
+    let (w, h) = negotiate(1024, 768, 1920, 1080, false, None, crate::bitmap_codecs()).await?;
     assert_eq!(
         (w, h),
         (1024, 768),
@@ -343,7 +398,7 @@ async fn server_advertises_macrdp_codecs_and_client_connects() -> anyhow::Result
     // capability exchange. Regression guard that `bitmap_codecs()` stays a
     // wire-valid, encodable, client-acceptable capability set — a malformed
     // codec added in a future edit would break the handshake here.
-    let (w, h) = negotiate(1280, 800, 1280, 800, false, crate::bitmap_codecs()).await?;
+    let (w, h) = negotiate(1280, 800, 1280, 800, false, None, crate::bitmap_codecs()).await?;
     assert_eq!(
         (w, h),
         (1280, 800),
@@ -368,7 +423,7 @@ async fn no_shared_codec_falls_back_and_connects() -> anyhow::Result<()> {
             color_loss_level: 3,
         }),
     }]);
-    let (w, h) = negotiate(1280, 800, 1280, 800, false, only_nscodec).await?;
+    let (w, h) = negotiate(1280, 800, 1280, 800, false, None, only_nscodec).await?;
     assert_eq!(
         (w, h),
         (1280, 800),
@@ -406,7 +461,7 @@ async fn server_survives_many_reconnects() -> anyhow::Result<()> {
     local
         .run_until(async {
             // One server, honoring client size, reused across every reconnect.
-            let mut server = build_test_server(1024, 768, true, crate::bitmap_codecs());
+            let mut server = build_test_server(1024, 768, true, None, crate::bitmap_codecs());
             for i in 0..n {
                 // Alternate the requested size so each reconnect re-adopts a
                 // (possibly different) resolution rather than repeating one.

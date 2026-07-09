@@ -150,6 +150,13 @@ AND released — #1276 landing is NOT sufficient.
     opts out). Upstream form is the builder method
     `RdpServerBuilder::with_honor_client_desktop_size` (#1373); on the next pin
     bump, drop this divergence and switch main.rs's setter call to the builder.
+    **Extension (2026-07-09):** `honor_client_desktop_size_max:
+    Option<DesktopSize>` + setter `set_honor_client_desktop_size_max`,
+    forwarded to the acceptor alongside the bool — the operator ceiling for
+    the honored size (macrdp's `--max-client-size`, defense-in-depth; the
+    clamp itself lives in the vendored acceptor, see its divergence (1)
+    extension). Mirrors upstream PR #1404 (OPEN); on the pin bump past it,
+    drop this and adopt the upstream `Option<DesktopSize>` honor-size API.
 
 (11) Server-side RDPDR (drive redirection) static channel (NOT upstreamed;
     added 2026-06-16; depends on vendored `ironrdp-rdpdr` divergence (1)):

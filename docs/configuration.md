@@ -36,6 +36,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           centered picture. Pass this for the old fill-and-distort
                           behavior. No effect with --width/--height or at a
                           matching aspect ratio. See [video.md](video.md).
+--max-client-size WxH     Cap the resolution a client can request on the
+                          auto-adopt path (e.g. 2560x1440). A request above the
+                          cap is clamped per-dimension and the session is served
+                          at the clamped size. Defense-in-depth resource bound:
+                          without it an authenticated client can request up to
+                          the protocol maximum 8192x8192 — a ~256 MB framebuffer
+                          per frame. Each dimension must be in [200, 8192]. No
+                          effect with --no-client-resolution or an explicit
+                          --width/--height/--hidpi/--virtual-display (those pin
+                          the size). Config key: MAX_CLIENT_SIZE.
 --unminimize-on-switch    On Cmd+Tab, un-minimize the target app's window (bring
                           it back from the Dock) instead of just activating the
                           app. Off by default (matches native macOS, which leaves
