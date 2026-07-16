@@ -437,7 +437,7 @@ webcams (a different transport, not yet built) and the mstsc camera-redirection 
 **Merge-readiness (branch `feat/usb-redirect-spike`).** The feature is fully wired and
 opt-in: `--enable-usb-redirection` (default OFF; when off the URBDRC factory is `None`, so
 the build is inert), `ENABLE_USB_REDIRECTION` in `config.env`, `docs/cli.md` + `--help`
-documented, and the `--fork-workers` supervisor forwards it (verbatim argv). CI green;
+documented. CI green;
 `cargo clippy`/`test`/`fmt` clean. It's **safe to merge as EXPERIMENTAL** (the UDP-multitransport
 precedent) — the robustness gaps found in review (disconnect-race deadlock, the connect-while-
 mounted SIGBUS, control forwarding, hot-unplug) are now closed and the clean path is

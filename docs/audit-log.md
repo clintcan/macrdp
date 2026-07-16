@@ -82,10 +82,8 @@ this point and can never produce a false `auth` failure — such a connection si
 has an `accept` and a `disconnect` with **no `auth` event in between**, which is
 itself the tell that it never reached authentication.
 
-> **Scope:** the `auth` event is emitted on the **single-process** server path
-> only. Under `--fork-workers` the verdict happens inside a worker that runs
-> without the audit handler, so `accept`/`disconnect` still appear (driven by the
-> supervisor) but **no `auth` event** is produced. See `configuration.md`.
+> **Scope:** the `auth` event is emitted on the single-process server path. See
+> `configuration.md`.
 
 ### `disconnect` — the connection ended *(INFO)*
 Emitted when the connection closes, with `duration_ms` (wall-clock lifetime) and a

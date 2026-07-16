@@ -89,9 +89,7 @@ finish (dominated by a wrong password, but also a client abort or a rare mid-exc
 error — the `reason`, a short sspi error description, disambiguates and never contains
 credential material; it is control-char-stripped and length-bounded, so it is always a safe
 single-line token — no log-injection risk in either sink). It's strictly better than inferring the verdict from `disconnect`'s
-duration heuristic. **v1 caveats:** emitted on the single-process server path only (under
-`--fork-workers` the verdict happens in a worker; its accept/disconnect audit is unchanged but
-no `auth` event fires); and it carries no client-*attempted* username (macrdp authenticates a
+duration heuristic. **v1 caveats:** it carries no client-*attempted* username (macrdp authenticates a
 static credential — surfacing the attempted user is a possible future additive field).
 
 **Correlation:** an `accept`, its `auth`, and its matching `disconnect` share the

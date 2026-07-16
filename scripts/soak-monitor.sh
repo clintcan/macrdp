@@ -12,8 +12,7 @@
 #   scripts/soak-monitor.sh monitor [--interval SECS] [--out FILE] [--pid PID]
 #       Sample every SECS (default 60) until the process exits, appending a CSV
 #       row each tick. Default target = the newest running macrdp; pass --pid to
-#       pin one (under --fork-workers, point it at the long-lived SUPERVISOR; the
-#       `procs` column also tracks worker accumulation).
+#       pin one.
 #
 #   scripts/soak-monitor.sh analyze [--csv FILE] [--logs GLOB]
 #       Summarize the CSV trend (first/last/min/max/delta of each metric) and

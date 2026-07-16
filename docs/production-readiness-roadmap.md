@@ -34,8 +34,7 @@ are scope limits, not gaps to close.
    who connected, from where, accept/reject/disconnect + outcome). On by default with
    conservative tunable thresholds (env / `config.env`); **loopback is exempt** so you
    can't self-lock. Lives in `src/auth_guard.rs` (a pure, unit-tested decision core) wired
-   through the existing `ConnectionHandler` seam (single-process) and the `--fork-workers`
-   supervisor loop — **zero vendored divergence**. The lockout is deliberately **heuristic**
+   through the existing `ConnectionHandler` seam — **zero vendored divergence**. The lockout is deliberately **heuristic**
    (errored/very-short ⇒ failure; clean long session resets), so a benign disconnect never
    locks anyone out. Not done here: precise CredSSP-failure classification (would need a
    vendored signal — intentionally avoided).
@@ -97,41 +96,26 @@ are scope limits, not gaps to close.
      (not a tokio task, so it survives a wedged runtime) periodically submits a trivial probe
      onto the tokio runtime and waits a bounded time for it to run. A deadlocked runtime never
      runs it; after N consecutive misses the watchdog `process::exit`s with a distinct code
-     (70/EX_SOFTWARE) so `KeepAlive`/the `--fork-workers` supervisor restarts a fresh process —
+     (70/EX_SOFTWARE) so `KeepAlive` restarts a fresh process —
      closing the "alive but wedged" gap `KeepAlive` alone can't. Conservative by default (15 s
      interval, 30 s timeout, 2 misses ⇒ a wedge must persist ~90 s before a bounce, so load
-     spikes never trip it). Armed on the long-lived launchd-watched process (single-process serve
-     OR the supervisor); skipped on short-lived fork *workers* and, by default, interactively
+     spikes never trip it). Armed on the long-lived launchd-watched serve process; skipped, by default, interactively
      (stdout a TTY). Env: `MACRDP_HEALTHCHECK=0/1` + `MACRDP_HEALTHCHECK_{INTERVAL_SECS,TIMEOUT_SECS,FAILURES}`
      (config.env keys `HEALTH_CHECK` / `HEALTHCHECK_*`). Verified: arms headless, no false bounce
      on an idle runtime. **Scope:** targets runtime-level hangs (deadlock / all workers blocked);
      a listener-level heartbeat for "accept loop silently stopped while the runtime is healthy"
      is a possible follow-up.
-6. **Make `--fork-workers` the production default — DECIDED 2026-07-04: NO.
-   Single-process + blank-recovery + ARC stays the default; `--fork-workers` stays a
-   documented opt-in.** This item was written when fork-workers was the *only* answer to
-   the mstsc reconnect-blank; that's no longer true, and the calculus settled against it:
-   - **Blank-recovery is field-proven; fork-workers isn't.** The v0.8.22 recovery +
-     v0.8.24 drop-first tuning healed real blanks repeatedly and unattended in the wild
-     (the 2026-07-04 ZeroTier cycle: detect → drop → ARC auto-reconnect → render, ×2,
-     zero false positives). fork-workers has demo-grade verification, zero soak hours,
-     and still leaves a residual ~1/7 blank that needs a reconnect — i.e. even under
-     fork-workers, **blank-recovery is what completes the story**; the reverse isn't true.
-   - **A default must compose with everything; fork-workers doesn't.** Mutually exclusive
-     with `--enable-udp-multitransport`, requires supervisor-owned persistent state
-     (virtual display / blanking / HUD / caffeinate), and adds a whole process-lifecycle
-     surface (fd passing, worker serialization, the SCK-exit trap — two non-obvious bugs
-     were fixed just getting it working).
-   - **Soak asymmetry.** Single-process has the 31 h clean Tier 2.4 foundation run;
-     defaulting to fork-workers would invalidate that evidence and demand a fresh soak of
-     the *more* complex model.
-   - **The motivating pain shrank.** The reconnect-blank is now ~6–8 s of self-healing on
-     LAN (detect window scales with QoE cadence on slow links), no user action.
-   **Recommendation stands in the docs:** `--fork-workers` for mstsc-heavy, no-UDP
-   deployments that want blip-free reconnects + per-connection isolation — and it
-   COMPOSES with blank-recovery (recovery drops land on a fresh worker process, the
-   strongest combination). Revisit only if the re-soak or field use surfaces a
-   single-process weakness that process isolation would fix.
+6. **Per-connection worker processes (`--fork-workers`) — REMOVED 2026-07-17,
+   superseded.** A `--fork-workers` model (a supervisor that fork+exec'd a fresh worker
+   process per connection, xrdp-style) was added as one answer to the mstsc
+   reconnect-blank, then kept a documented opt-in (DECIDED 2026-07-04: never the default —
+   single-process + blank-recovery + ARC was field-proven, composed with everything, and
+   had the 31 h clean Tier 2.4 soak, none of which fork-workers matched). Once the server
+   learned to self-heal the reconnect-blank **in place** via a bare core
+   Deactivation–Reactivation (v0.8.27, now the default blank-recovery action), fork-workers
+   no longer bought anything single-process didn't, so it was removed entirely along with
+   its process-lifecycle surface (fd passing, worker serialization, the SCK-exit trap) and
+   its mutual exclusion with `--enable-udp-multitransport`.
 
 ## Tier 3 — Polish / nice-to-have
 

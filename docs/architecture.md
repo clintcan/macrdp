@@ -8,9 +8,7 @@ src/auth_guard.rs Connection-level auth hardening (Tier 1.2): per-source-IP
                   `macrdp::audit` log, in front of the NLA/CredSSP gate. Pure,
                   platform-independent AuthGuardCore (decide/record_outcome, time
                   passed in for deterministic tests) + the ConnectionHandler
-                  adapter (AuthGuardHandler) for the single-process path; the
-                  --fork-workers supervisor (main.rs) drives the SAME core in its
-                  own accept loop (classifying each worker by exit code + duration).
+                  adapter (AuthGuardHandler) for the single-process serve path.
                   On by default, loopback-exempt, env-tunable (MACRDP_CONN_GUARD /
                   MACRDP_GUARD_* / MACRDP_AUDIT_LOG), zero vendored divergence
                   (reuses ironrdp-server's existing ConnectionHandler seam).
@@ -197,20 +195,18 @@ src/reaper.rs     Startup reaper — on launch, sweeps leftovers from a PRIOR ma
                   shutdown_cleanup (rdpdr/surface.rs, file_promise*.rs). Only
                   DEAD-pid, non-self dirs are reaped, so it's safe with another
                   instance live. Called once from async_main on a detached thread
-                  (a stale umount can't block startup); covers single-process,
-                  the fork supervisor, and each worker.
+                  (a stale umount can't block startup).
 src/health.rs     Health-check watchdog (Tier 2.5) — turns a hung-but-alive
-                  process into a clean exit so launchd KeepAlive / the
-                  --fork-workers supervisor restarts a fresh one (KeepAlive only
+                  process into a clean exit so launchd KeepAlive restarts a fresh
+                  one (KeepAlive only
                   catches an outright crash, not a wedge). A dedicated OS thread
                   (NOT a tokio task, so it ticks even when the runtime is wedged)
                   submits a trivial probe onto the tokio runtime each interval and
                   waits a bounded time; a deadlocked runtime never runs it, and
                   after N consecutive misses it process::exits with code 70. Pure,
                   unit-tested decision + parsing (should_arm / HealthConfig); armed
-                  from async_main on the long-lived launchd-watched process
-                  (single-process OR supervisor), skipped on short-lived fork
-                  workers and (by default) interactively (stdout a TTY).
+                  from async_main on the long-lived launchd-watched process,
+                  skipped (by default) interactively (stdout a TTY).
                   Conservative defaults (15s interval / 30s timeout / 2 misses ⇒
                   ~90s to bounce). Env: MACRDP_HEALTHCHECK=0/1 +
                   MACRDP_HEALTHCHECK_{INTERVAL_SECS,TIMEOUT_SECS,FAILURES}
@@ -332,8 +328,8 @@ Cross-cutting:
 - **TLS** terminates inside the acceptor; `rustls` with, by default, a self-signed cert at `~/Library/Application Support/macrdp/{cert,key}.pem` (generated on first run, persisted thereafter for stable client TOFU). **An operator can supply a real CA / ACME cert via `--cert`/`--key` (or `TLS_CERT`/`TLS_KEY`)** — `make_tls_acceptor` then loads exactly those PEM files and never silently self-signs (a missing/bad file is a hard error; it also warns at startup if the cert is expired / within 14 days). Both the self-signed and operator paths flow through the same `load_pem_cert_and_key` → so the rest is identical. `RdpServerSecurity::Hybrid` is used so the negotiation response advertises CredSSP — the public-key bytes handed to ironrdp are the raw `subjectPublicKey` BIT STRING from the X.509 cert (not the SPKI sequence, not the keypair-derived bytes), since that's what sspi hashes client-side. The same loaded cert/key also secure the UDP multitransport (TLS for the reliable flow, DTLS for the lossy flow), so operator certs apply there too.
 - **Auth** at startup: `--username` (defaults to `$USER`) + interactive password prompt → PAM `checkpw` service → set as the static credential ironrdp_server checks per-connection. `--skip-auth` bypasses for dev.
 - **Session model** — by default macrdp attaches to the console session of the logged-in user (single session, mirrors the primary panel). With `--virtual-display --width W --height H`, the server instead allocates a headless `CGVirtualDisplay` and serves *that*; the local Mac screen is untouched and the remote sees its own desktop at the requested resolution. The CG-side display is owned by `main()`'s scope, registered via `[CGVirtualDisplay initWithDescriptor:]` + `applySettings:`, and torn down on normal exit (signal-driven `std::process::exit(0)` skips Drop, but macOS reaps the registration when the owning process dies). Capture / input / cursor all parameterize on `(displayID, origin_pts, size_pts)` so they target the right surface regardless of which path is in effect.
-- **Process model — single-process by default; `--fork-workers` is multi-process (xrdp's model).** Normally one `macrdp` process does everything (accept → capture/encode/serve) for the lifetime of the server. Opt-in `--fork-workers` (default OFF; `FORK_WORKERS=1` in config.env) splits it: a thin **supervisor** binds the port and does NO capture, and for every inbound connection `fork+exec`s a **fresh worker process** of the same binary, handing it the already-accepted socket fd via `MACRDP_WORKER_FD` (its presence marks a worker and takes precedence over `--fork-workers`, so a re-passed flag / `--config` re-expansion can't recurse). The worker serves exactly ONE connection then `std::process::exit`s (a normal return would leave it alive — SCK framework threads block exit — leaking SCStreams). The supervisor **serializes** (drains the previous worker before spawning the next, avoiding an SCStream-slot overlap) and owns all **persistent** state so it survives worker churn: the virtual display (workers capture it by id via `MACRDP_VD_ID`), headless blanking (`--capture-primary`/`--detach-primary`, engaged on first connect, process-scoped so it auto-restores on supervisor death), `caffeinate`, and the app-switcher HUD helper (`:40243`; workers only push to it). This exists to beat mstsc's EGFX reconnect-blank (a fresh *process* dodges the client-side surface-retention bug) — see the H.264 reconnect-blank quirk. `run_fork_supervisor` + the worker branch live in `src/main.rs`. macOS-only; mirror-primary or `--virtual-display`. Under launchd the supervisor IS the job (KeepAlive watches it; `bootout` kills the worker children via the job's process group).
-- **Signal handling** — `main.rs` spawns a task that awaits SIGINT/SIGTERM and `std::process::exit(0)`s. Without it, ScreenCaptureKit's framework threads can leave the process unkillable by Ctrl-C once an SCStream is active. (With `--fork-workers` the supervisor's forced exit also relies on its headless blanking being process-scoped — it auto-restores the physical display on death — and on launchd's process-group kill to reap workers.)
+- **Process model — single-process.** One `macrdp` process does everything (accept → capture/encode/serve) for the lifetime of the server. Under launchd it IS the job (KeepAlive watches it). It owns all persistent state directly: the virtual display, headless blanking (`--capture-primary`/`--detach-primary`, engaged on first connect, process-scoped so it auto-restores on process death), `caffeinate`, and the app-switcher HUD helper. (An earlier `--fork-workers` model that fork+exec'd a fresh worker process per connection — xrdp's model, to dodge mstsc's EGFX reconnect-blank — was removed once the server learned to self-heal that blank in place via a bare core Deactivation–Reactivation; see the H.264 reconnect-blank quirk.)
+- **Signal handling** — `main.rs` spawns a task that awaits SIGINT/SIGTERM and `std::process::exit(0)`s. Without it, ScreenCaptureKit's framework threads can leave the process unkillable by Ctrl-C once an SCStream is active.
 - **Audio rate** — SCK only supports 8/16/24/48 kHz, so capture is at 48 kHz, but `src/audio.rs` resamples to 44.1 kHz via `rubato` before sending. 44.1 matches the native rate of most Windows audio endpoints, so the client plays directly without internal resampling — which used to cause a ~20% sustained over-feed and multi-second audio backlogs on mstsc. The advertised RDPSND `AudioFormat` is therefore 44.1 kHz / 2 ch / 16-bit.
 - **Single capture loop** — `MacRdpsnd` (the audio factory) holds an `Arc<AtomicU64>` generation counter shared with every backend it builds. Each `start()` claims a fresh generation; older capture loops observe the bump on their next iteration and exit. Without this, an mstsc cert-prompt reconnect leaves the first capture loop running while the second starts, both feeding the shared event channel → ~2× audio reaching the client.
 

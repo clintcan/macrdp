@@ -1,6 +1,5 @@
 //! Health-check watchdog — turn a hung-but-alive process into a clean exit so
-//! the launchd `KeepAlive` (or, under `--fork-workers`, the supervisor) revives
-//! a fresh one.
+//! the launchd `KeepAlive` revives a fresh one.
 //!
 //! `launchd` only restarts macrdp when the process *dies*. A process that is
 //! alive but **wedged** — the tokio runtime deadlocked, every worker thread
@@ -15,8 +14,8 @@
 //! trivial probe task onto the runtime and waits a bounded time for it to run.
 //! A healthy runtime executes the probe in microseconds; a deadlocked one never
 //! does. After `failures_before_exit` consecutive misses the watchdog logs and
-//! [`std::process::exit`]s with a distinct code, so the supervisor/launchd
-//! starts a clean process.
+//! [`std::process::exit`]s with a distinct code, so launchd starts a clean
+//! process.
 //!
 //! It is intentionally conservative — a generous timeout plus a
 //! multiple-consecutive-miss requirement — so a merely busy runtime (a heavy
@@ -93,17 +92,12 @@ impl HealthConfig {
 
 /// Decide whether to arm the watchdog for this process.
 ///
-/// - A fork **worker** never arms it: the worker is short-lived (one connection
-///   then exits) and the supervisor owns its liveness.
 /// - An explicit `MACRDP_HEALTHCHECK=1/0` (on/off/true/false/yes/no) wins.
 /// - Otherwise the default is **on when headless** (stdout is not a TTY, i.e.
 ///   running under launchd, which will restart a bounced process) and **off**
 ///   interactively (`cargo run` in a terminal — a false bounce there just kills
 ///   a dev session, and nothing would restart it anyway).
-pub fn should_arm(is_worker: bool, stdout_is_tty: bool, env_override: Option<&str>) -> bool {
-    if is_worker {
-        return false;
-    }
+pub fn should_arm(stdout_is_tty: bool, env_override: Option<&str>) -> bool {
     match env_override
         .map(|s| s.trim().to_ascii_lowercase())
         .as_deref()
@@ -152,7 +146,7 @@ fn run(handle: tokio::runtime::Handle, cfg: HealthConfig) {
                 exit_code = WATCHDOG_EXIT_CODE,
                 misses = consecutive_misses,
                 "health-check watchdog: tokio runtime wedged across consecutive probes — \
-                 exiting so the supervisor / launchd restarts a fresh process"
+                 exiting so launchd restarts a fresh process"
             );
             // Flush is best-effort; the wedge is by definition unrecoverable
             // in-process, and a restart is the only cure.
@@ -205,28 +199,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_never_arms_even_with_env_on() {
-        assert!(!should_arm(true, false, Some("1")));
-        assert!(!should_arm(true, false, None));
-    }
-
-    #[test]
     fn explicit_env_override_wins_over_tty() {
         // Forced on even in an interactive terminal.
-        assert!(should_arm(false, true, Some("1")));
-        assert!(should_arm(false, true, Some("on")));
-        assert!(should_arm(false, true, Some(" TRUE ")));
+        assert!(should_arm(true, Some("1")));
+        assert!(should_arm(true, Some("on")));
+        assert!(should_arm(true, Some(" TRUE ")));
         // Forced off even when headless.
-        assert!(!should_arm(false, false, Some("0")));
-        assert!(!should_arm(false, false, Some("off")));
+        assert!(!should_arm(false, Some("0")));
+        assert!(!should_arm(false, Some("off")));
     }
 
     #[test]
     fn default_is_on_headless_off_interactive() {
-        assert!(should_arm(false, false, None)); // headless -> on
-        assert!(!should_arm(false, true, None)); // TTY -> off
-                                                 // An unrecognized override falls through to the TTY default.
-        assert!(should_arm(false, false, Some("maybe")));
+        assert!(should_arm(false, None)); // headless -> on
+        assert!(!should_arm(true, None)); // TTY -> off
+                                          // An unrecognized override falls through to the TTY default.
+        assert!(should_arm(false, Some("maybe")));
     }
 
     #[test]

@@ -128,8 +128,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   On its own EGFX stays on TCP (the proven safe spike);
                           #   pass --udp-migrate-egfx to move H.264 video onto the
                           #   reliable UDP tunnel. Input/audio/clipboard always ride
-                          #   TCP. Not supported under --fork-workers (falls back to
-                          #   TCP). macOS-built but the protocol layer is
+                          #   TCP. macOS-built but the protocol layer is
                           #   cross-platform. See
                           #   docs/rdp-udp-multitransport-feasibility.md.
 --udp-migrate-egfx        # EXPERIMENTAL, opt-in (default OFF; requires
@@ -225,44 +224,6 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   client. Plain TCP (both flags off) remains the
                           #   zero-risk config for overlay-only setups.
                           #   macOS-only.
---fork-workers            # Opt-in (default OFF; FORK_WORKERS=1 in config.env).
-                          #   Workers sample the link RTT themselves, so the
-                          #   link-aware features (blank-recovery gate, bitrate
-                          #   seed) apply under fork-workers too —
-                          #   and staying opt-in by DECISION (2026-07-04, roadmap
-                          #   Tier 2.6): the production default is single-process +
-                          #   blank-recovery + the auto-reconnect cookie (field-
-                          #   proven, composes with every feature). Choose
-                          #   --fork-workers for mstsc-heavy, no-UDP deployments
-                          #   that want blip-free reconnects + per-connection
-                          #   isolation; it COMPOSES with blank-recovery (recovery
-                          #   drops land on a fresh worker = strongest combo).
-                          #   xrdp's model on macOS: a thin supervisor
-                          #   binds the port and fork+execs a FRESH worker process
-                          #   per connection (socket via MACRDP_WORKER_FD). The fresh
-                          #   process dodges mstsc's reconnect-blank (it re-maps a
-                          #   fresh EGFX surface on a brand-new channel) — reconnect
-                          #   to a still-running server renders instead of going
-                          #   blank; a residual ~1/7 blank recovers by reconnecting
-                          #   once more. The supervisor owns the persistent state
-                          #   (virtual display, headless blanking, caffeinate,
-                          #   app-switcher HUD); workers are per-connection. Works
-                          #   mirror-primary or with --virtual-display (+ optional
-                          #   --capture-primary/--detach-primary). Smart-card
-                          #   redirection works under it too (per-connection
-                          #   :40242 bridge; verified incl. reconnect).
-                          #   MUTUALLY EXCLUSIVE with --enable-udp-multitransport:
-                          #   the UDP path needs ONE persistent socket on the port
-                          #   that survives reconnects, but a per-connection worker
-                          #   can't own it (the supervisor owns the port). If both
-                          #   are set, the supervisor warns and each worker still
-                          #   OFFERS multitransport but binds no UDP listener, so
-                          #   the client falls back to TCP (EGFX on TCP). Combining
-                          #   them would need the supervisor to own the UDP socket +
-                          #   demux datagrams to the right worker — deferred, and low
-                          #   priority (the soak found reliable-UDP is a clean-link
-                          #   nicety, while --fork-workers fixes the real mstsc pain).
-                          #   macOS-only. See the H.264 reconnect-blank quirk note.
 --cert-dir PATH           # default ~/Library/Application Support/macrdp
 --cert PATH               # Operator-supplied TLS certificate (PEM; leaf first,
                           #   then any intermediate chain). Serve a real CA / ACME
@@ -345,11 +306,11 @@ and retry-after.
 
 Health-check watchdog (env-only; **on by default when headless**). Detects a
 **hung-but-alive** process — the tokio runtime deadlocked / all workers blocked —
-and exits (code 70) so the LaunchAgent `KeepAlive` (or the `--fork-workers`
-supervisor) restarts a fresh one. `KeepAlive` alone only restarts on an outright
+and exits (code 70) so the LaunchAgent `KeepAlive` restarts a fresh one.
+`KeepAlive` alone only restarts on an outright
 crash, not a wedge; this closes that gap. It's armed on the long-lived
-launchd-watched process (single-process serve or the supervisor) and **skipped on
-short-lived fork workers** and, by default, **interactively** (stdout is a TTY,
+launchd-watched serve process and **skipped**, by default, **interactively**
+(stdout is a TTY,
 e.g. `cargo run` — a false bounce there would just kill a dev session, and nothing
 would restart it). Defaults are conservative — a wedge must persist ~90 s before a
 bounce, so load spikes never trip it. Tune / force / disable via env (or the

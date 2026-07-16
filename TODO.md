@@ -394,14 +394,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   the In flight section above + `scripts/soak-monitor.sh`)**. Also done:
   log rotation + startup reaper (Tier 2.5, #103) and the **hung-but-alive health-check
   watchdog (`src/health.rs`) — DONE 2026-07-03** (probes the tokio runtime from a
-  dedicated OS thread; exits code 70 on a sustained wedge → launchd/supervisor restarts;
+  dedicated OS thread; exits code 70 on a sustained wedge → launchd restarts;
   on by default when headless, env-tunable). **Tier 2.5 now complete.** Tier 2.6
-  (`--fork-workers` as default) **DECIDED 2026-07-04: NO** — single-process +
-  blank-recovery + ARC stays the default (field-proven, composes with everything);
-  fork-workers stays the documented opt-in for mstsc-heavy no-UDP profiles (see the
-  roadmap for the full rationale). **Reinforced 2026-07-07 (v0.8.27):** the
-  reconnect-blank now self-heals in place via core reactivation, so fork-workers'
-  reconnect-freshness rationale is moot — single-process is the clear default. Still open beyond the soak: Tier 3 polish. Hard
+  (per-connection worker processes) — **the `--fork-workers` model was REMOVED
+  2026-07-17**: the reconnect-blank now self-heals in place via core reactivation
+  (v0.8.27), so its reconnect-freshness rationale was moot and single-process is the
+  only model. Still open beyond the soak: Tier 3 polish. Hard
   ceiling (NO-GO): multi-user concurrent GUI sessions (macOS limit).
 
 ## Parked — scoped, low priority

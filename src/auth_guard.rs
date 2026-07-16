@@ -15,10 +15,8 @@
 //!   a failure?). Time is passed in as `now: Instant` so tests time-travel
 //!   deterministically.
 //! - [`AuthGuardHandler`] is the thin `ironrdp_server::ConnectionHandler` adapter
-//!   for the **single-process** server path. The `--fork-workers` **supervisor**
-//!   has its own accept loop (it never builds an `RdpServer`) and so drives the
-//!   same `AuthGuardCore` directly — sharing the *code*, not an *instance* (the
-//!   two run modes are mutually exclusive at runtime).
+//!   that wires [`AuthGuardCore`] into the server's per-connection
+//!   pre-handshake / post-disconnect seam.
 //!
 //! ## Heuristic lockout (deliberate)
 //! `on_disconnected` only sees `Option<&anyhow::Error>`, which can't cleanly
@@ -197,8 +195,8 @@ pub enum Outcome {
 /// locked out (the pre-fix heuristic counted any errored connection as a
 /// failure, which locked out legit clients — observed in a soak 2026-07-01).
 ///
-/// `errored` is the transport-agnostic error signal: `Some(err)` on the
-/// single-process path, or a non-zero worker exit on the `--fork-workers` path.
+/// `errored` is the error signal from the connection's `on_disconnected`
+/// (`Some(err)` ⇒ the connection ended with an error).
 pub fn classify_outcome(errored: bool, duration: Duration, failfast_window: Duration) -> Outcome {
     if errored && duration < failfast_window {
         Outcome::Failure

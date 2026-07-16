@@ -78,9 +78,7 @@ verify again before acting, code moves.*
 >
 > **Possible next steps (none started):** **Phase 2** = lossy `UdpFecL` + DTLS (via
 > `boring`) + FEC — the *real* loss-resilience win; de-vendor once the IronRDP
-> changes are upstreamed + released. Still **not** supported under `--fork-workers`
-> (the persistent UDP socket would belong to the supervisor — deferred; warns + falls
-> back to TCP). **NB — do NOT route audio over the *reliable* tunnel** (it's a
+> changes are upstreamed + released. **NB — do NOT route audio over the *reliable* tunnel** (it's a
 > downgrade; see "Audio belongs on the lossy transport, not the reliable one"
 > below). Audio over a *lossy* tunnel is a Phase-2 thing and is arguably the best
 > first payload for it — better than video.
@@ -760,9 +758,8 @@ dropping every frame so nothing was ever encoded.)*
 
 A fuller rate controller (continuous queue_depth-aware pacing, ideally informed by a
 real-Windows-server capture since the raw `queueDepth` units are oddly large) remains
-finding-#5 future work. Everyday robust config stays `--udp-migrate-egfx` off (and
-`--fork-workers` gives clean in-process reconnect on the TCP path; it's mutually
-exclusive with UDP multitransport).
+finding-#5 future work. Everyday robust config stays `--udp-migrate-egfx` off (the
+in-place blank-recovery reactivation gives clean reconnect on the TCP path).
 
 ### P2.2 lossy-delivery soak (runbook)
 

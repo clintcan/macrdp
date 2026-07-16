@@ -1478,7 +1478,7 @@ impl Gfx {
                             "EGFX blank persisted across every auto-reconnect — giving up on \
                              automatic recovery for this client (it re-lands on its stale \
                              surface every time). Fully close and reopen the RDP client \
-                             window to clear its surface cache, or use --fork-workers."
+                             window to clear its surface cache."
                         );
                     } else {
                         ctx.blank_recovery_attempts += 1;

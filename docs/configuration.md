@@ -205,10 +205,6 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           actually blank the panel on your hardware. Mutually
                           exclusive with --detach-primary. Only with
                           --virtual-display.
---fork-workers            EXPERIMENTAL, opt-in. Fork a fresh worker process per
-                          connection (xrdp's model) so reconnecting mstsc to a
-                          still-running server renders instead of going blank.
-                          See the mstsc reconnect notes in [video.md](video.md). macOS-only; off by default.
 --enable-udp-multitransport  EXPERIMENTAL, opt-in. Offer RDP UDP multitransport
                           (MS-RDPEMT over reliable RDPEUDP) and bind a UDP
                           listener on the same address/port as TCP. On its own,
@@ -216,7 +212,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           --udp-migrate-egfx to move the video. Input/audio/
                           clipboard always ride TCP. As far as is known, the
                           first OSS RDP *server* with a working UDP data path.
-                          Not supported under --fork-workers. Off by default.
+                          Off by default.
 --udp-migrate-egfx        EXPERIMENTAL, opt-in (needs --enable-udp-multitransport).
                           Migrate the H.264/EGFX video channel onto the reliable
                           UDP tunnel via MS-RDPEDYC Soft-Sync (verified on mstsc).

@@ -174,15 +174,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "Un-minimize on Cmd+Tab", key: "UNMINIMIZE", cfg: cfg, sel: #selector(toggleUnminimize)))
         opts.addItem(toggle(
             "App-switcher HUD", key: "APP_SWITCHER_HUD", cfg: cfg, sel: #selector(toggleAppSwitcherHud)))
-        // Per-connection worker processes (xrdp's model): fixes mstsc's blank
-        // screen when reconnecting to a still-running server (a fresh process
-        // dodges its EGFX surface-retention bug). Opt-in; on in the preset.
-        opts.addItem(toggle(
-            "Per-connection workers (reconnect fix)", key: "FORK_WORKERS", cfg: cfg,
-            sel: #selector(toggleForkWorkers)))
         // RDP UDP multitransport (experimental). Offers an auxiliary UDP transport;
-        // the sub-option moves H.264 video onto it. Mutually exclusive with
-        // per-connection workers (handled in the toggle selectors).
+        // the sub-option moves H.264 video onto it.
         opts.addItem(toggle(
             "UDP multitransport (experimental)", key: "ENABLE_UDP_MULTITRANSPORT", cfg: cfg,
             sel: #selector(toggleUdpMultitransport)))
@@ -394,15 +387,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// One-click "remote into my Mac": headless virtual display + detach the
     /// physical panel (apps move to the virtual display) + H.264 + the
-    /// app-switcher HUD + per-connection workers (so reconnecting to the
-    /// still-running server renders instead of going blank on mstsc), then start.
+    /// app-switcher HUD, then start. The mstsc reconnect-blank is handled by the
+    /// server's in-place blank-recovery (reactivation) — no extra flag needed.
     @objc func presetRemoteDesktop() {
         writeConfig(key: "VIRTUAL_DISPLAY", value: "1")
         writeConfig(key: "PRIMARY_MODE", value: "detach")
         writeConfig(key: "CAPTURE_PRIMARY", value: "0")
         writeConfig(key: "ENABLE_H264", value: "1")
         writeConfig(key: "APP_SWITCHER_HUD", value: "1")
-        writeConfig(key: "FORK_WORKERS", value: "1")
         let cfg = readConfig()
         if cfg["VD_WIDTH"] == nil { writeConfig(key: "VD_WIDTH", value: "1920") }
         if cfg["VD_HEIGHT"] == nil { writeConfig(key: "VD_HEIGHT", value: "1080") }
@@ -564,38 +556,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleHiDPI() { flip("HIDPI") }
     @objc func toggleUnminimize() { flip("UNMINIMIZE") }
     @objc func toggleAppSwitcherHud() { flip("APP_SWITCHER_HUD") }
-    /// Per-connection workers. Mutually exclusive with UDP multitransport (the UDP
-    /// socket must persist across reconnects, which a per-connection worker can't
-    /// own) — enabling this disables UDP multitransport + its video-migrate option.
-    @objc func toggleForkWorkers() {
-        let cfg = readConfig()
-        let enabling = cfg["FORK_WORKERS"] != "1"
-        if enabling && cfg["ENABLE_UDP_MULTITRANSPORT"] == "1" {
-            alert(style: .informational, "UDP multitransport turned off",
-                  "Per-connection workers and UDP multitransport can't run together "
-                  + "(the UDP socket must persist across reconnects, which a per-connection "
-                  + "worker can't own). UDP multitransport has been disabled.")
-            writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "0")
-            writeConfig(key: "UDP_MIGRATE_EGFX", value: "0")
-        }
-        writeConfig(key: "FORK_WORKERS", value: enabling ? "1" : "0")
-        applyIfRunning()
-    }
 
-    /// RDP UDP multitransport (MS-RDPEMT). Mutually exclusive with per-connection
-    /// workers; turning it off also clears the video-migrate sub-option (which
-    /// needs the transport).
+    /// RDP UDP multitransport (MS-RDPEMT). Turning it off also clears the
+    /// video-migrate sub-option (which needs the transport).
     @objc func toggleUdpMultitransport() {
         let cfg = readConfig()
         let enabling = cfg["ENABLE_UDP_MULTITRANSPORT"] != "1"
         if enabling {
-            if cfg["FORK_WORKERS"] == "1" {
-                alert(style: .informational, "Per-connection workers turned off",
-                      "UDP multitransport and per-connection workers can't run together "
-                      + "(the UDP socket must persist across reconnects, which a per-connection "
-                      + "worker can't own). Per-connection workers have been disabled.")
-                writeConfig(key: "FORK_WORKERS", value: "0")
-            }
             writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "1")
         } else {
             writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "0")
@@ -607,17 +574,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Migrate the EGFX (H.264) video channel onto the reliable UDP tunnel. Needs
-    /// UDP multitransport + H.264 (auto-enabled, disabling per-connection workers if
-    /// needed). CLEAN-LINK ONLY: under packet loss the ordered tunnel head-of-line-
-    /// blocks and the picture can freeze with no recovery until reconnect (audio
-    /// survives on TCP).
+    /// UDP multitransport + H.264 (auto-enabled). CLEAN-LINK ONLY: under packet
+    /// loss the ordered tunnel head-of-line-blocks and the picture can freeze with
+    /// no recovery until reconnect (audio survives on TCP).
     @objc func toggleUdpMigrateEgfx() {
         let cfg = readConfig()
         let enabling = cfg["UDP_MIGRATE_EGFX"] != "1"
         if enabling {
             var autoEnabled: [String] = []
             if cfg["ENABLE_UDP_MULTITRANSPORT"] != "1" {
-                if cfg["FORK_WORKERS"] == "1" { writeConfig(key: "FORK_WORKERS", value: "0") }
                 writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "1")
                 autoEnabled.append("UDP multitransport")
             }

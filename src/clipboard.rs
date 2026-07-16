@@ -234,7 +234,7 @@ pub struct MacCliprdr {
     /// The pasteboard poller parks while this is 0, so an idle macrdp
     /// doesn't do an NSPasteboard round-trip 4×/s forever from process
     /// start — that poller was the sole reason a zero-client server wasn't
-    /// ~0% idle. Per-process, so it works under `--fork-workers` too.
+    /// ~0% idle.
     active_backends: Arc<std::sync::atomic::AtomicUsize>,
     /// When true (default), on_remote_file_list dispatches to
     /// `file_promise_lazy::spawn_lazy_paste`. Set false via

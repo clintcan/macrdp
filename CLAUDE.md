@@ -67,8 +67,7 @@ events. New explicit **`event="auth"` login verdict** (`outcome="success"` when
 CredSSP/NLA validates, else `"did_not_complete"` + a short `reason`), emitted once
 per connection **after** the TLS upgrade — single-process path — so a SOC sees the
 real authentication result instead of inferring it from the connection-duration
-heuristic (under `--fork-workers` the accept/disconnect audit is unchanged but no
-`auth` event fires). The audit `reason` is **control-char-stripped** (log-injection
+heuristic. The audit `reason` is **control-char-stripped** (log-injection
 defense for the human-readable logfmt sink, which writes fields verbatim; the JSON
 sink was already serde-safe) and length-bounded, never carrying credential
 material. New `docs/audit-log.md` (per-event/-field interpretation guide with
@@ -194,8 +193,7 @@ a tunnel that wedged BEFORE its session ended is still adjudicated as dead so
 the reset-cycle protection can't be laundered away; offer cookies are evicted
 on every connection end (was: leaked per failed handshake, with a
 late-tunnel-bind zombie-peer window); all three peer-removal sites now lower
-the shared bound flag (#137/#138/#139); **fork-workers sample the link RTT**
-so the blank-recovery gate + bitrate seed apply there too (#138). Triple
+the shared bound flag (#137/#138/#139). Triple
 adversarially reviewed; docs de-drifted.)
 Earlier: **v0.8.25** (the resilient-link release —
 three session-killers fixed, all live-verified over ZeroTier incl. mobile:
@@ -220,7 +218,7 @@ Earlier: **v0.8.23**
 `@docs/production-readiness-roadmap.md`: operator-supplied TLS certs `--cert`/`--key`,
 connection rate-limiting + lockout + an auth audit log, bounded log rotation + a
 startup reaper, and — v0.8.23 — a **health-check watchdog** (`src/health.rs`) that
-bounces a hung-but-alive process so launchd / the `--fork-workers` supervisor
+bounces a hung-but-alive process so launchd
 restarts a fresh one, closing the gap `KeepAlive` couldn't. v0.8.22 auto-recovers
 the mstsc EGFX reconnect-blank via QoE-EDR detection + a Server Auto-Reconnect
 Cookie; v0.8.21 fixed an auth-guard false-lockout of a legitimately reconnecting
