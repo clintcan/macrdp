@@ -1654,29 +1654,35 @@ async fn async_main() -> Result<()> {
     // normal exit (signal-driven exit goes through std::process::exit
     // and skips Drop, but macOS reaps virtual displays when the owning
     // process dies, so cleanup still happens — just not via Drop).
-    let virtual_display: Option<virtual_display::VirtualDisplay> = if args.virtual_display {
-        let w = args
-            .width
-            .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
-        let h = args
-            .height
-            .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-        // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
-        // metadata here (capture cadence is governed by --fps); pass a
-        // safe value so CGVirtualDisplay doesn't reject the mode.
-        let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-            .context("attaching virtual display")?;
-        info!(
-            display_id = vd.display_id(),
-            origin = ?vd.origin_pts(),
-            size = ?vd.size_pts(),
-            "virtual display attached — the RDP session uses this surface; \
-             your primary panel is untouched"
-        );
-        Some(vd)
-    } else {
-        None
-    };
+    // Arc<Mutex<>> because the display is shared with `CaptureDisplay` for
+    // live client-driven resize: the capture side re-modes it via
+    // `VirtualDisplay::resize` when the client's window size changes. This
+    // scope still holds a clone for the lifetime/teardown semantics
+    // described above.
+    let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> =
+        if args.virtual_display {
+            let w = args
+                .width
+                .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+            let h = args
+                .height
+                .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+            // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
+            // metadata here (capture cadence is governed by --fps); pass a
+            // safe value so CGVirtualDisplay doesn't reject the mode.
+            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
+                .context("attaching virtual display")?;
+            info!(
+                display_id = vd.display_id(),
+                origin = ?vd.origin_pts(),
+                size = ?vd.size_pts(),
+                "virtual display attached — the RDP session uses this surface; \
+                 your primary panel is untouched"
+            );
+            Some(Arc::new(std::sync::Mutex::new(vd)))
+        } else {
+            None
+        };
 
     // --detach-primary / --capture-primary are lazy: the headless
     // mechanism is only engaged once a client actually connects. A
@@ -1689,6 +1695,8 @@ async fn async_main() -> Result<()> {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --detach-primary")
+            .lock()
+            .expect("virtual display mutex poisoned")
             .display_id();
         spawn_primary_overlay_watcher(
             "detach",
@@ -1701,6 +1709,8 @@ async fn async_main() -> Result<()> {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --capture-primary")
+            .lock()
+            .expect("virtual display mutex poisoned")
             .display_id();
         spawn_primary_overlay_watcher(
             "capture",
@@ -1713,6 +1723,8 @@ async fn async_main() -> Result<()> {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --make-primary")
+            .lock()
+            .expect("virtual display mutex poisoned")
             .display_id();
         match virtual_display::PrimaryOverride::install(vd_id)
             .context("promoting virtual display to primary")?
@@ -1798,6 +1810,7 @@ async fn async_main() -> Result<()> {
     //     native size and use CGDisplay::main() for the point-space bounds.
     //   - primary panel with override: use the override + main geometry.
     let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
+        let vd = vd.lock().expect("virtual display mutex poisoned");
         // Both required earlier, so the unwraps can't fire.
         let w = args
             .width
@@ -2025,6 +2038,17 @@ async fn async_main() -> Result<()> {
         click_signal: click_signal.clone(),
         flush_frames: args.flush_frames,
         display_suppressed: Some(display_suppressed.clone()),
+        // Live in-session resize (client drags its window, sending an
+        // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
+        // connect-time auto-adopt above. See `CaptureDisplay::request_layout`.
+        pending_resize: capture::PendingResize::new(),
+        max_client_size: args
+            .max_client_size
+            .map(|(width, height)| ironrdp_server::DesktopSize { width, height }),
+        suppress_next_adopt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Shared so a live client resize can re-mode the display; None on
+        // the mirror-primary path (no virtual display to re-mode).
+        virtual_display: virtual_display.clone(),
     };
 
     // Shared cell the server fills with the connecting client's keyboard-layout

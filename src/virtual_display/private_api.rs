@@ -108,6 +108,62 @@ impl Handle {
     pub(super) fn display_id(&self) -> u32 {
         self.display_id
     }
+
+    /// Re-apply settings with a single new mode — the live-resize primitive.
+    /// Same `applySettings:` call that registered the display in `create`;
+    /// calling it again on the live instance switches the active mode (the
+    /// WindowServer relays out windows like a physical monitor changing
+    /// resolution). The new mode must fit the descriptor's max dimensions
+    /// (8192×8192, set in `create`).
+    pub(super) fn apply_mode(&self, width: u32, height: u32, refresh_hz: u32) -> Result<()> {
+        apply_single_mode(self.raw, width, height, refresh_hz)
+    }
+}
+
+/// Build a one-mode `CGVirtualDisplaySettings` and `applySettings:` it onto
+/// `display`. Shared by `create` (initial registration) and
+/// `Handle::apply_mode` (live resize). The temporaries are leaked, same
+/// rationale as in `create` — tiny, rare, and obviously double-free-proof.
+fn apply_single_mode(
+    display: *mut AnyObject,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> Result<()> {
+    let settings_class = class_required("CGVirtualDisplaySettings")?;
+    let mode_class = class_required("CGVirtualDisplayMode")?;
+    let nsarray_class = class_required("NSArray")?;
+
+    unsafe {
+        let mode: *mut AnyObject = msg_send![mode_class, alloc];
+        let mode: *mut AnyObject = msg_send![
+            mode,
+            initWithWidth: width,
+            height: height,
+            refreshRate: f64::from(refresh_hz),
+        ];
+        if mode.is_null() {
+            return Err(anyhow!("[CGVirtualDisplayMode init...] returned nil"));
+        }
+        let modes: *mut AnyObject = msg_send![nsarray_class, arrayWithObject: mode];
+
+        let settings: *mut AnyObject = msg_send![settings_class, alloc];
+        let settings: *mut AnyObject = msg_send![settings, init];
+        if settings.is_null() {
+            return Err(anyhow!("[CGVirtualDisplaySettings init] returned nil"));
+        }
+        let _: () = msg_send![settings, setHiDPI: 0u32];
+        let _: () = msg_send![settings, setModes: modes];
+
+        let ok: bool = msg_send![display, applySettings: settings];
+        if !ok {
+            return Err(anyhow!(
+                "[CGVirtualDisplay applySettings:] returned false — mode {width}x{height}@{refresh_hz} \
+                 is likely unsupported"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Handle {
@@ -131,9 +187,6 @@ impl Drop for Handle {
 pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Result<Handle> {
     let desc_class = class_required("CGVirtualDisplayDescriptor")?;
     let display_class = class_required("CGVirtualDisplay")?;
-    let settings_class = class_required("CGVirtualDisplaySettings")?;
-    let mode_class = class_required("CGVirtualDisplayMode")?;
-    let nsarray_class = class_required("NSArray")?;
 
     let ns_name = NSString::from_str(name);
 
@@ -147,8 +200,14 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
             return Err(anyhow!("CGVirtualDisplayDescriptor init returned nil"));
         }
         let _: () = msg_send![desc, setName: &*ns_name];
-        let _: () = msg_send![desc, setMaxPixelsWide: width];
-        let _: () = msg_send![desc, setMaxPixelsHigh: height];
+        // Max dimensions are a CAP fixed for the display's lifetime (the
+        // descriptor can't be re-applied), not the active resolution — the
+        // mode below is what sizes the framebuffer. Advertise the RDP
+        // protocol maximum (8192, MS-RDPBCGR) instead of the initial mode
+        // size so a live resize (`apply_mode`) can later switch to any
+        // protocol-legal mode, including ones larger than the first.
+        let _: () = msg_send![desc, setMaxPixelsWide: 8192u32];
+        let _: () = msg_send![desc, setMaxPixelsHigh: 8192u32];
         // 600x338 mm ≈ a 27-inch 16:9 panel. Just a label.
         let _: () = msg_send![desc, setSizeInMillimeters: CGSize { width: 600.0, height: 338.0 }];
         let _: () = msg_send![desc, setProductID: 0x6D616372u32]; // "macr"
@@ -170,39 +229,13 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
             ));
         }
 
-        // 3. One mode at the requested resolution, then a settings object
-        //    holding that single-mode array.
-        let mode: *mut AnyObject = msg_send![mode_class, alloc];
-        let mode: *mut AnyObject = msg_send![
-            mode,
-            initWithWidth: width,
-            height: height,
-            refreshRate: f64::from(refresh_hz),
-        ];
-        if mode.is_null() {
+        // 3+4. One mode at the requested resolution, applied via settings —
+        //      the applySettings: call is what actually registers the display
+        //      with the WindowServer so it appears in Displays. Shared with
+        //      the live-resize path (`Handle::apply_mode`).
+        if let Err(e) = apply_single_mode(display, width, height, refresh_hz) {
             let _: () = msg_send![display, release];
-            return Err(anyhow!("[CGVirtualDisplayMode init...] returned nil"));
-        }
-        let modes: *mut AnyObject = msg_send![nsarray_class, arrayWithObject: mode];
-
-        let settings: *mut AnyObject = msg_send![settings_class, alloc];
-        let settings: *mut AnyObject = msg_send![settings, init];
-        if settings.is_null() {
-            let _: () = msg_send![display, release];
-            return Err(anyhow!("[CGVirtualDisplaySettings init] returned nil"));
-        }
-        let _: () = msg_send![settings, setHiDPI: 0u32];
-        let _: () = msg_send![settings, setModes: modes];
-
-        // 4. Apply settings — this is the call that actually registers
-        //    the display with the WindowServer so it appears in Displays.
-        let ok: bool = msg_send![display, applySettings: settings];
-        if !ok {
-            let _: () = msg_send![display, release];
-            return Err(anyhow!(
-                "[CGVirtualDisplay applySettings:] returned false — mode is \
-                 likely unsupported (try a different resolution / refresh rate)"
-            ));
+            return Err(e);
         }
 
         // 5. Read back the assigned displayID.

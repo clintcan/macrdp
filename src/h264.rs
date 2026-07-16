@@ -2084,6 +2084,48 @@ impl Gfx {
         Ok(())
     }
 
+    /// Live client-driven resize (MS-RDPEDISP monitor layout — the client
+    /// resized its window) for an active EGFX/H.264 session. Called by the
+    /// capture loop right before it emits the `DisplayUpdate::Resize` that
+    /// drives the core deactivation-reactivation.
+    ///
+    /// Just resets the per-connection surface/encoder state so the first
+    /// frame after the reactivation re-runs `setup_locked` from scratch —
+    /// `resize_with_monitors` at the new size (DeleteSurface of the old
+    /// surfaces + RESET_GRAPHICS + fresh surface + map) + a fresh
+    /// VideoToolbox encoder + ship thread + IDR — the exact sequence a
+    /// brand-new connection gets, and the resize response MS-RDPEDISP
+    /// expects (real RDS servers send a deactivation-reactivation + graphics
+    /// reset). Dropping `ctx.encoder` here synchronously invalidates the old
+    /// VT session and closes its channel, so the old ship thread exits
+    /// cleanly; frames it still holds fail the `surface_id` lookup and are
+    /// dropped harmlessly.
+    ///
+    /// History: a channel-level non-destructive surface swap (CreateSurface
+    /// then MapSurfaceToOutput over the live session, NO core reactivation,
+    /// old surfaces left alive) was tried first — wire-mechanically clean
+    /// but visually broken on Windows App for macOS (blinking). The
+    /// `resize_with_monitors` DeleteSurface sequence this path triggers is
+    /// documented as fatal when aimed at a *blank/stale* mstsc mid-stream
+    /// (see `docs/known-quirks.md`), but here it runs inside the
+    /// client-requested resize/reactivation window where the client expects
+    /// a graphics reset — the same position it occupies on every fresh
+    /// connection.
+    pub(crate) fn reset_for_live_resize(&self) {
+        let mut guard = self.ctx.lock().unwrap();
+        if let Some(ctx) = guard.as_mut() {
+            // Order matters only in that both must be cleared before the
+            // post-reactivation submit: encoder drop tears down the old VT
+            // session + ship thread now; surface_id=None makes the next
+            // `submit_bgra` run `setup_locked` (which also rebuilds the
+            // encoder and resets the throttle counters).
+            ctx.encoder = None;
+            ctx.surface_id = None;
+            ctx.need_keyframe = true;
+            info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
+        }
+    }
+
     /// EXPERIMENTAL blank-recovery — request a bare core
     /// Deactivation–Reactivation ([`BlankAction::Reactivate`]). Does NOT touch
     /// the EGFX pipeline: it just stashes the current desktop size (packed) in

@@ -94,6 +94,107 @@ impl Default for ClickSignal {
     }
 }
 
+fn pack_size(width: u16, height: u16) -> u32 {
+    (u32::from(width) << 16) | u32::from(height)
+}
+
+fn unpack_size(packed: u32) -> (u16, u16) {
+    ((packed >> 16) as u16, (packed & 0xFFFF) as u16)
+}
+
+/// Debounce window for a client-driven live resize (MS-RDPEDISP monitor-layout
+/// PDU, sent by the client when its window is resized mid-session). A drag can
+/// emit several layout PDUs a second; applying one is a full RDP core
+/// deactivation-reactivation (fresh SCK stream, resized framebuffer), so we
+/// wait for the drag to settle rather than resizing on every tick.
+pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// A client-driven live-resize request (MS-RDPEDISP), debounced.
+/// `CaptureDisplay::request_layout` calls [`PendingResize::request`] on every
+/// monitor-layout PDU the client sends; the capture loop calls
+/// [`PendingResize::take_settled`] each iteration and only acts once
+/// [`RESIZE_DEBOUNCE`] has passed since the *last* PDU, so a multi-tick drag
+/// produces one resize, not one per tick. Same epoch+millis pattern as
+/// [`ClickSignal`] — one `Arc`, lock-free.
+#[derive(Clone)]
+pub struct PendingResize {
+    inner: Arc<PendingResizeInner>,
+}
+
+struct PendingResizeInner {
+    epoch: Instant,
+    /// Packed size of the most recently requested resize. Meaningless while
+    /// `last_update_ms == 0`.
+    size: AtomicU32,
+    /// Milliseconds since `epoch` of the last `request()` call; 0 = no
+    /// pending request (never requested, or already consumed).
+    last_update_ms: AtomicU64,
+}
+
+impl PendingResize {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(PendingResizeInner {
+                epoch: Instant::now(),
+                size: AtomicU32::new(0),
+                last_update_ms: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.inner.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Record a resize request "now", superseding any not-yet-settled
+    /// request — only the most recent size in a drag matters.
+    pub fn request(&self, width: u16, height: u16) {
+        self.inner
+            .size
+            .store(pack_size(width, height), Ordering::Relaxed);
+        // max(1) so a request at t≈0 isn't mistaken for "none pending".
+        self.inner
+            .last_update_ms
+            .store(self.now_ms().max(1), Ordering::Relaxed);
+    }
+
+    /// True if a request is outstanding (settled or not yet). The capture
+    /// loop uses this to decide whether to poll on a bounded timeout instead
+    /// of blocking indefinitely on the next camera sample.
+    pub fn has_pending(&self) -> bool {
+        self.inner.last_update_ms.load(Ordering::Relaxed) != 0
+    }
+
+    /// If a request has been outstanding for at least `debounce` with no
+    /// newer request superseding it, consume and return it. Returns `None`
+    /// if nothing is pending or it hasn't settled yet.
+    pub fn take_settled(&self, debounce: Duration) -> Option<(u16, u16)> {
+        let last_ms = self.inner.last_update_ms.load(Ordering::Relaxed);
+        if last_ms == 0 {
+            return None;
+        }
+        if self.now_ms().saturating_sub(last_ms) < debounce.as_millis() as u64 {
+            return None;
+        }
+        // Only consume if nothing newer raced in since we read `last_ms`.
+        if self
+            .inner
+            .last_update_ms
+            .compare_exchange(last_ms, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some(unpack_size(self.inner.size.load(Ordering::Relaxed)))
+    }
+}
+
+impl Default for PendingResize {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Live session desktop size, shared by every component that must agree on
 /// it: `CaptureDisplay` (SCK capture size + `RdpServerDisplay::size`),
 /// `MacInputHandler` (mouse-coordinate scaling), and the H.264 `Gfx`
@@ -115,23 +216,18 @@ pub struct SharedDesktopSize {
 impl SharedDesktopSize {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
-            packed: Arc::new(AtomicU32::new(Self::pack(width, height))),
+            packed: Arc::new(AtomicU32::new(pack_size(width, height))),
             letterbox: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn pack(width: u16, height: u16) -> u32 {
-        (u32::from(width) << 16) | u32::from(height)
-    }
-
     pub fn get(&self) -> (u16, u16) {
-        let v = self.packed.load(Ordering::Relaxed);
-        ((v >> 16) as u16, (v & 0xFFFF) as u16)
+        unpack_size(self.packed.load(Ordering::Relaxed))
     }
 
     pub fn set(&self, width: u16, height: u16) {
         self.packed
-            .store(Self::pack(width, height), Ordering::Relaxed);
+            .store(pack_size(width, height), Ordering::Relaxed);
     }
 
     pub fn set_letterbox(&self, on: bool) {
@@ -286,6 +382,31 @@ pub struct CaptureDisplay {
     /// where the server doesn't expose the handle — e.g., the non-macOS
     /// stub).
     pub display_suppressed: Option<Arc<AtomicBool>>,
+    /// Client-driven live-resize request in flight (MS-RDPEDISP monitor
+    /// layout — the client resized its window mid-session). `request_layout`
+    /// writes to it; the capture loop polls + debounces it into an actual
+    /// `DisplayUpdate::Resize` (with an EGFX state reset first on the H.264
+    /// path — see `Gfx::reset_for_live_resize`). Works on the auto-adopt
+    /// path (both codec paths) and, via `virtual_display` below, on the
+    /// virtual-display path.
+    pub pending_resize: PendingResize,
+    /// Operator ceiling for a live client-requested resize (`--max-client-size`),
+    /// mirroring the connect-time cap the vendored acceptor applies. `None` =
+    /// no cap beyond the protocol max (still enforced by `adopt_client_size`).
+    pub max_client_size: Option<DesktopSize>,
+    /// Set by the capture loop just before it emits a server-driven
+    /// `DisplayUpdate::Resize` (blank recovery's same-size reactivate, or a
+    /// settled `pending_resize`); consumed by `request_initial_size` on the
+    /// very next call to skip re-adopting the client's reactivation-echo
+    /// size. See `request_initial_size`'s doc comment for why this exists.
+    pub suppress_next_adopt: Arc<AtomicBool>,
+    /// The `--virtual-display` this session serves, when there is one.
+    /// Shared with `main.rs`, which created it. Enables live client-driven
+    /// resize on the virtual-display path:
+    /// `request_layout` accepts the request even though `auto_size` is
+    /// pinned off there, and `updates()` re-modes the display to match
+    /// `desktop_size` before each capture stream is built.
+    pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -353,6 +474,32 @@ impl RdpServerDisplay for CaptureDisplay {
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         let (width, height) = self.desktop_size.get();
+
+        // This call also fires on every deactivation-reactivation, not just
+        // the initial connect — including one WE just triggered (blank
+        // recovery's same-size reactivate, or a client-driven live resize
+        // via `pending_resize`). Empirically (live Windows App test,
+        // 2026-07-09), the client's Confirm Active bitmap capset during such
+        // a reactivation does NOT echo the size we just told it to use in
+        // Demand Active — it reports some other value (looked like its
+        // original connect-time size). Treating that as a fresh client
+        // request re-adopts the wrong size and immediately undoes the
+        // resize we just applied. So: when we ourselves armed this
+        // reactivation, trust `desktop_size` (already set by the capture
+        // loop before it emitted `DisplayUpdate::Resize`) and skip the
+        // adopt entirely for this one call.
+        if self.suppress_next_adopt.swap(false, Ordering::Relaxed) {
+            tracing::debug!(
+                width,
+                height,
+                echoed_client_w = client_size.width,
+                echoed_client_h = client_size.height,
+                "reactivation we triggered ourselves — keeping the server-driven \
+                 size, not re-adopting the client's capset echo"
+            );
+            return DesktopSize { width, height };
+        }
+
         if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
             tracing::info!(
                 client_w = adopted.width,
@@ -368,8 +515,145 @@ impl RdpServerDisplay for CaptureDisplay {
         DesktopSize { width, height }
     }
 
+    /// Handle a client-driven live resize (MS-RDPEDISP monitor layout — the
+    /// client resized its window). The connect-time auto-adopt path only
+    /// negotiates a size once, in `request_initial_size`; this is the
+    /// live-in-session counterpart, wired through the vendored server's
+    /// already-unconditional `DisplayControlServer` DVC (it decodes the PDU
+    /// and calls this on every layout change — the default trait impl is a
+    /// no-op debug log, which is why this used to silently do nothing).
+    ///
+    /// Engages on the auto-adopt path (mirrors `request_initial_size`) AND on
+    /// the virtual-display path (`virtual_display` is `Some` — the display
+    /// itself is re-moded to the requested size in `updates()`, so the
+    /// session stays a 1:1 native capture at the new size). Still a no-op
+    /// for a pinned size (`--width`/`--height`/`--hidpi` without a vd).
+    /// Debounced by the capture loop via `pending_resize` so a window drag
+    /// (many PDUs/sec) produces one resize, not one per tick. Both codec
+    /// paths ride the same core deactivation-reactivation; on the EGFX
+    /// (`--enable-h264`) path the capture loop additionally resets the
+    /// per-connection surface/encoder state first so the post-reactivation
+    /// rebuild starts from scratch at the new size — see
+    /// `Gfx::reset_for_live_resize`'s doc comment for why (a channel-level
+    /// surface swap without the core reactivation was tried first and was
+    /// visually broken on a real client).
+    fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+        let resizable = self.auto_size || self.virtual_display.is_some();
+        if !resizable {
+            tracing::debug!(
+                "client requested a live resize (window drag) but the session size \
+                 is pinned (--no-client-resolution, or an explicit \
+                 --width/--height/--hidpi without a virtual display) — ignoring"
+            );
+            return;
+        }
+
+        let Some(monitor) = layout
+            .monitors()
+            .iter()
+            .find(|m| m.is_primary())
+            .or_else(|| layout.monitors().first())
+        else {
+            tracing::debug!("client sent a monitor layout with no monitors — ignoring");
+            return;
+        };
+
+        let (w, h) = monitor.dimensions();
+        let (Ok(mut width), Ok(mut height)) = (u16::try_from(w), u16::try_from(h)) else {
+            tracing::warn!(
+                w,
+                h,
+                "client-requested monitor size out of range — ignoring"
+            );
+            return;
+        };
+
+        if let Some(max) = self.max_client_size {
+            width = width.min(max.width);
+            height = height.min(max.height);
+        }
+
+        let (cur_w, cur_h) = self.desktop_size.get();
+        let Some(adopted) =
+            adopt_client_size(resizable, (cur_w, cur_h), DesktopSize { width, height })
+        else {
+            return; // no-op: unchanged, or outside the protocol-legal band
+        };
+
+        tracing::info!(
+            client_w = adopted.width,
+            client_h = adopted.height,
+            prev_w = cur_w,
+            prev_h = cur_h,
+            "client resized its window — resizing the session (debounced)"
+        );
+        self.pending_resize.request(adopted.width, adopted.height);
+    }
+
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        // `sync_virtual_display` is a sync block (no awaits) so the display
+        // mutex guard never lives across an await point (Send bound on the
+        // returned future).
+        let (width, height) = self.sync_virtual_display();
+        self.build_updates(width, height).await
+    }
+}
+
+impl CaptureDisplay {
+    /// Keep the virtual display's mode in sync with the session size,
+    /// returning the (possibly corrected) size to serve.
+    /// [`RdpServerDisplay::updates`] runs at connect AND after every
+    /// deactivation-reactivation — including the one a live client-driven
+    /// resize just triggered (which is the only thing that changes
+    /// `desktop_size` on the vd path, since auto-adopt is off there) — so
+    /// re-moding here means the fresh capture stream opens against a display
+    /// that is already the right size (a 1:1 native capture, no SCK scaling,
+    /// no letterbox). On failure the session must still come up, so fall
+    /// back to serving the display's actual current size. No-op without a
+    /// virtual display (mirror-primary).
+    fn sync_virtual_display(&mut self) -> (u16, u16) {
         let (width, height) = self.desktop_size.get();
+        let Some(vd) = self.virtual_display.clone() else {
+            return (width, height);
+        };
+        let mut vd = vd.lock().unwrap();
+        let (cur_w, cur_h) = vd.size_pts();
+        if (cur_w as u16, cur_h as u16) == (width, height) {
+            return (width, height);
+        }
+        match vd.resize(u32::from(width), u32::from(height)) {
+            Ok(()) => {
+                self.screen_size_pts = vd.size_pts();
+                tracing::info!(
+                    width,
+                    height,
+                    display_id = vd.display_id(),
+                    "virtual display re-moded to the client-requested session size"
+                );
+                (width, height)
+            }
+            Err(e) => {
+                let (w, h) = (cur_w as u16, cur_h as u16);
+                tracing::warn!(
+                    error = ?e,
+                    requested_w = width,
+                    requested_h = height,
+                    "virtual display live resize failed — keeping the current \
+                     display mode and serving its size"
+                );
+                self.desktop_size.set(w, h);
+                (w, h)
+            }
+        }
+    }
+
+    /// The body of [`RdpServerDisplay::updates`], parameterized on the final
+    /// session size so the virtual-display sync above decides it first.
+    async fn build_updates(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         #[cfg(target_os = "macos")]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
             macos::ScreenCaptureUpdates::start(
@@ -388,6 +672,8 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.auto_size,
                 self.stretch,
                 self.desktop_size.clone(),
+                self.pending_resize.clone(),
+                self.suppress_next_adopt.clone(),
             )
             .await?,
         );
@@ -577,6 +863,26 @@ mod macos {
         /// primary physical display so the local Mac stays usable. Only set on
         /// the `--virtual-display` path.
         warp_cursor_home: bool,
+        /// Client-driven live-resize request (window drag), debounced — see
+        /// `super::CaptureDisplay::pending_resize`. Polled once per loop
+        /// iteration; once settled, changes `desktop_size` and returns a
+        /// `DisplayUpdate::Resize` — the same core-reactivation route as the
+        /// blank-recovery case above, but actually changing the size. On the
+        /// EGFX path the per-connection surface/encoder state is reset first
+        /// (`Gfx::reset_for_live_resize`) so the post-reactivation rebuild
+        /// starts from scratch at the new size.
+        pending_resize: PendingResize,
+        /// The shared session size, so a settled `pending_resize` can be
+        /// written back into it before emitting `DisplayUpdate::Resize` —
+        /// input scaling and the H.264 pipeline (via `Gfx::desktop_size`) read
+        /// this cell directly, so it must be current before the reactivation
+        /// round-trips back through `request_initial_size`.
+        desktop_size: SharedDesktopSize,
+        /// See `CaptureDisplay::suppress_next_adopt`. Set right before this
+        /// loop returns a server-driven `DisplayUpdate::Resize`, so the
+        /// reactivation's `request_initial_size` call doesn't re-adopt
+        /// whatever size the client's Confirm Active echoes.
+        suppress_next_adopt: Arc<AtomicBool>,
     }
 
     impl ScreenCaptureUpdates {
@@ -597,6 +903,8 @@ mod macos {
             auto_size: bool,
             stretch: bool,
             desktop_size: SharedDesktopSize,
+            pending_resize: PendingResize,
+            suppress_next_adopt: Arc<AtomicBool>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -772,6 +1080,9 @@ mod macos {
                 suppressed_since: None,
                 first_egfx_frame_sent: false,
                 warp_cursor_home,
+                pending_resize,
+                desktop_size,
+                suppress_next_adopt,
             })
         }
     }
@@ -851,11 +1162,62 @@ mod macos {
                 // forced IDR was already armed on the ctx.
                 if let Some(gfx) = self.gfx.as_ref() {
                     if let Some((w, h)) = gfx.take_reactivate_request() {
+                        // See `CaptureDisplay::suppress_next_adopt`: without
+                        // this, the reactivation's `request_initial_size`
+                        // call could re-adopt whatever size the client's
+                        // Confirm Active happens to echo, undoing this
+                        // same-size reactivate. Same-size made the bug
+                        // invisible here (see the pending_resize case below,
+                        // where it was caught live), but the exposure is
+                        // identical — set it unconditionally for safety.
+                        self.suppress_next_adopt.store(true, Ordering::Relaxed);
                         return Ok(Some(DisplayUpdate::Resize(DesktopSize {
                             width: w,
                             height: h,
                         })));
                     }
+                }
+
+                // Client-driven live resize (window drag), debounced. Both
+                // codec paths ride the SAME core deactivation-reactivation
+                // (the vendored server's `DisplayUpdate::Resize` machinery):
+                // after the reactivation, `client_loop` re-runs `updates()` and
+                // a fresh `ScreenCaptureUpdates` is built at the new size, so
+                // capture-side state rebuilds exactly like a fresh connect.
+                //
+                // The EGFX difference is one extra step: reset the per-
+                // connection surface/encoder state FIRST (`reset_for_live_
+                // resize`), so the first post-reactivation frame re-runs
+                // `setup_locked` from scratch — RESET_GRAPHICS at the new
+                // size, fresh surface, fresh VideoToolbox encoder, IDR —
+                // exactly the sequence a brand-new connection gets, and the
+                // resize response MS-RDPEDISP expects (deactivation-
+                // reactivation + graphics reset, what real RDS servers send).
+                // A channel-level surface swap withOUT the core reactivation
+                // was tried first and was visually broken (blinking) on
+                // Windows App for macOS despite clean wire mechanics.
+                //
+                // Write the new size into the shared `desktop_size` before
+                // emitting (so input scaling sees it immediately) and arm
+                // `suppress_next_adopt` — LIVE-VERIFIED 2026-07-09 against
+                // Windows App for macOS that without it, the reactivation's
+                // `request_initial_size` call re-adopts a DIFFERENT size from
+                // the client's Confirm Active bitmap capset (its original
+                // connect-time size, not the size we just told it via Demand
+                // Active, and not the size it just told us via the
+                // MonitorLayout PDU) — silently snapping the resize back
+                // before the next frame ships.
+                if let Some((w, h)) = self.pending_resize.take_settled(RESIZE_DEBOUNCE) {
+                    self.desktop_size.set(w, h);
+                    self.suppress_next_adopt.store(true, Ordering::Relaxed);
+                    if let Some(gfx) = self.gfx.as_ref() {
+                        gfx.reset_for_live_resize();
+                    }
+                    tracing::info!(w, h, "applying debounced client-driven resize");
+                    return Ok(Some(DisplayUpdate::Resize(DesktopSize {
+                        width: w,
+                        height: h,
+                    })));
                 }
 
                 // Poll cursor at loop top — preempts queued bitmap rects so
@@ -931,25 +1293,29 @@ mod macos {
                     }
                 }
 
-                // While a flush burst is pending, don't block indefinitely on
-                // SCK: it stops delivering frames on a static screen, so wait at
-                // most one frame interval and, on timeout, re-submit the last
-                // frame as a cheap skip-P-frame. That keeps mstsc's presentation
-                // buffer advancing so the last change before a pause appears
-                // promptly instead of stranding until the next periodic keyframe.
-                // (No flush pending — the common idle case — blocks normally.)
-                let sample = if self.flush_remaining > 0 {
+                // While a flush burst OR a debounced resize is pending, don't
+                // block indefinitely on SCK: it stops delivering frames on a
+                // static screen, so wait at most one frame interval before
+                // looping back to the top (where the flush burst re-submits the
+                // last frame, and a settled resize gets picked up promptly
+                // instead of stalling until the next real desktop change).
+                // (Neither pending — the common idle case — blocks normally.)
+                let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
                         Err(_) => {
-                            self.flush_remaining -= 1;
-                            if let Some(gfx) = self.gfx.as_ref() {
-                                if !self.last_frame.is_empty() {
-                                    if let Err(e) =
-                                        gfx.submit_bgra(&self.last_frame, self.last_stride, false)
-                                    {
-                                        tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                            if self.flush_remaining > 0 {
+                                self.flush_remaining -= 1;
+                                if let Some(gfx) = self.gfx.as_ref() {
+                                    if !self.last_frame.is_empty() {
+                                        if let Err(e) = gfx.submit_bgra(
+                                            &self.last_frame,
+                                            self.last_stride,
+                                            false,
+                                        ) {
+                                            tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                                        }
                                     }
                                 }
                             }
@@ -1247,6 +1613,37 @@ mod tests {
         let clone = size.clone();
         clone.set(u16::MAX, 1);
         assert_eq!(size.get(), (u16::MAX, 1));
+    }
+
+    #[test]
+    fn pending_resize_starts_empty() {
+        let pr = PendingResize::new();
+        assert!(!pr.has_pending());
+        assert_eq!(pr.take_settled(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn pending_resize_settles_once_debounce_elapses() {
+        // `take_settled` takes the debounce as a parameter, so timing can be
+        // tested deterministically without sleeping: a huge debounce never
+        // elapses, a zero debounce elapses immediately.
+        let pr = PendingResize::new();
+        pr.request(1920, 1080);
+        assert!(pr.has_pending());
+        assert_eq!(pr.take_settled(Duration::from_secs(3600)), None);
+        assert_eq!(pr.take_settled(Duration::ZERO), Some((1920, 1080)));
+        // Consumed — nothing left to take, even at zero debounce.
+        assert!(!pr.has_pending());
+        assert_eq!(pr.take_settled(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn pending_resize_later_request_supersedes_earlier() {
+        // A drag emits several layout PDUs; only the last size should apply.
+        let pr = PendingResize::new();
+        pr.request(1024, 768);
+        pr.request(1920, 1080);
+        assert_eq!(pr.take_settled(Duration::ZERO), Some((1920, 1080)));
     }
 
     #[test]

@@ -124,6 +124,43 @@ mod macos {
         pub fn size_pts(&self) -> (f64, f64) {
             self.size_pts
         }
+
+        /// Live-resize the display to a new mode (client-driven session
+        /// resize). Re-applies settings with a single mode at the new size
+        /// — the WindowServer treats it like a physical monitor changing
+        /// resolution (windows re-layout, bounds update) — then polls
+        /// `CGDisplayBounds` until the new size is visible (the apply is
+        /// async on the WindowServer side; creation has the same
+        /// zero-size-rect race, handled there by erroring). The display id
+        /// is stable across the resize; the global-space origin can shift,
+        /// so both cached values are refreshed. Virtual displays are
+        /// always 1:1 points-to-pixels (no HiDPI backing — see the
+        /// known-quirks note), so the expected bounds equal the mode size.
+        pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+            self._handle
+                .apply_mode(width, height, 60)
+                .context("re-applying virtual display mode")?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let bounds = CGDisplay::new(self.display_id).bounds();
+                if bounds.size.width as u32 == width && bounds.size.height as u32 == height {
+                    self.origin_pts = (bounds.origin.x, bounds.origin.y);
+                    self.size_pts = (bounds.size.width, bounds.size.height);
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "virtual display mode applied but CGDisplayBounds still reports \
+                         {}x{} (expected {width}x{height}) after 3s — WindowServer hasn't \
+                         picked up the new mode",
+                        bounds.size.width,
+                        bounds.size.height,
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     /// Promotes a virtual (or any other secondary) display to be the
@@ -738,6 +775,9 @@ mod stub {
         }
         pub fn size_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
+        }
+        pub fn resize(&mut self, _width: u32, _height: u32) -> Result<()> {
+            Err(anyhow!("virtual display is macOS-only"))
         }
     }
 
