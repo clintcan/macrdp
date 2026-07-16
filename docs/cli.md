@@ -22,7 +22,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --hidpi                   # capture the primary display at backing (Retina) pixels
                           #   instead of logical points (~4x pixels; crisp; best
                           #   with --enable-h264). Ignored with --width/--height
-                          #   or --virtual-display. macOS-only.
+                          #   or --virtual-display. macOS-only. Also disables live
+                          #   client-driven resize (a resized client window is
+                          #   silently ignored) — resize needs the client-resolution
+                          #   auto-adopt path, which --hidpi pins off, same as it
+                          #   pins the initial connect-time size.
 --fps N                   # default 60 with --enable-h264, else 15
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
@@ -49,7 +53,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --no-client-resolution    # Serve the Mac display's native size instead of the
                           #   resolution the client requests at connect (the
                           #   auto-adopt default when no --width/--height/
-                          #   --hidpi/--virtual-display is given).
+                          #   --hidpi/--virtual-display is given). Also disables
+                          #   live client-driven resize (resizing the client
+                          #   window mid-session) — it rides the same auto-adopt
+                          #   gate. --virtual-display sessions resize live via a
+                          #   separate path regardless of this flag.
 --stretch                 # On the auto-size path, fill the client frame instead
                           #   of the default aspect-preserving letterbox/pillarbox.
                           #   No effect with --width/--height or matching aspect.
