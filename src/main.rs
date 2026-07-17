@@ -1081,6 +1081,21 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
         // don't kick off a 10-second blocking install for a session
         // that's already gone.
         const CONNECT_DEBOUNCE: Duration = Duration::from_millis(750);
+        // Disconnect-side flap absorber. A core deactivation–reactivation (a live
+        // resize on maximize, or blank recovery) briefly drops the session count
+        // to 0 and right back to 1 as the vendored server drops the old
+        // `CountedUpdates` and builds a new one — a flap, not a real disconnect.
+        // Without absorbing it, the headless `CapturedPrimary` drops (restore
+        // gamma) and re-engages (re-blank) on every resize — a visible flicker,
+        // and the session re-cycle restarts audio. The gap is VARIABLE (observed
+        // ~0.5–0.9 s) because it includes the virtual-display re-mode, which
+        // blocks a variable amount — so a single fixed sleep can't reliably cover
+        // it. Instead POLL for the session to come back, up to REACTIVATION_GRACE,
+        // and skip the teardown as soon as it does; only a count that STAYS 0 for
+        // the whole window is a real disconnect (then teardown is delayed by at
+        // most the grace — a couple seconds of extra gamma-blank, harmless).
+        const REACTIVATION_GRACE: Duration = Duration::from_millis(2500);
+        const REACTIVATION_POLL: Duration = Duration::from_millis(75);
         let mut was_zero = true;
         let mut installed_at: Option<Instant> = None;
         loop {
@@ -1116,6 +1131,33 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                     }
                 }
                 (false, true) => {
+                    // Absorb a transient count→0: a core deactivation–reactivation
+                    // (a live resize on maximize, or blank recovery) flaps 1→0→1
+                    // as the vendored server rebuilds `CountedUpdates`. Poll for
+                    // the session to come back (up to REACTIVATION_GRACE); if it
+                    // does, keep the headless overlay engaged so it doesn't drop +
+                    // re-capture (the visible flicker) and doesn't restart audio.
+                    // Only a count that STAYS 0 for the whole window is a real
+                    // disconnect. `was_zero` is left false on the skip (overlay
+                    // still engaged), so the paired count→1 `enter` notification
+                    // lands as a no-op (false, false).
+                    let deadline = Instant::now() + REACTIVATION_GRACE;
+                    let mut came_back = false;
+                    while Instant::now() < deadline {
+                        tokio::time::sleep(REACTIVATION_POLL).await;
+                        if tracker.count.load(Ordering::SeqCst) > 0 {
+                            came_back = true;
+                            break;
+                        }
+                    }
+                    if came_back {
+                        info!(
+                            label,
+                            "session flapped during grace (reactivation) — keeping \
+                             headless overlay engaged"
+                        );
+                        continue;
+                    }
                     if let Some(installed) = installed_at {
                         let elapsed = installed.elapsed();
                         if elapsed < ENGAGED_SETTLE {

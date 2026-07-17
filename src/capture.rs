@@ -624,12 +624,40 @@ impl CaptureDisplay {
         match vd.resize(u32::from(width), u32::from(height)) {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
+                let vd_id = vd.display_id();
                 tracing::info!(
                     width,
                     height,
-                    display_id = vd.display_id(),
+                    display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
                 );
+                // A re-mode shifts the display's origin/bounds, so windows
+                // positioned in the old coordinate space are stranded off the
+                // new display and vanish from the client's view (the
+                // disappearing-apps report). In the HEADLESS modes
+                // (--capture-primary/--detach-primary — where the vd is the only
+                // visible display, and `session_tracker` is Some exactly then),
+                // sweep them back onto the new bounds — the same as an on-demand
+                // Ctrl+Alt+G, but automatic because a resize is when the user
+                // expects their windows to follow (an on-CONNECT auto-gather was
+                // rejected as surprising; a post-RESIZE one isn't). Skipped for
+                // plain --virtual-display, where a window off the vd may be
+                // intentionally on the still-active physical panel. Off-thread
+                // (AX), after a short settle for the WindowServer's own relayout.
+                #[cfg(target_os = "macos")]
+                if self.session_tracker.is_some() {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        let moved = crate::input::gather_windows_onto_display(vd_id);
+                        if moved > 0 {
+                            tracing::info!(
+                                moved,
+                                display_id = vd_id,
+                                "gathered stranded windows after live resize"
+                            );
+                        }
+                    });
+                }
                 (width, height)
             }
             Err(e) => {

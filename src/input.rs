@@ -314,6 +314,13 @@ pub fn init_focus_observer() {}
 #[cfg(target_os = "macos")]
 mod scancodes;
 
+// Re-export the gather-windows sweep so the capture path can trigger it
+// automatically after a live virtual-display re-mode (see
+// `capture.rs::sync_virtual_display`), the same routine the Ctrl+Alt+G hotkey
+// runs on demand.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::gather_windows_onto_display;
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::collections::HashSet;
@@ -2475,7 +2482,7 @@ mod macos {
     /// Accessibility grant (for `CGEventPost`), so no extra permission/prompt.
     /// Returns how many windows were moved. Triggered on demand by the
     /// Ctrl+Option+G hotkey (see `try_symbolic_hotkey`).
-    fn gather_windows_onto_display(display_id: u32) -> usize {
+    pub(crate) fn gather_windows_onto_display(display_id: u32) -> usize {
         // CFRelease + CGPoint are already in scope (the mod-level extern block /
         // `use` above); importing them here would shadow.
         use core_foundation::base::{CFTypeRef, TCFType};
