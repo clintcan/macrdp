@@ -616,7 +616,7 @@ impl CaptureDisplay {
         let Some(vd) = self.virtual_display.clone() else {
             return (width, height);
         };
-        let mut vd = vd.lock().unwrap();
+        let mut vd = vd.lock().expect("virtual display mutex poisoned");
         let (cur_w, cur_h) = vd.size_pts();
         if (cur_w as u16, cur_h as u16) == (width, height) {
             return (width, height);
