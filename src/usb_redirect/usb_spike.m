@@ -162,6 +162,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSData *> *reorder; // seq -> out-of-order arrival
 @property(nonatomic, assign) const IOUSBHostCIMessage *pendingHead;      // ring TRB presented but not yet fed (or NULL)
 @property(nonatomic, strong) IOUSBHostCIEndpointStateMachine *pendingEp; // identity guard for pendingHead
+@property(nonatomic, assign) uint64_t lastProgressNs;                    // ns of the last in-order delivery (stall watchdog)
 @end
 @implementation MacrdpBulkStream
 @end
@@ -195,6 +196,11 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpPrefetchRead *> *prefetchReads;
 // target concurrent client reads per streaming endpoint (MACRDP_USB_PREFETCH_DEPTH)
 @property(nonatomic, assign) NSInteger prefetchDepth;
+// Bulk-IN stall watchdog: a dispatch timer on the interface queue that recovers a
+// read-ahead stream whose client completions have silently stopped (see
+// -checkStreamStalls). streamStallNs == 0 disables it (MACRDP_USB_STREAM_STALL_MS=0).
+@property(nonatomic, strong) dispatch_source_t streamWatchdog;
+@property(nonatomic, assign) uint64_t streamStallNs;
 @property(nonatomic, assign) uint64_t nextToken;
 // ObjC -> Rust control-IN callback + its opaque context (set at create).
 @property(nonatomic, assign) MacrdpUsbControlInFn controlInCb;
@@ -225,6 +231,10 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         _prefetchDepth = pd ? atoi(pd) : 4;
         if (_prefetchDepth < 1) _prefetchDepth = 1;
         if (_prefetchDepth > 16) _prefetchDepth = 16;
+        const char *ss = getenv("MACRDP_USB_STREAM_STALL_MS");
+        long ssMs = ss ? atol(ss) : 3000;   // 0 disables the bulk-IN stall watchdog
+        if (ssMs < 0) ssMs = 0;
+        _streamStallNs = (uint64_t)ssMs * 1000000ull;
     }
     return self;
 }
@@ -804,10 +814,18 @@ static const uint32_t kStreamMinReadLen = 512;
 // the FIFO is always in stream order regardless of client completion order.
 - (void)drainReorder:(MacrdpBulkStream *)s {
     NSData *next;
+    BOOL advanced = NO;
     while ((next = s.reorder[@(s.nextDeliverSeq)]) != nil) {
         [s.reorder removeObjectForKey:@(s.nextDeliverSeq)];
         [s.fifo addObject:next];
         s.nextDeliverSeq++;
+        advanced = YES;
+    }
+    // Forward progress for the stall watchdog (-checkStreamStalls): the client is
+    // still completing reads in order. If completions go silent this stops
+    // updating and the watchdog recovers the stream.
+    if (advanced) {
+        s.lastProgressNs = macrdp_now_ns();
     }
 }
 
@@ -857,6 +875,7 @@ static const uint32_t kStreamMinReadLen = 512;
     s.reorder = [NSMutableDictionary dictionary];
     s.pendingHead = msg;
     s.pendingEp = ep;
+    s.lastProgressNs = macrdp_now_ns();   // arm the stall watchdog from creation
     self.bulkStreams[key] = s;
     // Reclassify the outstanding tied read as prefetch seq 0 so its bytes feed the
     // read-ahead FIFO (and complete the head) instead of the tied completion path.
@@ -943,6 +962,90 @@ static const uint32_t kStreamMinReadLen = 512;
         }
     }
     [self.prefetchReads removeObjectsForKeys:orphans];
+}
+
+// Bulk-IN stall watchdog. The read-ahead engine delivers strictly in sequence
+// order, and an errored/short completion still fills its seq slot (empty chunk)
+// so the reorder cursor advances — but a completion that NEVER comes back is a
+// permanent gap: -drainReorder can't advance past the missing seq, so a ring head
+// macOS presented sits unfed forever and the video freezes while the rest of the
+// session (a separate channel) keeps working. This happens when the client's
+// camera stalls on the host (USB autosuspend, a uvcvideo timeout, bandwidth
+// starvation) so its pending bulk-IN URBs hang and never complete. There is no
+// timeout on a missing seq, so without this the freeze is permanent until the
+// device is re-attached. This timer detects the wedge and forces macOS to
+// re-COMMIT, so a transient host-side stall becomes a self-recovering hiccup.
+- (void)startStreamWatchdog {
+    if (self.streamStallNs == 0) {
+        return;   // disabled (MACRDP_USB_STREAM_STALL_MS=0)
+    }
+    dispatch_queue_t q = self.interface.queue;
+    if (q == nil) {
+        return;
+    }
+    __weak MacrdpUsbController *weakSelf = self;
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    // ~1 s cadence (0.5 s leeway) — the threshold, not the tick, sets responsiveness.
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                              NSEC_PER_SEC, NSEC_PER_SEC / 2);
+    dispatch_source_set_event_handler(t, ^{
+        [weakSelf checkStreamStalls];
+    });
+    self.streamWatchdog = t;
+    dispatch_resume(t);
+}
+
+// Runs on the interface's serial queue (the timer targets it), so it can touch
+// stream state directly — same serialization as the completion path. A stream is
+// wedged when macOS is waiting on a ring head (pendingHead != NULL) but no
+// in-order data has been delivered for >= the threshold. A quiescent stream
+// (macOS not currently asking) has pendingHead == NULL and is left alone. Even a
+// false positive is self-correcting: the recovery just forces a re-COMMIT, which
+// re-establishes a healthy stream.
+- (void)checkStreamStalls {
+    if (self.bulkStreams.count == 0) {
+        return;
+    }
+    uint64_t now = macrdp_now_ns();
+    NSMutableArray<NSNumber *> *wedged = nil;
+    for (NSNumber *key in self.bulkStreams) {
+        MacrdpBulkStream *s = self.bulkStreams[key];
+        if (s.pendingHead != NULL && (now - s.lastProgressNs) >= self.streamStallNs) {
+            if (wedged == nil) {
+                wedged = [NSMutableArray array];
+            }
+            [wedged addObject:key];
+        }
+    }
+    // Recover AFTER enumeration — -recoverStalledStream mutates bulkStreams.
+    for (NSNumber *key in wedged) {
+        [self recoverStalledStream:key now:now];
+    }
+}
+
+- (void)recoverStalledStream:(NSNumber *)key now:(uint64_t)now {
+    MacrdpBulkStream *s = self.bulkStreams[key];
+    if (s == nil) {
+        return;
+    }
+    double stalledS = (double)(now - s.lastProgressNs) / 1.0e9;
+    NSLog(@"[usb2] bulk-IN read-ahead STALL ep=0x%02lx — no in-order data for %.1fs "
+          @"(inFlight=%ld); completing the waiting head empty + tearing down so macOS re-COMMITs",
+          (unsigned long)([key unsignedIntegerValue] & 0xff), stalledS, (long)s.inFlight);
+    // Unblock the ring head macOS is waiting on with a zero-length read. macOS
+    // treats moved=0 on a streaming bulk-IN as a starved endpoint and destroys +
+    // re-COMMITs it. Guarded by endpoint identity, so a stale endpoint is a no-op.
+    const IOUSBHostCIMessage *head = s.pendingHead;
+    IOUSBHostCIEndpointStateMachine *headEp = s.pendingEp;
+    s.pendingHead = NULL;
+    s.pendingEp = nil;
+    if (head != NULL) {
+        [self deliverStreamData:[NSData data] toMsg:head key:key expectedEp:headEp];
+    }
+    // Drop the wedged state + orphan the hung client reads (their late completions
+    // find no stream and are dropped). The re-COMMIT re-engages read-ahead fresh
+    // via -engageStream, so the stream recovers once the client resumes.
+    [self tearDownStream:key];
 }
 
 // M0 isoch observe-only: record + log an isochronous TRB's shape and the service
@@ -1146,12 +1249,27 @@ static const uint32_t kStreamMinReadLen = 512;
         return NO;
     }
     self.interface = iface;
+    [self startStreamWatchdog];   // recovers a bulk-IN stream whose completions go silent
     return YES;
 }
 
 - (void)stop {
+    if (self.streamWatchdog != nil) {
+        dispatch_source_cancel(self.streamWatchdog);
+        self.streamWatchdog = nil;
+    }
     [self.interface destroy];
     self.interface = nil;
+}
+
+// Safety net: a resumed dispatch source released without a prior cancel crashes.
+// -stop is the normal teardown (called by macrdp_usb_controller_destroy) and
+// already cancels; this covers any path that releases the controller without it.
+- (void)dealloc {
+    if (_streamWatchdog != nil) {
+        dispatch_source_cancel(_streamWatchdog);
+        _streamWatchdog = nil;
+    }
 }
 
 @end
