@@ -2148,6 +2148,47 @@ impl Gfx {
         Ok(())
     }
 
+    /// Manual A/V resync (the `Ctrl+Alt+Shift+R` hotkey — see `input.rs` and the
+    /// `crate::RESYNC_VIDEO` flag). Arms a forced IDR keyframe so the next frame
+    /// is a clean, self-contained repaint — enough to recover a stale/idle-blanked
+    /// mstsc presentation without the heavyweight core Deactivation–Reactivation,
+    /// which on the `--virtual-display`/`--capture-primary` headless path cascades
+    /// into a full session re-cycle (a re-mod of the virtual display → the #155
+    /// live-resize surface reset → a headless re-capture — the visible reconnect
+    /// flicker). If a plain IDR turns out not to un-blank the surface-retention
+    /// case on some client, [`request_reactivation`] is the heavier escalation.
+    /// `capture.rs` calls this when it observes the flag.
+    pub(crate) fn force_keyframe(&self) {
+        if let Ok(mut guard) = self.ctx.lock() {
+            if let Some(ctx) = guard.as_mut() {
+                ctx.need_keyframe = true;
+            }
+        }
+        info!("manual A/V resync (Ctrl+Alt+Shift+R): forcing an IDR keyframe");
+    }
+
+    /// Heavier manual-resync escalation: request the same bare core
+    /// Deactivation–Reactivation as blank-recovery ([`perform_blank_reactivate`])
+    /// plus a forced IDR. Re-maps a retained/blanked mstsc surface, but on the
+    /// headless virtual-display path it cascades into a session re-cycle (see
+    /// [`force_keyframe`]). Kept for the surface-retention case; not wired to the
+    /// hotkey by default.
+    #[allow(dead_code)]
+    pub(crate) fn request_reactivation(&self, width: u16, height: u16) {
+        let packed = (u32::from(width) << 16) | u32::from(height);
+        self.reactivate_request.store(packed, Ordering::Relaxed);
+        if let Ok(mut guard) = self.ctx.lock() {
+            if let Some(ctx) = guard.as_mut() {
+                ctx.need_keyframe = true;
+            }
+        }
+        info!(
+            width,
+            height,
+            "manual A/V resync (Ctrl+Alt+Shift+R): requesting a core reactivation + forced IDR"
+        );
+    }
+
     /// Drain a pending [`perform_blank_reactivate`] request. Called by the
     /// capture loop each poll; returns `Some((width, height))` exactly once per
     /// request (the size to emit a no-op `DisplayUpdate::Resize` to), else

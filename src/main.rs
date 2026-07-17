@@ -39,6 +39,18 @@ mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
 
+/// Manual A/V resync hotkey (Ctrl+Alt+Shift+R — handled in `input.rs`). Set true
+/// by the input handler on the chord; consumed independently by the video path
+/// (`capture.rs` → a bare core reactivation + forced IDR, reusing the
+/// blank-recovery machinery) and the audio path (`audio.rs` → an SCK stream
+/// rebuild). Two flags so each consumer swaps its own back to false. Lets a user
+/// recover a session gone stale after a long idle — a blanked mstsc surface
+/// and/or drifted audio — on demand, without disconnecting.
+pub(crate) static RESYNC_VIDEO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static RESYNC_AUDIO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 use std::fs;
 use std::io::{BufReader, IsTerminal};
 use std::net::SocketAddr;

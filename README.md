@@ -60,6 +60,7 @@ macrdp reimplements the macOS symbolic hotkeys in user space (WindowServer won't
 | **Cmd+Space** | Spotlight |
 | **Cmd+Shift+3 / 4 / 5** | Screenshots (full screen / region / Screenshot.app) |
 | **Ctrl+Alt+G** | Gather windows stranded off the virtual display (headless `--capture-primary`/`--detach-primary` modes) |
+| **Ctrl+Alt+Shift+R** | On-demand A/V resync — repaint a stale/idle-blanked screen (forced keyframe) and re-sync drifted audio, without disconnecting. Handy for mstsc after hours idle. |
 
 Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` accept **Option+Tab** / **Option+\`** as the same triggers; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents.
 

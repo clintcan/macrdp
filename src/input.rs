@@ -345,6 +345,7 @@ mod macos {
     const VK_GRAVE: u16 = 0x32;
     const VK_CAPS_LOCK: u16 = 0x39;
     const VK_G: u16 = 0x05; // kVK_ANSI_G — the on-demand "gather windows" chord
+    const VK_R: u16 = 0x0F; // kVK_ANSI_R — the on-demand "A/V resync" chord
 
     // macOS virtual keycodes for the left/right halves of each modifier.
     // Used by ModifierState to track which physical key is held so we can
@@ -1038,6 +1039,30 @@ mod macos {
                 }
                 // No virtual display — nothing to gather onto; let the key through.
                 return false;
+            }
+
+            // Ctrl+Option+Shift+R: on-demand A/V resync. Recovers a session gone
+            // stale after a long idle — a blanked mstsc surface and/or drifted
+            // audio (Windows' audiodg buffers playback downstream where the
+            // server can't see it, so this is a manual lever, not auto-detected).
+            // Sets two crate-global flags: the video path (`capture.rs`) forces a
+            // clean IDR keyframe to repaint a stale/idle-blanked mstsc
+            // presentation (live-verified to un-blank with no reconnect flicker —
+            // the heavier core reactivation cascades into a session re-cycle on
+            // the headless virtual-display path, so it's kept only as an
+            // escalation), and the audio path (`audio.rs`) rebuilds its SCK stream
+            // (a brief gap lets the client's audio backlog drain, the same
+            // principle as a minimize→unminimize resync). From a Windows client
+            // this is Ctrl+Alt+Shift+R — Win-key-free so mstsc forwards it, and
+            // not a system shortcut on either OS. Cheap atomic stores, so no
+            // off-thread hop needed; the consumers act on their next poll.
+            if ctrl && opt && shift && !cmd && vk == VK_R {
+                crate::RESYNC_VIDEO.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::RESYNC_AUDIO.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    "on-demand A/V resync hotkey (Ctrl+Option+Shift+R) — refreshing video (IDR) + rebuilding audio"
+                );
+                return true;
             }
 
             // Opt+Tab / Opt+Shift+Tab as an alternative app-cycle trigger

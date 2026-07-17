@@ -552,6 +552,21 @@ async fn capture_loop(
                 let _ = stream.stop_capture();
                 break 'reconnect;
             }
+            // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in input.rs via
+            // crate::RESYNC_AUDIO): rebuild the SCK stream now. The brief capture
+            // gap lets the client's downstream audio backlog (audiodg) drain and
+            // re-baselines the server-side wave timing — the same effect a
+            // minimize→unminimize achieves. This is a deliberate resync, not a
+            // failure, so reset the backoff and rebuild immediately.
+            if crate::RESYNC_AUDIO.swap(false, Ordering::Relaxed) {
+                let _ = stream.stop_capture();
+                consecutive_failures = 0;
+                info!(
+                    my_gen,
+                    "manual A/V resync (Ctrl+Alt+Shift+R): rebuilding audio capture stream"
+                );
+                continue 'reconnect;
+            }
             let Some(sample) = stream.next().await else {
                 // SCK stopped delivering. Stop, back off, and rebuild rather
                 // than ending the loop (which would silence audio for the rest

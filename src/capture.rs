@@ -1161,6 +1161,16 @@ mod macos {
                 // — the one untested lever for the mstsc reconnect-blank. A
                 // forced IDR was already armed on the ctx.
                 if let Some(gfx) = self.gfx.as_ref() {
+                    // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in
+                    // input.rs via crate::RESYNC_VIDEO): force a clean IDR
+                    // keyframe to repaint a stale/idle-blanked mstsc presentation.
+                    // Deliberately lighter than the full core reactivation
+                    // (gfx.request_reactivation), which on the headless
+                    // virtual-display path cascades into a visible session
+                    // re-cycle — see Gfx::force_keyframe.
+                    if crate::RESYNC_VIDEO.swap(false, Ordering::Relaxed) {
+                        gfx.force_keyframe();
+                    }
                     if let Some((w, h)) = gfx.take_reactivate_request() {
                         // See `CaptureDisplay::suppress_next_adopt`: without
                         // this, the reactivation's `request_initial_size`
