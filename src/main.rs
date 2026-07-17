@@ -1440,6 +1440,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS",
         ),
         ("AUTO_RECONNECT", "MACRDP_AUTO_RECONNECT"),
+        // USB-redirection read-ahead tunables (--enable-usb-redirection). These
+        // are env-only, read via getenv() in usb_spike.m; bridging them lets the
+        // webcam knobs be set from config.env instead of the plist's
+        // EnvironmentVariables (which a `kickstart -k` won't even pick up).
+        ("USB_PREFETCH_DEPTH", "MACRDP_USB_PREFETCH_DEPTH"),
+        ("USB_STREAM_STALL_MS", "MACRDP_USB_STREAM_STALL_MS"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
