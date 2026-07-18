@@ -37,11 +37,11 @@ The same event is written to both sinks, e.g. an accepted connection:
 {"timestamp":"2026-07-10T18:22:04.117Z","level":"INFO","target":"macrdp::audit","schema_version":1,"macrdp_version":"0.8.32","host":"mac-studio","event":"accept","src_ip":"203.0.113.5","src_port":54132}
 ```
 
-## The four events
+## The five events
 
-macrdp maps one TCP connection to (usually) three events in order —
-**`accept` → `auth` → `disconnect`** — plus **`reject`** for connections the guard
-blocks *before* they ever handshake.
+macrdp maps one TCP connection to (usually) four events in order —
+**`accept` → `auth` → `fingerprint` → `disconnect`** — plus **`reject`** for
+connections the guard blocks *before* they ever handshake.
 
 ### `accept` — the guard let the connection through *(INFO)*
 Emitted the moment a connection passes the pre-handshake auth guard (per-IP
@@ -85,6 +85,36 @@ itself the tell that it never reached authentication.
 > **Scope:** the `auth` event is emitted on the single-process server path. See
 > `configuration.md`.
 
+### `fingerprint` — which RDP client connected *(INFO)*
+Emitted **once per connection** when the capability exchange completes (after
+`auth`; not re-emitted on an in-session reactivation such as a live resize or
+blank recovery). Carries the identity the client announced during the handshake:
+
+- **`client_name`** — the client machine's hostname (client-controlled;
+  sanitized: control-chars stripped, length-bounded).
+- **`rdp_version`** — the announced RDP protocol version, hex (e.g. `0x80011` =
+  RDP 10.12).
+- **`client_build`** — the client's announced build number.
+- **`platform`** — the OS platform from the client's General capability set.
+
+**This is fingerprinting, not authentication** — a client can claim anything.
+Live-verified signatures for telling clients apart:
+
+| Client | `client_build` | `platform` |
+|---|---|---|
+| **mstsc** (real Windows) | the actual Windows build (e.g. `26100` = Win11 24H2, `22621` = 22H2) | `WINDOWS/WINDOWS_NT` |
+| **Thincast** | `18363` (a fixed, claimed value — not the host's real build) | `UNSPECIFIED/UNSPECIFIED` |
+| **FreeRDP** family | `2600` (hardcoded XP build) | `UNIX/...` |
+| **Windows App** (macOS/iOS/Android) | varies | its host platform |
+
+Reading it: mstsc reports the *machine's real* build and a Windows platform;
+everyone else reports a fixed/claimed build and (for the FreeRDP family, which
+Thincast derives from) a non-Windows or unspecified platform. Use it for "which
+client is this?" triage — never as a trust signal.
+
+> **Scope:** the `fingerprint` event is emitted on the single-process server
+> path (same as `auth`).
+
 ### `disconnect` — the connection ended *(INFO)*
 Emitted when the connection closes, with `duration_ms` (wall-clock lifetime) and a
 heuristic `outcome`:
@@ -112,13 +142,17 @@ heuristic `outcome`:
 | `schema_version` | int | all | audit contract version (`1`); bumps only on a breaking field change |
 | `macrdp_version` | string | all | server build, e.g. `0.8.32` |
 | `host` | string | all | server hostname (a collector usually adds its own too) |
-| `event` | string | all | `accept` \| `reject` \| `auth` \| `disconnect` |
+| `event` | string | all | `accept` \| `reject` \| `auth` \| `fingerprint` \| `disconnect` |
 | `src_ip` | string | all | client source IP — the primary correlation key |
-| `src_port` | int | accept, auth, disconnect | client source port — completes the per-connection tuple. **Absent on `reject`.** |
+| `src_port` | int | accept, auth, fingerprint, disconnect | client source port — completes the per-connection tuple. **Absent on `reject`.** |
 | `reason` | string | reject, auth (failure only) | reject: `rate_limit` \| `lockout`. auth: sanitized sspi error text |
 | `window_attempts` | int | reject (`rate_limit`) | attempts counted in the current window |
 | `retry_after_secs` | int | reject (`lockout`) | seconds until the cooldown expires |
 | `outcome` | string | auth, disconnect | auth: `success` \| `did_not_complete`. disconnect: `success` \| `failure` |
+| `client_name` | string | fingerprint | client's announced hostname (client-controlled; sanitized) |
+| `rdp_version` | string | fingerprint | announced RDP protocol version, hex |
+| `client_build` | int | fingerprint | client's announced build number |
+| `platform` | string | fingerprint | OS platform from the General capset (server-formatted) |
 | `duration_ms` | int | disconnect | connection wall-clock lifetime in milliseconds |
 
 **Correlation:** an `accept`, its `auth`, and its `disconnect` share
@@ -130,11 +164,13 @@ time window; a monotonic per-connection id is a possible future additive field.
 
 **Normal successful session**
 ```text
-event="accept"     src_ip=203.0.113.5 src_port=54132
-event="auth"       src_ip=203.0.113.5 src_port=54132 outcome="success"
-event="disconnect" src_ip=203.0.113.5 src_port=54132 duration_ms=216913 outcome="success"
+event="accept"      src_ip=203.0.113.5 src_port=54132
+event="auth"        src_ip=203.0.113.5 src_port=54132 outcome="success"
+event="fingerprint" src_ip=203.0.113.5 src_port=54132 client_name="GENMACWIN" client_build=26100 platform="WINDOWS/WINDOWS_NT"
+event="disconnect"  src_ip=203.0.113.5 src_port=54132 duration_ms=216913 outcome="success"
 ```
-Allowed → authenticated → clean multi-minute session. The baseline.
+Allowed → authenticated → identified as real mstsc → clean multi-minute session.
+The baseline.
 
 **A single wrong password**
 ```text

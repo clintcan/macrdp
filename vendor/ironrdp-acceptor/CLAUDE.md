@@ -153,3 +153,15 @@ vendor dir until divergence (1) is upstreamed AND released.
     advertises `UDP_FECR|UDP_FECL|UDP_PREFERRED|SOFT_SYNC`, accepts the `UdpFecL`
     Initiate Request, opens a `SYN_LOSSY` flow, and starts a **DTLS 1.2**
     handshake. See docs/rdp-udp-multitransport-feasibility.md → "P2.0 Result".
+
+(4) Client-fingerprint identity fields from GCC Client Core Data (NOT upstreamed;
+    added 2026-07-18): `Acceptor` gains private `client_name: String` /
+    `client_version: u32` (raw `RdpVersion.0`) / `client_build: u32`, captured in
+    `BasicSettingsWaitInitial` alongside the KLID (divergence (2)) and surfaced as
+    `pub` fields on `AcceptorResult` (name cloned, not taken, so a
+    deactivation–reactivation's result still carries it). Consumed by the vendored
+    server's divergence (20) client-fingerprint log. Same additive GCC-surfacing
+    shape as (2) KLID/#1397 and the #1453 multitransport flags → cleanly
+    upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
+    22621) + its hostname; FreeRDP hardcodes build 2600. Informational
+    fingerprinting only — a client can claim anything.

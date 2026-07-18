@@ -62,6 +62,16 @@ pub struct Acceptor {
     /// `BasicSettingsWaitInitial` and surfaced on `AcceptorResult` so the
     /// server can serve the client's keyboard layout. 0 = unknown / not sent.
     client_keyboard_layout: u32,
+    /// (vendored) Client-fingerprint identity fields from the GCC Client Core
+    /// Data (divergence (4)): the client machine's hostname, its announced RDP
+    /// version (raw u32; e.g. mstsc 0x80005 = V5_PLUS), and its build number
+    /// (mstsc = the real Windows build like 22621; FreeRDP hardcodes 2600).
+    /// Captured in `BasicSettingsWaitInitial` alongside the KLID and surfaced
+    /// on `AcceptorResult` for logging/audit. Informational fingerprinting —
+    /// a client can claim anything.
+    client_name: String,
+    client_version: u32,
+    client_build: u32,
     /// (vendored) The client's announced multitransport support flags
     /// (MS-RDPEMT) from its GCC MultiTransportChannelData block, captured in
     /// `BasicSettingsWaitInitial` and surfaced on `AcceptorResult` so the
@@ -125,6 +135,12 @@ pub struct AcceptorResult {
     /// (vendored) The client's announced keyboard-layout identifier (KLID)
     /// from its GCC Client Core Data; 0 if the client didn't send one.
     pub keyboard_layout: u32,
+    /// (vendored) Client-fingerprint identity from the GCC Client Core Data
+    /// (divergence (4)): hostname, raw RDP version, and build number. Empty /
+    /// 0 when not sent. Informational — a client can claim anything.
+    pub client_name: String,
+    pub client_version: u32,
+    pub client_build: u32,
     /// (vendored) The client's announced multitransport (MS-RDPEMT) support
     /// flags from its GCC MultiTransportChannelData block; empty if the client
     /// sent no multitransport block.
@@ -167,6 +183,9 @@ impl Acceptor {
             honor_client_desktop_size: false,
             honor_client_desktop_size_max: None,
             client_keyboard_layout: 0,
+            client_name: String::new(),
+            client_version: 0,
+            client_build: 0,
             client_multitransport: gcc::MultiTransportFlags::empty(),
             advertise_extended_client_data: false,
             multitransport_offer: None,
@@ -247,6 +266,9 @@ impl Acceptor {
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             honor_client_desktop_size_max: consumed.honor_client_desktop_size_max,
             client_keyboard_layout: consumed.client_keyboard_layout,
+            client_name: consumed.client_name,
+            client_version: consumed.client_version,
+            client_build: consumed.client_build,
             client_multitransport: consumed.client_multitransport,
             advertise_extended_client_data: consumed.advertise_extended_client_data,
             // Reactivation skips LicensingExchange, so nothing is re-emitted;
@@ -309,6 +331,11 @@ impl Acceptor {
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
                 keyboard_layout: self.client_keyboard_layout,
+                // Cloned (not mem::take'n) so a later deactivation–reactivation's
+                // result still carries the fingerprint.
+                client_name: self.client_name.clone(),
+                client_version: self.client_version,
+                client_build: self.client_build,
                 multitransport_flags: self.client_multitransport,
                 multitransport_offered: self.multitransport_offered,
             }),
@@ -574,6 +601,12 @@ impl Sequence for Acceptor {
                 // the server can serve a non-US layout. Always recorded (it's
                 // free); whether to act on it is the server's choice.
                 self.client_keyboard_layout = gcc_blocks.core.keyboard_layout;
+
+                // (vendored, divergence (4)) Capture the client-fingerprint
+                // identity fields for the server's connect log / audit.
+                self.client_name = gcc_blocks.core.client_name.clone();
+                self.client_version = gcc_blocks.core.version.0;
+                self.client_build = gcc_blocks.core.client_build;
 
                 // (vendored) Capture the client's multitransport (MS-RDPEMT)
                 // support flags so the server can decide whether to offer a UDP

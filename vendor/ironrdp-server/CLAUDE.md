@@ -1408,3 +1408,14 @@ AND released — #1276 landing is NOT sufficient.
     Cleanly upstreamable as the server counterpart to a (nonexistent-upstream)
     client MS-RDPECAM — but it's a gate, so hold until Phase 1 shapes the real API.
     Reference: FreeRDP `channels/rdpecam/server/` implements this server side.
+
+(20) Client-fingerprint connect log (NOT upstreamed; added 2026-07-18; pairs with
+    acceptor divergence (4)): `client_accepted` logs one `info!` line per initial
+    connection (skipped on reactivation) — `client fingerprint` with
+    `client_name` / `rdp_version` (hex) / `client_build` (from the acceptor's new
+    `AcceptorResult` fields) + `platform` (`major/minor_platform_type` scanned by
+    reference from the General capset in `result.capabilities`, before the
+    consuming loop). Answers "which RDP client connected": mstsc = real Windows
+    build + WINDOWS platform; FreeRDP family = build 2600; Windows Apps = their
+    host platform. Lands in macrdp.log next to the `macrdp::audit` lines.
+    Informational fingerprinting only. Additive; upstreamable with (4).

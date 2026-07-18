@@ -555,6 +555,42 @@ pub fn audit_auth(ip: IpAddr, port: u16, success: bool, reason: Option<&str>) {
     }
 }
 
+/// Audit-log the client fingerprint for a connection, emitted once per
+/// connection when the capability exchange completes (after `auth`). The
+/// identity fields come from the client's GCC Client Core Data + General capset
+/// and are **informational fingerprinting only** — a client can claim anything.
+/// Known signatures (see `docs/audit-log.md`): mstsc = the real Windows build
+/// (e.g. 26100 = Win11 24H2) + platform `WINDOWS/WINDOWS_NT`; FreeRDP family =
+/// build 2600; Thincast = build 18363 + platform `UNSPECIFIED/UNSPECIFIED`.
+/// `client_name` is client-controlled → control-char-stripped + length-bounded
+/// (same log-injection defense as the auth `reason`). `platform` is
+/// server-formatted (safe).
+pub fn audit_fingerprint(
+    ip: IpAddr,
+    port: u16,
+    client_name: &str,
+    rdp_version: u32,
+    client_build: u32,
+    platform: &str,
+) {
+    if !audit_enabled() {
+        return;
+    }
+    tracing::info!(
+        target: "macrdp::audit",
+        schema_version = AUDIT_SCHEMA_VERSION,
+        macrdp_version = env!("CARGO_PKG_VERSION"),
+        host = host(),
+        event = "fingerprint",
+        src_ip = %ip,
+        src_port = port,
+        client_name = %bound_reason(Some(client_name)),
+        rdp_version = format_args!("{rdp_version:#x}"),
+        client_build,
+        platform = %platform,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Single-process ConnectionHandler adapter
 // ---------------------------------------------------------------------------
@@ -603,6 +639,25 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         // precedes the connection); guard defensively rather than assume it.
         if let Some(peer) = self.last_peer {
             audit_auth(peer.ip(), peer.port(), success, reason);
+        }
+    }
+
+    fn on_client_fingerprint(
+        &mut self,
+        client_name: &str,
+        rdp_version: u32,
+        client_build: u32,
+        platform: &str,
+    ) {
+        if let Some(peer) = self.last_peer {
+            audit_fingerprint(
+                peer.ip(),
+                peer.port(),
+                client_name,
+                rdp_version,
+                client_build,
+                platform,
+            );
         }
     }
 
@@ -1006,6 +1061,48 @@ mod tests {
         // Failure event carries the (bounded) reason.
         assert!(out.contains("outcome=\"did_not_complete\""), "{out}");
         assert!(out.contains("reason=logon denied"), "{out}");
+    }
+
+    #[test]
+    fn on_client_fingerprint_emits_fingerprint_event() {
+        use ironrdp_server::ConnectionHandler;
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+
+        let peer = std::net::SocketAddr::from((Ipv4Addr::new(203, 0, 113, 5), 51000));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut handler = AuthGuardHandler {
+                core: AuthGuardCore::with_config(test_cfg()),
+                last_peer: None,
+            };
+            assert!(handler.on_accept(peer));
+            // A hostile client name with a control char (log-injection attempt)
+            // must come out stripped.
+            handler.on_client_fingerprint("GENMACWIN\nevil", 0x80011, 26100, "WINDOWS/WINDOWS_NT");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("event=\"fingerprint\""),
+            "no fingerprint event:\n{out}"
+        );
+        assert!(out.contains("src_ip=203.0.113.5"), "{out}");
+        assert!(out.contains("client_build=26100"), "{out}");
+        assert!(out.contains("rdp_version=0x80011"), "{out}");
+        assert!(out.contains("platform=WINDOWS/WINDOWS_NT"), "{out}");
+        // Control char stripped, name still present.
+        assert!(
+            out.contains("GENMACWIN evil"),
+            "control char not stripped:\n{out}"
+        );
+        assert!(
+            !out.contains("GENMACWIN\nevil"),
+            "raw control char leaked:\n{out}"
+        );
     }
 
     #[test]

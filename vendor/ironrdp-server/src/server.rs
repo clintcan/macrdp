@@ -29,7 +29,7 @@ use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 
 use crate::autodetect::{AutoDetectManager, RttSnapshot};
@@ -96,6 +96,22 @@ pub trait ConnectionHandler: Send {
     /// which runs immediately before, for the peer. Default: no-op.
     fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
         let _ = (success, reason);
+    }
+
+    /// (vendored, divergence (20)) Called once per connection when the
+    /// capability exchange completes (not on a deactivation–reactivation),
+    /// carrying the client-fingerprint identity: the GCC Client Core Data
+    /// hostname / raw RDP version / build number plus the General-capset
+    /// platform (formatted). Informational fingerprinting — a client can
+    /// claim anything. Default: no-op.
+    fn on_client_fingerprint(
+        &mut self,
+        client_name: &str,
+        rdp_version: u32,
+        client_build: u32,
+        platform: &str,
+    ) {
+        let _ = (client_name, rdp_version, client_build, platform);
     }
 }
 
@@ -2470,6 +2486,45 @@ impl RdpServer {
         if let Some(handle) = &self.keyboard_layout {
             handle.store(result.keyboard_layout, Ordering::Relaxed);
             debug!(klid = result.keyboard_layout, "client keyboard layout announced");
+        }
+
+        // (vendored, divergence (20)) Client-fingerprint log: the identity
+        // fields the acceptor captured from the GCC Client Core Data
+        // (acceptor divergence (4)) + the platform from the General capset.
+        // Heuristics for "which client is this": mstsc sends the real Windows
+        // build (e.g. 22621) + platform WINDOWS; FreeRDP hardcodes build 2600;
+        // the Windows Apps announce their host platform. Informational
+        // fingerprinting only — a client can claim anything. Skipped on
+        // reactivation (same connection, already logged).
+        if !result.reactivation {
+            let platform = result
+                .capabilities
+                .iter()
+                .find_map(|c| match c {
+                    CapabilitySet::General(g) => {
+                        Some(format!("{:?}/{:?}", g.major_platform_type, g.minor_platform_type))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "unknown".to_owned());
+            info!(
+                client_name = %result.client_name,
+                rdp_version = format_args!("{:#x}", result.client_version),
+                client_build = result.client_build,
+                platform = %platform,
+                "client fingerprint"
+            );
+            // Surface it to the application's ConnectionHandler (macrdp's
+            // AuthGuardHandler emits an `event="fingerprint"` audit record for
+            // the SIEM JSON stream).
+            if let Some(handler) = self.connection_handler.as_mut() {
+                handler.on_client_fingerprint(
+                    &result.client_name,
+                    result.client_version,
+                    result.client_build,
+                    &platform,
+                );
+            }
         }
 
         if !result.input_events.is_empty() {
