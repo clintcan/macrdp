@@ -631,29 +631,53 @@ impl CaptureDisplay {
                     display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
                 );
-                // A re-mode shifts the display's origin/bounds, so windows
-                // positioned in the old coordinate space are stranded off the
-                // new display and vanish from the client's view (the
-                // disappearing-apps report). In the HEADLESS modes
-                // (--capture-primary/--detach-primary — where the vd is the only
-                // visible display, and `session_tracker` is Some exactly then),
-                // sweep them back onto the new bounds — the same as an on-demand
-                // Ctrl+Alt+G, but automatic because a resize is when the user
-                // expects their windows to follow (an on-CONNECT auto-gather was
-                // rejected as surprising; a post-RESIZE one isn't). Skipped for
-                // plain --virtual-display, where a window off the vd may be
-                // intentionally on the still-active physical panel. Off-thread
-                // (AX), after a short settle for the WindowServer's own relayout.
+                // TWO post-re-mode fixes for the headless modes, with a
+                // deliberate split on WHERE each runs — learned the hard way (each
+                // has the OPPOSITE timing need):
+                //   1. Re-anchor the vd at (0,0) as the system MAIN display,
+                //      SYNCHRONOUSLY here on the capture path. A re-mode drifts the
+                //      vd off (0,0) (back to its creation origin), moving the menu
+                //      bar + Dock onto the blanked physical panel — they vanish
+                //      over RDP. The re-anchor must be IMMEDIATE: done even a few
+                //      hundred ms late (off-thread), the Dock has already settled
+                //      on the physical panel and doesn't re-follow the main-display
+                //      change. It's a fast CG config, so on-path is fine.
+                //   2. Gather windows stranded off the re-moded display back onto
+                //      it (the Ctrl+Alt+G sweep) — automatic because a resize is
+                //      when the user expects their windows to follow. But the
+                //      re-anchor is an arrangement change that triggers a
+                //      WindowServer RELAYOUT, so the gather must run AFTER that
+                //      settles (off-thread, ~0.7 s) and read the FINAL (0,0)
+                //      bounds; too soon and it sweeps windows in a coordinate space
+                //      that's about to shift → they land off-screen.
+                // Headless-only (session_tracker is Some exactly for
+                // --capture-primary/--detach-primary, where the vd is the only
+                // visible display); skipped for plain --virtual-display, where a
+                // window off the vd may be intentionally on the physical panel.
                 #[cfg(target_os = "macos")]
                 if self.session_tracker.is_some() {
+                    if let Err(e) = vd.reanchor_as_main() {
+                        tracing::warn!(error = ?e, "re-anchoring the vd as main after re-mode failed");
+                    }
                     std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(400));
-                        let moved = crate::input::gather_windows_onto_display(vd_id);
-                        if moved > 0 {
+                        // TWO sweeps. The re-anchor's WindowServer relayout can
+                        // still be finishing well after the first sweep (it fires
+                        // during the reactivation churn, so it's slow) and would
+                        // re-strand windows the first sweep just placed — the
+                        // "apps flicker then disappear" symptom. A second sweep
+                        // after the relayout has fully settled sticks. Robust to
+                        // however long the relayout takes; a no-op second sweep is
+                        // cheap when the first already stuck.
+                        std::thread::sleep(std::time::Duration::from_millis(700));
+                        let first = crate::input::gather_windows_onto_display(vd_id);
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        let second = crate::input::gather_windows_onto_display(vd_id);
+                        if first > 0 || second > 0 {
                             tracing::info!(
-                                moved,
+                                first,
+                                second,
                                 display_id = vd_id,
-                                "gathered stranded windows after live resize"
+                                "gathered stranded windows after live resize (two sweeps)"
                             );
                         }
                     });

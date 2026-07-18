@@ -161,6 +161,47 @@ mod macos {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+
+        /// Re-assert the virtual display at the global origin `(0, 0)` so it
+        /// stays the system MAIN display (the one holding the menu bar + Dock)
+        /// after a live re-mode. A mode change (`applySettings`) can reset the
+        /// display arrangement, knocking the vd off `(0, 0)` — and on the
+        /// headless capture/detach path (where `CapturedPrimary`/`DetachedPrimary`
+        /// placed the vd at `(0, 0)` precisely to make it main) that moves the
+        /// menu bar + Dock back onto the now-blanked physical panel, so they
+        /// vanish from the client's view. Headless-only helper: `capture.rs`
+        /// calls it right after `resize` when a session tracker is active. No-op
+        /// if the vd is already main at `(0, 0)`. Returns whether it had to move.
+        pub fn reanchor_as_main(&mut self) -> Result<bool> {
+            let vd = CGDisplay::new(self.display_id);
+            let b = vd.bounds();
+            let origin = (b.origin.x.round() as i32, b.origin.y.round() as i32);
+            let main_id = CGDisplay::main().id;
+            if origin == (0, 0) && main_id == self.display_id {
+                tracing::debug!(
+                    display_id = self.display_id,
+                    "virtual display still main at (0,0) after re-mode — no re-anchor needed"
+                );
+                return Ok(false);
+            }
+            tracing::info!(
+                display_id = self.display_id,
+                ?origin,
+                main_id,
+                "virtual display drifted off (0,0)/main after re-mode — re-anchoring so the \
+                 menu bar + Dock stay on it"
+            );
+            let config = vd
+                .begin_configuration()
+                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (re-anchor): CGError {e}"))?;
+            vd.configure_display_origin(&config, 0, 0).map_err(|e| {
+                anyhow!("CGConfigureDisplayOrigin(vd, 0, 0) (re-anchor): CGError {e}")
+            })?;
+            vd.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (re-anchor): CGError {e}"))?;
+            self.origin_pts = (0.0, 0.0);
+            Ok(true)
+        }
     }
 
     /// Promotes a virtual (or any other secondary) display to be the
@@ -616,6 +657,23 @@ mod macos {
             // vd's bounds line up with the RDP frame's (0, 0). After
             // capture the layout is frozen from our perspective; only
             // the vd is being composited to.
+            //
+            // ConfigureForSession (NOT ForAppOnly) is load-bearing for live
+            // resize: ForAppOnly is process-scoped and never enters the
+            // WindowServer's persisted arrangement, which therefore still says
+            // "vd at its creation origin, physical is main" — so EVERY live
+            // re-mode (`applySettings` on a client resize) re-derived the
+            // arrangement from that store and snapped the vd off (0,0)/main
+            // (confirmed in the log: `drifted off (0,0)/main after re-mode` on
+            // each resize), yanking the menu bar + Dock back to the blanked
+            // physical panel and re-stranding windows mid-gather. ForSession
+            // persists vd@(0,0) into the session store, so a re-mode has
+            // nothing to snap back to. Crash-safety is unchanged: the capture
+            // tokens + gamma below are process-scoped regardless (SIGKILL
+            // un-blanks the panels), and when the vd vanishes with a dead
+            // process the remaining physical automatically becomes main at
+            // (0,0) again (a lone display always anchors the arrangement);
+            // logout clears the session store as a backstop.
             let any = CGDisplay::new(virtual_display_id);
             let config = any
                 .begin_configuration()
@@ -632,7 +690,7 @@ mod macos {
                     x_off += d.bounds().size.width.round() as i32;
                 }
             }
-            any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+            any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
                 .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
 
             std::thread::sleep(TX_SETTLE);
@@ -777,6 +835,9 @@ mod stub {
             (0.0, 0.0)
         }
         pub fn resize(&mut self, _width: u32, _height: u32) -> Result<()> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
+        pub fn reanchor_as_main(&mut self) -> Result<bool> {
             Err(anyhow!("virtual display is macOS-only"))
         }
     }
