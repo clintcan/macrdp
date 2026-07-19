@@ -187,6 +187,35 @@ impl From<MousePdu> for MouseEvent {
     }
 }
 
+/// Expand a raw [`MousePdu`] into the ordered [`MouseEvent`]s the input
+/// handler should receive.
+///
+/// A mouse PDU that carries a button flag ALSO carries the pointer position,
+/// but the button `MouseEvent` variants have no position field — so the
+/// position must be applied as a [`MouseEvent::Move`] BEFORE the button, or
+/// the resulting click lands wherever the server's cursor happened to be.
+/// Most clients (mstsc, Microsoft Remote Desktop / Windows App for macOS)
+/// send a separate MOVE PDU immediately before the button PDU, so their
+/// button already lands correctly and the prepended Move is a redundant
+/// no-op (identical coordinates). The **iOS Windows App in touch mode**,
+/// however, sends a tap as a SINGLE button PDU with no preceding move — so
+/// without this its taps register at the previous cursor position (clicks
+/// "not working" / aim off). Plain move and wheel PDUs are unchanged.
+pub(crate) fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = MouseEvent> {
+    let lead = if pdu
+        .flags
+        .intersects(PointerFlags::LEFT_BUTTON | PointerFlags::RIGHT_BUTTON)
+    {
+        Some(MouseEvent::Move {
+            x: pdu.x_position,
+            y: pdu.y_position,
+        })
+    } else {
+        None
+    };
+    lead.into_iter().chain(core::iter::once(MouseEvent::from(pdu)))
+}
+
 impl From<MouseXPdu> for MouseEvent {
     fn from(value: MouseXPdu) -> Self {
         if value.flags.contains(PointerXFlags::BUTTON1) {

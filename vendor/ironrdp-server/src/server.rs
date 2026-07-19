@@ -2780,7 +2780,13 @@ impl RdpServer {
                 }
 
                 FastPathInputEvent::MouseEvent(mouse) => {
-                    handler.mouse(mouse.into());
+                    // A button PDU carries its position; emit that as a Move
+                    // first so the click lands there (fixes the iOS Windows App
+                    // touch-mode tap, which sends no preceding move). No-op for
+                    // clients that already move-then-click.
+                    for ev in crate::handler::mouse_events_from_pdu(mouse) {
+                        handler.mouse(ev);
+                    }
                 }
 
                 FastPathInputEvent::MouseEventEx(mouse) => {
@@ -2948,7 +2954,11 @@ impl RdpServer {
                 }
 
                 ironrdp_pdu::input::InputEvent::Mouse(mouse) => {
-                    handler.mouse(mouse.into());
+                    // Emit the button PDU's position as a Move first — see the
+                    // fast-path arm above (iOS Windows App touch-mode fix).
+                    for ev in crate::handler::mouse_events_from_pdu(mouse) {
+                        handler.mouse(ev);
+                    }
                 }
 
                 ironrdp_pdu::input::InputEvent::MouseX(mouse) => {
