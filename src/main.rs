@@ -345,6 +345,19 @@ struct Args {
     #[arg(long)]
     capture_primary: bool,
 
+    /// Make windows follow you between the local built-in screen and the
+    /// remote virtual display (opt-in; only meaningful with
+    /// --detach-primary/--capture-primary). By default the virtual display
+    /// is process-lifetime, so on disconnect its windows stay stranded on
+    /// the (now off-screen) virtual display — invisible on a laptop's
+    /// built-in panel until you reconnect. With this flag, the last-client
+    /// disconnect sweeps those windows back onto the built-in display (so
+    /// the Mac is usable locally), and a reconnect auto-gathers them onto
+    /// the virtual display the client sees (so you don't need Ctrl+Alt+G).
+    /// Reuses the same window-gather machinery as the Ctrl+Alt+G hotkey.
+    #[arg(long)]
+    restore_windows_on_disconnect: bool,
+
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
     /// Hardware-encoded via VideoToolbox. Falls back to the legacy path
@@ -1058,12 +1071,29 @@ fn make_tls_acceptor(
 /// ≥1→0 it takes the guard back out and drops it (which is what
 /// runs the actual re-enable / release). Edge-triggered: changes
 /// between two non-zero counts are no-ops.
+/// cfg-safe wrapper around the macOS-only window-gather so the cross-platform
+/// overlay watcher compiles on Linux CI. Returns the number of windows moved.
+#[cfg(target_os = "macos")]
+fn restore_gather_windows(display_id: u32) -> usize {
+    input::gather_windows_onto_display(display_id)
+}
+#[cfg(not(target_os = "macos"))]
+fn restore_gather_windows(_display_id: u32) -> usize {
+    0
+}
+
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
     tracker: capture::SessionTracker,
     slot: Arc<std::sync::Mutex<Option<T>>>,
     install: fn(u32) -> Result<T>,
+    // (--restore-windows-on-disconnect) When true, make windows follow the
+    // session: sweep them onto `physical_main_id` on real disconnect (so the
+    // Mac is usable locally) and auto-gather them onto the virtual display on
+    // reconnect (so the client sees them without Ctrl+Alt+G). No-op otherwise.
+    restore_windows: bool,
+    physical_main_id: u32,
 ) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
@@ -1123,6 +1153,26 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                  virtual display"
                             );
                             *slot.lock().expect("overlay mutex poisoned") = Some(ovr);
+                            // (--restore-windows-on-disconnect) Auto-gather any
+                            // windows stranded on the built-in panel (e.g. swept
+                            // there by a previous disconnect) onto the virtual
+                            // display the client now sees — the reconnect half of
+                            // "follow me". Off-thread; the install's reposition has
+                            // already settled, so the vd's live bounds are correct.
+                            if restore_windows {
+                                std::thread::spawn(move || {
+                                    let moved = restore_gather_windows(vd_id);
+                                    if moved > 0 {
+                                        info!(
+                                            label,
+                                            moved,
+                                            display_id = vd_id,
+                                            "restore-windows: gathered windows onto the \
+                                             virtual display on connect"
+                                        );
+                                    }
+                                });
+                            }
                         }
                         Err(e) => warn!(
                             label,
@@ -1176,6 +1226,26 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         drop(ovr);
                         installed_at = None;
                         info!(label, "last RDP client disconnected");
+                        // (--restore-windows-on-disconnect) Sweep windows off the
+                        // virtual display back onto the built-in panel so the Mac
+                        // is usable locally. MUST run AFTER `drop(ovr)` — that's
+                        // what restores the physical panel to main and repositions
+                        // the vd off (0,0); the gather reads each display's live
+                        // bounds. Off-thread so the watcher loop isn't blocked.
+                        if restore_windows {
+                            std::thread::spawn(move || {
+                                let moved = restore_gather_windows(physical_main_id);
+                                if moved > 0 {
+                                    info!(
+                                        label,
+                                        moved,
+                                        display_id = physical_main_id,
+                                        "restore-windows: swept windows back onto the \
+                                         built-in display on disconnect"
+                                    );
+                                }
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -1343,6 +1413,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
+    }
+    if on("RESTORE_WINDOWS_ON_DISCONNECT", false) {
+        argv.push("--restore-windows-on-disconnect".into());
     }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
@@ -1627,6 +1700,13 @@ async fn async_main() -> Result<()> {
              (pick one mechanism for going headless)"
         ));
     }
+    if args.restore_windows_on_disconnect && !(args.detach_primary || args.capture_primary) {
+        warn!(
+            "--restore-windows-on-disconnect has no effect without \
+             --detach-primary or --capture-primary (it needs the headless \
+             session watcher); ignoring"
+        );
+    }
 
     // Shared slots so the signal handler and the session-transition
     // watcher can drop the display RAII guards before process::exit and
@@ -1719,6 +1799,15 @@ async fn async_main() -> Result<()> {
     // `VirtualDisplay::resize` when the client's window size changes. This
     // scope still holds a clone for the lifetime/teardown semantics
     // described above.
+    // Capture the built-in/physical main display id BEFORE the virtual display
+    // exists — at this point CGMainDisplayID is the physical panel (the vd is
+    // created next and, under --capture-primary, only becomes main mid-session).
+    // Used as the sweep target for --restore-windows-on-disconnect. macOS-only.
+    #[cfg(target_os = "macos")]
+    let physical_main_id: u32 = core_graphics::display::CGDisplay::main().id;
+    #[cfg(not(target_os = "macos"))]
+    let physical_main_id: u32 = 0;
+
     let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> =
         if args.virtual_display {
             let w = args
@@ -1764,6 +1853,8 @@ async fn async_main() -> Result<()> {
             session_tracker.clone(),
             detached_primary.clone(),
             virtual_display::DetachedPrimary::install,
+            args.restore_windows_on_disconnect,
+            physical_main_id,
         );
     } else if args.capture_primary {
         let vd_id = virtual_display
@@ -1778,6 +1869,8 @@ async fn async_main() -> Result<()> {
             session_tracker.clone(),
             captured_primary.clone(),
             virtual_display::CapturedPrimary::install,
+            args.restore_windows_on_disconnect,
+            physical_main_id,
         );
     } else if args.make_primary {
         let vd_id = virtual_display

@@ -69,6 +69,19 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   per-dimension. Each dimension must be in [200,
                           #   8192]. No effect off the auto-adopt path. Config:
                           #   MAX_CLIENT_SIZE. Mirrors upstream IronRDP #1404.
+--restore-windows-on-disconnect  # Make windows follow you between the local
+                          #   built-in screen and the remote virtual display
+                          #   (opt-in; needs --detach-primary/--capture-primary).
+                          #   By default the virtual display is process-lifetime,
+                          #   so on disconnect its windows stay stranded on the
+                          #   (now off-screen) virtual display — invisible on a
+                          #   laptop's built-in panel until you reconnect. With
+                          #   this flag, the last-client disconnect sweeps those
+                          #   windows back onto the built-in screen (Mac usable
+                          #   locally) and a reconnect auto-gathers them onto the
+                          #   virtual display the client sees (no Ctrl+Alt+G).
+                          #   Reuses the Ctrl+Alt+G gather machinery. Config:
+                          #   RESTORE_WINDOWS_ON_DISCONNECT. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
