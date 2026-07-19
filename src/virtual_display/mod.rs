@@ -795,8 +795,20 @@ mod macos {
                 self.virtual_old_origin.0,
                 self.virtual_old_origin.1,
             );
+            // ConfigureForSession (NOT ForAppOnly) — MUST match `install`'s
+            // ConfigureForSession. `install` persists "vd@(0,0) is main" into the
+            // WindowServer's session store; if this restore reverts the origins
+            // only process-scoped (ForAppOnly), that store STILL says the vd is
+            // main while the live arrangement puts the physical back at (0,0) —
+            // and the Dock/menu bar (which follow the main display) then
+            // *sometimes* follow the persisted vd off-screen on disconnect
+            // ("the Dock disappears"). Persisting the restore updates the store to
+            // "physical@(0,0) is main again", so it agrees with reality and the
+            // Dock stays put. Crash-safety is unchanged: on SIGKILL/panic drop
+            // never runs, the vd vanishes with the process, and the lone physical
+            // auto-becomes main at (0,0); logout clears the session store.
             if let Err(e) =
-                any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
             {
                 tracing::warn!(
                     "displays released but reposition-tx failed (CGError {e}); \
