@@ -2048,19 +2048,32 @@ async fn async_main() -> Result<()> {
     // client's requested resolution at connect time.
     let desktop_size = capture::SharedDesktopSize::new(width, height);
 
-    // Adopt the client's requested resolution only on the mirror-primary
-    // path with no explicit size choice: --width/--height pin a size,
-    // --hidpi pins backing pixels, and --virtual-display owns its own
-    // fixed-size display.
+    // Adopt the client's requested resolution at connect (and re-mode to
+    // match on a live resize). Two cases:
+    //   - Virtual display: --width/--height are the display's INITIAL size,
+    //     not a pin — adopt the client's request and re-mode the virtual
+    //     display to match, so a phone and a laptop each get a crisp 1:1
+    //     desktop (and their mouse coords, sent in the client's own size,
+    //     map correctly). --hidpi is inert on this path.
+    //   - Mirror-primary: adopt only when nothing pins the size
+    //     (--width/--height pin a size, --hidpi pins backing pixels).
+    // --no-client-resolution opts out in both cases — the virtual display
+    // then stays fixed at --width/--height; mirror-primary serves native.
     let auto_size = !args.no_client_resolution
-        && !args.virtual_display
-        && !args.hidpi
-        && args.width.is_none()
-        && args.height.is_none();
+        && if args.virtual_display {
+            true
+        } else {
+            !args.hidpi && args.width.is_none() && args.height.is_none()
+        };
     if auto_size {
         info!(
             "client-resolution auto-adopt enabled — the session will be served at \
-             the resolution the client requests (--no-client-resolution disables)"
+             the resolution the client requests{} (--no-client-resolution disables)",
+            if args.virtual_display {
+                ", re-moding the virtual display to match"
+            } else {
+                ""
+            }
         );
     }
 
