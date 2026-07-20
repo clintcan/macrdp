@@ -587,14 +587,17 @@ struct Args {
     #[arg(long)]
     enable_lossy_audio: bool,
 
-    /// Don't adopt the client's requested desktop resolution. By default —
-    /// when mirroring the primary display without --width/--height/--hidpi —
+    /// Don't adopt the client's requested desktop resolution. By default
     /// macrdp reads the resolution the client asked for while connecting
     /// (e.g. mstsc full-screen on a 1920×1080 monitor) and serves the session
     /// at exactly that size, so the client presents the video 1:1 instead of
     /// rescaling it (client-side rescaling on mstsc costs typing latency and,
-    /// with --enable-h264, contributes to audio drift). Pass this to always
-    /// serve the size resolved at startup (the Mac display's native size)
+    /// with --enable-h264, contributes to audio drift). Applies when mirroring
+    /// the primary display without --width/--height/--hidpi, and on
+    /// --virtual-display (where the virtual display is re-moded to the
+    /// client's size — --width/--height are its initial size, not a pin).
+    /// Pass this to always serve the size resolved at startup (the Mac
+    /// display's native size, or the --width/--height virtual display size)
     /// and let the client scale.
     #[arg(long = "no-client-resolution", action = clap::ArgAction::SetTrue)]
     no_client_resolution: bool,
@@ -615,8 +618,9 @@ struct Args {
     /// size. Without it, an authenticated client can request up to the
     /// protocol maximum 8192x8192 — a ~256 MB BGRA framebuffer per frame.
     /// Each dimension must be in the RDP band [200, 8192]. No effect with
-    /// --no-client-resolution or an explicit --width/--height/--hidpi/
-    /// --virtual-display (those pin the size). Config: MAX_CLIENT_SIZE.
+    /// --no-client-resolution, or with an explicit --width/--height/--hidpi
+    /// on the mirror-primary path (those pin the size; --virtual-display
+    /// adopts, so the cap applies there). Config: MAX_CLIENT_SIZE.
     #[arg(long = "max-client-size", value_name = "WxH", value_parser = parse_max_client_size)]
     max_client_size: Option<(u16, u16)>,
 
@@ -2365,7 +2369,8 @@ async fn async_main() -> Result<()> {
         } else {
             warn!(
                 "--max-client-size has no effect: client-resolution auto-adopt is off \
-                 (--no-client-resolution or an explicit --width/--height/--hidpi/--virtual-display)"
+                 (--no-client-resolution, or an explicit --width/--height/--hidpi \
+                 without --virtual-display)"
             );
         }
     }

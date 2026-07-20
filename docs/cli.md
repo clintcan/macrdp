@@ -50,14 +50,17 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
                           #   auto-detected (e.g. com.microsoft.VSCode). macOS-only.
---no-client-resolution    # Serve the Mac display's native size instead of the
-                          #   resolution the client requests at connect (the
-                          #   auto-adopt default when no --width/--height/
-                          #   --hidpi/--virtual-display is given). Also disables
-                          #   live client-driven resize (resizing the client
-                          #   window mid-session) — it rides the same auto-adopt
-                          #   gate. --virtual-display sessions resize live via a
-                          #   separate path regardless of this flag.
+--no-client-resolution    # Don't adopt the resolution the client requests at
+                          #   connect (the auto-adopt default). Auto-adopt
+                          #   applies on the mirror-primary path when no
+                          #   --width/--height/--hidpi is given, AND on
+                          #   --virtual-display (the vd is re-moded to the
+                          #   client's size; --width/--height are its initial
+                          #   size, not a pin). With this flag the session is
+                          #   served at the startup-resolved size (native
+                          #   display size, or the --width/--height vd size)
+                          #   and live client-driven resize is disabled too —
+                          #   it rides the same auto-adopt gate.
 --stretch                 # On the auto-size path, fill the client frame instead
                           #   of the default aspect-preserving letterbox/pillarbox.
                           #   No effect with --width/--height or matching aspect.
