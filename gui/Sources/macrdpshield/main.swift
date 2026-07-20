@@ -1,5 +1,4 @@
-// macrdpshield — the black shield-window helper for the headless blanking
-// modes (--capture-primary / --detach-primary).
+// macrdpshield — the black shield-window helper for --shield-primary.
 //
 // WHY A SEPARATE PROCESS: AppKit windows are main-thread-only and need a
 // pumped runloop, and macrdp's main thread is owned by tokio. Same constraint
@@ -16,15 +15,35 @@
 // A window is not gamma: it survives the reconfiguration, so there is nothing
 // to re-assert and no flash.
 //
-// Protocol (opcode u8 + big-endian fields), mirroring src/switcher_hud.rs:
-//   SHOW(1): [count:u16] then count x [display_id:u32]
-//            Shield exactly these displays. Idempotent: re-sending SHOW
-//            reconciles (adds new, drops absent) rather than stacking.
+// Protocol (opcode u8 + big-endian fields). Every command gets a REPLY, which
+// is the part that matters: a bare write() succeeding proves only that bytes
+// reached a socket buffer — not that any display was actually covered. The
+// caller needs the achieved count back to decide whether it is safe to proceed.
+//   SHOW(1): [exclude_count:u16] then exclude_count x [display_id:u32]
+//            Shield EVERY screen except the excluded ones (i.e. except the
+//            virtual display the remote client is watching). Idempotent.
+//            Reply: [status:u8=0][shielded_count:u16]
 //   HIDE(3): no payload. Tear every shield down.
+//            Reply: [status:u8=0][shielded_count:u16=0]
+//
+// SHOW is phrased as an EXCLUDE list, not an include list, on purpose. An
+// include list is a snapshot: a monitor plugged in (or a display waking, or one
+// whose CGDirectDisplayID changed across sleep) mid-session would never be
+// covered, and would quietly show the live remote desktop. Excluding the vd
+// instead makes "everything else" the invariant, so the helper re-derives the
+// full set from NSScreen.screens on every screen-layout change.
 //
 // Unknown opcode -> drop the connection so the stream resyncs (same rule as
 // macrdphud). Nothing here is persistent state: no gamma, no display capture,
 // so if this process dies the shields simply vanish and the panel is normal.
+//
+// TRUST BOUNDARY: this is an unauthenticated loopback listener, like macrdp's
+// other helper channels — but unlike the HUD it controls a PRIVACY mechanism,
+// so any local process running as this user can un-blank the panel with a
+// single byte. That is consistent with macrdp's documented local security model
+// (a hostile same-user process is out of scope: it could read a shared secret
+// out of our environment anyway), but it is a real difference in consequence
+// and is written up in docs/macos-gotchas.md.
 
 import Cocoa
 
@@ -38,6 +57,10 @@ let SHIELD_PORT: UInt16 = {
 
 let PARENT_PID: Int32? = ProcessInfo.processInfo.environment["MACRDP_SHIELD_PARENT"]
     .flatMap { Int32($0) }
+
+func logLine(_ s: String) {
+    FileHandle.standardError.write("macrdpshield: \(s)\n".data(using: .utf8)!)
+}
 
 // MARK: - Shield windows
 
@@ -54,51 +77,66 @@ final class ShieldPanel: NSPanel {
 }
 
 final class ShieldController {
-    /// display id -> its shield window.
     private var shields: [CGDirectDisplayID: ShieldPanel] = [:]
+    /// Displays never to shield — the virtual display the client is watching.
+    private var excluded: Set<CGDirectDisplayID> = []
+    /// Whether shielding is currently meant to be active. Held so the
+    /// screen-parameters observer knows whether a layout change should
+    /// re-derive shields or stay down.
+    private var active = false
 
-    /// Reconcile the live shields to exactly `ids`.
-    func show(displayIDs ids: [CGDirectDisplayID]) {
-        for (id, panel) in shields where !ids.contains(id) {
+    /// Activate shielding, excluding `excludeIDs`. Returns the achieved count.
+    func show(excluding excludeIDs: Set<CGDirectDisplayID>) -> Int {
+        excluded = excludeIDs
+        active = true
+        return applyShields()
+    }
+
+    func hideAll() -> Int {
+        active = false
+        for (_, panel) in shields { panel.orderOut(nil) }
+        shields.removeAll()
+        logLine("HIDE -> all shields down")
+        return 0
+    }
+
+    /// Re-derive the shield set from the CURRENT screen list. Called on SHOW and
+    /// on every screen-parameters change, so a monitor attached mid-session (or
+    /// a display waking, or one whose id changed) gets covered instead of
+    /// quietly displaying the live remote desktop.
+    @discardableResult
+    func applyShields() -> Int {
+        guard active else { return 0 }
+
+        var live: [CGDirectDisplayID: NSScreen] = [:]
+        for s in NSScreen.screens {
+            let key = NSDeviceDescriptionKey("NSScreenNumber")
+            guard let n = s.deviceDescription[key] as? NSNumber else { continue }
+            let id = CGDirectDisplayID(n.uint32Value)
+            if !excluded.contains(id) { live[id] = s }
+        }
+
+        // Drop shields for displays that are gone or newly excluded.
+        for (id, panel) in shields where live[id] == nil {
             panel.orderOut(nil)
             shields.removeValue(forKey: id)
         }
-        for id in ids {
+        // Add/refit the rest.
+        for (id, screen) in live {
             if let existing = shields[id] {
-                reframe(existing, on: id)
+                existing.setFrame(screen.frame, display: true)
                 existing.orderFrontRegardless()
-            } else if let panel = makePanel(for: id) {
+            } else {
+                let panel = makePanel(on: screen)
                 shields[id] = panel
+                logLine("shielded display \(id)")
             }
         }
-        FileHandle.standardError.write(
-            "macrdpshield: SHOW -> \(shields.count) shield(s) up\n".data(using: .utf8)!)
+        logLine("SHOW -> \(shields.count) shield(s) up, \(excluded.count) excluded")
+        return shields.count
     }
 
-    func hideAll() {
-        for (_, panel) in shields { panel.orderOut(nil) }
-        shields.removeAll()
-        FileHandle.standardError.write("macrdpshield: HIDE -> all shields down\n".data(using: .utf8)!)
-    }
-
-    /// A display reconfiguration (the client resizing -> applySettings re-mode)
-    /// changes screen frames underneath us. The WINDOW survives it — that is
-    /// the whole point of this helper versus gamma — but its frame must be
-    /// re-fitted to the panel's new bounds.
-    func reframeAll() {
-        for (id, panel) in shields {
-            reframe(panel, on: id)
-            panel.orderFrontRegardless()
-        }
-    }
-
-    private func makePanel(for id: CGDirectDisplayID) -> ShieldPanel? {
-        guard let screen = screen(for: id) else {
-            FileHandle.standardError.write(
-                "macrdpshield: no NSScreen for display \(id) — not shielding it\n"
-                    .data(using: .utf8)!)
-            return nil
-        }
+    private func makePanel(on screen: NSScreen) -> ShieldPanel {
         let panel = ShieldPanel(
             contentRect: screen.frame,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -113,6 +151,9 @@ final class ShieldController {
         panel.hidesOnDeactivate = false
         // Swallow local clicks so someone at the machine cannot poke the
         // desktop that is still being composited underneath the shield.
+        // NOTE this only covers clicks landing ON the shield: the pointer is no
+        // longer confined (that was the capture's doing), so it can still be
+        // walked onto the virtual display, which is deliberately not shielded.
         panel.ignoresMouseEvents = false
         panel.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         panel.collectionBehavior = [
@@ -123,37 +164,20 @@ final class ShieldController {
         panel.orderFrontRegardless()
         return panel
     }
-
-    private func reframe(_ panel: ShieldPanel, on id: CGDirectDisplayID) {
-        guard let screen = screen(for: id) else { return }
-        panel.setFrame(screen.frame, display: true)
-    }
-
-    /// CGDirectDisplayID -> NSScreen, via the screen's NSScreenNumber. Same
-    /// lookup macrdphud uses; NSScreen.frame is already global Cocoa
-    /// (bottom-left origin) coords, so no CG flip is needed.
-    private func screen(for id: CGDirectDisplayID) -> NSScreen? {
-        for s in NSScreen.screens {
-            let key = NSDeviceDescriptionKey("NSScreenNumber")
-            if let n = s.deviceDescription[key] as? NSNumber, n.uint32Value == id {
-                return s
-            }
-        }
-        return nil
-    }
 }
 
 // MARK: - IPC (this process is the SERVER; macrdp connects as a client)
 
 enum ShieldCommand {
-    case show([CGDirectDisplayID])
+    case show(Set<CGDirectDisplayID>)
     case hide
 }
 
 final class IpcServer {
-    private let onCommand: (ShieldCommand) -> Void
+    /// Returns the achieved shield count, which is sent back as the reply.
+    private let onCommand: (ShieldCommand) -> Int
 
-    init(onCommand: @escaping (ShieldCommand) -> Void) {
+    init(onCommand: @escaping (ShieldCommand) -> Int) {
         self.onCommand = onCommand
     }
 
@@ -164,8 +188,8 @@ final class IpcServer {
     private func run() {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            FileHandle.standardError.write("macrdpshield: socket() failed\n".data(using: .utf8)!)
-            return
+            logLine("socket() failed — exiting")
+            exit(1)
         }
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
@@ -180,23 +204,35 @@ final class IpcServer {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
+        // EXIT, don't limp on. A helper that stays alive with no listener is
+        // worse than no helper at all: macrdp's connect would land on whatever
+        // process DID get the port (a stale helper from a previous run, or a
+        // squatter), its write would succeed, and macrdp would report a
+        // successfully shielded desktop that is in fact fully visible. Exiting
+        // makes the failure loud — macrdp's connect then fails outright.
         guard bound == 0 else {
-            FileHandle.standardError.write(
-                "macrdpshield: bind(127.0.0.1:\(SHIELD_PORT)) failed\n".data(using: .utf8)!)
+            logLine("bind(127.0.0.1:\(SHIELD_PORT)) failed — port already in use? exiting")
             close(fd)
-            return
+            exit(1)
         }
         guard listen(fd, 4) == 0 else {
-            FileHandle.standardError.write("macrdpshield: listen() failed\n".data(using: .utf8)!)
+            logLine("listen() failed — exiting")
             close(fd)
-            return
+            exit(1)
         }
-        FileHandle.standardError.write(
-            "macrdpshield: listening on 127.0.0.1:\(SHIELD_PORT)\n".data(using: .utf8)!)
+        logLine("listening on 127.0.0.1:\(SHIELD_PORT)")
 
         while true {
             let conn = accept(fd, nil, nil)
             if conn < 0 { continue }
+            // Bound every blocking recv on this connection. Without it, ONE
+            // peer that connects and never writes (a port scanner, a stray nc,
+            // or macrdp SIGKILLed between connect and write) wedges this
+            // single-threaded accept loop forever — and because the kernel
+            // still completes handshakes into the backlog, macrdp's later
+            // SHOW/HIDE would appear to succeed while nothing ever applied.
+            var tv = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
             serve(conn)
             close(conn)
         }
@@ -209,7 +245,7 @@ final class IpcServer {
             let n = buf.withUnsafeMutableBytes { raw -> Int in
                 recv(fd, raw.baseAddress!.advanced(by: got), count - got, 0)
             }
-            if n <= 0 { return nil }
+            if n <= 0 { return nil }  // EOF, error, or the recv timeout above
             got += n
         }
         return buf
@@ -223,6 +259,12 @@ final class IpcServer {
         (UInt32(b[i]) << 24) | (UInt32(b[i + 1]) << 16) | (UInt32(b[i + 2]) << 8) | UInt32(b[i + 3])
     }
 
+    private func reply(_ fd: Int32, count: Int) {
+        let c = UInt16(clamping: count)
+        let out: [UInt8] = [0, UInt8(c >> 8), UInt8(c & 0xff)]
+        _ = out.withUnsafeBytes { raw in send(fd, raw.baseAddress!, raw.count, 0) }
+    }
+
     private func serve(_ conn: Int32) {
         while true {
             guard let op = readFull(conn, 1) else { return }
@@ -230,15 +272,14 @@ final class IpcServer {
             case 1:  // SHOW
                 guard let head = readFull(conn, 2) else { return }
                 let count = Int(be16(head, 0))
-                var ids: [CGDirectDisplayID] = []
-                ids.reserveCapacity(count)
+                var ids = Set<CGDirectDisplayID>()
                 for _ in 0..<count {
                     guard let raw = readFull(conn, 4) else { return }
-                    ids.append(CGDirectDisplayID(be32(raw, 0)))
+                    ids.insert(CGDirectDisplayID(be32(raw, 0)))
                 }
-                emit(.show(ids))
+                reply(conn, count: emit(.show(ids)))
             case 3:  // HIDE
-                emit(.hide)
+                reply(conn, count: emit(.hide))
             default:
                 // Unknown opcode: drop the connection so the stream resyncs.
                 return
@@ -246,9 +287,14 @@ final class IpcServer {
         }
     }
 
-    /// Every command hops to the main thread — AppKit is main-thread-only.
-    private func emit(_ cmd: ShieldCommand) {
-        DispatchQueue.main.async { self.onCommand(cmd) }
+    /// Run the command on the main thread (AppKit is main-thread-only) and wait
+    /// for its result, so the reply carries the ACHIEVED count rather than an
+    /// optimistic acknowledgement. `sync` is safe here: this runs on the IPC
+    /// thread, never on main.
+    private func emit(_ cmd: ShieldCommand) -> Int {
+        var result = 0
+        DispatchQueue.main.sync { result = self.onCommand(cmd) }
+        return result
     }
 }
 
@@ -261,8 +307,7 @@ func watchParent(_ pid: Int32) {
     Thread.detachNewThread {
         while true {
             if kill(pid, 0) != 0 {
-                FileHandle.standardError.write(
-                    "macrdpshield: parent \(pid) is gone — exiting\n".data(using: .utf8)!)
+                logLine("parent \(pid) is gone — exiting")
                 exit(0)
             }
             Thread.sleep(forTimeInterval: 1.0)
@@ -277,21 +322,25 @@ app.setActivationPolicy(.accessory)
 
 let controller = ShieldController()
 
-// A display reconfiguration re-frames the shields. The window itself survives
-// the re-mode (unlike gamma, which macOS resets), so this is a fit-up, not a
-// re-blank.
+// Re-derive shields whenever the screen layout changes: a display attached,
+// removed, woken, or re-moded. This is what covers a monitor plugged in
+// mid-session. macrdp ALSO pushes a SHOW from its capture path after a
+// virtual-display re-mode, because the private CGVirtualDisplay applySettings
+// is known not to emit a public reconfiguration event (see the removed-callback
+// NOTE in src/virtual_display/mod.rs) and this notification may likewise not
+// fire for it.
 NotificationCenter.default.addObserver(
     forName: NSApplication.didChangeScreenParametersNotification,
     object: nil,
     queue: .main
 ) { _ in
-    controller.reframeAll()
+    controller.applyShields()
 }
 
 let server = IpcServer { cmd in
     switch cmd {
-    case .show(let ids): controller.show(displayIDs: ids)
-    case .hide: controller.hideAll()
+    case .show(let excluded): return controller.show(excluding: excluded)
+    case .hide: return controller.hideAll()
     }
 }
 server.start()

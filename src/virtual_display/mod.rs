@@ -959,11 +959,27 @@ mod macos {
             // itself a visible relayout on the physical panel; shielding first
             // means the user never sees it. (CapturedPrimary has the opposite
             // order because its gamma write would be reset by the tx anyway.)
-            let ids: Vec<u32> = targets.iter().map(|(id, _)| *id).collect();
-            crate::shield::show(&ids).context(
+            // Exclude the vd; the helper shields everything else it can see.
+            // Phrased as an exclude list so a monitor attached mid-session is
+            // covered too (the helper re-derives on screen-layout changes) —
+            // an include list is a snapshot and would silently miss it.
+            let shielded_count = crate::shield::show(&[virtual_display_id]).context(
                 "could not raise the shield windows — refusing to engage \
                  --shield-primary rather than leave the desktop visible",
             )?;
+            // The helper reports what it ACTUALLY covered. A display absent from
+            // NSScreen.screens (asleep, mid-wake) is skipped silently on its
+            // side, so without this check we would happily report a shielded
+            // desktop that is partly — or entirely — visible.
+            if usize::from(shielded_count) < targets.len() {
+                let _ = crate::shield::hide();
+                return Err(anyhow!(
+                    "shield helper covered only {shielded_count} of {} physical \
+                     display(s) — refusing to engage --shield-primary rather than \
+                     leave one visible (a display may be asleep or mid-wake)",
+                    targets.len()
+                ));
+            }
 
             // Origin tx: vd → (0, 0), physicals shifted aside. See
             // `CapturedPrimary::install` for the full ConfigureForSession
@@ -1024,7 +1040,7 @@ mod macos {
             // frames. The helper also re-fits itself on the screen-parameters
             // notification; this is the belt to that suspenders, and is cheap
             // because SHOW reconciles rather than stacking.
-            if let Err(e) = crate::shield::show(&ids) {
+            if let Err(e) = crate::shield::show(&[virtual_display_id]) {
                 tracing::warn!("could not re-fit shields after the arrangement tx: {e:#}");
             }
 
@@ -1046,20 +1062,33 @@ mod macos {
             })
         }
 
-        /// Re-fit the shields. Unlike [`CapturedPrimary::reassert_blanking`],
-        /// this is **not** required for correctness after a re-mode — the
-        /// windows survive a display reconfiguration and the helper re-fits
-        /// itself on the screen-parameters notification. It exists so the
-        /// capture path can call the same hook on both guards.
+        /// Re-fit the shields, **fire-and-forget on a detached thread**.
+        ///
+        /// Unlike [`CapturedPrimary::reassert_blanking`] — a pair of
+        /// synchronous CG calls costing microseconds — this is a loopback round
+        /// trip to another process. The call sites in `capture.rs` run on the
+        /// latency-sensitive resize path (one of them while holding the
+        /// `VirtualDisplay` mutex, and three more from the post-gather sweep),
+        /// so doing it inline would put a multi-second worst case — a dead or
+        /// wedged helper — onto a hot path and hold that mutex across it.
+        ///
+        /// Detaching is safe precisely because this call is **not required for
+        /// correctness**: a shield window survives a display reconfiguration
+        /// (that is the entire premise of the mode), and the helper re-derives
+        /// its shields on every screen-layout change anyway. This is belt to
+        /// that suspenders, sent because the private `CGVirtualDisplay
+        /// applySettings` is known not to emit a public reconfiguration event.
+        ///
+        /// Always returns 0 (nothing to report synchronously); failures are
+        /// logged from the thread.
         pub fn reassert_blanking(&self) -> usize {
-            let ids: Vec<u32> = self.shielded.iter().map(|(id, _)| *id).collect();
-            match crate::shield::show(&ids) {
-                Ok(()) => 0,
-                Err(e) => {
-                    tracing::warn!("could not re-fit shields: {e:#}");
-                    ids.len()
+            let vd = self.virtual_id;
+            std::thread::spawn(move || {
+                if let Err(e) = crate::shield::show(&[vd]) {
+                    tracing::warn!("could not re-fit shields after a display change: {e:#}");
                 }
-            }
+            });
+            0
         }
     }
 

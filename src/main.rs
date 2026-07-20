@@ -830,9 +830,14 @@ fn spawn_shield_helper() -> Result<std::process::Child> {
     if let Some(port) = std::env::var_os("MACRDP_SHIELD_PORT") {
         cmd.env("MACRDP_SHIELD_PORT", port);
     }
+    // stderr is INHERITED, not nulled (the HUD helper nulls all three). Every
+    // helper-side diagnostic — bind failure, a display it could not shield, the
+    // achieved count — goes to stderr, and nulling it made macrdp structurally
+    // blind to exactly the failures that leave the desktop visible. Inheriting
+    // lands them in macrdp.err.log under the LaunchAgent.
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::inherit());
     let child = cmd
         .spawn()
         .with_context(|| format!("spawning the shield helper {}", path.display()))?;

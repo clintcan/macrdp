@@ -8,28 +8,46 @@
 //! cosmetic, so it fires and forgets onto a bounded channel and drops commands
 //! when the helper is down. A shield is a *privacy* mechanism: a dropped SHOW
 //! means the physical panel keeps displaying the desktop while the operator
-//! believes it is blanked. So every call here is **synchronous and returns a
-//! `Result`**, letting the caller refuse to engage the mode rather than silently
-//! leave the screen visible.
+//! believes it is blanked. So every call here is **synchronous, waits for the
+//! helper's reply, and returns the number of displays actually shielded**.
 //!
-//! Failure mode on helper death is *fail-open* (the panel becomes visible), which
-//! matches the gamma path it replaces: a gamma LUT is process-scoped, so a
-//! SIGKILLed macrdp also un-blanks. Fail-open is the right default here — the
-//! alternative, a black screen with no live process to dismiss it, would strand
-//! the machine.
+//! Waiting for the reply is the whole point and was a real bug when it was
+//! missing: a successful `write_all` proves only that bytes reached a kernel
+//! socket buffer. It does *not* prove the helper read them (its accept loop can
+//! be wedged by an unrelated peer), that it is even listening (a stale helper or
+//! a squatter may hold the port), or that any display was covered (a display
+//! absent from `NSScreen.screens` is skipped). All three of those return a
+//! cheerful `Ok` from a write-only protocol while the desktop stays fully
+//! visible. The achieved count closes that gap.
+//!
+//! Failure mode on helper death is *fail-open*: the panel becomes visible.
+//! Fail-open is the right default — the alternative, a black screen with no live
+//! process to dismiss it, would strand the machine. But be precise about what it
+//! is **not** equivalent to: when a `--capture-primary` macrdp is SIGKILLed its
+//! gamma reverts *and the session ends with it*. Here macrdp keeps serving the
+//! remote user while the local panel goes clear, and **nothing supervises or
+//! restarts the helper**. That asymmetry is a real gap, not a wash.
 //!
 //! Wire framing mirrors [`crate::switcher_hud`] (opcode `u8` + big-endian):
-//!   SHOW(1): [count:u16] then count×[display_id:u32]
-//!   HIDE(3): (no payload)
+//!   SHOW(1): [exclude_count:u16] then exclude_count×[display_id:u32]
+//!            → reply [status:u8][shielded_count:u16]
+//!   HIDE(3): (no payload) → reply [status:u8][shielded_count:u16=0]
+//!
+//! SHOW carries an **exclude** list (the virtual display), not an include list,
+//! so the helper can re-derive "everything else" whenever the screen layout
+//! changes — which is what covers a monitor plugged in mid-session. An include
+//! list is a snapshot and silently misses those.
 
 use anyhow::{anyhow, Context, Result};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 40244;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Bounded so a wedged helper cannot hang the caller (which is a tokio worker).
+const READ_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Retry budget for reaching the helper.
 ///
@@ -84,21 +102,33 @@ fn connect() -> Result<TcpStream> {
     ))
 }
 
-fn send(frame: &[u8]) -> Result<()> {
+/// Send a frame and wait for the helper's `[status:u8][count:u16]` reply.
+/// Returns the number of displays the helper reports it actually shielded.
+fn send(frame: &[u8]) -> Result<u16> {
     let mut s = connect()?;
+    s.set_read_timeout(Some(READ_TIMEOUT)).ok();
     s.write_all(frame)
         .context("writing to the macrdpshield helper")?;
     s.flush().context("flushing to the macrdpshield helper")?;
-    Ok(())
+
+    let mut reply = [0u8; 3];
+    s.read_exact(&mut reply).context(
+        "no reply from the macrdpshield helper — it may be wedged, or another \
+         process may hold its port",
+    )?;
+    if reply[0] != 0 {
+        return Err(anyhow!("macrdpshield reported failure status {}", reply[0]));
+    }
+    Ok(u16::from_be_bytes([reply[1], reply[2]]))
 }
 
 /// Encode SHOW. Split out so it can be unit-tested without a live helper.
-fn encode_show(display_ids: &[u32]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(3 + display_ids.len() * 4);
+fn encode_show(exclude_ids: &[u32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(3 + exclude_ids.len() * 4);
     b.push(1);
-    let count = u16::try_from(display_ids.len()).unwrap_or(u16::MAX);
+    let count = u16::try_from(exclude_ids.len()).unwrap_or(u16::MAX);
     b.extend_from_slice(&count.to_be_bytes());
-    for id in display_ids.iter().take(count as usize) {
+    for id in exclude_ids.iter().take(count as usize) {
         b.extend_from_slice(&id.to_be_bytes());
     }
     b
@@ -108,22 +138,30 @@ fn encode_hide() -> Vec<u8> {
     vec![3]
 }
 
-/// Raise an opaque black shield over exactly `display_ids`.
+/// Shield every screen EXCEPT `exclude_ids` (the virtual display the client is
+/// watching). Returns the number of displays actually shielded.
 ///
-/// Idempotent: re-sending reconciles the live set rather than stacking windows,
-/// so this doubles as the "re-fit after a display change" call.
-pub fn show(display_ids: &[u32]) -> Result<()> {
-    if display_ids.is_empty() {
-        return Err(anyhow!("shield show called with no displays"));
+/// Idempotent — re-sending reconciles rather than stacking — so this doubles as
+/// the "re-fit after a display change" call.
+///
+/// Refuses an empty exclude list: that would tell the helper to shield *every*
+/// screen including the virtual display, blacking out the remote session too.
+/// Every real caller has a vd id to exclude, so an empty list is a bug.
+pub fn show(exclude_ids: &[u32]) -> Result<u16> {
+    if exclude_ids.is_empty() {
+        return Err(anyhow!(
+            "shield show called with an empty exclude list — that would shield \
+             the virtual display too and black out the remote session"
+        ));
     }
-    send(&encode_show(display_ids))
+    send(&encode_show(exclude_ids))
 }
 
 /// Tear every shield down. Best-effort by contract — the caller is usually a
 /// `Drop`, and the helper exiting also removes the shields, so a failure here is
 /// logged rather than propagated.
 pub fn hide() -> Result<()> {
-    send(&encode_hide())
+    send(&encode_hide()).map(|_| ())
 }
 
 #[cfg(test)]

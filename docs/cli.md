@@ -93,12 +93,19 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   swallowed by the shield; their keystrokes go where
                           #   focus already was (capture never blocked the
                           #   keyboard either, so that part is unchanged).
-                          #   Fail-safe: if the helper can't be found or reached,
-                          #   macrdp REFUSES TO START rather than run a "headless"
-                          #   session over a visible desktop. If the helper dies
-                          #   mid-session the panel becomes visible — same end
-                          #   state as a SIGKILLed --capture-primary, whose gamma
-                          #   is likewise process-scoped. Config: PRIMARY_MODE=shield.
+                          #   STATUS: the lock behaviour is NOT yet live-verified
+                          #   (it needs someone physically at the Mac). See the
+                          #   quirk note in docs/known-quirks.md before relying
+                          #   on it for security.
+                          #   Fail-safe, precisely: a MISSING helper binary aborts
+                          #   startup. An UNREACHABLE helper at connect time only
+                          #   warns — the session proceeds with the desktop
+                          #   visible. SHOW/HIDE are acknowledged (the helper
+                          #   replies with the count it actually covered) and the
+                          #   mode refuses to engage if that is short, so the
+                          #   failure is at least detected. If the helper dies
+                          #   mid-session the panel becomes visible and nothing
+                          #   restarts it. Config: PRIMARY_MODE=shield.
                           #   Env: MACRDP_SHIELD_HELPER (path override),
                           #   MACRDP_SHIELD_PORT (default 40244). macOS-only.
 --restore-windows-on-disconnect  # Make windows follow you between the local
