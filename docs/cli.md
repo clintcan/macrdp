@@ -93,10 +93,12 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   swallowed by the shield; their keystrokes go where
                           #   focus already was (capture never blocked the
                           #   keyboard either, so that part is unchanged).
-                          #   STATUS: the lock behaviour is NOT yet live-verified
-                          #   (it needs someone physically at the Mac). See the
-                          #   quirk note in docs/known-quirks.md before relying
-                          #   on it for security.
+                          #   STATUS: the lock behaviour is VERIFIED at the
+                          #   mechanism level (black windows at shielding level,
+                          #   no capture/gamma -> the Mac locks; capture-primary
+                          #   never did). The assembled mode has NOT yet been run
+                          #   end-to-end with a real RDP client. See the quirk
+                          #   note in docs/known-quirks.md.
                           #   Fail-safe, precisely: a MISSING helper binary aborts
                           #   startup. An UNREACHABLE helper at connect time only
                           #   warns — the session proceeds with the desktop
