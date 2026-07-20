@@ -273,9 +273,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         vd.state = vdOn ? .on : .off
         disp.addItem(vd)
         // Primary-screen handling (radio). "detach" moves your apps onto the
-        // virtual display so you can see/use them remotely; "capture" just
-        // blanks the panel (apps stay on it). Both need the virtual display, so
-        // picking one auto-enables it.
+        // virtual display so you can see/use them remotely; "shield" and
+        // "capture" just blank the panel (apps stay on it). All need the virtual
+        // display, so picking one auto-enables it.
+        //
+        // shield vs capture — the labels spell out the difference because it is
+        // a SECURITY one, not a preference: while `capture` is engaged the Mac
+        // CANNOT BE LOCKED (Lock Screen silently does nothing, since macOS
+        // cannot draw the lock screen onto a captured display), so the machine
+        // is physically unsecured. `shield` covers the panel with a black window
+        // instead, leaves locking working, and also avoids the ~250 ms desktop
+        // flash a client resize causes under `capture`. `capture` is kept as the
+        // fallback for the case it was originally added for — a machine where
+        // the window-based blanking doesn't take.
         let curMode: String = {
             if let m = cfg["PRIMARY_MODE"], !m.isEmpty { return m }
             return cfg["CAPTURE_PRIMARY"] == "1" ? "capture" : "none" // back-compat
@@ -284,7 +294,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (mode, label) in [
             ("none", "Keep local screen on"),
             ("detach", "Detach — move apps to remote"),
-            ("capture", "Blank — keep apps on Mac"),
+            ("shield", "Blank — keep apps on Mac (lockable)"),
+            ("capture", "Blank — keep apps on Mac (can't lock)"),
         ] {
             let mi = NSMenuItem(title: label, action: #selector(setPrimaryMode(_:)), keyEquivalent: "")
             mi.target = self
