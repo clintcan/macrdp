@@ -93,14 +93,15 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   swallowed by the shield; their keystrokes go where
                           #   focus already was (capture never blocked the
                           #   keyboard either, so that part is unchanged).
-                          #   ⚠️ STATUS: NOT RECOMMENDED YET. The Mac does lock
-                          #   (unlike --capture-primary), but a live test found
-                          #   you CANNOT SEE the lock screen to unlock it and the
-                          #   physical panel shows the LIVE DESKTOP while locked:
-                          #   the vd is system main, so loginwindow draws the
-                          #   password field on the headless display. Touch ID
-                          #   still works. See docs/known-quirks.md before using
-                          #   this as a security control.
+                          #   STATUS: the Mac locks AND the lock screen is
+                          #   visible (live-verified) — by default it keeps the
+                          #   PHYSICAL panel main so loginwindow draws the lock
+                          #   there. COST (not yet measured on a 2nd machine): the
+                          #   remote desktop then has NO menu bar / Dock (they
+                          #   stay on the shielded physical panel). MACRDP_SHIELD_
+                          #   KEEP_PHYSICAL_MAIN=0 gives the old vd-as-main
+                          #   behaviour (Dock on the vd, but lock screen invisible
+                          #   locally). See docs/known-quirks.md.
                           #   Fail-safe, precisely: a MISSING helper binary aborts
                           #   startup. An UNREACHABLE helper at connect time only
                           #   warns — the session proceeds with the desktop

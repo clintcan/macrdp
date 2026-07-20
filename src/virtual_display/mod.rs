@@ -14,7 +14,8 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    shield_keeps_physical_main, CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary,
+    VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -924,6 +925,35 @@ mod macos {
         /// Physical displays we shielded, with the pre-install origin so Drop
         /// can put them back.
         shielded: Vec<(u32, (i32, i32))>,
+        /// Whether `install` moved the vd to `(0,0)` as main. `false` in the
+        /// default keep-physical-main mode, in which case `Drop` has no
+        /// arrangement to restore (it only lowers the shields).
+        moved_arrangement: bool,
+    }
+
+    /// Whether `--shield-primary` should keep the PHYSICAL panel as the system
+    /// main display instead of moving the vd to `(0, 0)` as main.
+    ///
+    /// This exists because making the vd main (as `CapturedPrimary` does, and as
+    /// shield originally copied) puts the lock screen where nobody can see it:
+    /// `loginwindow` draws on the main display, so on a shielded session ⌃⌘Q
+    /// locked the Mac but rendered the password field on the *headless* vd, with
+    /// the physical panel showing the live desktop (live-observed 2026-07-20).
+    /// Keeping the physical panel main puts the lock screen back on the physical
+    /// panel where it is visible (corroborated by the capture-off positive
+    /// control, which also drew the lock on the physical main display).
+    ///
+    /// The trade-off: with the vd not main, the menu bar + Dock stay on the
+    /// (shielded/black) physical panel rather than on the display the client
+    /// sees — so the remote desktop loses them. You cannot have the lock visible
+    /// AND the Dock on the vd; they are the same `(0,0)`/main bit. Default on
+    /// (lock visibility wins); `MACRDP_SHIELD_KEEP_PHYSICAL_MAIN=0` restores the
+    /// old vd-as-main behaviour for A/B comparison.
+    pub fn shield_keeps_physical_main() -> bool {
+        match std::env::var("MACRDP_SHIELD_KEEP_PHYSICAL_MAIN") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false") && !v.is_empty(),
+            Err(_) => true,
+        }
     }
 
     impl ShieldedPrimary {
@@ -981,67 +1011,90 @@ mod macos {
                 ));
             }
 
-            // Origin tx: vd → (0, 0), physicals shifted aside. See
-            // `CapturedPrimary::install` for the full ConfigureForSession
-            // rationale — it is identical here and equally load-bearing.
+            // Arrangement: whether to move the vd to (0,0) as system main.
             //
-            // CRITICAL: from here on the shields are UP, but no `Self` exists
-            // yet — so `Drop` cannot run and there is nothing to lower them.
-            // A bare `?` on any step below would return `Err` and strand a
-            // black screen over the user's desktop for the life of the process
-            // (macrdp keeps running; the watcher just logs the failed install).
-            // So the fallible remainder runs in a closure whose `Err` we
-            // intercept to lower the shields before propagating.
-            let arrange = || -> Result<()> {
-                let any = CGDisplay::new(virtual_display_id);
-                let config = any
-                    .begin_configuration()
-                    .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
-                vd.configure_display_origin(&config, 0, 0)
-                    .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-                let mut x_off = vd_width;
-                for (id, _) in &targets {
-                    let d = CGDisplay::new(*id);
-                    if d.is_active() {
-                        d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                            anyhow!(
-                                "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
-                            )
-                        })?;
-                        x_off += d.bounds().size.width.round() as i32;
-                    }
-                }
-                any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
-                    .map_err(|e| {
-                        anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
-                    })?;
-                Ok(())
-            };
-            if let Err(e) = arrange() {
-                tracing::warn!(
-                    "arrangement transaction failed after the shields were raised — \
-                     lowering them so the desktop is not left blacked out"
+            // keep_physical_main = true (default): SKIP the move entirely. The
+            // physical panel stays main, so the lock screen (which loginwindow
+            // draws on main) renders on the physical panel where it is visible.
+            // The cost is that the vd is not main, so the remote desktop's menu
+            // bar + Dock stay on the physical (shielded) panel. See
+            // `shield_keeps_physical_main`.
+            //
+            // keep_physical_main = false: the old behaviour — move vd → (0,0),
+            // physicals aside. Remote gets the menu bar + Dock, but the lock
+            // screen renders on the invisible headless vd (refuted 2026-07-20).
+            let keep_physical_main = shield_keeps_physical_main();
+            if keep_physical_main {
+                tracing::info!(
+                    "--shield-primary: keeping the PHYSICAL panel as system main so a \
+                     lock screen stays visible locally (the vd is NOT moved to (0,0)). \
+                     Trade-off: the remote desktop's menu bar + Dock stay on the \
+                     shielded physical panel. Set MACRDP_SHIELD_KEEP_PHYSICAL_MAIN=0 \
+                     for the old vd-as-main behaviour."
                 );
-                if let Err(he) = crate::shield::hide() {
-                    // Both failed. Say so loudly: the screen is black and we
-                    // could not clear it. It will clear when macrdp exits (the
-                    // helper self-exits with its parent).
-                    tracing::error!(
-                        "could not lower the shields after a failed install: {he:#} — \
-                         the physical display will stay black until macrdp exits"
+            } else {
+                // Origin tx: vd → (0, 0), physicals shifted aside. See
+                // `CapturedPrimary::install` for the full ConfigureForSession
+                // rationale — it is identical here and equally load-bearing.
+                //
+                // CRITICAL: from here on the shields are UP, but no `Self` exists
+                // yet — so `Drop` cannot run and there is nothing to lower them.
+                // A bare `?` on any step below would return `Err` and strand a
+                // black screen over the user's desktop for the life of the process
+                // (macrdp keeps running; the watcher just logs the failed install).
+                // So the fallible remainder runs in a closure whose `Err` we
+                // intercept to lower the shields before propagating.
+                let arrange = || -> Result<()> {
+                    let any = CGDisplay::new(virtual_display_id);
+                    let config = any.begin_configuration().map_err(|e| {
+                        anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}")
+                    })?;
+                    vd.configure_display_origin(&config, 0, 0)
+                        .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
+                    let mut x_off = vd_width;
+                    for (id, _) in &targets {
+                        let d = CGDisplay::new(*id);
+                        if d.is_active() {
+                            d.configure_display_origin(&config, x_off, 0).map_err(|e| {
+                                anyhow!(
+                                    "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
+                                )
+                            })?;
+                            x_off += d.bounds().size.width.round() as i32;
+                        }
+                    }
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+                        .map_err(|e| {
+                            anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
+                        })?;
+                    Ok(())
+                };
+                if let Err(e) = arrange() {
+                    tracing::warn!(
+                        "arrangement transaction failed after the shields were raised — \
+                         lowering them so the desktop is not left blacked out"
                     );
+                    if let Err(he) = crate::shield::hide() {
+                        // Both failed. Say so loudly: the screen is black and we
+                        // could not clear it. It will clear when macrdp exits (the
+                        // helper self-exits with its parent).
+                        tracing::error!(
+                            "could not lower the shields after a failed install: {he:#} — \
+                             the physical display will stay black until macrdp exits"
+                        );
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
 
-            std::thread::sleep(TX_SETTLE);
+                std::thread::sleep(TX_SETTLE);
 
-            // The tx moved the panels, so re-fit the shields to their new
-            // frames. The helper also re-fits itself on the screen-parameters
-            // notification; this is the belt to that suspenders, and is cheap
-            // because SHOW reconciles rather than stacking.
-            if let Err(e) = crate::shield::show(&[virtual_display_id]) {
-                tracing::warn!("could not re-fit shields after the arrangement tx: {e:#}");
+                // The tx moved the panels, so re-fit the shields to their new
+                // frames. The helper also re-fits itself on the screen-parameters
+                // notification; this is the belt to that suspenders, and is cheap
+                // because SHOW reconciles rather than stacking.
+                if let Err(e) = crate::shield::show(&[virtual_display_id]) {
+                    tracing::warn!("could not re-fit shields after the arrangement tx: {e:#}");
+                }
             }
 
             tracing::info!(
@@ -1059,6 +1112,7 @@ mod macos {
                 virtual_id: virtual_display_id,
                 virtual_old_origin,
                 shielded: targets,
+                moved_arrangement: !keep_physical_main,
             })
         }
 
@@ -1106,6 +1160,14 @@ mod macos {
                     "could not lower the shield windows: {e:#} — they will vanish \
                      when the helper exits with this process"
                 );
+            }
+
+            // In keep-physical-main mode `install` never moved the arrangement,
+            // so there is nothing to restore — lowering the shields is the whole
+            // teardown.
+            if !self.moved_arrangement {
+                tracing::info!("lowered shields (no arrangement was moved)");
+                return;
             }
 
             let any = CGDisplay::new(self.virtual_id);

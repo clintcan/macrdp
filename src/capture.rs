@@ -680,8 +680,16 @@ impl CaptureDisplay {
                 // window off the vd may be intentionally on the physical panel.
                 #[cfg(target_os = "macos")]
                 if self.session_tracker.is_some() {
-                    if let Err(e) = vd.reanchor_as_main() {
-                        tracing::warn!(error = ?e, "re-anchoring the vd as main after re-mode failed");
+                    // --shield-primary in keep-physical-main mode deliberately
+                    // does NOT make the vd the system main display (so the lock
+                    // screen stays on the visible physical panel). Re-anchoring
+                    // it as main here would undo that on every resize, so skip it.
+                    let skip_reanchor = self.shielded_primary.is_some()
+                        && crate::virtual_display::shield_keeps_physical_main();
+                    if !skip_reanchor {
+                        if let Err(e) = vd.reanchor_as_main() {
+                            tracing::warn!(error = ?e, "re-anchoring the vd as main after re-mode failed");
+                        }
                     }
                     // 0. Re-assert the --capture-primary gamma blanking. The
                     //    re-mode (applySettings) and the re-anchor above are
