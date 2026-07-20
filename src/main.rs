@@ -34,6 +34,7 @@ mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+mod shield;
 mod switcher_hud;
 mod usb_redirect;
 mod videotoolbox;
@@ -344,6 +345,22 @@ struct Args {
     /// Only valid with --virtual-display.
     #[arg(long)]
     capture_primary: bool,
+
+    /// Third headless mechanism, alternative to --detach-primary and
+    /// --capture-primary: while a client is connected, cover every physical
+    /// display with an opaque **black shield window** (drawn by the bundled
+    /// macrdpshield helper). Two advantages over --capture-primary: (1) the
+    /// Mac **can still be locked** — capture-primary silently prevents
+    /// locking, because loginwindow cannot draw onto a captured display; and
+    /// (2) no ~250 ms desktop flash when the client resizes, because a window
+    /// survives a display reconfiguration whereas a gamma LUT is reset by it.
+    /// The trade-off: without the capture the local pointer is NOT confined,
+    /// so someone at the machine can move it and disturb the remote cursor
+    /// (their clicks are swallowed by the shield). Mutually exclusive with
+    /// --detach-primary and --capture-primary. Only valid with
+    /// --virtual-display.
+    #[arg(long)]
+    shield_primary: bool,
 
     /// Make windows follow you between the local built-in screen and the
     /// remote virtual display (opt-in; only meaningful with
@@ -766,6 +783,65 @@ fn locate_hud_helper() -> Option<std::path::PathBuf> {
         .nth(3)
         .map(|root| root.join("gui/.build/release/macrdphud"));
     dev.filter(|p| p.is_file())
+}
+
+/// Locate the `macrdpshield` blanking helper. Same search order as
+/// [`locate_hud_helper`]: `MACRDP_SHIELD_HELPER` env override, else the bundled
+/// copy (`../Resources/macrdpshield`), else the dev build.
+#[cfg(target_os = "macos")]
+fn locate_shield_helper() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("MACRDP_SHIELD_HELPER") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    if let Some(macos_dir) = exe.parent() {
+        let bundled = macos_dir.join("../Resources/macrdpshield");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    let dev = exe
+        .ancestors()
+        .nth(3)
+        .map(|root| root.join("gui/.build/release/macrdpshield"));
+    dev.filter(|p| p.is_file())
+}
+
+/// Spawn the shield helper. Unlike the HUD helper (cosmetic, so a miss is a
+/// warning), this one is **required** for `--shield-primary`: without it there is
+/// nothing to blank the panel with, so a miss is a hard error and the server
+/// refuses to start rather than running a "headless" session over a fully visible
+/// desktop.
+#[cfg(target_os = "macos")]
+fn spawn_shield_helper() -> Result<std::process::Child> {
+    let path = locate_shield_helper().ok_or_else(|| {
+        anyhow!(
+            "--shield-primary needs the macrdpshield helper, which was not found. \
+             Set MACRDP_SHIELD_HELPER, or build it with gui/make-shield-helper.sh. \
+             Refusing to start: without the helper the physical display would stay \
+             fully visible while the session claims to be headless."
+        )
+    })?;
+    let mut cmd = std::process::Command::new(&path);
+    cmd.env("MACRDP_SHIELD_PARENT", std::process::id().to_string());
+    if let Some(port) = std::env::var_os("MACRDP_SHIELD_PORT") {
+        cmd.env("MACRDP_SHIELD_PORT", port);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning the shield helper {}", path.display()))?;
+    info!(
+        shield_pid = child.id(),
+        helper = %path.display(),
+        "shield helper spawned"
+    );
+    Ok(child)
 }
 
 /// Spawn the app-switcher HUD helper. Passes the loopback port and our pid (so it
@@ -1468,6 +1544,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         match primary_mode.as_str() {
             "detach" => argv.push("--detach-primary".into()),
             "capture" => argv.push("--capture-primary".into()),
+            "shield" => argv.push("--shield-primary".into()),
             _ => {}
         }
     }
@@ -1702,17 +1779,40 @@ async fn async_main() -> Result<()> {
              with no usable display otherwise)"
         ));
     }
+    if args.shield_primary && !args.virtual_display {
+        return Err(anyhow!(
+            "--shield-primary requires --virtual-display (you'd be left \
+             with no usable display otherwise)"
+        ));
+    }
+    // All three headless mechanisms fight over the same display arrangement,
+    // so exactly one may be active. Checked pairwise so the error names the
+    // actual conflict.
     if args.capture_primary && args.detach_primary {
         return Err(anyhow!(
             "--capture-primary and --detach-primary are mutually exclusive \
              (pick one mechanism for going headless)"
         ));
     }
-    if args.restore_windows_on_disconnect && !(args.detach_primary || args.capture_primary) {
+    if args.shield_primary && args.detach_primary {
+        return Err(anyhow!(
+            "--shield-primary and --detach-primary are mutually exclusive \
+             (pick one mechanism for going headless)"
+        ));
+    }
+    if args.shield_primary && args.capture_primary {
+        return Err(anyhow!(
+            "--shield-primary and --capture-primary are mutually exclusive \
+             (pick one mechanism for going headless)"
+        ));
+    }
+    if args.restore_windows_on_disconnect
+        && !(args.detach_primary || args.capture_primary || args.shield_primary)
+    {
         warn!(
             "--restore-windows-on-disconnect has no effect without \
-             --detach-primary or --capture-primary (it needs the headless \
-             session watcher); ignoring"
+             --detach-primary, --capture-primary or --shield-primary (it needs \
+             the headless session watcher); ignoring"
         );
     }
 
@@ -1729,6 +1829,9 @@ async fn async_main() -> Result<()> {
     let captured_primary: std::sync::Arc<
         std::sync::Mutex<Option<virtual_display::CapturedPrimary>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let shielded_primary: std::sync::Arc<
+        std::sync::Mutex<Option<virtual_display::ShieldedPrimary>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     // Install signal handling before anything touches ScreenCaptureKit. Once an
     // SCK capture stream is live, macOS framework threads can leave the process
@@ -1743,6 +1846,7 @@ async fn async_main() -> Result<()> {
     let cleanup_primary = primary_override.clone();
     let cleanup_detach = detached_primary.clone();
     let cleanup_capture = captured_primary.clone();
+    let cleanup_shield = shielded_primary.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
@@ -1755,6 +1859,9 @@ async fn async_main() -> Result<()> {
             .take()
         {
             drop(ovr); // releases captured displays
+        }
+        if let Some(ovr) = cleanup_shield.lock().expect("shield mutex poisoned").take() {
+            drop(ovr); // lowers the shield windows
         }
         if let Some(ovr) = cleanup_primary
             .lock()
@@ -1877,6 +1984,22 @@ async fn async_main() -> Result<()> {
             session_tracker.clone(),
             captured_primary.clone(),
             virtual_display::CapturedPrimary::install,
+            args.restore_windows_on_disconnect,
+            physical_main_id,
+        );
+    } else if args.shield_primary {
+        let vd_id = virtual_display
+            .as_ref()
+            .expect("checked above when --shield-primary")
+            .lock()
+            .expect("virtual display mutex poisoned")
+            .display_id();
+        spawn_primary_overlay_watcher(
+            "shield",
+            vd_id,
+            session_tracker.clone(),
+            shielded_primary.clone(),
+            virtual_display::ShieldedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
         );
@@ -2114,6 +2237,17 @@ async fn async_main() -> Result<()> {
     // App-switcher HUD overlay helper (macOS-only). Tell it which display to
     // center on (the captured one) and spawn it; it idles until a Cmd+Tab. Held
     // for the process lifetime; the helper also self-exits if we die.
+    // Shield helper (macOS-only). Spawned eagerly at startup rather than lazily
+    // on first connect, so a missing/broken helper is a loud startup failure
+    // instead of a silently-visible desktop at the moment a client arrives.
+    // Held for the process lifetime; it also self-exits if we die.
+    #[cfg(target_os = "macos")]
+    let _shield_helper = if args.shield_primary {
+        Some(spawn_shield_helper()?)
+    } else {
+        None
+    };
+
     #[cfg(target_os = "macos")]
     let _hud_helper = if args.app_switcher_hud {
         let did =
@@ -2204,7 +2338,7 @@ async fn async_main() -> Result<()> {
         cursor_scale: args.cursor_scale,
         // Only attach the tracker when the watchdog needs it. Saves
         // a useless atomic increment/decrement per session otherwise.
-        session_tracker: (args.detach_primary || args.capture_primary)
+        session_tracker: (args.detach_primary || args.capture_primary || args.shield_primary)
             .then(|| session_tracker.clone()),
         #[cfg(target_os = "macos")]
         gfx: gfx.clone(),
@@ -2227,6 +2361,13 @@ async fn async_main() -> Result<()> {
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
             Some(captured_primary.clone())
+        } else {
+            None
+        },
+        // Shared so a live re-mode can re-fit the shield windows to the panels'
+        // new frames. Only for --shield-primary.
+        shielded_primary: if args.shield_primary {
+            Some(shielded_primary.clone())
         } else {
             None
         },

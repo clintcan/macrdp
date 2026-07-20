@@ -8,6 +8,10 @@ import PackageDescription
 // `macrdphud` is a second executable: the app-switcher HUD overlay helper that
 // macrdp spawns and drives over loopback to draw a visual Cmd+Tab switcher the
 // remote client sees. make-hud-helper.sh embeds it inside macrdp.app.
+// `macrdpshield` is a fourth executable: the black shield-window helper for
+// --shield-primary, the headless blanking mode that (unlike --capture-primary)
+// leaves the Mac lockable and survives a live re-mode without a desktop flash.
+// make-shield-helper.sh embeds it inside macrdp.app.
 // `macrdpcamera` is a third executable: the CoreMediaIO Camera **system
 // extension** (camera redirection Phase 3) that presents the redirected webcam
 // as a selectable macOS camera. It's assembled into a `.systemextension` bundle
@@ -24,6 +28,7 @@ let package = Package(
             linkerSettings: [.linkedFramework("SystemExtensions")]
         ),
         .executableTarget(name: "macrdphud", path: "Sources/macrdphud"),
+        .executableTarget(name: "macrdpshield", path: "Sources/macrdpshield"),
         .executableTarget(
             name: "macrdpcamera",
             path: "Sources/macrdpcamera",

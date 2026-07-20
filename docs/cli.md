@@ -72,6 +72,35 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   per-dimension. Each dimension must be in [200,
                           #   8192]. No effect off the auto-adopt path. Config:
                           #   MAX_CLIENT_SIZE. Mirrors upstream IronRDP #1404.
+--shield-primary          # Third headless blanking mechanism, alternative to
+                          #   --detach-primary / --capture-primary (mutually
+                          #   exclusive with both; needs --virtual-display).
+                          #   Covers every physical panel with an opaque BLACK
+                          #   WINDOW drawn by the bundled macrdpshield helper
+                          #   instead of gamma-blacking a captured display.
+                          #   Two wins over --capture-primary:
+                          #     (1) the Mac CAN STILL BE LOCKED. capture-primary
+                          #         silently prevents locking (loginwindow can't
+                          #         draw onto a CGDisplayCapture'd display), so a
+                          #         capture-primary Mac is physically unsecured.
+                          #     (2) no ~250 ms desktop flash on a live client
+                          #         resize — a window survives a display
+                          #         reconfiguration, whereas macOS RESETS gamma
+                          #         on one (that flash is unfixable with gamma).
+                          #   Trade-off: without the capture the local pointer is
+                          #   NOT confined, so a person at the machine can move it
+                          #   and disturb the remote cursor. Their clicks are
+                          #   swallowed by the shield; their keystrokes go where
+                          #   focus already was (capture never blocked the
+                          #   keyboard either, so that part is unchanged).
+                          #   Fail-safe: if the helper can't be found or reached,
+                          #   macrdp REFUSES TO START rather than run a "headless"
+                          #   session over a visible desktop. If the helper dies
+                          #   mid-session the panel becomes visible — same end
+                          #   state as a SIGKILLed --capture-primary, whose gamma
+                          #   is likewise process-scoped. Config: PRIMARY_MODE=shield.
+                          #   Env: MACRDP_SHIELD_HELPER (path override),
+                          #   MACRDP_SHIELD_PORT (default 40244). macOS-only.
 --restore-windows-on-disconnect  # Make windows follow you between the local
                           #   built-in screen and the remote virtual display
                           #   (opt-in; needs --detach-primary/--capture-primary).

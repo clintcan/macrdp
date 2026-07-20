@@ -13,10 +13,14 @@
 mod private_api;
 
 #[cfg(target_os = "macos")]
-pub use macos::{CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay};
+pub use macos::{
+    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+};
 
 #[cfg(not(target_os = "macos"))]
-pub use stub::{CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay};
+pub use stub::{
+    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+};
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -878,6 +882,210 @@ mod macos {
             }
         }
     }
+
+    /// Headless blanking via an opaque black **shield window** over each
+    /// physical panel, drawn by the `macrdpshield` helper process.
+    ///
+    /// Third headless mode alongside [`DetachedPrimary`] and
+    /// [`CapturedPrimary`]. The arrangement half is identical to
+    /// `CapturedPrimary` — vd to `(0, 0)` as system main, physicals shifted
+    /// aside, completed `ConfigureForSession` (see that type for why ForSession
+    /// is load-bearing across live re-modes and on disconnect). What differs is
+    /// how the panel is hidden:
+    ///
+    /// | | `CapturedPrimary` | `ShieldedPrimary` |
+    /// |---|---|---|
+    /// | hides the desktop with | all-black gamma LUT | an opaque black window |
+    /// | survives a live re-mode | **no** — macOS resets gamma on every display reconfiguration, so it must be re-asserted, and a write *during* the reconfiguration does not stick (irreducible ~250 ms desktop flash) | **yes** — a window is not gamma; nothing to re-assert, no flash |
+    /// | Mac can be locked | **no** — `loginwindow` cannot draw onto a display held by `CGDisplayCapture` | **yes** — no capture is taken |
+    /// | local cursor | confined off the panel by the capture | **not confined** — see below |
+    /// | crash safety | process-scoped; SIGKILL auto-reverts | helper self-exits when its parent dies |
+    ///
+    /// **Security trade-off, stated plainly.** Dropping `CGDisplayCapture` is
+    /// what makes the machine lockable again, but capture was also what kept the
+    /// local pointer off the panel. Under a shield, someone physically at the Mac
+    /// can move the pointer — which is shared global state, so it yanks the
+    /// remote user's cursor out of the virtual display. Their *clicks* are
+    /// swallowed (the shield window takes mouse events), and their keystrokes go
+    /// wherever focus already was, exactly as under capture (capture never
+    /// blocked the keyboard). Net: this mode trades "a local person can disturb
+    /// the pointer" for "the Mac can actually be locked", which is the better
+    /// posture for an unattended machine — but it is a real trade, not a
+    /// free win.
+    ///
+    /// **Fail-open by design.** If the helper cannot be reached, `install`
+    /// fails and the mode refuses to engage rather than reporting success over a
+    /// visible desktop. If the helper dies mid-session the panel becomes
+    /// visible — the same end state as a SIGKILLed `CapturedPrimary`, whose
+    /// gamma is likewise process-scoped.
+    pub struct ShieldedPrimary {
+        virtual_id: u32,
+        virtual_old_origin: (i32, i32),
+        /// Physical displays we shielded, with the pre-install origin so Drop
+        /// can put them back.
+        shielded: Vec<(u32, (i32, i32))>,
+    }
+
+    impl ShieldedPrimary {
+        pub fn install(virtual_display_id: u32) -> Result<Self> {
+            let vd = CGDisplay::new(virtual_display_id);
+            let vd_bounds = vd.bounds();
+            let virtual_old_origin = (
+                vd_bounds.origin.x.round() as i32,
+                vd_bounds.origin.y.round() as i32,
+            );
+            let vd_width = vd_bounds.size.width.round() as i32;
+
+            let actives = CGDisplay::active_displays()
+                .map_err(|e| anyhow!("CGGetActiveDisplayList: CGError {e}"))?;
+            let targets: Vec<(u32, (i32, i32))> = actives
+                .iter()
+                .copied()
+                .filter(|id| *id != virtual_display_id)
+                .map(|id| {
+                    let b = CGDisplay::new(id).bounds();
+                    (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
+                })
+                .collect();
+            if targets.is_empty() {
+                return Err(anyhow!(
+                    "no physical display to shield — the virtual display is \
+                     the only active one already"
+                ));
+            }
+
+            // Raise the shields BEFORE the arrangement change. The origin tx
+            // moves the vd to (0,0) and pushes the physicals aside, which is
+            // itself a visible relayout on the physical panel; shielding first
+            // means the user never sees it. (CapturedPrimary has the opposite
+            // order because its gamma write would be reset by the tx anyway.)
+            let ids: Vec<u32> = targets.iter().map(|(id, _)| *id).collect();
+            crate::shield::show(&ids).context(
+                "could not raise the shield windows — refusing to engage \
+                 --shield-primary rather than leave the desktop visible",
+            )?;
+
+            // Origin tx: vd → (0, 0), physicals shifted aside. See
+            // `CapturedPrimary::install` for the full ConfigureForSession
+            // rationale — it is identical here and equally load-bearing.
+            let any = CGDisplay::new(virtual_display_id);
+            let config = any
+                .begin_configuration()
+                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
+            vd.configure_display_origin(&config, 0, 0)
+                .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
+            let mut x_off = vd_width;
+            for (id, _) in &targets {
+                let d = CGDisplay::new(*id);
+                if d.is_active() {
+                    d.configure_display_origin(&config, x_off, 0).map_err(|e| {
+                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
+                    })?;
+                    x_off += d.bounds().size.width.round() as i32;
+                }
+            }
+            any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
+
+            std::thread::sleep(TX_SETTLE);
+
+            // The tx moved the panels, so re-fit the shields to their new
+            // frames. The helper also re-fits itself on the screen-parameters
+            // notification; this is the belt to that suspenders, and is cheap
+            // because SHOW reconciles rather than stacking.
+            if let Err(e) = crate::shield::show(&ids) {
+                tracing::warn!("could not re-fit shields after the arrangement tx: {e:#}");
+            }
+
+            tracing::info!(
+                shielded_count = targets.len(),
+                "physical displays shielded with black windows"
+            );
+            tracing::info!(
+                "NOTE: --shield-primary does NOT capture the displays, so this Mac \
+                 CAN still be locked normally (unlike --capture-primary). The \
+                 trade-off is that a person at the machine can move the pointer, \
+                 which disturbs the remote cursor; their clicks are swallowed."
+            );
+
+            Ok(Self {
+                virtual_id: virtual_display_id,
+                virtual_old_origin,
+                shielded: targets,
+            })
+        }
+
+        /// Re-fit the shields. Unlike [`CapturedPrimary::reassert_blanking`],
+        /// this is **not** required for correctness after a re-mode — the
+        /// windows survive a display reconfiguration and the helper re-fits
+        /// itself on the screen-parameters notification. It exists so the
+        /// capture path can call the same hook on both guards.
+        pub fn reassert_blanking(&self) -> usize {
+            let ids: Vec<u32> = self.shielded.iter().map(|(id, _)| *id).collect();
+            match crate::shield::show(&ids) {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::warn!("could not re-fit shields: {e:#}");
+                    ids.len()
+                }
+            }
+        }
+    }
+
+    impl Drop for ShieldedPrimary {
+        fn drop(&mut self) {
+            tracing::info!(
+                shielded_count = self.shielded.len(),
+                "ShieldedPrimary::drop running — lowering shields + restoring layout"
+            );
+
+            // Lower the shields first so the panels are usable again even if
+            // the arrangement restore below fails.
+            if let Err(e) = crate::shield::hide() {
+                tracing::warn!(
+                    "could not lower the shield windows: {e:#} — they will vanish \
+                     when the helper exits with this process"
+                );
+            }
+
+            let any = CGDisplay::new(self.virtual_id);
+            let config = match any.begin_configuration() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        "shields lowered but could not begin reposition-tx \
+                         (CGError {e}); layout will revert on logout"
+                    );
+                    return;
+                }
+            };
+            for (id, origin) in &self.shielded {
+                let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
+            }
+            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
+                &config,
+                self.virtual_old_origin.0,
+                self.virtual_old_origin.1,
+            );
+            // ConfigureForSession — MUST match `install`, for exactly the reason
+            // spelled out in `CapturedPrimary`'s Drop (a ForAppOnly restore
+            // leaves the persisted store saying "vd is main" and the Dock
+            // sometimes follows it off-screen on disconnect).
+            if let Err(e) =
+                any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+            {
+                tracing::warn!(
+                    "shields lowered but reposition-tx failed (CGError {e}); \
+                     layout will revert on logout"
+                );
+            } else {
+                tracing::info!(
+                    shielded_count = self.shielded.len(),
+                    "lowered shields and restored layout"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -931,6 +1139,17 @@ mod stub {
     impl CapturedPrimary {
         pub fn install(_virtual_display_id: u32) -> Result<Self> {
             Err(anyhow!("primary-display capture is macOS-only"))
+        }
+        pub fn reassert_blanking(&self) -> usize {
+            0
+        }
+    }
+
+    pub struct ShieldedPrimary;
+
+    impl ShieldedPrimary {
+        pub fn install(_virtual_display_id: u32) -> Result<Self> {
+            Err(anyhow!("primary-display shielding is macOS-only"))
         }
         pub fn reassert_blanking(&self) -> usize {
             0

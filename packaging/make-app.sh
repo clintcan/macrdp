@@ -153,6 +153,24 @@ else
     echo "==> WARNING: macrdphud not found; app-switcher HUD NOT embedded (unset SKIP_BUILD?)" >&2
 fi
 
+# 2e. Embed the black shield-window helper (--shield-primary). Same shape as the
+#     HUD helper: a small Swift executable macrdp spawns from
+#     Contents/Resources/macrdpshield (see locate_shield_helper in src/main.rs),
+#     signed before the outer bundle seal.
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    echo "==> swift build -c release (macrdpshield)"
+    ( cd "$REPO_ROOT/gui" && swift build -c release --product macrdpshield )
+fi
+SHIELD_BIN="$REPO_ROOT/gui/.build/release/macrdpshield"
+if [ -f "$SHIELD_BIN" ]; then
+    cp "$SHIELD_BIN" "$STAGE/Contents/Resources/macrdpshield"
+    chmod +x "$STAGE/Contents/Resources/macrdpshield"
+    codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE/Contents/Resources/macrdpshield"
+    echo "==> embedded macrdpshield (shield-window helper)"
+else
+    echo "==> WARNING: macrdpshield not found; --shield-primary will REFUSE to start (unset SKIP_BUILD?)" >&2
+fi
+
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
 #    Resources, including the app icon + the embedded IFD bundle).
 # Embed the provisioning profile (if any) BEFORE the bundle sign so it's sealed in.
@@ -162,8 +180,8 @@ if [ -n "$PROVISION_PROFILE" ]; then
 fi
 echo "==> codesign (hardened runtime, ts: $TS${ENT_ARG:+, entitlements})"
 # Entitlements go on the main executable (which actually runs) and the bundle.
-# The other signed items (IFD dylib/bundle, macrdphud) deliberately get NO
-# entitlements — only macrdp needs the USB host-controller capability.
+# The other signed items (IFD dylib/bundle, macrdphud, macrdpshield) deliberately
+# get NO entitlements — only macrdp needs the USB host-controller capability.
 codesign --force --options runtime $TS $ENT_ARG -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdp"
 codesign --force --options runtime $TS $ENT_ARG -s "$IDENTITY" "$STAGE"
 codesign --verify --deep --strict "$STAGE"

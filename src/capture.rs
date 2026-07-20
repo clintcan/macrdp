@@ -415,6 +415,22 @@ pub struct CaptureDisplay {
     /// is active. See `sync_virtual_display`.
     pub captured_primary:
         Option<Arc<std::sync::Mutex<Option<crate::virtual_display::CapturedPrimary>>>>,
+
+    /// The `--shield-primary` blanking guard (shared with main.rs), re-fitted
+    /// after a live re-mode for the same reason as `captured_primary` above —
+    /// but a weaker one. A shield WINDOW survives a display reconfiguration
+    /// (that's the point of the mode), so this is not required for correctness
+    /// the way the gamma re-assert is. It is wired anyway because the helper's
+    /// own `didChangeScreenParameters` observer cannot be trusted here: this
+    /// codebase already established that the private `CGVirtualDisplay
+    /// applySettings` re-mode does NOT emit a public display-reconfiguration
+    /// event (a `CGDisplayRegisterReconfigurationCallback` never fired across
+    /// many resizes — see the removed-callback NOTE in virtual_display/mod.rs),
+    /// so the AppKit notification very likely does not fire either. Re-fitting
+    /// from the capture path does not depend on any notification. `None` unless
+    /// `--shield-primary` is active.
+    pub shielded_primary:
+        Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -677,13 +693,14 @@ impl CaptureDisplay {
                     //    otherwise undo an earlier one) covers the common case; the
                     //    LATE resets (capture re-engage / a final relayout after the
                     //    session re-enters, ~1 s in — the "quick blink after the
-                    //    resize" a polling burst couldn't beat) are handled
-                    //    event-driven by the reconfiguration callback armed in
-                    //    `CapturedPrimary::install` (`arm_reblank`), which re-blanks
-                    //    the instant ANY reconfiguration completes — no polling
-                    //    window to miss, and a gamma set made *after* the commit is
-                    //    the only one that sticks. No-op for --detach-primary (slot
-                    //    is None; that mode disables the panel, not gamma).
+                    //    resize" a polling burst couldn't beat) are handled by the
+                    //    post-sweep re-blanks in the thread below. (An event-driven
+                    //    re-blank was tried and REMOVED: the private
+                    //    CGVirtualDisplay applySettings resets gamma without
+                    //    emitting a public reconfiguration event, so the callback
+                    //    never fired — see the NOTE in virtual_display/mod.rs.)
+                    //    No-op for --detach-primary (slot is None; that mode
+                    //    disables the panel, not gamma).
                     if let Some(cap) = self.captured_primary.as_ref() {
                         if let Some(g) = cap.lock().expect("captured_primary poisoned").as_ref() {
                             let failed = g.reassert_blanking();
@@ -693,7 +710,17 @@ impl CaptureDisplay {
                             );
                         }
                     }
+                    // Same hook for --shield-primary: re-fit the shield windows to
+                    // the panels' new frames. Cheap and idempotent (SHOW
+                    // reconciles rather than stacking).
+                    if let Some(sh) = self.shielded_primary.as_ref() {
+                        if let Some(g) = sh.lock().expect("shielded_primary poisoned").as_ref() {
+                            let failed = g.reassert_blanking();
+                            tracing::info!(failed, "re-fitted shield windows after re-mode");
+                        }
+                    }
                     let captured_primary = self.captured_primary.clone();
+                    let shielded_primary = self.shielded_primary.clone();
                     std::thread::spawn(move || {
                         // Re-blank after each window-gather sweep. DIAGNOSED from
                         // the callback trace: the vd re-mode resets the physical
@@ -709,6 +736,13 @@ impl CaptureDisplay {
                             if let Some(cap) = captured_primary.as_ref() {
                                 if let Some(g) =
                                     cap.lock().expect("captured_primary poisoned").as_ref()
+                                {
+                                    g.reassert_blanking();
+                                }
+                            }
+                            if let Some(sh) = shielded_primary.as_ref() {
+                                if let Some(g) =
+                                    sh.lock().expect("shielded_primary poisoned").as_ref()
                                 {
                                     g.reassert_blanking();
                                 }

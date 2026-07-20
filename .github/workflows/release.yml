@@ -171,6 +171,12 @@ jobs:
           set -euo pipefail
           ( cd gui && swift build -c release --product macrdphud )
 
+      - name: Build shield-window helper (for the .app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd gui && swift build -c release --product macrdpshield )
+
       - name: Assemble macrdp.app (ad-hoc signed)
         # SKIP_BUILD reuses the binary already built + signed above (so the app
         # ships the identical Mach-O) and the IFD dylib from the step above.
@@ -188,6 +194,8 @@ jobs:
             || { echo "IFD handler not embedded in the app"; exit 1; }
           test -f "target/macrdp.app/Contents/Resources/macrdphud" \
             || { echo "app-switcher HUD helper not embedded in the app"; exit 1; }
+          test -f "target/macrdp.app/Contents/Resources/macrdpshield" \
+            || { echo "shield-window helper not embedded in the app"; exit 1; }
           codesign --verify --deep --strict target/macrdp.app
 
       - name: Stage app artifact
