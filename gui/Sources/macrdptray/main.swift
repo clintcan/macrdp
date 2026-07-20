@@ -294,7 +294,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (mode, label) in [
             ("none", "Keep local screen on"),
             ("detach", "Detach — move apps to remote"),
-            ("shield", "Blank — keep apps on Mac (lockable, experimental)"),
+            ("shield", "Blank — keep apps on Mac (lockable)"),
             ("capture", "Blank — keep apps on Mac (can't lock)"),
         ] {
             let mi = NSMenuItem(title: label, action: #selector(setPrimaryMode(_:)), keyEquivalent: "")
