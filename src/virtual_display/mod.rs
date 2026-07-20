@@ -968,24 +968,55 @@ mod macos {
             // Origin tx: vd → (0, 0), physicals shifted aside. See
             // `CapturedPrimary::install` for the full ConfigureForSession
             // rationale — it is identical here and equally load-bearing.
-            let any = CGDisplay::new(virtual_display_id);
-            let config = any
-                .begin_configuration()
-                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
-            vd.configure_display_origin(&config, 0, 0)
-                .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-            let mut x_off = vd_width;
-            for (id, _) in &targets {
-                let d = CGDisplay::new(*id);
-                if d.is_active() {
-                    d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
-                    })?;
-                    x_off += d.bounds().size.width.round() as i32;
+            //
+            // CRITICAL: from here on the shields are UP, but no `Self` exists
+            // yet — so `Drop` cannot run and there is nothing to lower them.
+            // A bare `?` on any step below would return `Err` and strand a
+            // black screen over the user's desktop for the life of the process
+            // (macrdp keeps running; the watcher just logs the failed install).
+            // So the fallible remainder runs in a closure whose `Err` we
+            // intercept to lower the shields before propagating.
+            let arrange = || -> Result<()> {
+                let any = CGDisplay::new(virtual_display_id);
+                let config = any
+                    .begin_configuration()
+                    .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
+                vd.configure_display_origin(&config, 0, 0)
+                    .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
+                let mut x_off = vd_width;
+                for (id, _) in &targets {
+                    let d = CGDisplay::new(*id);
+                    if d.is_active() {
+                        d.configure_display_origin(&config, x_off, 0).map_err(|e| {
+                            anyhow!(
+                                "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
+                            )
+                        })?;
+                        x_off += d.bounds().size.width.round() as i32;
+                    }
                 }
+                any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+                    .map_err(|e| {
+                        anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
+                    })?;
+                Ok(())
+            };
+            if let Err(e) = arrange() {
+                tracing::warn!(
+                    "arrangement transaction failed after the shields were raised — \
+                     lowering them so the desktop is not left blacked out"
+                );
+                if let Err(he) = crate::shield::hide() {
+                    // Both failed. Say so loudly: the screen is black and we
+                    // could not clear it. It will clear when macrdp exits (the
+                    // helper self-exits with its parent).
+                    tracing::error!(
+                        "could not lower the shields after a failed install: {he:#} — \
+                         the physical display will stay black until macrdp exits"
+                    );
+                }
+                return Err(e);
             }
-            any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
-                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
 
             std::thread::sleep(TX_SETTLE);
 

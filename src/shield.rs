@@ -28,12 +28,24 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 40244;
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// The helper is spawned just before the first `show`, so allow a few attempts
-/// for its listener to come up before declaring failure.
-const CONNECT_ATTEMPTS: usize = 10;
+/// Retry budget for reaching the helper.
+///
+/// **Kept deliberately small because these calls block a tokio worker.**
+/// `ShieldedPrimary::install` is invoked from `spawn_primary_overlay_watcher`,
+/// which is a `tokio::spawn`ed task (see main.rs) — so every millisecond spent
+/// here is a millisecond a runtime worker is not serving anything else. The
+/// worst case is `CONNECT_ATTEMPTS × (CONNECT_TIMEOUT + CONNECT_RETRY_DELAY)`,
+/// which at these values is ~1 s, in line with the `TX_SETTLE` sleeps the same
+/// path already performs.
+///
+/// A generous budget would be pointless anyway: the helper is spawned at
+/// **startup**, long before the first client connects, so by the time anything
+/// calls `show` its listener has been up for seconds-to-hours. The retries only
+/// cover a cold race, not a slow start.
+const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn port() -> u16 {
