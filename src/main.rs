@@ -1086,6 +1086,15 @@ fn restore_gather_windows(_display_id: u32) -> usize {
     0
 }
 
+/// Exit code used when a stuck `--detach-primary` disconnect bounces the process
+/// so launchd restarts it (#168). **Deliberately non-zero** (`EX_UNAVAILABLE`,
+/// distinct from the health watchdog's `70`): with the shipped LaunchAgent
+/// (`KeepAlive = true`, unconditional) any exit restarts, but a non-zero code
+/// also restarts under a `KeepAlive = { SuccessfulExit: false }` plist — so the
+/// fix doesn't silently depend on KeepAlive being unconditional — and it makes
+/// the intentional bounce distinguishable from a clean shutdown in telemetry.
+const DETACH_STUCK_EXIT_CODE: i32 = 69;
+
 /// Whether a `--detach-primary` disconnect that couldn't re-enable the physical
 /// panel should `process::exit` so launchd restarts a fresh process (which is
 /// the only thing that reverts the CGS disable on macOS 26.x — see #168).
@@ -1256,8 +1265,10 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         // reverts the CGS disable. If Drop just flagged that
                         // failure, restart (under launchd) so the panel comes
                         // back, rather than leaving it dark until the next manual
-                        // kickstart. No-op for capture/shield (they never set the
-                        // flag) and off macOS. The take_* read clears the flag.
+                        // kickstart. Only DetachedPrimary::drop sets the flag, so
+                        // this is a guaranteed no-op for --capture-primary (and
+                        // off macOS, where the stub returns false). The take_*
+                        // read clears the flag.
                         if virtual_display::take_detach_reenable_failed() {
                             if detach_restart_on_stuck(
                                 std::io::stdout().is_terminal(),
@@ -1272,9 +1283,18 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                      launchd restarts a fresh process to restore it. \
                                      Set MACRDP_DETACH_RESTART_ON_STUCK=0 to disable."
                                 );
-                                // Let the log line flush before we go.
-                                std::thread::sleep(Duration::from_millis(150));
-                                std::process::exit(0);
+                                // Mirror the signal handler's cleanup before a
+                                // process::exit (which bypasses Drop): flush lazy-
+                                // paste state + unmount RDPDR NFS volumes. On this
+                                // disconnect edge the per-connection Drops have
+                                // usually already run, so these are near-no-ops —
+                                // but they keep the bounce as clean as the signal
+                                // path, and the startup reaper backstops anything
+                                // that slips through on the relaunch.
+                                #[cfg(target_os = "macos")]
+                                file_promise_lazy::shutdown_cleanup();
+                                rdpdr::shutdown_cleanup();
+                                std::process::exit(DETACH_STUCK_EXIT_CODE);
                             } else {
                                 warn!(
                                     label,
