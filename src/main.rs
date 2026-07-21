@@ -1086,6 +1086,26 @@ fn restore_gather_windows(_display_id: u32) -> usize {
     0
 }
 
+/// Whether a `--detach-primary` disconnect that couldn't re-enable the physical
+/// panel should `process::exit` so launchd restarts a fresh process (which is
+/// the only thing that reverts the CGS disable on macOS 26.x — see #168).
+///
+/// Mirrors [`health::should_arm`]: an explicit `MACRDP_DETACH_RESTART_ON_STUCK=
+/// 1/0` wins; otherwise **on when headless** (stdout not a TTY ⇒ under launchd,
+/// which will restart the bounce) and **off** interactively (a `cargo run`
+/// session has nothing to restart it, so self-exiting would just kill the dev
+/// server and leave the panel stuck anyway — strictly worse). Pure + unit-tested.
+fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> bool {
+    match env_override
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1") | Some("on") | Some("true") | Some("yes") => true,
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        _ => !stdout_is_tty,
+    }
+}
+
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
@@ -1230,6 +1250,41 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         drop(ovr);
                         installed_at = None;
                         info!(label, "last RDP client disconnected");
+
+                        // #168: on --detach-primary, macOS 26.x can't re-enable
+                        // the physical panel in-process — only process exit
+                        // reverts the CGS disable. If Drop just flagged that
+                        // failure, restart (under launchd) so the panel comes
+                        // back, rather than leaving it dark until the next manual
+                        // kickstart. No-op for capture/shield (they never set the
+                        // flag) and off macOS. The take_* read clears the flag.
+                        if virtual_display::take_detach_reenable_failed() {
+                            if detach_restart_on_stuck(
+                                std::io::stdout().is_terminal(),
+                                std::env::var("MACRDP_DETACH_RESTART_ON_STUCK")
+                                    .ok()
+                                    .as_deref(),
+                            ) {
+                                warn!(
+                                    label,
+                                    "detach could not re-enable the built-in display \
+                                     (macOS won't do it in-process, #168) — exiting so \
+                                     launchd restarts a fresh process to restore it. \
+                                     Set MACRDP_DETACH_RESTART_ON_STUCK=0 to disable."
+                                );
+                                // Let the log line flush before we go.
+                                std::thread::sleep(Duration::from_millis(150));
+                                std::process::exit(0);
+                            } else {
+                                warn!(
+                                    label,
+                                    "detach could not re-enable the built-in display \
+                                     (#168) and restart-on-stuck is off — the panel \
+                                     stays dark until macrdp restarts (launchctl \
+                                     kickstart -k, or quit + relaunch)."
+                                );
+                            }
+                        }
                         // (--restore-windows-on-disconnect) Sweep windows off the
                         // virtual display back onto the built-in panel so the Mac
                         // is usable locally. MUST run AFTER `drop(ovr)` — that's
@@ -1581,6 +1636,10 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // H.264 + PNG frame dumps to $TMPDIR. Env-only like the USB knobs above;
         // bridged so it can be flipped in config.env when debugging the camera.
         ("CAMERA_DUMP", "MACRDP_CAMERA_DUMP"),
+        // #168 stopgap: when --detach-primary can't re-enable the physical panel
+        // on disconnect (macOS 26.x won't do it in-process), restart under
+        // launchd to restore it. Env-read at the disconnect edge.
+        ("DETACH_RESTART_ON_STUCK", "MACRDP_DETACH_RESTART_ON_STUCK"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
@@ -2580,6 +2639,35 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod detach_restart_tests {
+    use super::detach_restart_on_stuck;
+
+    #[test]
+    fn explicit_override_wins_over_tty() {
+        // Forced on even interactively (for testing on a TTY).
+        assert!(detach_restart_on_stuck(true, Some("1")));
+        assert!(detach_restart_on_stuck(true, Some("on")));
+        assert!(detach_restart_on_stuck(true, Some("TRUE")));
+        // Forced off even headless.
+        assert!(!detach_restart_on_stuck(false, Some("0")));
+        assert!(!detach_restart_on_stuck(false, Some("off")));
+        assert!(!detach_restart_on_stuck(false, Some(" no ")));
+    }
+
+    #[test]
+    fn defaults_on_when_headless_off_interactively() {
+        // Headless (not a TTY, i.e. under launchd) ⇒ default on.
+        assert!(detach_restart_on_stuck(false, None));
+        // Interactive (a TTY, e.g. `cargo run`) ⇒ default off (nothing to
+        // restart it, so self-exit would just kill the dev server).
+        assert!(!detach_restart_on_stuck(true, None));
+        // An unrecognized value falls back to the headless default.
+        assert!(detach_restart_on_stuck(false, Some("maybe")));
+        assert!(!detach_restart_on_stuck(true, Some("maybe")));
     }
 }
 

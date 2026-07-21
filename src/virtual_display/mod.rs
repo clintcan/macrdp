@@ -13,10 +13,14 @@
 mod private_api;
 
 #[cfg(target_os = "macos")]
-pub use macos::{CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay};
+pub use macos::{
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay,
+};
 
 #[cfg(not(target_os = "macos"))]
-pub use stub::{CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay};
+pub use stub::{
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay,
+};
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -36,6 +40,25 @@ mod macos {
     // it's fully applied — back-to-back configures on the same display can
     // race and reject the second with CGError 1001.
     const TX_SETTLE: Duration = Duration::from_millis(200);
+
+    /// Set true by `DetachedPrimary::drop` when its re-enable transaction is
+    /// exhausted (the panel is left disabled). On macOS 26.x the CGS app-scoped
+    /// display *disable* is not reversible in-process — only the process exiting
+    /// (which closes our CGS connection) reverts it — so a disconnect that hits
+    /// this leaves the built-in panel dark until macrdp restarts (#168). The
+    /// overlay watcher reads-and-clears this after `drop`, and under launchd
+    /// deliberately exits so KeepAlive restarts a fresh process (panel back in
+    /// ~2-3 s) instead of leaving it dark indefinitely. Process-global because
+    /// detach is single-instance and `Drop` can't return a value to the
+    /// (guard-type-generic) watcher.
+    static DETACH_REENABLE_FAILED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Read-and-clear the "detach left the physical panel stuck-disabled" flag
+    /// (see [`DETACH_REENABLE_FAILED`]). Returns true at most once per failure.
+    pub fn take_detach_reenable_failed() -> bool {
+        DETACH_REENABLE_FAILED.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
 
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
     // core-graphics crate. "Online" includes both active displays and any
@@ -516,9 +539,17 @@ mod macos {
                 }
             }
             if !enable_ok {
+                // The panel is left disabled. On macOS 26.x this is not
+                // recoverable in-process (the CGS app-scoped disable only
+                // reverts when our CGS connection closes, i.e. on process
+                // exit) — so flag it for the overlay watcher, which under
+                // launchd will exit to trigger a clean restart (#168).
+                DETACH_REENABLE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(
-                    "exhausted enable-tx retries; detached displays will be \
-                     re-enabled when this process exits (ForAppOnly scope)"
+                    "exhausted enable-tx retries; the built-in display is left \
+                     disabled — it re-enables only when this process exits \
+                     (ForAppOnly scope). Under launchd macrdp will restart to \
+                     restore it (#168)."
                 );
                 return;
             }
@@ -883,6 +914,11 @@ mod macos {
 #[cfg(not(target_os = "macos"))]
 mod stub {
     use anyhow::{anyhow, Result};
+
+    /// No detach path off macOS, so nothing ever leaves a panel stuck.
+    pub fn take_detach_reenable_failed() -> bool {
+        false
+    }
 
     pub struct VirtualDisplay;
 
