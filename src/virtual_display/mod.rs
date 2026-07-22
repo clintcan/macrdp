@@ -929,6 +929,11 @@ mod macos {
         /// default keep-physical-main mode, in which case `Drop` has no
         /// arrangement to restore (it only lowers the shields).
         moved_arrangement: bool,
+        /// Physical displays whose vd-mirror `install` broke (single-panel
+        /// auto-mirror hardware). `Drop` re-mirrors them so the built-in panel
+        /// shows the desktop again between sessions. Empty on hardware where
+        /// the vd extends rather than mirrors.
+        broke_mirror: Vec<u32>,
     }
 
     /// Whether `--shield-primary` should keep the PHYSICAL panel as the system
@@ -968,7 +973,7 @@ mod macos {
 
             let actives = CGDisplay::active_displays()
                 .map_err(|e| anyhow!("CGGetActiveDisplayList: CGError {e}"))?;
-            let targets: Vec<(u32, (i32, i32))> = actives
+            let mut targets: Vec<(u32, (i32, i32))> = actives
                 .iter()
                 .copied()
                 .filter(|id| *id != virtual_display_id)
@@ -978,10 +983,103 @@ mod macos {
                 })
                 .collect();
             if targets.is_empty() {
+                // No *active* physical display — but on single-panel hardware
+                // creating the vd makes macOS mirror the built-in INTO the vd,
+                // which drops the physical out of the active list (it reads
+                // online-but-inactive) even though it is very much still lit and
+                // showing the desktop. Without this fallback `install` fails with
+                // "no physical display to shield" and the overlay watcher's error
+                // arm only warns — so the session proceeds with the desktop fully
+                // VISIBLE, silently defeating the whole point of the mode. Fall
+                // back to CGGetOnlineDisplayList (which includes mirrored /
+                // disabled panels) and shield those, exactly as
+                // DetachedPrimary/CapturedPrimary already do. The origin is
+                // unknowable while mirrored/disabled, so use (0, 0) — Drop only
+                // repositions when it actually moved the arrangement, and the
+                // default keep-physical-main path moves nothing.
+                let online = online_displays()
+                    .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
+                let mirrored: Vec<u32> = online
+                    .into_iter()
+                    .filter(|id| *id != virtual_display_id && !actives.contains(id))
+                    .collect();
+                if !mirrored.is_empty() {
+                    tracing::warn!(
+                        mirrored_count = mirrored.len(),
+                        "no ACTIVE physical display to shield, but found \
+                         online-but-inactive panel(s) (mirrored into the virtual \
+                         display, or left disabled by a prior session) — shielding \
+                         those so the desktop is covered"
+                    );
+                    targets = mirrored.into_iter().map(|id| (id, (0, 0))).collect();
+                }
+            }
+            if targets.is_empty() {
                 return Err(anyhow!(
                     "no physical display to shield — the virtual display is \
-                     the only active one already"
+                     the only online one already"
                 ));
+            }
+
+            // Break any mirror a physical shares with the vd BEFORE shielding.
+            // On single-panel hardware macOS mirrors the vd onto the built-in
+            // panel, which is fatal to a window-based blank two ways: (1) the
+            // mirror set collapses to ONE screen in `NSScreen.screens` (the vd),
+            // so the helper — which shields everything in NSScreen minus the vd —
+            // has nothing separate to cover; (2) even if it did, a mirrored
+            // panel is the SAME framebuffer as the vd, so a black window can't
+            // hide one without hiding what the client sees. Un-mirroring makes
+            // the physical its own independent display the helper can cover while
+            // the vd stays visible to the client. `ConfigureForAppOnly` keeps it
+            // process-scoped (SIGKILL/crash auto-reverts, like capture's gamma
+            // and detach's disable); `Drop` restores the mirror on a clean
+            // disconnect. A no-op on hardware where the vd extends rather than
+            // mirrors (no target reports `mirrors_display() == vd`).
+            let broke_mirror: Vec<u32> = targets
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| CGDisplay::new(*id).mirrors_display() == virtual_display_id)
+                .collect();
+            if !broke_mirror.is_empty() {
+                let any = CGDisplay::new(virtual_display_id);
+                // kCGNullDirectDisplay (id 0) as the mirror master = "mirror
+                // nothing" = break the mirror.
+                let null_master = CGDisplay::new(0);
+                let unmirror = || -> Result<()> {
+                    let config = any.begin_configuration().map_err(|e| {
+                        anyhow!("CGBeginDisplayConfiguration (unmirror-tx): CGError {e}")
+                    })?;
+                    for id in &broke_mirror {
+                        CGDisplay::new(*id)
+                            .configure_display_mirror_of_display(&config, &null_master)
+                            .map_err(|e| {
+                                anyhow!(
+                                    "CGConfigureDisplayMirrorOfDisplay(break {id}): CGError {e}"
+                                )
+                            })?;
+                    }
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                        .map_err(|e| {
+                            anyhow!("CGCompleteDisplayConfiguration (unmirror-tx): CGError {e}")
+                        })
+                };
+                unmirror().context(
+                    "could not break the vd↔physical mirror — refusing to engage \
+                     --shield-primary rather than shield a display that shares the \
+                     client's framebuffer",
+                )?;
+                tracing::info!(
+                    unmirrored_count = broke_mirror.len(),
+                    "broke the vd→physical mirror so the built-in panel is a \
+                     separate, shieldable display (reverts on disconnect / exit)"
+                );
+                // Let the un-mirror settle so the newly-separate physical appears
+                // in NSScreen.screens AND the helper finishes the shield relayout
+                // its own screen-parameters observer kicks off, before we send the
+                // explicit SHOW below — otherwise SHOW races that relayout and the
+                // helper is too busy to answer within the read timeout (observed:
+                // the 1 s timeout firing while the helper's window was already up).
+                std::thread::sleep(Duration::from_millis(600));
             }
 
             // Raise the shields BEFORE the arrangement change. The origin tx
@@ -993,22 +1091,47 @@ mod macos {
             // Phrased as an exclude list so a monitor attached mid-session is
             // covered too (the helper re-derives on screen-layout changes) —
             // an include list is a snapshot and would silently miss it.
-            let shielded_count = crate::shield::show(&[virtual_display_id]).context(
-                "could not raise the shield windows — refusing to engage \
-                 --shield-primary rather than leave the desktop visible",
-            )?;
-            // The helper reports what it ACTUALLY covered. A display absent from
-            // NSScreen.screens (asleep, mid-wake) is skipped silently on its
-            // side, so without this check we would happily report a shielded
-            // desktop that is partly — or entirely — visible.
-            if usize::from(shielded_count) < targets.len() {
+            //
+            // Retry until the helper confirms it covered every target: right
+            // after a mirror-break the helper is relaying out its own shields
+            // from the screen-change notification and can be transiently slow to
+            // answer (read timeout) or answer before NSScreen has updated to
+            // include the newly-separate panel (a short count). Neither is a real
+            // failure; a retry a beat later succeeds. The ack (`count >= targets`)
+            // is what proves the desktop is actually covered — a display absent
+            // from NSScreen.screens (asleep/mid-wake) is skipped silently on the
+            // helper side, so without it we could report a shielded-but-visible
+            // desktop.
+            const SHOW_ATTEMPTS: usize = 4;
+            let need = targets.len();
+            let mut shielded_count = 0u16;
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 0..SHOW_ATTEMPTS {
+                match crate::shield::show(&[virtual_display_id]) {
+                    Ok(n) => {
+                        shielded_count = n;
+                        if usize::from(n) >= need {
+                            last_err = None;
+                            break;
+                        }
+                        last_err = Some(anyhow!(
+                            "shield helper covered only {n} of {need} display(s)"
+                        ));
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+                if attempt + 1 < SHOW_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+            if usize::from(shielded_count) < need {
                 let _ = crate::shield::hide();
-                return Err(anyhow!(
-                    "shield helper covered only {shielded_count} of {} physical \
-                     display(s) — refusing to engage --shield-primary rather than \
-                     leave one visible (a display may be asleep or mid-wake)",
-                    targets.len()
-                ));
+                return Err(last_err
+                    .unwrap_or_else(|| anyhow!("shield show failed"))
+                    .context(
+                        "could not raise the shield windows over every physical display \
+                     — refusing to engage --shield-primary rather than leave one visible",
+                    ));
             }
 
             // Arrangement: whether to move the vd to (0,0) as system main.
@@ -1113,6 +1236,7 @@ mod macos {
                 virtual_old_origin,
                 shielded: targets,
                 moved_arrangement: !keep_physical_main,
+                broke_mirror,
             })
         }
 
@@ -1162,9 +1286,46 @@ mod macos {
                 );
             }
 
+            // Restore any vd→physical mirror `install` broke, so the built-in
+            // panel shows the desktop again between sessions. The un-mirror was
+            // `ConfigureForAppOnly` (process-scoped), so it only self-reverts on
+            // process EXIT — a clean disconnect keeps the process alive, so we
+            // must re-mirror explicitly here or the built-in is left a separate,
+            // empty extended desktop. Best-effort: a failure only means the panel
+            // stays un-mirrored until the next connect or process exit.
+            if !self.broke_mirror.is_empty() {
+                let any = CGDisplay::new(self.virtual_id);
+                let vd = CGDisplay::new(self.virtual_id);
+                match any.begin_configuration() {
+                    Ok(config) => {
+                        for id in &self.broke_mirror {
+                            let _ = CGDisplay::new(*id)
+                                .configure_display_mirror_of_display(&config, &vd);
+                        }
+                        if let Err(e) = any
+                            .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                        {
+                            tracing::warn!(
+                                "shields lowered but re-mirror tx failed (CGError {e}); \
+                                 the built-in panel stays a separate display until the \
+                                 next connect or process exit"
+                            );
+                        } else {
+                            tracing::info!(
+                                remirrored_count = self.broke_mirror.len(),
+                                "restored the vd→physical mirror"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "shields lowered but could not begin re-mirror tx (CGError {e})"
+                    ),
+                }
+            }
+
             // In keep-physical-main mode `install` never moved the arrangement,
-            // so there is nothing to restore — lowering the shields is the whole
-            // teardown.
+            // so there is nothing to restore — lowering the shields (and any
+            // re-mirror above) is the whole teardown.
             if !self.moved_arrangement {
                 tracing::info!("lowered shields (no arrangement was moved)");
                 return;
