@@ -2469,17 +2469,19 @@ mod macos {
         ) -> *const std::ffi::c_void;
     }
 
-    /// Gather "stranded" windows — ones sitting entirely off the display the RDP
+    /// Gather "stranded" windows — ones sitting mostly off the display the RDP
     /// client sees — back onto that display. Under `--capture-primary` (and the
     /// other headless modes) a window opened on the physical panel keeps its old
     /// global coordinates, which fall outside the virtual display's region, so
     /// it's invisible/unclickable over RDP. Triggered on demand by Ctrl+Option+G,
     /// this moves every such window's top-left just inside the target display.
-    /// Windows that (even partly) overlap the target are left untouched,
-    /// so a window the user positioned on the virtual display is never disturbed;
-    /// only *regular* (Dock) GUI apps are considered, so menu-extras / system
-    /// panels are never yanked around. Best-effort AX — macrdp already holds the
-    /// Accessibility grant (for `CGEventPost`), so no extra permission/prompt.
+    /// A window is left untouched only if at least **half its area** is already on
+    /// the target, so a window the user positioned on the virtual display is never
+    /// disturbed, while one straddling the vd/physical boundary (mostly on the
+    /// blanked panel, poking a sliver onto the vd) is still swept rather than left
+    /// half-cut. Only *regular* (Dock) GUI apps are considered, so menu-extras /
+    /// system panels are never yanked around. Best-effort AX — macrdp already holds
+    /// the Accessibility grant (for `CGEventPost`), so no extra permission/prompt.
     /// Returns how many windows were moved. Triggered on demand by the
     /// Ctrl+Option+G hotkey (see `try_symbolic_hotkey`).
     pub(crate) fn gather_windows_onto_display(display_id: u32) -> usize {
@@ -2567,12 +2569,22 @@ mod macos {
                         // counts as stranded by its origin alone.
                         let (sw, sh) = read_pair(win, &size_attr, K_AX_VALUE_CGSIZE_TYPE)
                             .unwrap_or((1.0, 1.0));
-                        // Overlaps the target display at all? Leave it be.
-                        let overlaps = px < tx + tw && px + sw > tx && py < ty + th && py + sh > ty;
-                        if overlaps {
+                        // How much of the window lies on the target display?
+                        // Skip a window only if at least HALF its area is already
+                        // there — so a window straddling the vd/physical boundary
+                        // (mostly on the blanked panel, poking a sliver onto the vd)
+                        // is still swept, instead of being left half-cut. A window
+                        // fully off the target overlaps by 0 and is always moved; a
+                        // window fully on it overlaps 100% and is always left.
+                        let ix = (px + sw).min(tx + tw) - px.max(tx);
+                        let iy = (py + sh).min(ty + th) - py.max(ty);
+                        let on_target = ix.max(0.0) * iy.max(0.0);
+                        let win_area = (sw * sh).max(1.0);
+                        if on_target >= win_area * 0.5 {
+                            // Mostly (or fully) visible on the target — leave it be.
                             continue;
                         }
-                        // Stranded — move its top-left onto the target display.
+                        // Stranded (or mostly off) — move its top-left onto the target.
                         let np = CGPoint::new(nx, ny);
                         let val =
                             AXValueCreate(K_AX_VALUE_CGPOINT_TYPE, (&np as *const CGPoint).cast());
