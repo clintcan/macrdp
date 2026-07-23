@@ -318,13 +318,11 @@ struct ConnectionContext {
     /// `last_throttle_ship` does for the EGFX-on-UDP trickle. See [`frame_drop_at_floor`].
     last_floor_fps_pass: Instant,
     /// Blank-presentation detector state (the mstsc reconnect-blank; see
-    /// [`should_blank_recover`]). `qoe_reports` counts `on_qoe_metrics`
-    /// callbacks (reset per recovery attempt so a re-fire needs a fresh
-    /// all-zero window); `qoe_render_seen` latches true on the first report
-    /// with a nonzero decode+render time (`time_diff_dr > 0`) — the proof the
-    /// client actually presents, which disarms the detector for the connection.
-    qoe_reports: u64,
-    qoe_render_seen: bool,
+    /// [`should_blank_recover`]): consecutive zero / nonzero decode+render-time
+    /// streaks from `on_qoe_metrics`, reset per recovery attempt so a re-fire
+    /// needs a fresh window. See [`QoeEvidence`] for why this is a pair of
+    /// streaks and not a "has ever rendered" latch.
+    qoe: QoeEvidence,
     /// Recovery attempts this connection + when the last one ran (init to the
     /// connection epoch, which also serves as the arm-delay baseline).
     blank_recovery_attempts: u32,
@@ -443,6 +441,19 @@ struct BlankRecoveryParams {
     /// the auto-reconnect cookie — a hypothetical false positive now costs one
     /// client-driven reconnect, not a dead session.)
     min_qoe_reports: u64,
+    /// Consecutive nonzero-EDR reports that count as "the client is presenting"
+    /// and disarm the detector. **Sustained, not a single report** — see
+    /// [`QoeEvidence`] for the live case that forced this: a client can resume
+    /// reporting nonzero decode+render times after a recovery reactivation
+    /// while its picture stays black, and a one-report disarm then suppressed
+    /// the fallback drop forever. `MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS`,
+    /// default 3 — at the ~8 callbacks/s upstream delivers during active
+    /// decoding that is ~0.4 s, so a genuinely healthy session still disarms
+    /// long before the 3 s `arm_delay` lets the detector evaluate anything.
+    /// Deliberately NOT scaled by the RTT gate ([`blank_params_scaled`]):
+    /// raising it on a slow link would make the disarm *harder*, and slow links
+    /// are exactly where a false positive is most costly.
+    min_render_reports: u64,
     /// Don't evaluate before this much of the connection has elapsed — the
     /// connect-time surface/caps churn shouldn't race the detector.
     arm_delay: Duration,
@@ -566,6 +577,63 @@ fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
     cap > 0 && consecutive_drops >= cap
 }
 
+/// Raw QoE decode+render-time counters for the blank detector — pure tallies,
+/// no policy (the thresholds live in [`BlankRecoveryParams`]).
+///
+/// **Why streaks rather than a "has ever rendered" latch.** The original design
+/// latched `qoe_render_seen` on the *first* report with `time_diff_dr > 0` and
+/// never cleared it, on the reasoning that one nonzero EDR proves the client
+/// composited a frame. Live evidence (2026-07-22, Windows App for macOS)
+/// refuted that as a disarm condition: after a recovery *reactivation* the
+/// client resumed reporting nonzero decode+render times while the picture on
+/// screen stayed black. The latch made that permanent — the detector considered
+/// the session healed, so the fallback drop (the lever that actually recovers
+/// this client) could never fire, and the user had to reconnect by hand.
+///
+/// Two independent counters fix both halves of that:
+/// - `nonzero_streak` — consecutive nonzero-EDR reports. Requiring several
+///   ("sustained") means a brief post-reactivation blip no longer disarms.
+/// - `zero_streak` — consecutive all-zero reports, reset by ANY nonzero one.
+///   This is what makes the disarm revocable: a client that lapses back to
+///   zero rebuilds a full fresh evidence window and the detector re-fires.
+///
+/// `max_nonzero_streak` is the high-water mark of `nonzero_streak`, i.e. "did
+/// this connection ever genuinely present" — kept only to gate the wall-clock
+/// fast path (see [`should_blank_recover`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct QoeEvidence {
+    zero_streak: u64,
+    nonzero_streak: u64,
+    max_nonzero_streak: u64,
+}
+
+impl QoeEvidence {
+    /// Fold in one QoE frame-acknowledge.
+    fn record(&mut self, time_diff_dr: u16) {
+        if time_diff_dr > 0 {
+            self.zero_streak = 0;
+            self.nonzero_streak = self.nonzero_streak.saturating_add(1);
+            self.max_nonzero_streak = self.max_nonzero_streak.max(self.nonzero_streak);
+        } else {
+            self.nonzero_streak = 0;
+            self.zero_streak = self.zero_streak.saturating_add(1);
+        }
+    }
+
+    /// Clear the live streaks after a recovery attempt so a re-fire needs a
+    /// full fresh window. `max_nonzero_streak` survives — it is a fact about
+    /// the connection, not evidence for the current window.
+    fn reset_streaks(&mut self) {
+        self.zero_streak = 0;
+        self.nonzero_streak = 0;
+    }
+
+    /// Has this connection ever presented (sustained nonzero EDR)?
+    fn ever_presented(&self, min_render_reports: u64) -> bool {
+        self.max_nonzero_streak >= min_render_reports
+    }
+}
+
 /// Decide whether to run a blank-recovery attempt. Pure (counters + Durations,
 /// not a clock) so it's unit-testable without timing.
 ///
@@ -580,11 +648,12 @@ fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
 /// attempt number: remap to a fresh surface, or drop the connection.
 ///
 /// Each clause guards a distinct failure mode:
-/// - `qoe_reports >= min_qoe_reports`: enough evidence, and implies the client
+/// - `zero_streak >= min_qoe_reports`: enough evidence, and implies the client
 ///   actually sends QoE acks at all (FreeRDP-family clients that don't are
 ///   simply never evaluated — no false recovery on non-QoE clients).
-/// - `!qoe_render_seen`: a single nonzero EDR proves presentation and disarms
-///   the detector for the connection.
+/// - `!presenting_now`: a SUSTAINED run of nonzero EDR proves presentation and
+///   disarms the detector — see [`QoeEvidence`] for why a single report is not
+///   enough and why the disarm has to be revocable.
 /// - `egfx_acks_seen && !acks_suspended`: regular FrameAcks flowing too — the
 ///   blank signature is "acking normally while EDR stays zero", not a stalled
 ///   or suspended client (those are congestion, handled elsewhere).
@@ -594,8 +663,7 @@ fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
 ///   fresh connection starts a fresh detector.
 #[allow(clippy::too_many_arguments)]
 fn should_blank_recover(
-    qoe_reports: u64,
-    qoe_render_seen: bool,
+    qoe: QoeEvidence,
     egfx_acks_seen: bool,
     acks_suspended: bool,
     since_connect: Duration,
@@ -603,17 +671,30 @@ fn should_blank_recover(
     attempts: u32,
     p: &BlankRecoveryParams,
 ) -> bool {
+    // "Presenting" = the LAST `min_render_reports` reports were all nonzero.
+    // Streak, not a latch: a client that goes back to reporting zero (the
+    // post-reactivation relapse) re-arms the detector automatically, because a
+    // single zero report resets the streak.
+    let presenting_now = qoe.nonzero_streak >= p.min_render_reports;
+    // "Has presented at some point this connection" — only used to withhold the
+    // aggressive wall-clock fast path (see below). Deliberately NOT revocable:
+    // once a client has genuinely presented, a relapse must clear the full
+    // count window before we act, so a stray zero can't trigger a drop.
+    let ever_presented = qoe.ever_presented(p.min_render_reports);
     // Blank evidence: EITHER the full all-zero report count (fast on an active
     // screen) OR — for a STATIC blank whose QoE trickles in slowly — enough
     // wall-clock elapsed with at least `blank_min_reports` all-zero reports
     // (which rules out a client that sends no QoE, e.g. FreeRDP, from ever
-    // firing on the wall-clock branch). That floor plus `!qoe_render_seen`
-    // means "a QoE client that has reported only zero decode+render time" — a
-    // real blank on a trustworthy-RTT link (the RTT gate handles the rest).
-    let blank_evidence = qoe_reports >= p.min_qoe_reports
-        || (since_connect >= p.blank_max_wait && qoe_reports >= p.blank_min_reports);
+    // firing on the wall-clock branch). The fast path additionally requires
+    // that the client has never presented: with `blank_min_reports` as low as
+    // 1, a single stray zero from a healthy long-running session would
+    // otherwise satisfy it.
+    let blank_evidence = qoe.zero_streak >= p.min_qoe_reports
+        || (since_connect >= p.blank_max_wait
+            && qoe.zero_streak >= p.blank_min_reports
+            && !ever_presented);
     blank_evidence
-        && !qoe_render_seen
+        && !presenting_now
         && egfx_acks_seen
         && !acks_suspended
         && since_connect >= p.arm_delay
@@ -1154,6 +1235,7 @@ impl Gfx {
             .unwrap_or(true);
         let blank_params = BlankRecoveryParams {
             min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 24)),
+            min_render_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS", 3)),
             arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
             retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 4000),
             // Reactivate-first needs ≥2 attempts so, if the reactivation ever
@@ -1399,7 +1481,8 @@ impl Gfx {
                 // A presenting connection clears the reconnect-storm guard: the
                 // consecutive-drop counter only tracks UNBROKEN runs of
                 // blank-dropped connections (see `blank_drop_capped`).
-                if ctx.qoe_render_seen && self.consecutive_blank_drops.load(Ordering::Relaxed) != 0
+                if ctx.qoe.ever_presented(self.blank_params.min_render_reports)
+                    && self.consecutive_blank_drops.load(Ordering::Relaxed) != 0
                 {
                     self.consecutive_blank_drops.store(0, Ordering::Relaxed);
                     debug!("EGFX connection presented — consecutive blank-drop counter reset");
@@ -1438,8 +1521,7 @@ impl Gfx {
                 // never the frame path — this whole branch is decision-only.
                 if effective_params.as_ref().is_some_and(|p| {
                     should_blank_recover(
-                        ctx.qoe_reports,
-                        ctx.qoe_render_seen,
+                        ctx.qoe,
                         ctx.egfx_acks_seen,
                         ctx.acks_suspended,
                         now.saturating_duration_since(ctx.epoch),
@@ -1483,8 +1565,9 @@ impl Gfx {
                     } else {
                         ctx.blank_recovery_attempts += 1;
                         ctx.last_blank_recovery_at = now;
-                        let evidence = ctx.qoe_reports;
-                        ctx.qoe_reports = 0;
+                        let evidence = ctx.qoe.zero_streak;
+                        let presented_before = ctx.qoe.max_nonzero_streak;
+                        ctx.qoe.reset_streaks();
                         let (w, h) = ctx.dims;
                         if action == BlankAction::Reactivate {
                             // The surface survives the core reactivation, so the
@@ -1511,6 +1594,10 @@ impl Gfx {
                             attempt = ctx.blank_recovery_attempts,
                             max_attempts = self.blank_params.max_attempts,
                             qoe_reports_all_zero = evidence,
+                            // >0 means this connection HAD presented and lapsed
+                            // back to zero EDR — the post-reactivation relapse
+                            // the streak-based disarm exists to catch.
+                            longest_render_run_before = presented_before,
                             "EGFX client is decoding but not presenting (QoE decode+render \
                              time zero across the whole window — the reconnect-blank) — \
                              running blank recovery"
@@ -2488,8 +2575,7 @@ impl GfxServerFactory for Gfx {
             adaptive_delay_ewma: 0.0,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
-            qoe_reports: 0,
-            qoe_render_seen: false,
+            qoe: QoeEvidence::default(),
             blank_recovery_attempts: 0,
             last_blank_recovery_at: Instant::now(),
             link_rtt_ms,
@@ -2695,14 +2781,16 @@ impl GraphicsPipelineHandler for GfxHandler {
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
         trace!(?metrics, "EGFX on_qoe_metrics");
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
-            ctx.qoe_reports = ctx.qoe_reports.saturating_add(1);
-            if metrics.time_diff_dr > 0 && !ctx.qoe_render_seen {
-                ctx.qoe_render_seen = true;
+            let was = ctx.qoe;
+            ctx.qoe.record(metrics.time_diff_dr);
+            if metrics.time_diff_dr > 0 && was.nonzero_streak == 0 {
                 debug!(
                     frame_id = metrics.frame_id,
                     time_diff_dr = metrics.time_diff_dr,
-                    "EGFX first nonzero QoE decode+render time — client is presenting \
-                     (blank detector disarmed for this connection)"
+                    zero_streak_broken = was.zero_streak,
+                    "EGFX nonzero QoE decode+render time — client is presenting (the blank \
+                     detector disarms once the nonzero run is sustained, and re-arms if it \
+                     lapses back to zero)"
                 );
             }
         }
@@ -3254,9 +3342,24 @@ mod tests {
 
     // ---- Blank-presentation detector (reconnect-blank resize dance) ----
 
+    /// `(zero_streak, nonzero_streak, max_nonzero_streak)` — note the first two
+    /// are mutually exclusive in reality (either kind of report resets the
+    /// other), so a realistic "was presenting, now blank" state is
+    /// `qoe(N, 0, M)`.
+    fn qoe(zero: u64, nonzero: u64, max_nonzero: u64) -> QoeEvidence {
+        QoeEvidence {
+            zero_streak: zero,
+            nonzero_streak: nonzero,
+            max_nonzero_streak: max_nonzero,
+        }
+    }
+
     fn blank_params() -> BlankRecoveryParams {
         BlankRecoveryParams {
             min_qoe_reports: 120,
+            // 3 = the production default; the sustained-disarm tests assert
+            // against this value directly.
+            min_render_reports: 3,
             arm_delay: ms(3000),
             retry_interval: ms(5000),
             max_attempts: 2,
@@ -3300,14 +3403,16 @@ mod tests {
         let s = blank_params_scaled(&p, 2.0);
         assert_eq!(s.min_qoe_reports, 240);
         assert_eq!(s.arm_delay, ms(6000));
-        // Attempt spacing/caps untouched.
+        // Attempt spacing/caps untouched — and so is the presenting threshold:
+        // scaling it up on a slow link would make the DISARM harder, which is
+        // backwards (slow links are where a false positive costs most).
+        assert_eq!(s.min_render_reports, p.min_render_reports);
         assert_eq!(s.retry_interval, p.retry_interval);
         assert_eq!(s.max_attempts, p.max_attempts);
         assert_eq!(s.max_consecutive_drops, p.max_consecutive_drops);
         // A window that fires at 1× must NOT fire mid-window at 2×.
         assert!(should_blank_recover(
-            150,
-            false,
+            qoe(150, 0, 0),
             true,
             false,
             ms(7000),
@@ -3316,8 +3421,7 @@ mod tests {
             &p
         ));
         assert!(!should_blank_recover(
-            150,
-            false,
+            qoe(150, 0, 0),
             true,
             false,
             ms(7000),
@@ -3352,13 +3456,40 @@ mod tests {
     }
 
     #[test]
+    fn qoe_evidence_streaks_reset_each_other() {
+        let mut q = QoeEvidence::default();
+        for _ in 0..5 {
+            q.record(0);
+        }
+        assert_eq!(q, qoe(5, 0, 0));
+        // One nonzero report clears the all-zero evidence outright.
+        q.record(7);
+        assert_eq!(q, qoe(0, 1, 1));
+        q.record(9);
+        assert_eq!(q, qoe(0, 2, 2));
+        // …and one zero report clears the nonzero run, but not its high-water
+        // mark (that is what "did this connection ever present" reads).
+        q.record(0);
+        assert_eq!(q, qoe(1, 0, 2));
+        assert!(!q.ever_presented(3));
+        for _ in 0..3 {
+            q.record(4);
+        }
+        assert_eq!(q, qoe(0, 3, 3));
+        assert!(q.ever_presented(3));
+        // A recovery attempt clears the live streaks only.
+        q.reset_streaks();
+        assert_eq!(q, qoe(0, 0, 3));
+        assert!(q.ever_presented(3));
+    }
+
+    #[test]
     fn blank_recovery_fires_on_the_pcap_signature() {
         // The captured blank session: QoE reports flowing (well past the window),
         // zero render-time ever, regular acks alive, connection well past arm.
         let p = blank_params();
         assert!(should_blank_recover(
-            131,
-            false,
+            qoe(131, 0, 0),
             true,
             false,
             ms(10_000),
@@ -3369,13 +3500,86 @@ mod tests {
     }
 
     #[test]
-    fn blank_recovery_disarmed_by_a_single_nonzero_render_time() {
-        // A rendering session shows nonzero EDR within ~60 ms of the first frame —
-        // one report disarms the detector no matter what else holds.
+    fn blank_recovery_disarmed_while_the_client_is_presenting() {
+        // A rendering session shows nonzero EDR within ~60 ms of the first
+        // frame; a sustained run of them disarms the detector no matter what
+        // else holds.
         let p = blank_params();
         assert!(!should_blank_recover(
-            10_000,
+            qoe(0, 3, 3),
             true,
+            false,
+            ms(60_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // A long healthy run is likewise never touched.
+        assert!(!should_blank_recover(
+            qoe(0, 5_000, 5_000),
+            true,
+            false,
+            ms(60_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_not_disarmed_by_a_brief_nonzero_blip() {
+        // THE 2026-07-22 REGRESSION (Windows App for macOS): after a recovery
+        // reactivation the client emitted a couple of nonzero decode+render
+        // times while its picture stayed black. Under the old "first nonzero
+        // report latches" disarm that suppressed the fallback drop for the rest
+        // of the connection and the user had to reconnect by hand. A run
+        // shorter than `min_render_reports` must NOT count as presenting.
+        let p = blank_params();
+        assert_eq!(p.min_render_reports, 3);
+        // Two nonzero reports, then back to a full all-zero window.
+        assert!(should_blank_recover(
+            qoe(200, 0, 2),
+            true,
+            false,
+            ms(10_000),
+            ms(10_000),
+            1, // i.e. the reactivation already ran; this is the fallback drop
+            &p
+        ));
+        // Mid-blip (the blip itself is the most recent report) it still holds
+        // off — 2 < 3, but there is no fresh all-zero evidence either.
+        assert!(!should_blank_recover(
+            qoe(0, 2, 2),
+            true,
+            false,
+            ms(10_000),
+            ms(10_000),
+            1,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_re_arms_after_a_relapse() {
+        // The disarm is revocable: a client that genuinely presented (long
+        // nonzero run) and then lapses back to zero EDR rebuilds a full fresh
+        // all-zero window and the detector fires again. This is what makes the
+        // reactivation → still-black → drop escalation reachable.
+        let p = blank_params();
+        assert!(should_blank_recover(
+            qoe(200, 0, 5_000),
+            true,
+            false,
+            ms(60_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // A relapse must clear the FULL count window, not the aggressive
+        // wall-clock fast path — so a short zero run after a healthy session
+        // holds off (a stray zero can't drop a working connection).
+        assert!(!should_blank_recover(
+            qoe(5, 0, 5_000),
             true,
             false,
             ms(60_000),
@@ -3391,8 +3595,7 @@ mod tests {
         // so the count never reaches the window and the dance never fires).
         let p = blank_params();
         assert!(!should_blank_recover(
-            119,
-            false,
+            qoe(119, 0, 0),
             true,
             false,
             ms(10_000),
@@ -3401,8 +3604,7 @@ mod tests {
             &p
         ));
         assert!(!should_blank_recover(
-            0,
-            false,
+            qoe(0, 0, 0),
             true,
             false,
             ms(10_000),
@@ -3417,8 +3619,7 @@ mod tests {
         let p = blank_params();
         // No regular FrameAcks seen → not the blank signature.
         assert!(!should_blank_recover(
-            200,
-            false,
+            qoe(200, 0, 0),
             false,
             false,
             ms(10_000),
@@ -3428,8 +3629,7 @@ mod tests {
         ));
         // Acks suspended (queueDepth sentinel) → congestion territory, not blank.
         assert!(!should_blank_recover(
-            200,
-            false,
+            qoe(200, 0, 0),
             true,
             true,
             ms(10_000),
@@ -3444,8 +3644,7 @@ mod tests {
         let p = blank_params();
         // Inside the connect-time arm delay → hold.
         assert!(!should_blank_recover(
-            200,
-            false,
+            qoe(200, 0, 0),
             true,
             false,
             ms(2999),
@@ -3455,8 +3654,7 @@ mod tests {
         ));
         // Too soon after the previous dance → hold.
         assert!(!should_blank_recover(
-            200,
-            false,
+            qoe(200, 0, 0),
             true,
             false,
             ms(10_000),
@@ -3466,8 +3664,7 @@ mod tests {
         ));
         // Attempts exhausted → give up (client-side floor).
         assert!(!should_blank_recover(
-            200,
-            false,
+            qoe(200, 0, 0),
             true,
             false,
             ms(60_000),
@@ -3477,8 +3674,7 @@ mod tests {
         ));
         // Second attempt inside the cap, past the spacing → fires.
         assert!(should_blank_recover(
-            200,
-            false,
+            qoe(200, 0, 0),
             true,
             false,
             ms(10_000),
@@ -3499,20 +3695,31 @@ mod tests {
         };
         assert!(p.min_qoe_reports > 3, "test assumes a high count threshold");
         assert!(should_blank_recover(
-            4,          // few reports (< min_qoe_reports), but >= 3
-            false,      // never rendered
-            true,       // acks flowing
-            false,      // not suspended
-            ms(8000),   // == blank_max_wait
-            ms(60_000), // long since last attempt
+            qoe(4, 0, 0), // few reports (< min_qoe_reports) but >= 3, never rendered
+            true,         // acks flowing
+            false,        // not suspended
+            ms(8000),     // == blank_max_wait
+            ms(60_000),   // long since last attempt
+            0,
+            &p
+        ));
+        // …but NOT once the client has genuinely presented at some point. With
+        // the production `blank_min_reports` of 1, a single stray zero report
+        // from a healthy long-running session would otherwise satisfy this
+        // branch and drop a working connection.
+        assert!(!should_blank_recover(
+            qoe(4, 0, 3),
+            true,
+            false,
+            ms(8000),
+            ms(60_000),
             0,
             &p
         ));
         // Same but only 2 reports → the >=3 floor blocks it (guards a client
         // that sends no / almost no QoE, e.g. FreeRDP, from ever firing here).
         assert!(!should_blank_recover(
-            2,
-            false,
+            qoe(2, 0, 0),
             true,
             false,
             ms(8000),
@@ -3522,8 +3729,7 @@ mod tests {
         ));
         // Zero reports (QoE-less client) never fires on the wall-clock path.
         assert!(!should_blank_recover(
-            0,
-            false,
+            qoe(0, 0, 0),
             true,
             false,
             ms(30_000),
@@ -3534,8 +3740,7 @@ mod tests {
         // Before blank_max_wait, with a low count → still holds (neither path
         // is satisfied yet).
         assert!(!should_blank_recover(
-            4,
-            false,
+            qoe(4, 0, 0),
             true,
             false,
             ms(7999),

@@ -390,6 +390,7 @@ MACRDP_BLANK_RECOVERY=1                # 0 disables the detector entirely
 MACRDP_BLANK_RECOVERY_REACTIVATE=1     # 1 = reactivate-in-place (heals mstsc); 0 = fall back to drop
 MACRDP_BLANK_RECOVERY_MAX_RTT_MS=80    # withhold recovery at/above this link RTT (0 = no gate)
 MACRDP_BLANK_RECOVERY_MIN_QOE=24       # all-zero QoE reports for the count path (~3 s of active decode)
+MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS=3  # CONSECUTIVE nonzero decode+render reports that count as "presenting" and disarm the detector (a shorter blip doesn't, and a lapse back to zero re-arms it)
 MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank
 MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS=1  # min all-zero reports the fast-path needs (rules out QoE-less clients)
 MACRDP_BLANK_RECOVERY_ARM_MS=3000      # skip the connect-time churn window
