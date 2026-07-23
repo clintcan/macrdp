@@ -110,7 +110,21 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   mode refuses to engage if that is short, so the
                           #   failure is at least detected. If the helper dies
                           #   mid-session the panel becomes visible and nothing
-                          #   restarts it. Config: PRIMARY_MODE=shield.
+                          #   restarts it.
+                          #   SINGLE-PANEL hardware (a MacBook with no external
+                          #   display): macOS auto-mirrors the vd onto the
+                          #   built-in panel, so on connect the mode BREAKS that
+                          #   mirror (process-scoped; auto-reverts on crash,
+                          #   restored on disconnect — and on a failed engage)
+                          #   and moves the panel aside so app windows land on
+                          #   the display the client sees. Side effects there:
+                          #   the vd becomes the system main display (lock-
+                          #   while-shielded is UNVERIFIED on this hardware),
+                          #   and when the vd is larger than the panel the Dock
+                          #   + menu bar land on the vd — so the remote gets
+                          #   them despite keep-physical-main. See the shield
+                          #   single-panel note in docs/known-quirks.md.
+                          #   Config: PRIMARY_MODE=shield.
                           #   Env: MACRDP_SHIELD_HELPER (path override),
                           #   MACRDP_SHIELD_PORT (default 40244). macOS-only.
 --restore-windows-on-disconnect  # Make windows follow you between the local
