@@ -1073,12 +1073,101 @@ mod macos {
                     "broke the vd→physical mirror so the built-in panel is a \
                      separate, shieldable display (reverts on disconnect / exit)"
                 );
-                // Let the un-mirror settle so the newly-separate physical appears
-                // in NSScreen.screens AND the helper finishes the shield relayout
-                // its own screen-parameters observer kicks off, before we send the
-                // explicit SHOW below — otherwise SHOW races that relayout and the
-                // helper is too busy to answer within the read timeout (observed:
-                // the 1 s timeout firing while the helper's window was already up).
+
+                // Displace the newly-separate physical(s) OFF the vd's origin —
+                // load-bearing on single-panel auto-mirror hardware, and the fix
+                // for "reconnect shows my windows, then a few seconds later the
+                // desktop goes blank" (2026-07-22). Breaking the mirror leaves
+                // the built-in panel a SEPARATE framebuffer that still sits at
+                // the SAME bounds as the vd (both at (0,0), 1728×1084 here). The
+                // user's app windows stay on the built-in; the client watches the
+                // vd; so once the mirror breaks the client sees an empty vd
+                // (wallpaper + its own menu bar) — the "reset to blank desktop".
+                // The window-gather (capture.rs, on the connect re-mode) is meant
+                // to sweep those windows onto the vd, but with both displays at
+                // IDENTICAL bounds "move to the vd's top-left" is also inside the
+                // physical, so macOS keeps the window there and the sweep is a
+                // no-op. Moving the physical aside (x = vd_width) gives the vd
+                // sole ownership of (0,0): the windows travel with the physical,
+                // land off the vd, and the gather then relocates them onto the vd
+                // unambiguously — exactly how the keep_physical_main=false
+                // `arrange()` path already works. ForAppOnly so a SIGKILL/crash
+                // auto-reverts (like the mirror-break itself); Drop's re-mirror
+                // resets the origin regardless, so no extra restore is needed.
+                // Only fires when a mirror was actually broken, so multi-panel
+                // hardware (physicals already at their own origins) is untouched.
+                let displace = || -> Result<()> {
+                    let any = CGDisplay::new(virtual_display_id);
+                    let config = any.begin_configuration().map_err(|e| {
+                        anyhow!("CGBeginDisplayConfiguration (displace-tx): CGError {e}")
+                    })?;
+                    // Pin the vd at (0,0) so it owns the origin the client sees…
+                    vd.configure_display_origin(&config, 0, 0)
+                        .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
+                    // …and push each unmirrored physical to the right of it.
+                    let mut x_off = vd_width;
+                    for id in &broke_mirror {
+                        let d = CGDisplay::new(*id);
+                        d.configure_display_origin(&config, x_off, 0).map_err(|e| {
+                            anyhow!(
+                                "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
+                            )
+                        })?;
+                        x_off += d.bounds().size.width.round().max(1.0) as i32;
+                    }
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                        .map_err(|e| {
+                            anyhow!("CGCompleteDisplayConfiguration (displace-tx): CGError {e}")
+                        })
+                };
+                // Non-fatal: if the displace fails the shield still covers the
+                // panel (privacy intact); the only loss is the client seeing an
+                // empty vd until a manual Ctrl+Alt+G. Don't strand the session.
+                if let Err(e) = displace() {
+                    tracing::warn!(
+                        error = %e,
+                        "could not displace the shielded physical off the vd origin — the \
+                         remote may see an empty desktop until Ctrl+Alt+G gathers windows"
+                    );
+                } else {
+                    tracing::info!(
+                        displaced_count = broke_mirror.len(),
+                        "moved the shielded physical panel(s) off the vd origin so app \
+                         windows gather onto the display the client sees"
+                    );
+                    // The displace pushed the user's windows OFF the vd (they
+                    // travelled with the physical). Now pull them back onto the
+                    // vd — this is the step that actually makes the client see
+                    // them. Detached + delayed so it runs after the shields are
+                    // up and the displace has registered in the WindowServer,
+                    // and doesn't block this watcher-task's install. Two sweeps
+                    // for the same reason capture.rs uses two: the WindowServer
+                    // relayout from the displace has variable timing and can
+                    // trail the first sweep. A no-op second sweep is cheap.
+                    let vd_for_gather = virtual_display_id;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(900));
+                        let first = crate::input::gather_windows_onto_display(vd_for_gather);
+                        std::thread::sleep(Duration::from_millis(1000));
+                        let second = crate::input::gather_windows_onto_display(vd_for_gather);
+                        if first > 0 || second > 0 {
+                            tracing::info!(
+                                first,
+                                second,
+                                display_id = vd_for_gather,
+                                "gathered windows onto the vd after displacing the shielded panel"
+                            );
+                        }
+                    });
+                }
+
+                // Let the un-mirror + displace settle so the newly-separate
+                // physical appears in NSScreen.screens AND the helper finishes
+                // the shield relayout its own screen-parameters observer kicks
+                // off, before we send the explicit SHOW below — otherwise SHOW
+                // races that relayout and the helper is too busy to answer within
+                // the read timeout (observed: the 1 s timeout firing while the
+                // helper's window was already up).
                 std::thread::sleep(Duration::from_millis(600));
             }
 
