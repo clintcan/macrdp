@@ -454,6 +454,26 @@ struct BlankRecoveryParams {
     /// raising it on a slow link would make the disarm *harder*, and slow links
     /// are exactly where a false positive is most costly.
     min_render_reports: u64,
+    /// Consecutive nonzero-EDR reports that mark a session as ESTABLISHED
+    /// (presented for a meaningful stretch, presumed healthy). At the ~8
+    /// callbacks/s active cadence the default 40 is ~5 s of continuous
+    /// presentation. Above this bar a relapse to zero EDR is treated as
+    /// probably-transient and held to `established_min_qoe` instead of the
+    /// aggressive `min_qoe_reports`; below it (a never/barely-presented
+    /// connection, incl. a post-reactivation few-frame flicker) the aggressive
+    /// connect-blank path applies. Deliberately HIGHER than `min_render_reports`
+    /// (the few-frame disarm) — the two gate opposite things. NOT RTT-scaled.
+    /// `MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS`.
+    established_render_reports: u64,
+    /// All-zero QoE window required to recover an ESTABLISHED session (see
+    /// `established_render_reports`). Much larger than `min_qoe_reports`: this
+    /// client has ~3 s windows where it stops reporting nonzero EDR while
+    /// displaying fine, and the aggressive count dropped a healthy 12-minute
+    /// session live (2026-07-22). At ~8/s the default 160 is ~20 s of sustained
+    /// zeros — long enough that a transient clears first, while a genuine (rare)
+    /// mid-session blackout still eventually recovers. RTT-scaled like
+    /// `min_qoe_reports`. `MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE`.
+    established_min_qoe: u64,
     /// Don't evaluate before this much of the connection has elapsed — the
     /// connect-time surface/caps churn shouldn't race the detector.
     arm_delay: Duration,
@@ -632,6 +652,18 @@ impl QoeEvidence {
     fn ever_presented(&self, min_render_reports: u64) -> bool {
         self.max_nonzero_streak >= min_render_reports
     }
+
+    /// Has this connection presented for a MEANINGFUL stretch — i.e. it is an
+    /// established, presumed-healthy session rather than one that merely
+    /// flickered a few frames? Distinct from [`ever_presented`] (a much lower
+    /// bar) because the two gate opposite things: a few-frame blip must still
+    /// be treated as a suspicious (probably still-blank) connection and
+    /// recovered aggressively, whereas a session that genuinely showed the
+    /// desktop for seconds must tolerate a transient zero-EDR window without
+    /// being dropped. See [`should_blank_recover`].
+    fn established(&self, established_render_reports: u64) -> bool {
+        self.max_nonzero_streak >= established_render_reports
+    }
 }
 
 /// Decide whether to run a blank-recovery attempt. Pure (counters + Durations,
@@ -676,23 +708,38 @@ fn should_blank_recover(
     // post-reactivation relapse) re-arms the detector automatically, because a
     // single zero report resets the streak.
     let presenting_now = qoe.nonzero_streak >= p.min_render_reports;
-    // "Has presented at some point this connection" — only used to withhold the
-    // aggressive wall-clock fast path (see below). Deliberately NOT revocable:
-    // once a client has genuinely presented, a relapse must clear the full
-    // count window before we act, so a stray zero can't trigger a drop.
-    let ever_presented = qoe.ever_presented(p.min_render_reports);
+    // Established = the session presented for a MEANINGFUL stretch, so it is
+    // presumed healthy. This is the false-positive fix (2026-07-22): this
+    // client (Windows App for macOS) has brief windows — a few seconds — where
+    // it stops reporting nonzero EDR while still displaying fine. On a
+    // never/barely-presented connection those zeros are the reconnect-blank and
+    // we act in ~3 s; on an ESTABLISHED session they are almost always one of
+    // those transients, so requiring only `min_qoe_reports` (~3 s) dropped a
+    // healthy 12-minute session live. An established session therefore needs a
+    // much longer sustained zero window (`established_min_qoe`, ~20 s) — long
+    // enough that a hiccup clears first, while a genuine (rare) mid-session
+    // blackout still eventually recovers. `established_render_reports` (~5 s of
+    // presentation) is deliberately a HIGHER bar than `min_render_reports` (the
+    // few-frame disarm), so a post-reactivation few-frame flicker stays on the
+    // aggressive path and the reconnect-blank escalation is unaffected.
+    let established = qoe.established(p.established_render_reports);
+    let count_threshold = if established {
+        p.established_min_qoe
+    } else {
+        p.min_qoe_reports
+    };
     // Blank evidence: EITHER the full all-zero report count (fast on an active
     // screen) OR — for a STATIC blank whose QoE trickles in slowly — enough
     // wall-clock elapsed with at least `blank_min_reports` all-zero reports
     // (which rules out a client that sends no QoE, e.g. FreeRDP, from ever
-    // firing on the wall-clock branch). The fast path additionally requires
-    // that the client has never presented: with `blank_min_reports` as low as
-    // 1, a single stray zero from a healthy long-running session would
-    // otherwise satisfy it.
-    let blank_evidence = qoe.zero_streak >= p.min_qoe_reports
+    // firing on the wall-clock branch). The wall-clock fast path is withheld
+    // once the session is established: with `blank_min_reports` as low as 1, a
+    // single stray zero from a healthy long-running session would otherwise
+    // satisfy it.
+    let blank_evidence = qoe.zero_streak >= count_threshold
         || (since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
-            && !ever_presented);
+            && !established);
     blank_evidence
         && !presenting_now
         && egfx_acks_seen
@@ -727,6 +774,7 @@ fn blank_rtt_gate(link_rtt_ms: u32, max_rtt_ms: u32) -> Option<f64> {
 fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParams {
     BlankRecoveryParams {
         min_qoe_reports: ((p.min_qoe_reports as f64) * mult).ceil() as u64,
+        established_min_qoe: ((p.established_min_qoe as f64) * mult).ceil() as u64,
         arm_delay: p.arm_delay.mul_f64(mult),
         blank_max_wait: p.blank_max_wait.mul_f64(mult),
         ..*p
@@ -1236,6 +1284,14 @@ impl Gfx {
         let blank_params = BlankRecoveryParams {
             min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 24)),
             min_render_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS", 3)),
+            established_render_reports: u64::from(env_u32(
+                "MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS",
+                40,
+            )),
+            established_min_qoe: u64::from(env_u32(
+                "MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE",
+                160,
+            )),
             arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
             retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 4000),
             // Reactivate-first needs ≥2 attempts so, if the reactivation ever
@@ -3360,6 +3416,12 @@ mod tests {
             // 3 = the production default; the sustained-disarm tests assert
             // against this value directly.
             min_render_reports: 3,
+            // Established tier: a run of >= 50 nonzero reports marks a healthy
+            // session, which then needs >= 600 all-zero to recover. Both are
+            // well clear of the count-based tests' small values so they don't
+            // interfere; the established-tier tests assert against these.
+            established_render_reports: 50,
+            established_min_qoe: 600,
             arm_delay: ms(3000),
             retry_interval: ms(5000),
             max_attempts: 2,
@@ -3402,11 +3464,15 @@ mod tests {
         let p = blank_params();
         let s = blank_params_scaled(&p, 2.0);
         assert_eq!(s.min_qoe_reports, 240);
+        // The established-tier window scales the same way.
+        assert_eq!(s.established_min_qoe, 1200);
         assert_eq!(s.arm_delay, ms(6000));
-        // Attempt spacing/caps untouched — and so is the presenting threshold:
-        // scaling it up on a slow link would make the DISARM harder, which is
-        // backwards (slow links are where a false positive costs most).
+        // Attempt spacing/caps untouched — and so are the presentation-quality
+        // thresholds: scaling those up on a slow link would make the DISARM (or
+        // the established bar) harder, which is backwards (slow links are where
+        // a false positive costs most).
         assert_eq!(s.min_render_reports, p.min_render_reports);
+        assert_eq!(s.established_render_reports, p.established_render_reports);
         assert_eq!(s.retry_interval, p.retry_interval);
         assert_eq!(s.max_attempts, p.max_attempts);
         assert_eq!(s.max_consecutive_drops, p.max_consecutive_drops);
@@ -3560,13 +3626,19 @@ mod tests {
     }
 
     #[test]
-    fn blank_recovery_re_arms_after_a_relapse() {
-        // The disarm is revocable: a client that genuinely presented (long
-        // nonzero run) and then lapses back to zero EDR rebuilds a full fresh
-        // all-zero window and the detector fires again. This is what makes the
-        // reactivation → still-black → drop escalation reachable.
+    fn blank_recovery_re_arms_after_a_relapse_but_only_on_a_long_window() {
+        // THE 2026-07-22 FALSE POSITIVE (Windows App for macOS): a healthy
+        // 12-minute session briefly (~3 s) stopped reporting nonzero EDR while
+        // displaying fine, and the revocable disarm dropped it. So an
+        // ESTABLISHED session (max_nonzero >= established_render_reports = 50)
+        // must NOT fire on the aggressive `min_qoe_reports` window — a relapse
+        // that short is almost always a transient.
         let p = blank_params();
-        assert!(should_blank_recover(
+        assert_eq!(p.established_render_reports, 50);
+        assert_eq!(p.established_min_qoe, 600);
+        // 200 all-zero on a long-presented session: over the aggressive 120,
+        // but under the established 600 → HOLD (the transient window).
+        assert!(!should_blank_recover(
             qoe(200, 0, 5_000),
             true,
             false,
@@ -3575,9 +3647,7 @@ mod tests {
             0,
             &p
         ));
-        // A relapse must clear the FULL count window, not the aggressive
-        // wall-clock fast path — so a short zero run after a healthy session
-        // holds off (a stray zero can't drop a working connection).
+        // A stray/short zero run likewise holds off.
         assert!(!should_blank_recover(
             qoe(5, 0, 5_000),
             true,
@@ -3585,6 +3655,47 @@ mod tests {
             ms(60_000),
             ms(60_000),
             0,
+            &p
+        ));
+        // But the disarm is still REVOCABLE: a genuinely sustained blackout
+        // (>= established_min_qoe of continuous zeros) DOES eventually fire, so
+        // a real mid-session blank still recovers.
+        assert!(should_blank_recover(
+            qoe(600, 0, 5_000),
+            true,
+            false,
+            ms(60_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_barely_presented_stays_aggressive() {
+        // A few-frame flicker (e.g. a post-reactivation blip) is BELOW the
+        // established bar, so it keeps the aggressive connect-blank window — the
+        // reconnect-blank escalation must not be slowed by the established-tier
+        // leniency.
+        let p = blank_params();
+        // max_nonzero 40 < established 50 → aggressive min_qoe 120 applies.
+        assert!(should_blank_recover(
+            qoe(120, 0, 40),
+            true,
+            false,
+            ms(10_000),
+            ms(10_000),
+            1,
+            &p
+        ));
+        // Just over the established bar → the long window is required instead.
+        assert!(!should_blank_recover(
+            qoe(120, 0, 50),
+            true,
+            false,
+            ms(10_000),
+            ms(10_000),
+            1,
             &p
         ));
     }
@@ -3703,12 +3814,14 @@ mod tests {
             0,
             &p
         ));
-        // …but NOT once the client has genuinely presented at some point. With
-        // the production `blank_min_reports` of 1, a single stray zero report
-        // from a healthy long-running session would otherwise satisfy this
-        // branch and drop a working connection.
+        // …but NOT once the client is ESTABLISHED (presented for a meaningful
+        // stretch). With the production `blank_min_reports` of 1, a single stray
+        // zero report from a healthy long-running session would otherwise
+        // satisfy this branch and drop a working connection. (A few-frame blip
+        // below the established bar still keeps the fast path — see
+        // `blank_recovery_barely_presented_stays_aggressive`.)
         assert!(!should_blank_recover(
-            qoe(4, 0, 3),
+            qoe(4, 0, 5_000),
             true,
             false,
             ms(8000),
