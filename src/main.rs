@@ -1565,6 +1565,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE",
         ),
         (
+            "BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS",
+            "MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS",
+        ),
+        (
+            "BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS",
+            "MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS",
+        ),
+        (
             "BLANK_RECOVERY_MAX_WAIT_MS",
             "MACRDP_BLANK_RECOVERY_MAX_WAIT_MS",
         ),

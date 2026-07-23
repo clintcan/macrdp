@@ -323,6 +323,12 @@ struct ConnectionContext {
     /// needs a fresh window. See [`QoeEvidence`] for why this is a pair of
     /// streaks and not a "has ever rendered" latch.
     qoe: QoeEvidence,
+    /// When the last NONZERO decode+render report arrived — drives the
+    /// established wall-clock blackout branch in [`should_blank_recover`].
+    /// Init to the connection epoch so a never-presented session reads as
+    /// "since connect" (irrelevant there anyway: that branch requires an
+    /// established session, which implies nonzero reports have updated this).
+    last_nonzero_qoe_at: Instant,
     /// Recovery attempts this connection + when the last one ran (init to the
     /// connection epoch, which also serves as the arm-delay baseline).
     blank_recovery_attempts: u32,
@@ -474,6 +480,23 @@ struct BlankRecoveryParams {
     /// mid-session blackout still eventually recovers. RTT-scaled like
     /// `min_qoe_reports`. `MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE`.
     established_min_qoe: u64,
+    /// Wall-clock companion to `established_min_qoe`: an established session is
+    /// also declared blank once no nonzero-EDR report has arrived for this long
+    /// AND `established_wall_reports` consecutive zeros are in evidence. Exists
+    /// because the count path assumes the active ~8/s QoE cadence — on a STATIC
+    /// blank the cadence collapses to ~0.3/s and 160 reports is ~9 minutes, so
+    /// without this bound a genuine mid-session blackout on an idle screen
+    /// would practically never recover. Default 30 s; RTT-scaled like
+    /// `blank_max_wait`. `MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS`.
+    established_max_wait: Duration,
+    /// Consecutive-zero floor for the established wall-clock branch (above).
+    /// Proves the client is still decoding/acking while nothing presents;
+    /// without it an IDLE healthy session (frames stop ⇒ QoE stops ⇒ the
+    /// since-nonzero clock grows unboundedly) would trip the branch after any
+    /// quiet half-minute. Default 16 (~2 s of active decode). Not RTT-scaled —
+    /// it is paired with the wall clock, which is.
+    /// `MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS`.
+    established_wall_reports: u64,
     /// Don't evaluate before this much of the connection has elapsed — the
     /// connect-time surface/caps churn shouldn't race the detector.
     arm_delay: Duration,
@@ -699,6 +722,7 @@ fn should_blank_recover(
     egfx_acks_seen: bool,
     acks_suspended: bool,
     since_connect: Duration,
+    since_last_nonzero: Duration,
     since_last_attempt: Duration,
     attempts: u32,
     p: &BlankRecoveryParams,
@@ -728,15 +752,32 @@ fn should_blank_recover(
     } else {
         p.min_qoe_reports
     };
+    // The established tier needs its own WALL-CLOCK branch, because the count
+    // path alone silently assumes the active QoE cadence (~8 reports/s): on a
+    // STATIC blank the cadence collapses to ~0.3/s, at which the 160-report
+    // window is ~9 minutes — the drop escalation would be theoretically
+    // reachable but practically never fire. So: an established session is also
+    // considered blank once NOTHING nonzero has arrived for
+    // `established_max_wait` wall-clock AND at least `established_wall_reports`
+    // consecutive zeros prove the client is still decoding/acking (without that
+    // floor, an IDLE healthy session — frames stop, QoE stops, the since-
+    // nonzero clock grows unboundedly — would trip this after any quiet
+    // half-minute). `since_last_nonzero` is wall time since the last nonzero
+    // EDR report, saturating at `since_connect` for a session that never had
+    // one (irrelevant here — this branch requires `established`).
+    let established_blackout = established
+        && since_last_nonzero >= p.established_max_wait
+        && qoe.zero_streak >= p.established_wall_reports;
     // Blank evidence: EITHER the full all-zero report count (fast on an active
-    // screen) OR — for a STATIC blank whose QoE trickles in slowly — enough
-    // wall-clock elapsed with at least `blank_min_reports` all-zero reports
-    // (which rules out a client that sends no QoE, e.g. FreeRDP, from ever
-    // firing on the wall-clock branch). The wall-clock fast path is withheld
-    // once the session is established: with `blank_min_reports` as low as 1, a
-    // single stray zero from a healthy long-running session would otherwise
-    // satisfy it.
+    // screen), OR the established wall-clock blackout above, OR — for a STATIC
+    // connect-time blank whose QoE trickles in slowly — enough wall-clock
+    // elapsed with at least `blank_min_reports` all-zero reports (which rules
+    // out a client that sends no QoE, e.g. FreeRDP, from ever firing on the
+    // wall-clock branch). That last fast path is withheld once the session is
+    // established: with `blank_min_reports` as low as 1, a single stray zero
+    // from a healthy long-running session would otherwise satisfy it.
     let blank_evidence = qoe.zero_streak >= count_threshold
+        || established_blackout
         || (since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
             && !established);
@@ -777,6 +818,7 @@ fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParam
         established_min_qoe: ((p.established_min_qoe as f64) * mult).ceil() as u64,
         arm_delay: p.arm_delay.mul_f64(mult),
         blank_max_wait: p.blank_max_wait.mul_f64(mult),
+        established_max_wait: p.established_max_wait.mul_f64(mult),
         ..*p
     }
 }
@@ -1292,6 +1334,14 @@ impl Gfx {
                 "MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE",
                 160,
             )),
+            established_max_wait: watchdog_ms(
+                "MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS",
+                30_000,
+            ),
+            established_wall_reports: u64::from(env_u32(
+                "MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS",
+                16,
+            )),
             arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
             retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 4000),
             // Reactivate-first needs ≥2 attempts so, if the reactivation ever
@@ -1537,6 +1587,12 @@ impl Gfx {
                 // A presenting connection clears the reconnect-storm guard: the
                 // consecutive-drop counter only tracks UNBROKEN runs of
                 // blank-dropped connections (see `blank_drop_capped`).
+                // Deliberately the LOW `min_render_reports` bar (3), not the
+                // established bar (40): the guard asks "did this connection
+                // compose ANY real frames?" to distinguish it from a
+                // never-rendered blank run — even a brief render breaks the
+                // "every reconnect lands blank" pattern the cap exists for.
+                // Don't "harmonize" this up to the established threshold.
                 if ctx.qoe.ever_presented(self.blank_params.min_render_reports)
                     && self.consecutive_blank_drops.load(Ordering::Relaxed) != 0
                 {
@@ -1581,6 +1637,7 @@ impl Gfx {
                         ctx.egfx_acks_seen,
                         ctx.acks_suspended,
                         now.saturating_duration_since(ctx.epoch),
+                        now.saturating_duration_since(ctx.last_nonzero_qoe_at),
                         now.saturating_duration_since(ctx.last_blank_recovery_at),
                         ctx.blank_recovery_attempts,
                         p,
@@ -2632,6 +2689,7 @@ impl GfxServerFactory for Gfx {
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
             qoe: QoeEvidence::default(),
+            last_nonzero_qoe_at: Instant::now(),
             blank_recovery_attempts: 0,
             last_blank_recovery_at: Instant::now(),
             link_rtt_ms,
@@ -2839,6 +2897,9 @@ impl GraphicsPipelineHandler for GfxHandler {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             let was = ctx.qoe;
             ctx.qoe.record(metrics.time_diff_dr);
+            if metrics.time_diff_dr > 0 {
+                ctx.last_nonzero_qoe_at = Instant::now();
+            }
             if metrics.time_diff_dr > 0 && was.nonzero_streak == 0 {
                 debug!(
                     frame_id = metrics.frame_id,
@@ -3422,6 +3483,12 @@ mod tests {
             // interfere; the established-tier tests assert against these.
             established_render_reports: 50,
             established_min_qoe: 600,
+            // Established wall-clock blackout: 30 s since the last nonzero
+            // report + >= 16 consecutive zeros. Every test that is NOT
+            // exercising this branch passes since_last_nonzero = ms(0), which
+            // can never satisfy it.
+            established_max_wait: ms(30_000),
+            established_wall_reports: 16,
             arm_delay: ms(3000),
             retry_interval: ms(5000),
             max_attempts: 2,
@@ -3466,6 +3533,10 @@ mod tests {
         assert_eq!(s.min_qoe_reports, 240);
         // The established-tier window scales the same way.
         assert_eq!(s.established_min_qoe, 1200);
+        assert_eq!(s.established_max_wait, ms(60_000));
+        // The wall-branch report floor is paired with the (scaled) wall clock,
+        // so it stays put.
+        assert_eq!(s.established_wall_reports, p.established_wall_reports);
         assert_eq!(s.arm_delay, ms(6000));
         // Attempt spacing/caps untouched — and so are the presentation-quality
         // thresholds: scaling those up on a slow link would make the DISARM (or
@@ -3482,6 +3553,7 @@ mod tests {
             true,
             false,
             ms(7000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(7000),
             0,
             &p
@@ -3491,6 +3563,7 @@ mod tests {
             true,
             false,
             ms(7000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(7000),
             0,
             &s
@@ -3559,6 +3632,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
             &p
@@ -3576,6 +3650,7 @@ mod tests {
             true,
             false,
             ms(60_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
@@ -3586,6 +3661,7 @@ mod tests {
             true,
             false,
             ms(60_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
@@ -3608,6 +3684,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1, // i.e. the reactivation already ran; this is the fallback drop
             &p
@@ -3619,6 +3696,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1,
             &p
@@ -3643,6 +3721,7 @@ mod tests {
             true,
             false,
             ms(60_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
@@ -3653,6 +3732,7 @@ mod tests {
             true,
             false,
             ms(60_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
@@ -3665,6 +3745,65 @@ mod tests {
             true,
             false,
             ms(60_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
+            ms(60_000),
+            0,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_established_blackout_fires_on_the_wall_clock() {
+        // The count path assumes the ACTIVE QoE cadence (~8/s); on a static
+        // blank it collapses to ~0.3/s, at which established_min_qoe would take
+        // ~9 minutes — so an established session is also declared blank once
+        // nothing nonzero has arrived for established_max_wait AND enough
+        // consecutive zeros prove the client is still decoding.
+        let p = blank_params();
+        // 20 zeros (>= the 16 floor), 35 s since the last nonzero → fires.
+        assert!(should_blank_recover(
+            qoe(20, 0, 5_000),
+            true,
+            false,
+            ms(600_000),
+            ms(35_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // Same zeros but the last nonzero was recent → the transient window.
+        assert!(!should_blank_recover(
+            qoe(20, 0, 5_000),
+            true,
+            false,
+            ms(600_000),
+            ms(20_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // Long silence but too few zero reports: an IDLE session (frames stop,
+        // QoE stops) must never trip this — the floor is the idle guard.
+        assert!(!should_blank_recover(
+            qoe(10, 0, 5_000),
+            true,
+            false,
+            ms(600_000),
+            ms(120_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // Not established → this branch never applies. (since_connect kept
+        // under blank_max_wait so the CONNECT-time fast path — which correctly
+        // owns never-established sessions — doesn't fire either and the hold is
+        // attributable to the established branch alone.)
+        assert!(!should_blank_recover(
+            qoe(20, 0, 5),
+            true,
+            false,
+            ms(30_000),
+            ms(35_000),
             ms(60_000),
             0,
             &p
@@ -3684,6 +3823,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1,
             &p
@@ -3694,6 +3834,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1,
             &p
@@ -3710,6 +3851,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
             &p
@@ -3719,6 +3861,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
             &p
@@ -3734,6 +3877,7 @@ mod tests {
             false,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
             &p
@@ -3744,6 +3888,7 @@ mod tests {
             true,
             true,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
             &p
@@ -3759,6 +3904,7 @@ mod tests {
             true,
             false,
             ms(2999),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(2999),
             0,
             &p
@@ -3769,6 +3915,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(4999),
             1,
             &p
@@ -3779,6 +3926,7 @@ mod tests {
             true,
             false,
             ms(60_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             2,
             &p
@@ -3789,6 +3937,7 @@ mod tests {
             true,
             false,
             ms(10_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(5000),
             1,
             &p
@@ -3810,7 +3959,8 @@ mod tests {
             true,         // acks flowing
             false,        // not suspended
             ms(8000),     // == blank_max_wait
-            ms(60_000),   // long since last attempt
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
+            ms(60_000), // long since last attempt
             0,
             &p
         ));
@@ -3825,6 +3975,7 @@ mod tests {
             true,
             false,
             ms(8000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
@@ -3836,6 +3987,7 @@ mod tests {
             true,
             false,
             ms(8000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
@@ -3846,6 +3998,7 @@ mod tests {
             true,
             false,
             ms(30_000),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
@@ -3857,6 +4010,7 @@ mod tests {
             true,
             false,
             ms(7999),
+            ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
             &p
