@@ -1102,11 +1102,33 @@ mod macos {
             // from NSScreen.screens (asleep/mid-wake) is skipped silently on the
             // helper side, so without it we could report a shielded-but-visible
             // desktop.
-            const SHOW_ATTEMPTS: usize = 4;
+            // Backoff, not a flat retry: the helper can stay busy well past a
+            // second. Observed live 2026-07-22 — a flat 4×300 ms (~5 s worst
+            // case) EXHAUSTED and the mode refused to engage, leaving the panel
+            // visible for the whole session. The helper was not wedged (a
+            // manual SHOW moments later answered instantly); it was busy
+            // relaying out across the mirror-break screen change *while*
+            // macrdp's own post-resize gather sweep was moving 10 windows
+            // through the WindowServer. So the tail is much longer than the
+            // typical case, which is what backoff is for: the common path still
+            // settles in ~300 ms, and a slow one gets ~13 s before we give up.
+            //
+            // Bounded deliberately rather than "retry until it works": this runs
+            // on a `tokio::spawn`ed watcher task, so the whole loop blocks a
+            // runtime worker (see the `crate::shield` module docs). ~13 s is the
+            // most that seems defensible against that; if it is ever exhausted
+            // again the fix is to move `install` onto a blocking thread rather
+            // than to keep widening this.
+            const SHOW_BACKOFF_MS: [u64; 6] = [300, 500, 800, 1200, 1600, 2000];
             let need = targets.len();
             let mut shielded_count = 0u16;
             let mut last_err: Option<anyhow::Error> = None;
-            for attempt in 0..SHOW_ATTEMPTS {
+            for (attempt, backoff) in SHOW_BACKOFF_MS
+                .iter()
+                .map(Some)
+                .chain(std::iter::once(None)) // final attempt: no trailing sleep
+                .enumerate()
+            {
                 match crate::shield::show(&[virtual_display_id]) {
                     Ok(n) => {
                         shielded_count = n;
@@ -1120,8 +1142,18 @@ mod macos {
                     }
                     Err(e) => last_err = Some(e),
                 }
-                if attempt + 1 < SHOW_ATTEMPTS {
-                    std::thread::sleep(Duration::from_millis(300));
+                // Visible in the log, so a future engage failure shows how many
+                // attempts it burned rather than only the final error.
+                if let Some(e) = last_err.as_ref() {
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        "shield SHOW not acknowledged yet — retrying"
+                    );
+                }
+                match backoff {
+                    Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+                    None => break,
                 }
             }
             if usize::from(shielded_count) < need {
