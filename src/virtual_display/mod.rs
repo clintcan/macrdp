@@ -1174,7 +1174,22 @@ mod macos {
                         })?;
                         x_off += d.bounds().size.width.round().max(1.0) as i32;
                     }
-                    any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                    // ConfigureForSession, NOT ForAppOnly — the #161/#162 lesson
+                    // replayed on this path, from a live re-strand (2026-07-22):
+                    // with ForAppOnly the WindowServer's session store never
+                    // learns the displaced arrangement, and a TRAILING relayout
+                    // re-derives window placement from the stale store — a
+                    // window the connect-time gather had already parked on the
+                    // vd was observed re-stranded onto the physical's region
+                    // minutes later ("chrome window is not showing"), exactly
+                    // the whack-a-mole `CapturedPrimary` hit before its
+                    // ForSession fix. Crash-safety holds by the same #162
+                    // argument: if macrdp dies, the vd vanishes and the lone
+                    // physical auto-anchors at (0,0) regardless of the store (a
+                    // single display always anchors the arrangement), and Drop's
+                    // re-mirror makes the stored origin moot on a clean
+                    // disconnect (a mirrored panel has no independent origin).
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
                         .map_err(|e| {
                             anyhow!("CGCompleteDisplayConfiguration (displace-tx): CGError {e}")
                         })
