@@ -20,8 +20,8 @@ pub use macos::{
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary,
-    VirtualDisplay,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
