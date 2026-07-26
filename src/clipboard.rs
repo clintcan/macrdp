@@ -1402,9 +1402,14 @@ mod tests {
 
         pb::write_string("on_ready_second_call_probe");
         backend.on_ready();
-        match rx.try_recv().expect("post-handshake on_ready must advertise") {
+        match rx
+            .try_recv()
+            .expect("post-handshake on_ready must advertise")
+        {
             ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
-                assert!(formats.iter().any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT));
+                assert!(formats
+                    .iter()
+                    .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT));
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1428,7 +1433,10 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
-        assert_eq!(backend.last_requested, Some(ClipboardFormatId::CF_UNICODETEXT));
+        assert_eq!(
+            backend.last_requested,
+            Some(ClipboardFormatId::CF_UNICODETEXT)
+        );
     }
 
     /// Disposable temp directory; removed on drop. Standalone for the same
