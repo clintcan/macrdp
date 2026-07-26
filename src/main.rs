@@ -1737,6 +1737,10 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "BLANK_RECOVERY_MIN_WALL_REPORTS",
             "MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS",
         ),
+        (
+            "BLANK_RECOVERY_HEAL_CONFIRM_MS",
+            "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
+        ),
         ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
         ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
         (

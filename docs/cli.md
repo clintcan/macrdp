@@ -454,6 +454,7 @@ MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS=30000  # wall-clock companion to t
 MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS=16  # consecutive zeros the wall-clock branch needs — proves the client is still decoding, so an IDLE session (no frames, no QoE at all) never trips it
 MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank (never-established sessions only)
 MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS=1  # min all-zero reports the fast-path needs (rules out QoE-less clients)
+MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS=8000  # post-attempt heal-confirmation deadline (0 disables): once a recovery attempt has run, the session must show a SUSTAINED nonzero-EDR run within this long or the next attempt (the fallback drop) fires — on cumulative-zero / total-silence evidence that interleaved phantom nonzero reports can't reset (Windows App for macOS starved the consecutive-zero paths for 12+ s live, 2026-07-23)
 MACRDP_BLANK_RECOVERY_ARM_MS=3000      # skip the connect-time churn window
 MACRDP_BLANK_RECOVERY_RETRY_MS=4000    # spacing between attempts
 MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # forced to >=2 when REACTIVATE=1 so the fallback drop can fire

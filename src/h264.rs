@@ -503,6 +503,27 @@ struct BlankRecoveryParams {
     /// Minimum spacing between recovery attempts (the QoE-report counter also
     /// resets per attempt, so a re-fire needs a full fresh all-zero window).
     retry_interval: Duration,
+    /// Post-attempt heal-confirmation deadline (2026-07-23, Windows App for
+    /// macOS build 68576): once a recovery attempt has run, the session must
+    /// PROVE it healed — a sustained nonzero-EDR run (`min_render_reports`) at
+    /// some point since the attempt — within this much wall-clock, or the next
+    /// attempt (normally the fallback drop) fires. Exists because this client
+    /// starved the consecutive-zero escalation paths after a reactivation two
+    /// distinct ways — interleaved phantom nonzero reports (runs of 2–18 while
+    /// visibly black) that kept resetting `zero_streak`, or total QoE silence —
+    /// and the user stared at black for 12 s then reconnected by hand while
+    /// the drop that recovers this client sat unreachable. Guarded so an
+    /// idle-but-healed session can't trip it: it requires the client to have
+    /// ACKED frames since the attempt (the post-attempt IDR + flush frames
+    /// give a live client something to ack; no acks ⇒ nothing shipped ⇒
+    /// nothing to conclude) and either total QoE silence while acking (the
+    /// blank tell — this client emitted QoE fine before the attempt) or
+    /// `blank_min_reports` CUMULATIVE zeros since the attempt (immune to the
+    /// interleaved blips, which reset the streak but not the tally). A healed
+    /// static-desktop mstsc emits a few honest nonzero reports and no zeros
+    /// post-heal, so it matches neither arm. RTT-scaled like `blank_max_wait`.
+    /// `MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS`, default 8000; 0 disables.
+    heal_confirm_deadline: Duration,
     /// Total attempts per connection. All attempts but the last REMAP the
     /// output to a fresh surface (non-destructive); the LAST attempt drops the
     /// connection so the client auto-reconnects (a fresh attempt renders with
@@ -643,32 +664,59 @@ fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
 /// `max_nonzero_streak` is the high-water mark of `nonzero_streak`, i.e. "did
 /// this connection ever genuinely present" — kept only to gate the wall-clock
 /// fast path (see [`should_blank_recover`]).
+///
+/// The three `*_since_reset` fields are CUMULATIVE tallies over the current
+/// evidence window (since connect, or since the last recovery attempt's
+/// [`reset_streaks`]) — unlike the streaks, a report of the opposite kind does
+/// NOT clear them. They exist for the post-attempt heal-confirmation deadline
+/// (2026-07-23, Windows App for macOS build 68576): after a reactivation this
+/// client can emit interleaved phantom nonzero reports (runs of 2–18 observed
+/// while visibly black) that reset `zero_streak` forever, or go QoE-silent
+/// entirely — either way the consecutive-zero paths starve and the fallback
+/// drop never fires. Cumulative counters are immune to the interleaving, and
+/// `reports_since_reset == 0` is the silence tell.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct QoeEvidence {
     zero_streak: u64,
     nonzero_streak: u64,
     max_nonzero_streak: u64,
+    /// Total QoE reports folded in since the last [`reset_streaks`].
+    reports_since_reset: u64,
+    /// Cumulative ZERO reports since the last [`reset_streaks`] — NOT cleared
+    /// by a nonzero report (that is the whole point; see the type doc).
+    zeros_since_reset: u64,
+    /// High-water `nonzero_streak` since the last [`reset_streaks`] — "did the
+    /// client sustain presentation at any point in THIS window", as opposed to
+    /// `max_nonzero_streak` which spans the whole connection.
+    nonzero_max_since_reset: u64,
 }
 
 impl QoeEvidence {
     /// Fold in one QoE frame-acknowledge.
     fn record(&mut self, time_diff_dr: u16) {
+        self.reports_since_reset = self.reports_since_reset.saturating_add(1);
         if time_diff_dr > 0 {
             self.zero_streak = 0;
             self.nonzero_streak = self.nonzero_streak.saturating_add(1);
             self.max_nonzero_streak = self.max_nonzero_streak.max(self.nonzero_streak);
+            self.nonzero_max_since_reset = self.nonzero_max_since_reset.max(self.nonzero_streak);
         } else {
             self.nonzero_streak = 0;
             self.zero_streak = self.zero_streak.saturating_add(1);
+            self.zeros_since_reset = self.zeros_since_reset.saturating_add(1);
         }
     }
 
-    /// Clear the live streaks after a recovery attempt so a re-fire needs a
-    /// full fresh window. `max_nonzero_streak` survives — it is a fact about
-    /// the connection, not evidence for the current window.
+    /// Clear the live streaks + the cumulative window tallies after a recovery
+    /// attempt so a re-fire needs a full fresh window. `max_nonzero_streak`
+    /// survives — it is a fact about the connection, not evidence for the
+    /// current window.
     fn reset_streaks(&mut self) {
         self.zero_streak = 0;
         self.nonzero_streak = 0;
+        self.reports_since_reset = 0;
+        self.zeros_since_reset = 0;
+        self.nonzero_max_since_reset = 0;
     }
 
     /// Has this connection ever presented (sustained nonzero EDR)?
@@ -716,6 +764,9 @@ impl QoeEvidence {
 /// - `since_last_attempt >= retry_interval` + `attempts < max_attempts`:
 ///   rate-limit; the final attempt is the connection drop, after which the
 ///   fresh connection starts a fresh detector.
+/// - `acked_since_attempt`: whether the client has acknowledged frames since
+///   the last recovery attempt — only consulted by the post-attempt
+///   heal-confirmation deadline (see [`BlankRecoveryParams::heal_confirm_deadline`]).
 #[allow(clippy::too_many_arguments)]
 fn should_blank_recover(
     qoe: QoeEvidence,
@@ -725,6 +776,7 @@ fn should_blank_recover(
     since_last_nonzero: Duration,
     since_last_attempt: Duration,
     attempts: u32,
+    acked_since_attempt: bool,
     p: &BlankRecoveryParams,
 ) -> bool {
     // "Presenting" = the LAST `min_render_reports` reports were all nonzero.
@@ -776,8 +828,28 @@ fn should_blank_recover(
     // wall-clock branch). That last fast path is withheld once the session is
     // established: with `blank_min_reports` as low as 1, a single stray zero
     // from a healthy long-running session would otherwise satisfy it.
+    // Post-attempt heal-confirmation deadline (2026-07-23, Windows App for
+    // macOS build 68576 — see the param doc): the consecutive-zero branches
+    // above all assume the client keeps emitting zeros in an unbroken run, and
+    // after a recovery attempt this client starved them for 12+ s live —
+    // either interleaved phantom nonzero reports (each one resetting
+    // `zero_streak`) or total QoE silence — so the fallback drop, the lever
+    // that actually recovers it, never fired and the user reconnected by hand.
+    // Once an attempt has run, the burden of proof flips: the session must
+    // show a sustained nonzero run within the deadline, or the escalation
+    // fires on cumulative-zero / silence evidence the blips can't reset.
+    // `acked_since_attempt` keeps an idle session out (no frames shipped ⇒
+    // nothing to conclude), and `nonzero_max_since_reset < min_render_reports`
+    // implies `!presenting_now` below, so the arms can't fight.
+    let post_attempt_unconfirmed = attempts >= 1
+        && !p.heal_confirm_deadline.is_zero()
+        && since_last_attempt >= p.heal_confirm_deadline
+        && acked_since_attempt
+        && qoe.nonzero_max_since_reset < p.min_render_reports
+        && (qoe.reports_since_reset == 0 || qoe.zeros_since_reset >= p.blank_min_reports);
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
+        || post_attempt_unconfirmed
         || (since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
             && !established);
@@ -819,6 +891,8 @@ fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParam
         arm_delay: p.arm_delay.mul_f64(mult),
         blank_max_wait: p.blank_max_wait.mul_f64(mult),
         established_max_wait: p.established_max_wait.mul_f64(mult),
+        // mul_f64 of zero stays zero, so "0 = disabled" survives scaling.
+        heal_confirm_deadline: p.heal_confirm_deadline.mul_f64(mult),
         ..*p
     }
 }
@@ -1344,6 +1418,12 @@ impl Gfx {
             )),
             arm_delay: watchdog_ms("MACRDP_BLANK_RECOVERY_ARM_MS", 3000),
             retry_interval: watchdog_ms("MACRDP_BLANK_RECOVERY_RETRY_MS", 4000),
+            // Allows an explicit 0 (= disable the deadline), so not watchdog_ms
+            // (whose zero-filter falls back to the default).
+            heal_confirm_deadline: Duration::from_millis(u64::from(env_u32_zero_ok(
+                "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
+                8000,
+            ))),
             // Reactivate-first needs ≥2 attempts so, if the reactivation ever
             // fails to heal, the fallback drop can still fire on the next window.
             max_attempts: if blank_reactivate {
@@ -1640,6 +1720,10 @@ impl Gfx {
                         now.saturating_duration_since(ctx.last_nonzero_qoe_at),
                         now.saturating_duration_since(ctx.last_blank_recovery_at),
                         ctx.blank_recovery_attempts,
+                        // Real frame acks after the attempt = the client is
+                        // alive and decoding our post-attempt IDR/flush frames
+                        // (feeds the post-attempt heal-confirmation deadline).
+                        ctx.last_ack_advance_at > ctx.last_blank_recovery_at,
                         p,
                     )
                 }) {
@@ -1680,6 +1764,9 @@ impl Gfx {
                         ctx.last_blank_recovery_at = now;
                         let evidence = ctx.qoe.zero_streak;
                         let presented_before = ctx.qoe.max_nonzero_streak;
+                        let window_reports = ctx.qoe.reports_since_reset;
+                        let window_zeros = ctx.qoe.zeros_since_reset;
+                        let window_best_run = ctx.qoe.nonzero_max_since_reset;
                         ctx.qoe.reset_streaks();
                         let (w, h) = ctx.dims;
                         if action == BlankAction::Reactivate {
@@ -1711,6 +1798,17 @@ impl Gfx {
                             // back to zero EDR — the post-reactivation relapse
                             // the streak-based disarm exists to catch.
                             longest_render_run_before = presented_before,
+                            // The cumulative tallies over THIS evidence window
+                            // (since connect, or since the previous attempt).
+                            // reports==0 on an attempt ≥2 = the client went
+                            // QoE-SILENT after the previous attempt; zeros <
+                            // reports with a short best run = the interleaved
+                            // phantom-nonzero pattern. Both starve the streak
+                            // paths and are what the heal-confirmation
+                            // deadline exists to catch.
+                            window_reports,
+                            window_zeros,
+                            window_best_render_run = window_best_run,
                             "EGFX client is decoding but not presenting (QoE decode+render \
                              time zero across the whole window — the reconnect-blank) — \
                              running blank recovery"
@@ -2900,6 +2998,21 @@ impl GraphicsPipelineHandler for GfxHandler {
             if metrics.time_diff_dr > 0 {
                 ctx.last_nonzero_qoe_at = Instant::now();
             }
+            // INFO (not debug) deliberately, and rare (once per recovery
+            // attempt): the deployed agent runs at RUST_LOG=info, and the
+            // 2026-07-23 incident was undiagnosable from its log precisely
+            // because the post-attempt QoE pattern (phantom nonzeros vs
+            // silence) was invisible. This one line disambiguates next time.
+            if ctx.blank_recovery_attempts > 0 && was.reports_since_reset == 0 {
+                info!(
+                    frame_id = metrics.frame_id,
+                    time_diff_dr = metrics.time_diff_dr,
+                    since_attempt_ms = ctx.last_blank_recovery_at.elapsed().as_millis() as u64,
+                    "EGFX first QoE report after a blank-recovery attempt (nonzero = the \
+                     client claims to be presenting; only a SUSTAINED run confirms the heal — \
+                     otherwise the heal-confirmation deadline escalates)"
+                );
+            }
             if metrics.time_diff_dr > 0 && was.nonzero_streak == 0 {
                 debug!(
                     frame_id = metrics.frame_id,
@@ -3463,11 +3576,18 @@ mod tests {
     /// are mutually exclusive in reality (either kind of report resets the
     /// other), so a realistic "was presenting, now blank" state is
     /// `qoe(N, 0, M)`.
+    /// Minimal-consistent evidence snapshot: the cumulative window tallies are
+    /// filled as if the current streaks are the whole window (the smallest
+    /// state that could produce these streaks). Tests exercising the
+    /// post-attempt deadline branch build richer windows via struct-update.
     fn qoe(zero: u64, nonzero: u64, max_nonzero: u64) -> QoeEvidence {
         QoeEvidence {
             zero_streak: zero,
             nonzero_streak: nonzero,
             max_nonzero_streak: max_nonzero,
+            reports_since_reset: zero + nonzero,
+            zeros_since_reset: zero,
+            nonzero_max_since_reset: nonzero,
         }
     }
 
@@ -3491,6 +3611,10 @@ mod tests {
             established_wall_reports: 16,
             arm_delay: ms(3000),
             retry_interval: ms(5000),
+            // Post-attempt heal-confirmation deadline (8 s, the production
+            // default). Existing tests pass acked_since_attempt = false, which
+            // keeps this branch inert for them; its own tests set true.
+            heal_confirm_deadline: ms(8000),
             max_attempts: 2,
             max_consecutive_drops: 3,
             max_rtt_ms: 80,
@@ -3556,6 +3680,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(7000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         assert!(!should_blank_recover(
@@ -3566,6 +3691,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(7000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &s
         ));
     }
@@ -3600,25 +3726,51 @@ mod tests {
         for _ in 0..5 {
             q.record(0);
         }
-        assert_eq!(q, qoe(5, 0, 0));
-        // One nonzero report clears the all-zero evidence outright.
+        assert_eq!(
+            (q.zero_streak, q.nonzero_streak, q.max_nonzero_streak),
+            (5, 0, 0)
+        );
+        // One nonzero report clears the all-zero STREAK outright…
         q.record(7);
-        assert_eq!(q, qoe(0, 1, 1));
+        assert_eq!(
+            (q.zero_streak, q.nonzero_streak, q.max_nonzero_streak),
+            (0, 1, 1)
+        );
         q.record(9);
-        assert_eq!(q, qoe(0, 2, 2));
+        assert_eq!(
+            (q.zero_streak, q.nonzero_streak, q.max_nonzero_streak),
+            (0, 2, 2)
+        );
+        // …but NOT the cumulative window tallies (the post-attempt deadline
+        // reads those precisely because a phantom nonzero can't erase them).
+        assert_eq!((q.reports_since_reset, q.zeros_since_reset), (7, 5));
         // …and one zero report clears the nonzero run, but not its high-water
         // mark (that is what "did this connection ever present" reads).
         q.record(0);
-        assert_eq!(q, qoe(1, 0, 2));
+        assert_eq!(
+            (q.zero_streak, q.nonzero_streak, q.max_nonzero_streak),
+            (1, 0, 2)
+        );
         assert!(!q.ever_presented(3));
         for _ in 0..3 {
             q.record(4);
         }
-        assert_eq!(q, qoe(0, 3, 3));
+        assert_eq!(
+            (q.zero_streak, q.nonzero_streak, q.max_nonzero_streak),
+            (0, 3, 3)
+        );
+        assert_eq!(q.nonzero_max_since_reset, 3);
         assert!(q.ever_presented(3));
-        // A recovery attempt clears the live streaks only.
+        // A recovery attempt clears the live streaks AND the window tallies;
+        // only the connection-lifetime high-water mark survives.
         q.reset_streaks();
-        assert_eq!(q, qoe(0, 0, 3));
+        assert_eq!(
+            q,
+            QoeEvidence {
+                max_nonzero_streak: 3,
+                ..QoeEvidence::default()
+            }
+        );
         assert!(q.ever_presented(3));
     }
 
@@ -3635,6 +3787,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3653,6 +3806,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // A long healthy run is likewise never touched.
@@ -3664,6 +3818,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3686,7 +3841,8 @@ mod tests {
             ms(10_000),
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
-            1, // i.e. the reactivation already ran; this is the fallback drop
+            1,     // i.e. the reactivation already ran; this is the fallback drop
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Mid-blip (the blip itself is the most recent report) it still holds
@@ -3699,7 +3855,168 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_post_attempt_deadline_escalates_the_starved_cases() {
+        // THE 2026-07-23 INCIDENT (Windows App for macOS build 68576): after a
+        // reactivation the client starved BOTH streak-based escalation paths
+        // for 12+ s while visibly black — either interleaved phantom nonzero
+        // reports kept resetting `zero_streak`, or QoE went silent entirely —
+        // and the user reconnected by hand. Once the deadline passes with no
+        // sustained presentation since the attempt, cumulative / silence
+        // evidence must escalate to the fallback drop.
+        let p = blank_params();
+
+        // (a) The interleaved phantom pattern: the most recent report was a
+        // nonzero blip (zero_streak reset to 0!), runs never reached
+        // min_render_reports, but zeros kept accruing cumulatively.
+        let interleaved = QoeEvidence {
+            zero_streak: 0,
+            nonzero_streak: 2,
+            max_nonzero_streak: 2,
+            reports_since_reset: 12,
+            zeros_since_reset: 8,
+            nonzero_max_since_reset: 2,
+        };
+        assert!(should_blank_recover(
+            interleaved,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000), // = heal_confirm_deadline
+            1,        // the reactivation already ran
+            true,     // client is acking our post-attempt frames
+            &p
+        ));
+        // Same evidence BEFORE the deadline → hold (give the heal time).
+        assert!(!should_blank_recover(
+            interleaved,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(6000),
+            1,
+            true,
+            &p
+        ));
+
+        // (b) Total QoE silence after the attempt, while frame acks flow: the
+        // client is decoding our post-attempt IDR/flush frames but has stopped
+        // claiming presentation at all.
+        let silent = QoeEvidence {
+            max_nonzero_streak: 2, // the pre-attempt phantom blips
+            ..QoeEvidence::default()
+        };
+        assert!(should_blank_recover(
+            silent,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000),
+            1,
+            true,
+            &p
+        ));
+        // …but silence WITHOUT acks proves nothing (nothing shipped — an idle
+        // or wedged session is not deadline-escalation evidence).
+        assert!(!should_blank_recover(
+            silent,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000),
+            1,
+            false,
+            &p
+        ));
+        // …and the branch is strictly post-attempt (attempts == 0 → inert;
+        // the connect-time paths own that phase).
+        assert!(!should_blank_recover(
+            silent,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000),
+            0,
+            true,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_post_attempt_sustained_presentation_confirms_the_heal() {
+        // A genuinely healed session (e.g. mstsc after the verified-healing
+        // reactivation) shows a sustained nonzero run at some point in the
+        // post-attempt window — that confirms the heal and the deadline must
+        // NOT fire, even if stray zeros arrived around it (this client emits
+        // zero-EDR windows during healthy operation).
+        let p = blank_params();
+        let healed = QoeEvidence {
+            zero_streak: 1, // a stray healthy zero is the most recent report
+            nonzero_streak: 0,
+            max_nonzero_streak: 9,
+            reports_since_reset: 10,
+            zeros_since_reset: 4,
+            nonzero_max_since_reset: 9, // sustained run since the attempt
+        };
+        assert!(!should_blank_recover(
+            healed,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(9000),
+            1,
+            true,
+            &p
+        ));
+        // A healed-but-static mstsc: a couple of honest nonzero reports and NO
+        // zeros since the attempt — matches neither the silence arm nor the
+        // cumulative-zeros arm, so it is not dropped either.
+        let static_healed = QoeEvidence {
+            zero_streak: 0,
+            nonzero_streak: 2,
+            max_nonzero_streak: 2,
+            reports_since_reset: 2,
+            zeros_since_reset: 0,
+            nonzero_max_since_reset: 2,
+        };
+        assert!(!should_blank_recover(
+            static_healed,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(9000),
+            1,
+            true,
+            &p
+        ));
+        // A zero-length deadline disables the branch outright.
+        let disabled = BlankRecoveryParams {
+            heal_confirm_deadline: ms(0),
+            ..p
+        };
+        let silent = QoeEvidence::default();
+        assert!(!should_blank_recover(
+            silent,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(60_000),
+            1,
+            true,
+            &disabled
         ));
     }
 
@@ -3724,6 +4041,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // A stray/short zero run likewise holds off.
@@ -3735,6 +4053,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // But the disarm is still REVOCABLE: a genuinely sustained blackout
@@ -3748,6 +4067,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3769,6 +4089,7 @@ mod tests {
             ms(35_000),
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Same zeros but the last nonzero was recent → the transient window.
@@ -3780,6 +4101,7 @@ mod tests {
             ms(20_000),
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Long silence but too few zero reports: an IDLE session (frames stop,
@@ -3792,6 +4114,7 @@ mod tests {
             ms(120_000),
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Not established → this branch never applies. (since_connect kept
@@ -3806,6 +4129,7 @@ mod tests {
             ms(35_000),
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3826,6 +4150,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Just over the established bar → the long window is required instead.
@@ -3837,6 +4162,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3854,6 +4180,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         assert!(!should_blank_recover(
@@ -3864,6 +4191,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3880,6 +4208,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Acks suspended (queueDepth sentinel) → congestion territory, not blank.
@@ -3891,6 +4220,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3907,6 +4237,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(2999),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Too soon after the previous dance → hold.
@@ -3918,6 +4249,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(4999),
             1,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Attempts exhausted → give up (client-side floor).
@@ -3929,6 +4261,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             2,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Second attempt inside the cap, past the spacing → fires.
@@ -3940,6 +4273,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(5000),
             1,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
@@ -3962,6 +4296,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000), // long since last attempt
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // …but NOT once the client is ESTABLISHED (presented for a meaningful
@@ -3978,6 +4313,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Same but only 2 reports → the >=3 floor blocks it (guards a client
@@ -3990,6 +4326,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Zero reports (QoE-less client) never fires on the wall-clock path.
@@ -4001,6 +4338,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
         // Before blank_max_wait, with a low count → still holds (neither path
@@ -4013,6 +4351,7 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(60_000),
             0,
+            false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
     }
