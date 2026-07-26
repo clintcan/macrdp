@@ -31,8 +31,8 @@ use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{ClientConnector, Config, ConnectorResult, Credentials, DesktopSize};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
 use ironrdp_server::{
-    DesktopSize as ServerDesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, RdpServer,
-    RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
+    ConnectionHandler, DesktopSize as ServerDesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent,
+    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
 };
 use ironrdp_tokio::TokioFramed;
 use tokio_rustls::{rustls, TlsConnector};
@@ -67,6 +67,49 @@ impl RdpServerDisplay for TestDisplay {
     }
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(TestUpdates))
+    }
+}
+
+/// A do-nothing sound factory whose only job is to KEEP THE SESSION ALIVE in
+/// the preemption test. With no sound factory the server drops the audio
+/// sender, so `dispatch_audio`'s channel closes and the client loop ends
+/// immediately with `Disconnect` — a client would never actually stay
+/// connected. Holding the `audio_sender` here (and never sending) makes the
+/// audio arm park forever, so the session lives until it's torn down for real.
+struct KeepAliveSound {
+    audio_sender: Option<tokio::sync::mpsc::Sender<ironrdp_server::AudioWave>>,
+}
+impl ironrdp_server::ServerEventSender for KeepAliveSound {
+    fn set_sender(
+        &mut self,
+        _sender: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+    ) {
+    }
+}
+impl ironrdp_server::SoundServerFactory for KeepAliveSound {
+    fn build_backend(&self) -> Box<dyn ironrdp_server::RdpsndServerHandler> {
+        #[derive(Debug)]
+        struct NoAudio;
+        impl ironrdp_server::RdpsndServerHandler for NoAudio {
+            fn get_formats(&self) -> &[ironrdp_rdpsnd::pdu::AudioFormat] {
+                &[]
+            }
+            fn start(
+                &mut self,
+                _client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu,
+            ) -> Option<u16> {
+                None
+            }
+            fn stop(&mut self) {}
+        }
+        Box::new(NoAudio)
+    }
+    fn set_audio_sender(
+        &mut self,
+        audio_sender: tokio::sync::mpsc::Sender<ironrdp_server::AudioWave>,
+    ) {
+        // Hold it so the receiver stays open (never sends).
+        self.audio_sender = Some(audio_sender);
     }
 }
 
@@ -213,17 +256,53 @@ fn build_test_server(
     max: Option<(u16, u16)>,
     codecs: BitmapCodecs,
 ) -> RdpServer {
+    build_test_server_on(3389, server_w, server_h, honor, max, codecs)
+}
+
+/// As [`build_test_server`], but bound to `port` — only meaningful for a test
+/// that drives the real TCP accept loop (`RdpServer::run`) rather than calling
+/// `run_connection` over an in-memory duplex.
+fn build_test_server_on(
+    port: u16,
+    server_w: u16,
+    server_h: u16,
+    honor: bool,
+    max: Option<(u16, u16)>,
+    codecs: BitmapCodecs,
+) -> RdpServer {
+    build_test_server_full(port, server_w, server_h, honor, max, codecs, false)
+}
+
+/// As above, with `keep_alive` opting into a `KeepAliveSound` factory so a
+/// served connection stays up (the preemption test needs a live session to
+/// take over). Without it the client loop ends immediately (closed audio
+/// channel), which is fine for the negotiate-and-drop tests.
+fn build_test_server_full(
+    port: u16,
+    server_w: u16,
+    server_h: u16,
+    honor: bool,
+    max: Option<(u16, u16)>,
+    codecs: BitmapCodecs,
+    keep_alive: bool,
+) -> RdpServer {
     let display = TestDisplay {
         size: ServerDesktopSize {
             width: server_w,
             height: server_h,
         },
     };
+    let sound: Option<Box<dyn ironrdp_server::SoundServerFactory>> = if keep_alive {
+        Some(Box::new(KeepAliveSound { audio_sender: None }))
+    } else {
+        None
+    };
     let mut server = RdpServer::builder()
-        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_addr((Ipv4Addr::LOCALHOST, port))
         .with_tls(server_tls_acceptor())
         .with_input_handler(TestInput)
         .with_display_handler(display)
+        .with_sound_factory(sound)
         .with_bitmap_codecs(codecs)
         .build();
     server.set_honor_client_desktop_size(honor);
@@ -243,6 +322,22 @@ async fn drive_client(
     client_w: u16,
     client_h: u16,
 ) -> anyhow::Result<(u16, u16)> {
+    let (size, _framed) = connect_client(client_io, client_w, client_h).await?;
+    Ok(size)
+}
+
+/// Same handshake as [`drive_client`], but generic over the transport and
+/// returning the still-open framed TLS stream so a caller can keep the session
+/// alive (and observe it being torn down). Used by the preemption test, which
+/// needs a real TCP connection that outlives the handshake.
+async fn connect_client<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+) -> anyhow::Result<((u16, u16), TokioFramed<tokio_rustls::client::TlsStream<S>>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
     let mut connector = ClientConnector::new(
         client_config(client_w, client_h),
@@ -278,7 +373,10 @@ async fn drive_client(
         None,
     )
     .await?;
-    Ok((result.desktop_size.width, result.desktop_size.height))
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        tls_framed,
+    ))
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
@@ -487,4 +585,289 @@ async fn server_survives_many_reconnects() -> anyhow::Result<()> {
             Ok(())
         })
         .await
+}
+
+/// A second client connecting while a session is live must TAKE OVER: the old
+/// session is dropped and the newcomer completes its handshake. Before the
+/// accept loop learned to preempt, it `await`ed the whole connection, so the
+/// second client sat unserved in the TCP backlog — from the user's side, a
+/// silent hang until the first client left.
+///
+/// This is the one test that drives the real `RdpServer::run` accept loop over
+/// real TCP (every other test here calls `run_connection` over a duplex), since
+/// preemption lives in that loop.
+#[tokio::test]
+async fn second_client_preempts_the_live_session() -> anyhow::Result<()> {
+    init_tracing();
+
+    // Claim an ephemeral port, then release it for the server to bind.
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            // A live session (see `KeepAliveSound`) — otherwise the client loop
+            // ends the moment it starts and there's nothing to preempt.
+            let mut server = build_test_server_full(
+                addr.port(),
+                1024,
+                768,
+                true,
+                None,
+                crate::bitmap_codecs(),
+                true,
+            );
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // First client: connect and keep the session open.
+            let a = connect_with_retry(addr).await?;
+            let (size_a, mut framed_a) = connect_client(a, 1280, 800).await?;
+            assert_eq!(
+                size_a,
+                (1280, 800),
+                "first client should be served normally"
+            );
+
+            // Second client, while the first is still connected: it must be
+            // served, not queued behind the live session.
+            let b = connect_with_retry(addr).await?;
+            let (size_b, _framed_b) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connect_client(b, 1920, 1080),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("second client hung — the accept loop did not preempt the session")
+            })??;
+            assert_eq!(
+                size_b,
+                (1920, 1080),
+                "second client should complete its own handshake"
+            );
+
+            // ...and the first session is gone: its socket is closed, so the
+            // next read fails rather than blocking forever.
+            let dropped =
+                tokio::time::timeout(std::time::Duration::from_secs(10), framed_a.read_pdu())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("first session was left alive after being preempted")
+                    })?;
+            assert!(
+                dropped.is_err(),
+                "preempted session should be torn down, got {dropped:?}"
+            );
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A `ConnectionHandler` that accepts exactly the first connection it sees
+/// and rejects every one after — standing in for macrdp's own
+/// `AuthGuardHandler` (per-source-IP rate-limit/lockout) rejecting a
+/// preempting candidate.
+struct RejectAfterFirst {
+    accepted_once: bool,
+}
+
+impl ConnectionHandler for RejectAfterFirst {
+    fn on_accept(&mut self, _peer: SocketAddr) -> bool {
+        !core::mem::replace(&mut self.accepted_once, true)
+    }
+}
+
+/// A candidate that speaks RDP (passes the TPKT probe) but that `on_accept`
+/// would reject — e.g. an IP the auth guard has already locked out — must
+/// NOT be allowed to preempt the live session. `on_accept` has to run, and be
+/// honored, before the preemption is committed, or the guard's rejection
+/// would only be observed after the damage (evicting a real session) is
+/// already done. Regression guard for the ordering bug caught in review on
+/// the upstreamed shape of this fix, Devolutions/IronRDP#1476.
+#[tokio::test]
+async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let display = TestDisplay {
+                size: ServerDesktopSize {
+                    width: 1024,
+                    height: 768,
+                },
+            };
+            let sound: Box<dyn ironrdp_server::SoundServerFactory> =
+                Box::new(KeepAliveSound { audio_sender: None });
+            let mut server = RdpServer::builder()
+                .with_addr((Ipv4Addr::LOCALHOST, addr.port()))
+                .with_tls(server_tls_acceptor())
+                .with_input_handler(TestInput)
+                .with_display_handler(display)
+                .with_sound_factory(Some(sound))
+                .with_bitmap_codecs(crate::bitmap_codecs())
+                .with_connection_handler(Some(Box::new(RejectAfterFirst {
+                    accepted_once: false,
+                })))
+                .build();
+            server.set_honor_client_desktop_size(true);
+
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // Client A: the live session under test — a real, completed
+            // handshake kept open via `KeepAliveSound`, same as the sibling
+            // preemption test.
+            let a = connect_with_retry(addr).await?;
+            let (_size_a, mut framed_a) = connect_client(a, 1280, 800).await?;
+
+            // Client B: the preempting candidate. It DOES speak RDP (a valid
+            // TPKT header), but `RejectAfterFirst` rejects every accept after
+            // the first, so it must never be allowed to preempt client A.
+            let mut client_b = connect_with_retry(addr).await?;
+            client_b.write_all(&[0x03, 0x00]).await?;
+
+            // Client B should be dropped by the server (on_accept rejected
+            // it): its read side observes the connection closing. The
+            // server's TPKT probe `peek()`s those 2 bytes without consuming
+            // them, so a close with unread data queued can surface as a
+            // reset instead of a clean EOF, platform-dependently — either is
+            // "the server dropped this connection."
+            let mut buf = [0u8; 1];
+            let client_b_read =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client_b.read(&mut buf)).await;
+            assert!(
+                matches!(client_b_read, Ok(Ok(0)) | Ok(Err(_))),
+                "the rejected candidate's connection should be closed by the server, got {client_b_read:?}"
+            );
+
+            // Client A must still be alive: reading a PDU TIMES OUT (no
+            // disconnect) rather than observing the server having dropped it
+            // to serve the (rejected) client B.
+            let client_a_still_alive =
+                tokio::time::timeout(std::time::Duration::from_millis(500), framed_a.read_pdu()).await;
+            assert!(
+                client_a_still_alive.is_err(),
+                "the live session must survive a preemption attempt the handler rejected, got {client_a_still_alive:?}"
+            );
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A `ConnectionHandler` that always accepts, but counts how many times
+/// `on_accept` fires — via a shared counter, since the handler itself is
+/// moved into the server and the test can't reach back into it directly.
+struct CountingAccepts {
+    count: Arc<core::sync::atomic::AtomicU32>,
+}
+
+impl ConnectionHandler for CountingAccepts {
+    fn on_accept(&mut self, _peer: SocketAddr) -> bool {
+        self.count
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        true
+    }
+}
+
+/// A winning preemption candidate must clear `on_accept` exactly ONCE for the
+/// one physical connection it is — not once as a candidate during the race
+/// and again when it's served from the `pending` slot on the next loop
+/// iteration. `on_accept` is stateful for macrdp's real handler
+/// (`AuthGuardHandler` records the accept toward its per-source-IP
+/// rate-limit window and writes an audit line), so a double call would
+/// silently inflate both for a single real connection attempt.
+#[tokio::test]
+async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let accept_count = Arc::new(core::sync::atomic::AtomicU32::new(0));
+
+            let display = TestDisplay {
+                size: ServerDesktopSize {
+                    width: 1024,
+                    height: 768,
+                },
+            };
+            let sound: Box<dyn ironrdp_server::SoundServerFactory> =
+                Box::new(KeepAliveSound { audio_sender: None });
+            let mut server = RdpServer::builder()
+                .with_addr((Ipv4Addr::LOCALHOST, addr.port()))
+                .with_tls(server_tls_acceptor())
+                .with_input_handler(TestInput)
+                .with_display_handler(display)
+                .with_sound_factory(Some(sound))
+                .with_bitmap_codecs(crate::bitmap_codecs())
+                .with_connection_handler(Some(Box::new(CountingAccepts {
+                    count: Arc::clone(&accept_count),
+                })))
+                .build();
+            server.set_honor_client_desktop_size(true);
+
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // Client A: the live session.
+            let a = connect_with_retry(addr).await?;
+            let (_size_a, _framed_a) = connect_client(a, 1280, 800).await?;
+            assert_eq!(
+                accept_count.load(core::sync::atomic::Ordering::SeqCst),
+                1,
+                "on_accept should have fired exactly once for client A"
+            );
+
+            // Client B: preempts client A.
+            let b = connect_with_retry(addr).await?;
+            let (_size_b, _framed_b) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connect_client(b, 1920, 1080),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("second client hung"))??;
+
+            assert_eq!(
+                accept_count.load(core::sync::atomic::Ordering::SeqCst),
+                2,
+                "on_accept should have fired exactly once for the winning candidate \
+                 (once during the race, not again when served from `pending`)"
+            );
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// The listener needs a moment to bind after `run()` is spawned; retry briefly
+/// so the test isn't racy on a loaded machine.
+async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
+    for _ in 0..100 {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    anyhow::bail!("server never started listening on {addr}")
 }

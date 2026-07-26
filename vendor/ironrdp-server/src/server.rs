@@ -45,6 +45,72 @@ use crate::{SoundServerFactory, builder, capabilities};
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 
+/// (vendored, divergence 22) How long a connection accepted while a session is
+/// live may take to start speaking RDP before it is dropped instead of being
+/// allowed to preempt that session.
+const PREEMPT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// (vendored, divergence 22) What resolved first while a session was live: the
+/// session itself ending, a new inbound connection, or the verdict on a
+/// previously accepted candidate. The `select!` yields one of these and does
+/// NOT mutate the probe slot — its futures still borrow it inside the select
+/// expression.
+enum PreemptRace {
+    Ended(Result<()>),
+    Accepted(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
+    Probed(Option<(tokio::net::TcpStream, SocketAddr)>),
+}
+
+/// (vendored, divergence 22) Decide whether a connection accepted while another
+/// session is live may PREEMPT it, without consuming anything the RDP handshake
+/// needs.
+///
+/// Preemption is destructive to the connected user, so a bare TCP connect must
+/// not be enough to trigger it — otherwise any port scan (or a half-open probe)
+/// would kill a live desktop session. This peeks — `recv(MSG_PEEK)`, so the
+/// bytes stay queued for `run_connection` — at the first two bytes and requires
+/// them to be a TPKT header (version 3, reserved 0), i.e. the start of an X.224
+/// Connection Request. A scanner that connects and closes, or that never sends
+/// anything, resolves to `None` and the live session is left alone.
+///
+/// This is a cheap filter, not authentication: a peer that speaks RDP but fails
+/// NLA still takes over the session slot. That case is bounded by the
+/// [`ConnectionHandler`] gate (rate limiting / lockout), which the caller runs
+/// on the winner before serving it.
+async fn probe_preempting_client(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+) -> Option<(tokio::net::TcpStream, SocketAddr)> {
+    const TPKT_VERSION: u8 = 0x03;
+
+    let speaks_rdp = tokio::time::timeout(PREEMPT_PROBE_TIMEOUT, async {
+        let mut head = [0u8; 2];
+        loop {
+            match stream.peek(&mut head).await {
+                // Peer closed without sending — a connect-scan, not a client.
+                Ok(0) => return false,
+                // Only the first byte has landed; wait for its partner.
+                Ok(1) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Ok(_) => return head[0] == TPKT_VERSION && head[1] == 0x00,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    if speaks_rdp {
+        Some((stream, peer))
+    } else {
+        debug!(
+            ?peer,
+            "connection did not start an RDP handshake while a session was live — \
+             dropping it rather than preempting the live session"
+        );
+        None
+    }
+}
+
 /// Action to take after a client disconnects.
 ///
 /// Returned by [`ConnectionHandler::on_disconnected`] to control whether
@@ -1275,136 +1341,261 @@ impl RdpServer {
         debug!("Listening for connections on {local_addr}");
         self.local_addr = Some(local_addr);
 
+        // (vendored, divergence 22) A connection that arrives while a session is
+        // live PREEMPTS it (see `probe_preempting_client`). The preempting stream
+        // is carried here so the next iteration serves it instead of accepting a
+        // fresh one — it still goes through the RTT sample below, exactly like
+        // any other connection, but NOT `on_accept` again (see `from_pending`):
+        // it already cleared that gate once, as a candidate, during the race.
+        let mut pending: Option<(tokio::net::TcpStream, SocketAddr)> = None;
+
         loop {
-            let ev_receiver = Arc::clone(&self.ev_receiver);
-            let mut ev_receiver = ev_receiver.lock().await;
-            tokio::select! {
-                Some(event) = ev_receiver.recv() => {
-                    match event {
-                        ServerEvent::Quit(reason) => {
-                            debug!("Got quit event {reason}");
-                            break;
-                        }
-                        ServerEvent::GetLocalAddr(tx) => {
-                            let _ = tx.send(self.local_addr);
-                        }
-                        ServerEvent::SetCredentials(creds) => {
-                            self.set_credentials(Some(creds));
-                        }
-                        ev => {
-                            debug!("Unexpected event {:?}", ev);
-                        }
-                    }
-                },
-                Ok((stream, peer)) = listener.accept() => {
-                    debug!(?peer, "Received connection");
-                    drop(ev_receiver);
-
-                    let accepted = self.connection_handler
-                        .as_mut()
-                        .is_none_or(|h| h.on_accept(peer));
-
-                    if !accepted {
-                        debug!(?peer, "Connection rejected by handler");
-                        drop(stream);
-                    } else {
-                        // (vendored, divergence 15) Sample the kernel's smoothed TCP
-                        // RTT here — the accept loop is the only point the concrete
-                        // TcpStream (hence the raw fd) is reachable; run_connection
-                        // takes a generic stream and wraps it immediately. The
-                        // handshake-seeded srtt is available right away and is what
-                        // link-adaptive consumers key on. 0 = unknown (kept on error).
-                        if let Some(cell) = &self.link_rtt_ms {
-                            let rtt = tcp_srtt_ms(&stream).unwrap_or(0);
-                            cell.store(rtt, Ordering::Relaxed);
-                            debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
-                        }
-                        let started = tokio::time::Instant::now();
-                        let result = self.run_connection(stream).await;
-                        let duration = started.elapsed();
-
-                        if let Err(ref error) = result {
-                            error!(?error, "Connection error");
-                        }
-
-                        self.static_channels = StaticChannelSet::new();
-
-                        // (M3c) Reset per-connection UDP-multitransport state that is
-                        // otherwise only ever SET, never cleared — so a reconnect to
-                        // this same persistent RdpServer starts clean. Critically
-                        // `egfx_on_udp`: left true from the previous connection, the
-                        // next connection routes EGFX over a UDP tunnel that its OWN
-                        // Soft-Sync hasn't bound yet → frames are dropped and the
-                        // client sees a blank/black desktop on reconnect. Resetting it
-                        // keeps EGFX on TCP until the new connection's tunnel binds and
-                        // re-fires Soft-Sync (clean migration; and a correct TCP
-                        // fallback if the new tunnel never binds). The lossy-audio
-                        // counters + the on-lossy handle must likewise restart.
-                        // (`multitransport_migration`, `udp_tunnel_bound`, and the
-                        // inbound rx ARE refreshed per connection at the offer site, so
-                        // only these only-set-never-reset flags need clearing here.)
-                        #[cfg(feature = "multitransport")]
-                        {
-                            self.egfx_on_udp = false;
-                            self.lossy_audio_block_no = 0;
-                            self.lossy_audio_streaming = false;
-                            if let Some(handle) = &self.egfx_on_lossy_handle {
-                                handle.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (stream, peer, from_pending) = match pending.take() {
+                Some((stream, peer)) => (stream, peer, true),
+                None => {
+                    let ev_receiver = Arc::clone(&self.ev_receiver);
+                    let mut ev_receiver = ev_receiver.lock().await;
+                    let (stream, peer) = tokio::select! {
+                        Some(event) = ev_receiver.recv() => {
+                            match event {
+                                ServerEvent::Quit(reason) => {
+                                    debug!("Got quit event {reason}");
+                                    break;
+                                }
+                                ServerEvent::GetLocalAddr(tx) => {
+                                    let _ = tx.send(self.local_addr);
+                                }
+                                ServerEvent::SetCredentials(creds) => {
+                                    self.set_credentials(Some(creds));
+                                }
+                                ev => {
+                                    debug!("Unexpected event {:?}", ev);
+                                }
                             }
-                            if let Some(handle) = &self.egfx_on_udp_handle {
-                                handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        },
+                        Ok((stream, peer)) = listener.accept() => {
+                            drop(ev_receiver);
+                            (stream, peer)
+                        },
+                        else => break,
+                    };
+                    (stream, peer, false)
+                }
+            };
+
+            debug!(?peer, "Received connection");
+
+            // A `pending` winner already ran (and passed) `on_accept` once,
+            // as a candidate, inside the preemption race below. Re-running it
+            // here would be a silent double-count for a STATEFUL handler —
+            // macrdp's own `AuthGuardHandler::on_accept` records the accept
+            // toward its per-source-IP rate-limit window and writes an audit
+            // line, so calling it twice for the one physical connection would
+            // inflate both without a second real attempt behind it.
+            let accepted =
+                from_pending || self.connection_handler.as_mut().is_none_or(|h| h.on_accept(peer));
+
+            if !accepted {
+                debug!(?peer, "Connection rejected by handler");
+                drop(stream);
+            } else {
+                // (vendored, divergence 15) Sample the kernel's smoothed TCP
+                // RTT here — the accept loop is the only point the concrete
+                // TcpStream (hence the raw fd) is reachable; run_connection
+                // takes a generic stream and wraps it immediately. The
+                // handshake-seeded srtt is available right away and is what
+                // link-adaptive consumers key on. 0 = unknown (kept on error).
+                if let Some(cell) = &self.link_rtt_ms {
+                    let rtt = tcp_srtt_ms(&stream).unwrap_or(0);
+                    cell.store(rtt, Ordering::Relaxed);
+                    debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
+                }
+                let started = tokio::time::Instant::now();
+
+                // (vendored, divergence 22) Serve this connection, but keep
+                // accepting meanwhile: a NEW client must be able to take over
+                // an existing session instead of hanging in the backlog behind
+                // it (the accept loop used to `await` the whole connection, so
+                // a second client saw a silent hang until the first left).
+                // A candidate that clears `on_accept` (the auth guard's
+                // rate-limit/lockout — see below) AND passes
+                // `probe_preempting_client` wins: the in-flight connection
+                // future is dropped (cancelled — its socket closes and every
+                // per-connection resource unwinds via Drop, the same teardown
+                // a client-side disconnect takes) and the newcomer is served
+                // on the next iteration.
+                //
+                // Take `connection_handler` out of `self` first: `conn` below
+                // captures `&mut self` for the whole race, and the candidate's
+                // `on_accept` must still be callable alongside it — see the
+                // next comment for why that ordering matters. Restored into
+                // `self` once the race ends (`conn`'s scope closes here).
+                let mut handler = self.connection_handler.take();
+
+                let outcome = {
+                    let mut conn = core::pin::pin!(self.run_connection(stream));
+                    let mut probe: core::pin::Pin<
+                        Box<dyn core::future::Future<Output = Option<(tokio::net::TcpStream, SocketAddr)>>>,
+                    > = Box::pin(core::future::pending());
+                    let mut probing = false;
+
+                    loop {
+                        // The select must only YIELD here, never mutate
+                        // `probe`: its futures still borrow it inside the
+                        // select expression.
+                        let race = tokio::select! {
+                            res = &mut conn => PreemptRace::Ended(res),
+                            accepted = listener.accept(), if !probing => PreemptRace::Accepted(accepted),
+                            candidate = &mut probe => PreemptRace::Probed(candidate),
+                        };
+
+                        match race {
+                            // The session ended on its own. A candidate still
+                            // being probed is NOT dropped on the floor — that
+                            // would silently reset a legitimate client that
+                            // happened to connect right as the old session
+                            // left; finish the probe and serve it next.
+                            PreemptRace::Ended(res) => {
+                                if probing {
+                                    // Not a preemption (nothing was taken from
+                                    // anyone) — hand it straight to the next
+                                    // iteration.
+                                    pending = probe.await;
+                                }
+                                break (res, None);
                             }
-                            // Clear the watchdog's de-migrate request so a fresh
-                            // connection retries UDP instead of instantly routing the
-                            // newly-migrated EGFX straight back to TCP.
-                            if let Some(handle) = &self.demigrate_request {
-                                handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                            PreemptRace::Accepted(Ok((next_stream, next_peer))) => {
+                                // Gate the candidate through `on_accept`
+                                // (the AuthGuardHandler's per-source-IP
+                                // rate-limit/lockout) BEFORE it's allowed to
+                                // start probing — and so before it can ever
+                                // preempt anything. Without this, a candidate
+                                // the guard would reject could still evict the
+                                // live session just by winning the TPKT
+                                // probe, since `on_accept` would only run
+                                // afterward once it became the next
+                                // iteration's connection — the exact ordering
+                                // bug Devolutions/IronRDP#1476 review caught
+                                // in the upstreamed shape of this fix.
+                                let candidate_accepted = handler.as_mut().is_none_or(|h| h.on_accept(next_peer));
+                                if candidate_accepted {
+                                    probing = true;
+                                    probe = Box::pin(probe_preempting_client(next_stream, next_peer));
+                                } else {
+                                    debug!(
+                                        ?next_peer,
+                                        "candidate connection rejected by handler while a session was live"
+                                    );
+                                    drop(next_stream);
+                                }
                             }
-                            // Retire this connection's tunnel: lower the shared bound
-                            // flag so the listener's tunnel-death check (which skips
-                            // lowered flags) treats the now-abandoned tunnel as benign
-                            // teardown — it just ages out via the idle GC. Without
-                            // this, every ended session's tunnel "dies" ~30 s later
-                            // and starts the multitransport-offer COOLDOWN, silently
-                            // downgrading the next 10 min of healthy-LAN connections
-                            // to plain TCP (observed live 2026-07-06 after a
-                            // blank-recovery drop). A tunnel that wedges while its
-                            // session is ALIVE still declares death + cooldown exactly
-                            // as before (its flag is still up when the check runs).
-                            if let Some(flag) = &self.udp_tunnel_bound {
-                                flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            PreemptRace::Accepted(Err(error)) => {
+                                warn!(?error, "accept failed while a session was live");
                             }
-                            // Evict the connection's offer cookie no matter how it
-                            // ended. Eviction used to be keyed off `MigrationState`
-                            // (set only at activation), so a connection dying
-                            // earlier — mstsc's cert-prompt broken pipe, CredSSP
-                            // failures, probes — leaked one registry entry per
-                            // attempt forever, and a LATE tunnel bind (the client's
-                            // UDP handshake outliving a fast session end) could
-                            // still consume the stale cookie and re-raise the
-                            // retired flag → zombie peer → spurious death + a
-                            // 10-min offer cooldown on a healthy setup.
-                            if let Some(cookie) = self.current_offer_cookie.take() {
-                                if let Some(registry) = self.multitransport_cookies.as_ref() {
-                                    registry.remove(&cookie);
+                            PreemptRace::Probed(candidate) => {
+                                probing = false;
+                                probe = Box::pin(core::future::pending());
+                                if let Some(next) = candidate {
+                                    break (Ok(()), Some(next));
                                 }
                             }
                         }
+                    }
+                };
 
-                        if let Some(ref mut handler) = self.connection_handler {
-                            let action = handler.on_disconnected(
-                                peer,
-                                duration,
-                                result.as_ref().err(),
-                            );
-                            if action == PostConnectionAction::Stop {
-                                debug!(?peer, "Handler requested stop after disconnect");
-                                break;
-                            }
+                self.connection_handler = handler;
+                let (result, preempted_by) = outcome;
+                let duration = started.elapsed();
+
+                if let Some((next_stream, next_peer)) = preempted_by {
+                    info!(
+                        old_peer = ?peer,
+                        new_peer = ?next_peer,
+                        "another client connected — dropping the existing session in its favor"
+                    );
+                    pending = Some((next_stream, next_peer));
+                }
+
+                if let Err(ref error) = result {
+                    error!(?error, "Connection error");
+                }
+
+                self.static_channels = StaticChannelSet::new();
+
+                // (M3c) Reset per-connection UDP-multitransport state that is
+                // otherwise only ever SET, never cleared — so a reconnect to
+                // this same persistent RdpServer starts clean. Critically
+                // `egfx_on_udp`: left true from the previous connection, the
+                // next connection routes EGFX over a UDP tunnel that its OWN
+                // Soft-Sync hasn't bound yet → frames are dropped and the
+                // client sees a blank/black desktop on reconnect. Resetting it
+                // keeps EGFX on TCP until the new connection's tunnel binds and
+                // re-fires Soft-Sync (clean migration; and a correct TCP
+                // fallback if the new tunnel never binds). The lossy-audio
+                // counters + the on-lossy handle must likewise restart.
+                // (`multitransport_migration`, `udp_tunnel_bound`, and the
+                // inbound rx ARE refreshed per connection at the offer site, so
+                // only these only-set-never-reset flags need clearing here.)
+                #[cfg(feature = "multitransport")]
+                {
+                    self.egfx_on_udp = false;
+                    self.lossy_audio_block_no = 0;
+                    self.lossy_audio_streaming = false;
+                    if let Some(handle) = &self.egfx_on_lossy_handle {
+                        handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Some(handle) = &self.egfx_on_udp_handle {
+                        handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Clear the watchdog's de-migrate request so a fresh
+                    // connection retries UDP instead of instantly routing the
+                    // newly-migrated EGFX straight back to TCP.
+                    if let Some(handle) = &self.demigrate_request {
+                        handle.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Retire this connection's tunnel: lower the shared bound
+                    // flag so the listener's tunnel-death check (which skips
+                    // lowered flags) treats the now-abandoned tunnel as benign
+                    // teardown — it just ages out via the idle GC. Without
+                    // this, every ended session's tunnel "dies" ~30 s later
+                    // and starts the multitransport-offer COOLDOWN, silently
+                    // downgrading the next 10 min of healthy-LAN connections
+                    // to plain TCP (observed live 2026-07-06 after a
+                    // blank-recovery drop). A tunnel that wedges while its
+                    // session is ALIVE still declares death + cooldown exactly
+                    // as before (its flag is still up when the check runs).
+                    if let Some(flag) = &self.udp_tunnel_bound {
+                        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Evict the connection's offer cookie no matter how it
+                    // ended. Eviction used to be keyed off `MigrationState`
+                    // (set only at activation), so a connection dying
+                    // earlier — mstsc's cert-prompt broken pipe, CredSSP
+                    // failures, probes — leaked one registry entry per
+                    // attempt forever, and a LATE tunnel bind (the client's
+                    // UDP handshake outliving a fast session end) could
+                    // still consume the stale cookie and re-raise the
+                    // retired flag → zombie peer → spurious death + a
+                    // 10-min offer cooldown on a healthy setup.
+                    if let Some(cookie) = self.current_offer_cookie.take() {
+                        if let Some(registry) = self.multitransport_cookies.as_ref() {
+                            registry.remove(&cookie);
                         }
                     }
                 }
-                else => break,
+
+                if let Some(ref mut handler) = self.connection_handler {
+                    let action = handler.on_disconnected(
+                        peer,
+                        duration,
+                        result.as_ref().err(),
+                    );
+                    if action == PostConnectionAction::Stop {
+                        debug!(?peer, "Handler requested stop after disconnect");
+                        break;
+                    }
+                }
             }
         }
 

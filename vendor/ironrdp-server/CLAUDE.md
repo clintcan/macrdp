@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21)/(22) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -1458,3 +1458,62 @@ AND released — #1276 landing is NOT sufficient.
     maintainer, since the same gap is reachable through `MousePdu`/`MouseXPdu`/
     `MouseRelPdu` and a uniform fix touches the public `MouseEvent` API). Delete
     this divergence once the upstream fix lands and the pin moves past it.
+
+(22) Second-client PREEMPTS the live session in the accept loop (NOT
+    upstreamed; added 2026-07-23). Upstream `RdpServer::run` `await`s the whole
+    `run_connection(stream)` inline, so while one client is connected a SECOND
+    client's TCP connect sits unserved in the listen backlog — the server never
+    calls `accept()` again until the first session ends. From the second user's
+    side that is a silent HANG (the connection is established at the TCP layer,
+    but no RDP handshake response ever comes). macrdp is single-console-session
+    by design (it mirrors/serves ONE desktop), so the right behavior is for a
+    new client to TAKE OVER: drop the existing session and serve the newcomer.
+    Reshaped `run()` so the in-flight connection races `listener.accept()`: a
+    new connection that passes `probe_preempting_client` (a `recv(MSG_PEEK)` for
+    a TPKT header — version 3 + reserved 0 — within `PREEMPT_PROBE_TIMEOUT` = 5 s,
+    so a bare TCP connect / port scan can't kill a live desktop; the peeked bytes
+    stay queued for the real handshake) causes the in-flight `run_connection`
+    future to be DROPPED (cancellation = the same per-connection teardown a
+    client-side disconnect takes: socket closes, every Drop runs), and the
+    winner is carried in a `pending` slot and served on the next loop iteration
+    — so it still flows through the RTT sample + the multitransport reset
+    exactly like any accepted connection. A candidate mid-probe when the OLD
+    session ends on its own is NOT dropped (it's handed to `pending`, not a
+    preemption). Preemption is only a cheap TPKT filter, not auth — a peer that
+    speaks RDP but fails NLA still takes the slot once it clears `on_accept`
+    (below); that's bounded by the existing `ConnectionHandler` rate-limit/
+    lockout gate (`AuthGuardHandler`).
+    New helpers `probe_preempting_client` + the `PreemptRace` enum (the select
+    must only yield, never mutate the probe slot its futures borrow). Covered by
+    `src/conn_test.rs::second_client_preempts_the_live_session` (the one test
+    that drives the real `RdpServer::run` accept loop over real TCP — every other
+    conn_test uses `run_connection` over a duplex; it needs a `KeepAliveSound`
+    factory to hold the audio channel open, or the client loop ends instantly and
+    there's nothing to preempt). Additive to `run()` only; `run_connection` and
+    the per-connection path are untouched. Upstreamable as an opt-in policy (e.g.
+    a `ConnectionHandler`/builder switch: reject-new vs preempt-existing), since
+    a multi-session server would want the current queue-behind behavior — offer
+    it that way rather than as an unconditional change. **Filed upstream as
+    Devolutions/IronRDP#1476** (an opt-in `preempt_existing_session` builder
+    option, since a general-purpose server needs to keep the queue-behind
+    default) — drop this divergence once it's released and the pin can adopt it.
+
+    **on_accept-ordering fix (2026-07-26, from the #1476 review):** the initial
+    cut only ran `ConnectionHandler::on_accept` on the candidate on the NEXT
+    outer-loop iteration — by which point the live session had already been
+    cancelled to make room for it. A candidate `on_accept` (the auth guard's
+    per-source-IP rate-limit/lockout) would reject could therefore still evict
+    the active session; it would just get rejected immediately afterward, after
+    the damage was done. Fixed by gating the candidate through `on_accept` as
+    soon as it's accepted, BEFORE it's allowed to start the TPKT probe (and so
+    before it can ever preempt anything). This needs `connection_handler`
+    pulled out of `self` into a local `handler` before the live connection's
+    `conn` future is created — `conn` captures `&mut self` for the whole race,
+    and `on_accept` must stay callable alongside it — restored into `self` once
+    the race ends (`conn`'s scope must close BEFORE the restore, or the
+    borrow checker rejects it — hence the extra `{ }` block around `conn`).
+    Covered by `src/conn_test.rs::
+    preemption_does_not_evict_a_session_the_handler_would_reject` (a real
+    `RdpServer::run()` with a handler that accepts only the first connection);
+    verified it fails without this fix (the live session gets evicted) and
+    passes with it.
