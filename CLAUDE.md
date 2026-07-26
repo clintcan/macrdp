@@ -21,7 +21,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.9.1** (the lockable-headless release — a new
+(VPN/ZeroTier). **Latest release: v0.9.2** (blank-recovery clean-presentation latch — a
+point release fixing a v0.9.1 regression in the mstsc/Windows-App reconnect-blank
+auto-recovery; **default runtime path unchanged**, only the blank detector's disarm logic
+changed. v0.9.1's #172 made the disarm *revocable* (to catch a client reporting nonzero-EDR
+*while black*), which regressed the mirror client — one that **presents fine but reports
+`timeDiffEDR == 0` mid-session**, whose short nonzero runs never reach the "established" bar —
+so the aggressive path force-dropped its working ~50 s sessions and the ARC cookie reconnected
+each time = a connect/disconnect loop on a session in active use. QoE decode+render-time is
+*bidirectionally* unreliable, so no EDR threshold separates the two clients; the signal that
+does is *when* the nonzero run occurs. Fix (`src/h264.rs`): a durable **`presented_clean`**
+latch — a sustained nonzero-EDR run seen **before any recovery attempt** (`attempts == 0`)
+proves the client painted the desktop at connect (not the reconnect-blank, which is black from
+frame one), so the detector latches off for the connection = the v0.9.0 behavior, restored.
+The `attempts == 0` guard preserves #172 (the blank client's nonzero-while-black flicker only
+appears *after* its reactivation → latch withheld → escalation still recovers it).
+LIVE-VERIFIED: a 6-min session held (was dropping every ~50 s) and a real reconnect-blank
+still self-healed. Trade-off: a genuine *mid-session* blackout on a cleanly-presented
+connection is no longer auto-recovered (unconfirmed case) — `Ctrl+Alt+Shift+R` is the manual
+lever. **Known issue, deferred (NOT a regression):** a blank-recovery reactivation un-blanks
+the `--capture-primary` physical panel (macOS resets gamma on the reconfiguration; the
+same-size `Resize` skips the re-assert the resize path runs) — present since v0.8.27, only
+noticed now; a gamma-timing reblank was flaky + reverted (`wip/capture-primary-reblank-on-heal`),
+the robust fix is a shield-window helper (`--shield-primary` avoids the class). See
+`docs/release-history.md` + the blank-recovery note in `@docs/known-quirks.md`.)
+Earlier: **v0.9.1** (the lockable-headless release — a new
 opt-in headless blanking mode **`--shield-primary`** covers the physical panel with an
 opaque black *window* (via the `macrdpshield` helper) instead of capturing it, so unlike
 `--capture-primary` **the Mac can still be locked** and there's no ~250 ms resize flash;

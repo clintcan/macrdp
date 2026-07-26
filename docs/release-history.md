@@ -4,9 +4,16 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
-## Unreleased (on `main`, since v0.9.1)
+## Unreleased (on `main`, since v0.9.2)
 
 Nothing tagged yet.
+
+## v0.9.2 — blank-recovery clean-presentation latch
+
+A point release fixing a v0.9.1 regression in the mstsc/Windows-App reconnect-blank auto-recovery. **The default runtime path is unchanged**; only the blank detector's disarm logic changed.
+
+- **Fix: a working session that presents fine but reports zero decode+render time is no longer force-dropped.** v0.9.1's #172 replaced the v0.9.0 one-way disarm latch (first nonzero EDR → detector off for the connection) with a *revocable* disarm, to catch a client that reported nonzero-EDR *while still black* after a reactivation. That regressed a client with the mirror behaviour — it **presents the desktop fine but reports `timeDiffEDR == 0` mid-session**, and its nonzero-EDR runs (3–14) never reach the "established" bar (40) — so the aggressive path force-dropped its working ~50 s sessions and the auto-reconnect cookie reconnected each time, producing a connect/disconnect loop on a session the user was actively using. Root cause: QoE decode+render-time is *bidirectionally* unreliable (one client class reports nonzero-while-black, another zero-while-presenting), so no EDR threshold separates them. The signal that does: **when** the nonzero run occurs. Fix (`src/h264.rs`): a durable **`presented_clean`** latch — a sustained nonzero-EDR run seen **before any recovery attempt has fired** (`attempts == 0`) proves the client painted the desktop at connect (it is not the reconnect-blank, which is black from frame one), so the detector latches off for the connection (the v0.9.0 behaviour, restored). The `attempts == 0` guard preserves #172: the blank client's nonzero-while-black flicker only appears *after* its reactivation, so the latch is withheld for it and the escalation still recovers it. **Live-verified:** a 6-minute session held (previously dropped every ~50 s) and a genuine reconnect-blank (`longest_render_run_before=0`) still self-healed. Trade-off: a genuine *mid-session* blackout on a cleanly-presented connection is no longer auto-recovered (an unconfirmed case) — `Ctrl+Alt+Shift+R` is the manual A/V-resync lever. Unit-tested (`blank_recovery_disarmed_by_clean_presentation`, `blank_recovery_clean_latch_does_not_shield_a_never_presented_blank`).
+- **Known issue (deferred, not a regression): a blank-recovery *reactivation* un-blanks the `--capture-primary` physical panel.** With sessions no longer false-dropping, a genuine reconnect-blank heal (the bare core Deactivation–Reactivation) was observed to leave the physical primary showing the desktop — macOS resets the panels' gamma on the reconfiguration, and the recovery's same-size `Resize` skips the re-assert the live-resize path runs. Present since blank-recovery reactivation shipped (v0.8.27), only *noticed* now. A gamma-timing reblank fix was tried and was flaky, so it was reverted (kept on `wip/capture-primary-reblank-on-heal`); the robust fix is a shield-window helper (`--shield-primary` already avoids the whole class) and is deferred. See `docs/known-quirks.md`.
 
 ## v0.9.1 — the lockable-headless release
 
