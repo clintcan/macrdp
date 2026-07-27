@@ -117,7 +117,7 @@ fn map_client_to_display(
 ) -> (f64, f64) {
     let dwf = f64::from(dw.max(1));
     let dhf = f64::from(dh.max(1));
-    if letterbox {
+    let (mx, my) = if letterbox {
         let mac_aspect = sw / sh.max(1.0);
         let out_aspect = dwf / dhf;
         let (cw, ch) = if out_aspect > mac_aspect {
@@ -132,7 +132,28 @@ fn map_client_to_display(
         (fx * sw, fy * sh)
     } else {
         (f64::from(x) * sw / dwf, f64::from(y) * sh / dhf)
-    }
+    };
+    // Clamp the result INTO the display, on both paths.
+    //
+    // Why the direct-scale path needs it at all: some clients (observed: iOS
+    // Windows App in "Mouse pointer" mode, whose touch-to-cursor math
+    // rubber-bands past the desktop bounds when the user keeps dragging beyond
+    // where the on-screen cursor visually stops) report x/y well outside
+    // [0,dw)x[0,dh) — e.g. y=549 against a negotiated desktop_h of 505.
+    //
+    // Why the bound is `s - 1` and not `s`: a display of height `sh` covers
+    // rows 0..=sh-1, so `sh` itself is the first row PAST it. That one pixel is
+    // load-bearing on a headless-vd layout, where the vd sits at (0,0) and the
+    // physical panel is parked beside it at (sw, 0): a point at y == sh is dead
+    // space owned by NO display (so macOS's edge-triggered UI — Dock and
+    // menu-bar auto-reveal — never fires), and x == sw is the physical panel's
+    // first column (so the cursor teleports off the display the client is
+    // watching). The letterbox path reached the same two values via its
+    // clamp-to-1.0 fraction, so it gets the same treatment.
+    (
+        mx.clamp(0.0, (sw - 1.0).max(0.0)),
+        my.clamp(0.0, (sh - 1.0).max(0.0)),
+    )
 }
 
 /// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
@@ -188,10 +209,32 @@ mod coord_tests {
     #[test]
     fn stretch_maps_full_frame() {
         // 16:9 client onto a 16:10 Mac, fill mode: corners map to corners.
+        // The far corner clamps to the LAST pixel (1511,981), not the size
+        // (1512,982) — see the `s - 1` note in map_client_to_display.
         let (mx, my) = map_client_to_display(1920, 1080, 1920, 1080, 1512.0, 982.0, false);
-        assert!(approx(mx, 1512.0) && approx(my, 982.0));
+        assert!(approx(mx, 1511.0) && approx(my, 981.0));
         let (mx, my) = map_client_to_display(960, 540, 1920, 1080, 1512.0, 982.0, false);
         assert!(approx(mx, 756.0) && approx(my, 491.0)); // center
+    }
+
+    #[test]
+    fn stretch_clamps_a_client_coordinate_past_its_own_desktop_bounds() {
+        // A 1:1 client/Mac size (the client-resolution auto-adopt path,
+        // which forces letterbox=false since there's no aspect mismatch to
+        // bar). Some clients (iOS Windows App's "Mouse pointer" mode) report
+        // y past their own negotiated desktop_h when the user keeps dragging
+        // beyond where their on-screen cursor visually stopped. Unclamped,
+        // that posts the Mac cursor below the display's real bottom edge
+        // instead of pinned at it.
+        // Clamped to the LAST ROW (504), not the height (505) — y == sh is the
+        // first row past the display, which on a headless-vd layout is dead
+        // space owned by no display, so the Dock's edge trigger never fires.
+        let (_, my) = map_client_to_display(356, 549, 944, 505, 944.0, 505.0, false);
+        assert!(approx(my, 504.0));
+        // Same one-pixel rule horizontally: x == sw would be the physical
+        // panel's first column when it's parked at (sw, 0).
+        let (mx, _) = map_client_to_display(1200, 300, 944, 505, 944.0, 505.0, false);
+        assert!(approx(mx, 943.0));
     }
 
     #[test]
@@ -208,12 +251,12 @@ mod coord_tests {
         assert!(approx(mx, 0.0));
         // right bar clamps to the right edge
         let (mx, _) = map_client_to_display(1900, 540, 1920, 1080, sw, sh, true);
-        assert!(approx(mx, sw));
+        assert!(approx(mx, sw - 1.0));
         // top/bottom fill the height → no vertical clamp at extremes
         let (_, my) = map_client_to_display(960, 0, 1920, 1080, sw, sh, true);
         assert!(approx(my, 0.0));
         let (_, my) = map_client_to_display(960, 1080, 1920, 1080, sw, sh, true);
-        assert!(approx(my, sh));
+        assert!(approx(my, sh - 1.0));
     }
 
     #[test]
@@ -1194,9 +1237,7 @@ mod macos {
                 | MouseEvent::Button5Released => {
                     trace!(?event, "extra mouse buttons not implemented");
                 }
-                MouseEvent::RelMove { .. } => {
-                    trace!(?event, "relative move not implemented");
-                }
+                MouseEvent::RelMove { x, y } => self.move_rel(x, y),
             }
         }
 
@@ -1209,8 +1250,30 @@ mod macos {
             let (ox, oy, sw, sh) = self.target_bounds();
             let (mx, my) =
                 super::map_client_to_display(x, y, desktop_w, desktop_h, sw, sh, letterbox);
-            let sx = ox + mx;
-            let sy = oy + my;
+            self.post_move(ox + mx, oy + my);
+        }
+
+        /// Relative mouse motion (MS-RDPBCGR `TS_POINTERREL_EVENT` / the
+        /// MS-RDPEI "Advanced Input" channel's REL flag), sent by clients that
+        /// emulate a trackpad rather than mapping touches 1:1 (e.g. Windows
+        /// App's "Mouse pointer" input mode on iOS). Unlike `Move`, there is
+        /// no absolute client coordinate to map — the delta is applied
+        /// directly to the server-side cursor position, clamped to the
+        /// target display's bounds so a client that keeps pushing past an
+        /// edge (exactly the gesture macOS's Dock/menu-bar auto-reveal
+        /// watches for) leaves the cursor pinned at the true edge pixel
+        /// instead of silently doing nothing. Previously this variant was
+        /// dropped entirely (`trace!` no-op), which — on a client that relies
+        /// on it for some or all pointer motion — left the cursor unable to
+        /// reach the screen edge at all.
+        fn move_rel(&mut self, dx: i32, dy: i32) {
+            let (ox, oy, sw, sh) = self.target_bounds();
+            let sx = (self.last_x + f64::from(dx)).clamp(ox, ox + sw - 1.0);
+            let sy = (self.last_y + f64::from(dy)).clamp(oy, oy + sh - 1.0);
+            self.post_move(sx, sy);
+        }
+
+        fn post_move(&mut self, sx: f64, sy: f64) {
             self.last_x = sx;
             self.last_y = sy;
 
