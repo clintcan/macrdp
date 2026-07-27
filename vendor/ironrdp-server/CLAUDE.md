@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21)/(22) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21)/(22)/(23) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -1459,61 +1459,151 @@ AND released — #1276 landing is NOT sufficient.
     `MouseRelPdu` and a uniform fix touches the public `MouseEvent` API). Delete
     this divergence once the upstream fix lands and the pin moves past it.
 
-(22) Second-client PREEMPTS the live session in the accept loop (NOT
-    upstreamed; added 2026-07-23). Upstream `RdpServer::run` `await`s the whole
-    `run_connection(stream)` inline, so while one client is connected a SECOND
-    client's TCP connect sits unserved in the listen backlog — the server never
-    calls `accept()` again until the first session ends. From the second user's
-    side that is a silent HANG (the connection is established at the TCP layer,
-    but no RDP handshake response ever comes). macrdp is single-console-session
-    by design (it mirrors/serves ONE desktop), so the right behavior is for a
-    new client to TAKE OVER: drop the existing session and serve the newcomer.
-    Reshaped `run()` so the in-flight connection races `listener.accept()`: a
-    new connection that passes `probe_preempting_client` (a `recv(MSG_PEEK)` for
-    a TPKT header — version 3 + reserved 0 — within `PREEMPT_PROBE_TIMEOUT` = 5 s,
-    so a bare TCP connect / port scan can't kill a live desktop; the peeked bytes
-    stay queued for the real handshake) causes the in-flight `run_connection`
-    future to be DROPPED (cancellation = the same per-connection teardown a
-    client-side disconnect takes: socket closes, every Drop runs), and the
-    winner is carried in a `pending` slot and served on the next loop iteration
-    — so it still flows through the RTT sample + the multitransport reset
-    exactly like any accepted connection. A candidate mid-probe when the OLD
-    session ends on its own is NOT dropped (it's handed to `pending`, not a
-    preemption). Preemption is only a cheap TPKT filter, not auth — a peer that
-    speaks RDP but fails NLA still takes the slot once it clears `on_accept`
-    (below); that's bounded by the existing `ConnectionHandler` rate-limit/
-    lockout gate (`AuthGuardHandler`).
-    New helpers `probe_preempting_client` + the `PreemptRace` enum (the select
-    must only yield, never mutate the probe slot its futures borrow). Covered by
-    `src/conn_test.rs::second_client_preempts_the_live_session` (the one test
-    that drives the real `RdpServer::run` accept loop over real TCP — every other
-    conn_test uses `run_connection` over a duplex; it needs a `KeepAliveSound`
-    factory to hold the audio channel open, or the client loop ends instantly and
-    there's nothing to preempt). Additive to `run()` only; `run_connection` and
-    the per-connection path are untouched. Upstreamable as an opt-in policy (e.g.
-    a `ConnectionHandler`/builder switch: reject-new vs preempt-existing), since
-    a multi-session server would want the current queue-behind behavior — offer
-    it that way rather than as an unconditional change. **Filed upstream as
-    Devolutions/IronRDP#1476** (an opt-in `preempt_existing_session` builder
-    option, since a general-purpose server needs to keep the queue-behind
-    default) — drop this divergence once it's released and the pin can adopt it.
+(22) Second-client PREEMPTS the live session in the accept loop — SUPERSEDED
+    by (23) below; kept for history (added 2026-07-23, superseded 2026-07-27).
+    Upstream `RdpServer::run` `await`s the whole `run_connection(stream)`
+    inline, so while one client is connected a SECOND client's TCP connect
+    sits unserved in the listen backlog — the server never calls `accept()`
+    again until the first session ends: a silent HANG for the second client.
+    macrdp is single-console-session by design, so the right behavior is for a
+    new client to TAKE OVER. The original mechanism reshaped `run()` so the
+    in-flight connection raced `listener.accept()`, and a candidate won by
+    passing `probe_preempting_client` — a cheap `recv(MSG_PEEK)` check for a
+    TPKT header (version 3 + reserved 0), just enough to prove "this looks
+    like the start of an RDP handshake." Two narrower bugs in that mechanism
+    were fixed in place (on_accept had to run on the candidate BEFORE it could
+    start probing, not after it already won; and exactly once per physical
+    connection, not twice) before the mechanism itself was found to have a
+    structural problem — see (23).
 
-    **on_accept-ordering fix (2026-07-26, from the #1476 review):** the initial
-    cut only ran `ConnectionHandler::on_accept` on the candidate on the NEXT
-    outer-loop iteration — by which point the live session had already been
-    cancelled to make room for it. A candidate `on_accept` (the auth guard's
-    per-source-IP rate-limit/lockout) would reject could therefore still evict
-    the active session; it would just get rejected immediately afterward, after
-    the damage was done. Fixed by gating the candidate through `on_accept` as
-    soon as it's accepted, BEFORE it's allowed to start the TPKT probe (and so
-    before it can ever preempt anything). This needs `connection_handler`
-    pulled out of `self` into a local `handler` before the live connection's
-    `conn` future is created — `conn` captures `&mut self` for the whole race,
-    and `on_accept` must stay callable alongside it — restored into `self` once
-    the race ends (`conn`'s scope must close BEFORE the restore, or the
-    borrow checker rejects it — hence the extra `{ }` block around `conn`).
-    Covered by `src/conn_test.rs::
-    preemption_does_not_evict_a_session_the_handler_would_reject` (a real
-    `RdpServer::run()` with a handler that accepts only the first connection);
-    verified it fails without this fix (the live session gets evicted) and
-    passes with it.
+(23) Second-client preemption is gated on FULL AUTHENTICATION, not a TPKT peek
+    (NOT upstreamed; added 2026-07-27, replacing divergence (22)'s mechanism).
+    **The bug that forced this redesign, found via a real CI failure:**
+    `scripts/test-audit-log.sh` (two sequential connections — correct password,
+    then wrong password) started failing after (22) shipped: the FIRST
+    connection's `event="auth" outcome="success"` never appeared in the audit
+    log at all. Root cause: (22)'s `probing = false` from the moment a
+    connection started being served meant the accept loop raced
+    `listener.accept()` through the live connection's OWN negotiation, not just
+    once it was fully active. The test's second `sdl-freerdp` process could
+    connect and win the TPKT-peek race (2 bytes, near-instant) BEFORE the
+    first connection's TLS+CredSSP handshake (real crypto, genuinely slower)
+    completed — cancelling a connection that was about to authenticate
+    successfully, based on nothing more than "some other socket also sent 2
+    plausible bytes." This is not just a benign-overlap edge case: it means
+    ANY connection attempt — including a failed/malicious one that never
+    authenticates — could evict the live session purely by winning a race
+    against a TPKT peek, which is exactly backwards from what preemption
+    should guarantee ("unauthenticated connection shouldn't disconnect the
+    session," confirmed as the hard requirement rather than a nice-to-have).
+
+    **The fix: a candidate must complete REAL negotiation — TLS, then CredSSP
+    where applicable — before it's allowed to preempt anything.** This is
+    architecturally harder than the TPKT peek because `RdpServer` serves one
+    connection at a time by design (single `static_channels`, single
+    `gfx_handle`, factories that build real per-connection backends against
+    shared hardware — SCK capture, camera, USB, RDPDR/NFS); the live
+    connection's `run_connection` holds `&mut self` for its whole lifetime, so
+    a candidate's negotiation has to run WITHOUT touching `self` mutably at
+    all, or it can't run concurrently with the live connection's own
+    `&mut self` borrow. The fix is a Phase 1 (negotiate + authenticate,
+    concurrency-safe) / Phase 2 (exclusive, resource-driving) split:
+
+    - **`NegotiationContext`** (new struct): a cheap `Rc`/`Arc`-cloned snapshot
+      of everything Phase 1 needs — `self.opts`/`self.creds` (both `Clone`),
+      `self.display`/`self.handler` (already `Arc`), `self.echo_handle`/
+      `self.ev_sender` (already `Clone`), the channel factories, and
+      `self.connection_handler` (already `Rc<RefCell<..>>` from the (22)
+      on_accept-ordering fix). Built once per race via
+      `RdpServer::negotiation_context(&self)`.
+    - **Factory storage changed `Box<dyn X>` → `Rc<dyn X>`** (cliprdr, sound,
+      rdpdr, usb, camera, gfx) so `NegotiationContext` can hold cheap clones
+      instead of needing exclusive access through `self`. Public builder API
+      unchanged (still takes `Box<dyn X>`; wrapped via `Rc::from` at
+      construction, after the one-time `set_sender` setup that needs `&mut`
+      on the still-owned `Box`).
+    - **`attach_channels_impl`** (new free function): the channel-attaching
+      body of the old `attach_channels`, factored out to take explicit
+      factory/handle references instead of reading `self`. `RdpServer::
+      attach_channels` (the normal path) now just calls it with `self`'s own
+      fields; `negotiate_candidate` calls it with a `NegotiationContext`'s.
+      Returns the GFX handle instead of writing `self.gfx_handle` directly —
+      only the actual WINNER should claim it, so installation is deferred to
+      `serve_negotiated` (Phase 2 entry).
+    - **`negotiate_candidate`** (new free function, `TcpStream`-specific):
+      duplicates the pre-`accept_finalize` portion of `run_connection` —
+      build `Acceptor` → `attach_channels_impl` → `accept_begin` → TLS upgrade
+      → CredSSP (when the security mode is Hybrid; fires
+      `on_authenticated` on the candidate's outcome too, so a rejected
+      preemption attempt still shows up in the audit log) — against a
+      `NegotiationContext` instead of `&mut self`. Returns `Some(
+      NegotiatedCandidate)` (the negotiated `Acceptor` + framed TLS stream +
+      GFX handle) ONLY on full success; any failure at any step — malformed
+      negotiation, TLS rejected, CredSSP rejected — returns `None` and the
+      live session is left completely untouched. Duplicates rather than
+      shares code with `run_connection` because that function is generic over
+      any stream type and needs `&mut self`; this needs neither. Keep the two
+      in sync by hand if the negotiation sequence changes upstream.
+    - **Multitransport is a normal-path-only feature for a candidate.** Both
+      the UDP transport OFFER (in `run_connection`, before `attach_channels`)
+      and the lossy-audio DVC (inside `attach_channels_impl`, only useful
+      paired with that offer) are skipped entirely for a candidate — those
+      fields (`multitransport_cookies`, `current_offer_cookie`,
+      `udp_tunnel_bound`, …) are process-wide, per-connection-mutated
+      bookkeeping shared with the live connection's own multitransport state,
+      not safe to touch concurrently. A candidate that wins via preemption
+      always negotiates plain TCP; a normal (non-racing) connection is
+      unaffected. Same reasoning extends to RTT sampling (`link_rtt_ms`) —
+      not sampled for a preemption winner, since by the time it's confirmed
+      the winner its raw `TcpStream` is already wrapped in TLS.
+    - **`serve_negotiated`** (new method): Phase 2 for a winning candidate —
+      installs the deferred GFX handle, resets `auto_reconnect_sent`
+      (mirroring the top of `run_connection`), then hands off to the SAME
+      `accept_finalize` the normal path uses. From here a preemption-won
+      connection is indistinguishable from a normally-accepted one.
+    - **`run()`'s race loop**: `pending` now carries a `NegotiatedCandidate`
+      (not a raw stream) — by construction, nothing reaches `pending` without
+      having already passed `on_accept` AND fully authenticated. The `probe`
+      future's output changed from `Option<(TcpStream, SocketAddr)>` to
+      `Option<NegotiatedCandidate>`; since that no longer carries the peer
+      address, a `probing_peer: Option<SocketAddr>` local tracks it alongside
+      `probing`. `conn` (the live connection's future) changed from
+      `core::pin::pin!` (stack-pinned, single concrete type) to `Box::pin`
+      (heap-allocated, `dyn Future`), because it's now EITHER
+      `self.run_connection(stream)` (a fresh `Entry::Fresh`) OR
+      `self.serve_negotiated(candidate)` (an `Entry::Negotiated` — a
+      previously-preempting candidate that itself is now the live connection,
+      and must be just as preemptible by a THIRD candidate) — two different
+      concrete future types unified behind one `dyn Future` so the same race
+      loop serves both without duplicating it.
+
+    Covered by the existing `src/conn_test.rs::
+    second_client_preempts_the_live_session` (a well-behaved candidate still
+    wins end-to-end — proves the positive path through the new
+    `negotiate_candidate` machinery) and `::
+    preemption_does_not_evict_a_session_the_handler_would_reject` (the
+    `on_accept` gate still blocks a bad actor before negotiation even starts).
+    **Not covered locally: a candidate that reaches CredSSP but fails it**
+    (wrong password) — `ironrdp-server` isn't a workspace member here (a
+    `[patch.crates-io]` path override), so `#[cfg(test)]` code inside the
+    vendor crate itself can never run via any `cargo test` invocation from
+    macrdp (confirmed empirically: `cargo test -p ironrdp-server` refuses,
+    "requires dev-dependencies and is not a member of the workspace" — the
+    same reason other vendored crates' tests live in macrdp's own `src/*.rs`
+    testing public APIs instead). Building a full NTLM-capable test client in
+    `conn_test.rs` to drive real CredSSP failure was judged more risk/effort
+    than the remaining gap warranted, given `scripts/test-audit-log.sh` (real
+    sdl-freerdp, correct AND wrong password) is exactly this scenario and runs
+    in CI — that's the authoritative check for this path. The property does
+    follow directly from the code structure, though: a candidate cannot reach
+    `pending` without `negotiate_candidate` returning `Some`, and that can
+    only happen after `accept_credssp` returns `Ok`.
+
+    Upstreamable, same shape as (22): an opt-in policy (a `ConnectionHandler`/
+    builder switch: reject-new vs preempt-existing-once-authenticated), since
+    a general-purpose multi-session server would want to keep the existing
+    queue-behind behavior. Filed as Devolutions/IronRDP#1476 (still the
+    TPKT-peek shape as of this writing — the auth-gating redesign is
+    macrdp-specific for now, since it needed the `Box`→`Rc` factory change
+    which isn't obviously desirable upstream). Revisit upstreaming once (22)'s
+    design has had more real-world runway.

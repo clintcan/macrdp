@@ -26,7 +26,7 @@ use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor,
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
-use tokio::net::TcpSocket;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
@@ -46,11 +46,6 @@ use crate::{SoundServerFactory, builder, capabilities};
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 
-/// (vendored, divergence 22) How long a connection accepted while a session is
-/// live may take to start speaking RDP before it is dropped instead of being
-/// allowed to preempt that session.
-const PREEMPT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// (vendored, divergence 22) What resolved first while a session was live: the
 /// session itself ending, a new inbound connection, or the verdict on a
 /// previously accepted candidate. The `select!` yields one of these and does
@@ -59,57 +54,10 @@ const PREEMPT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 enum PreemptRace {
     Ended(Result<()>),
     Accepted(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
-    Probed(Option<(tokio::net::TcpStream, SocketAddr)>),
-}
-
-/// (vendored, divergence 22) Decide whether a connection accepted while another
-/// session is live may PREEMPT it, without consuming anything the RDP handshake
-/// needs.
-///
-/// Preemption is destructive to the connected user, so a bare TCP connect must
-/// not be enough to trigger it — otherwise any port scan (or a half-open probe)
-/// would kill a live desktop session. This peeks — `recv(MSG_PEEK)`, so the
-/// bytes stay queued for `run_connection` — at the first two bytes and requires
-/// them to be a TPKT header (version 3, reserved 0), i.e. the start of an X.224
-/// Connection Request. A scanner that connects and closes, or that never sends
-/// anything, resolves to `None` and the live session is left alone.
-///
-/// This is a cheap filter, not authentication: a peer that speaks RDP but fails
-/// NLA still takes over the session slot. That case is bounded by the
-/// [`ConnectionHandler`] gate (rate limiting / lockout), which the caller runs
-/// on the winner before serving it.
-async fn probe_preempting_client(
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
-) -> Option<(tokio::net::TcpStream, SocketAddr)> {
-    const TPKT_VERSION: u8 = 0x03;
-
-    let speaks_rdp = tokio::time::timeout(PREEMPT_PROBE_TIMEOUT, async {
-        let mut head = [0u8; 2];
-        loop {
-            match stream.peek(&mut head).await {
-                // Peer closed without sending — a connect-scan, not a client.
-                Ok(0) => return false,
-                // Only the first byte has landed; wait for its partner.
-                Ok(1) => tokio::time::sleep(Duration::from_millis(20)).await,
-                Ok(_) => return head[0] == TPKT_VERSION && head[1] == 0x00,
-                Err(_) => return false,
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-
-    if speaks_rdp {
-        Some((stream, peer))
-    } else {
-        debug!(
-            ?peer,
-            "connection did not start an RDP handshake while a session was live — \
-             dropping it rather than preempting the live session"
-        );
-        None
-    }
+    /// The outcome of `negotiate_candidate` for whichever peer is currently
+    /// being probed — see `probing_peer` at the call site for why the peer
+    /// itself isn't carried here.
+    Probed(Option<NegotiatedCandidate>),
 }
 
 /// Action to take after a client disconnects.
@@ -471,19 +419,26 @@ pub struct RdpServer {
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     static_channels: StaticChannelSet,
-    sound_factory: Option<Box<dyn SoundServerFactory>>,
-    cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
-    rdpdr_factory: Option<Box<dyn crate::RdpdrServerFactory>>,
+    // (vendored, divergence 23) `Rc`, not `Box`: a preempting candidate's
+    // trial negotiation (see `negotiate_and_authenticate`) needs to build its
+    // own real static/dynamic channels concurrently with the live
+    // connection's `run_connection`, which holds `&mut self` for the whole
+    // race — so it works from a cheaply-cloned snapshot of these factories
+    // instead of going through `self`. They're set once at construction and
+    // never reassigned, so sharing via `Rc` costs nothing at steady state.
+    sound_factory: Option<Rc<dyn SoundServerFactory>>,
+    cliprdr_factory: Option<Rc<dyn CliprdrServerFactory>>,
+    rdpdr_factory: Option<Rc<dyn crate::RdpdrServerFactory>>,
     // (divergence 16) server-direction MS-RDPEUSB (URBDRC) USB redirection.
     // Ships inert: the URBDRC DVC is advertised only when this is `Some`.
-    usb_factory: Option<Box<dyn crate::UrbdrcServerFactory>>,
+    usb_factory: Option<Rc<dyn crate::UrbdrcServerFactory>>,
     // (divergence 19) server-direction MS-RDPECAM camera redirection — Phase-0
     // protocol gate. The `RDCamera_Device_Enumerator` DVC is advertised only when
     // this is `Some`; byte-identical when None.
-    camera_factory: Option<Box<dyn crate::RdCameraServerFactory>>,
+    camera_factory: Option<Rc<dyn crate::RdCameraServerFactory>>,
     echo_handle: EchoServerHandle,
     #[cfg(feature = "egfx")]
-    gfx_factory: Option<Box<dyn GfxServerFactory>>,
+    gfx_factory: Option<Rc<dyn GfxServerFactory>>,
     #[cfg(feature = "egfx")]
     gfx_handle: Option<crate::gfx::GfxServerHandle>,
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
@@ -717,6 +672,340 @@ enum RunState {
     DeactivationReactivation { desktop_size: DesktopSize },
 }
 
+/// (vendored, divergence 23) The GFX server handle `attach_channels_impl`
+/// hands back, so its caller can decide whether/when to install it on
+/// `self.gfx_handle` — a type alias so the function signature doesn't need
+/// its own `#[cfg(feature = "egfx")]` variant.
+#[cfg(feature = "egfx")]
+type AttachedGfxHandle = Option<crate::gfx::GfxServerHandle>;
+#[cfg(not(feature = "egfx"))]
+type AttachedGfxHandle = ();
+
+/// (vendored, divergence 23) The channel-attaching half of connection setup,
+/// factored out of `RdpServer::attach_channels` so it can also run for a
+/// preempting candidate's trial negotiation (`negotiate_candidate`), which
+/// races concurrently against the live connection's `&mut self` borrow and so
+/// can't call a `&mut self` method. Takes borrowed/cloned factory references
+/// instead of reading `self` directly; the normal path
+/// (`RdpServer::attach_channels`) passes `self`'s own fields, the candidate
+/// path passes a cloned `NegotiationContext`'s.
+///
+/// Returns the GFX handle instead of writing it to a field — the normal path
+/// installs it on `self.gfx_handle` immediately (nothing else is racing);
+/// the candidate path holds it in the `NegotiatedCandidate` and only installs
+/// it on `self.gfx_handle` if/when that candidate actually wins (see
+/// `serve_negotiated`), since only the winner should claim it.
+///
+/// **Multitransport is a normal-path-only channel here.** The lossy-audio DVC
+/// (added when `multitransport_lossy_audio_formats` is `Some`) is
+/// deliberately NOT offered to a preempting candidate: it's only useful when
+/// paired with the UDP transport OFFER, which candidates also skip (see
+/// `negotiate_candidate`) because that offer registers process-wide cookie/
+/// tunnel state on `self` that isn't safe to touch concurrently with the live
+/// connection's own multitransport bookkeeping. A candidate that wins via
+/// preemption always runs plain TCP with no lossy-audio channel; a normal
+/// (non-racing) connection is unaffected.
+#[expect(clippy::too_many_arguments, reason = "internal helper, one call site per caller shape")]
+fn attach_channels_impl(
+    acceptor: &mut Acceptor,
+    cliprdr_factory: Option<&dyn CliprdrServerFactory>,
+    sound_factory: Option<&dyn SoundServerFactory>,
+    rdpdr_factory: Option<&dyn crate::RdpdrServerFactory>,
+    usb_factory: Option<&dyn crate::UrbdrcServerFactory>,
+    camera_factory: Option<&dyn crate::RdCameraServerFactory>,
+    #[cfg(feature = "egfx")] gfx_factory: Option<&dyn GfxServerFactory>,
+    #[cfg(feature = "multitransport")] multitransport_lossy_audio_formats: Option<Vec<ironrdp_rdpsnd::pdu::AudioFormat>>,
+    #[cfg(feature = "multitransport")] lossy_audio_format: crate::multitransport::audio_dvc::NegotiatedAudioFormat,
+    display: &Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+    handler: &Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    echo_handle: &EchoServerHandle,
+    ev_sender: &mpsc::UnboundedSender<ServerEvent>,
+) -> AttachedGfxHandle {
+    if let Some(cliprdr_factory) = cliprdr_factory {
+        let backend = cliprdr_factory.build_cliprdr_backend();
+
+        let cliprdr = CliprdrServer::new(backend);
+
+        acceptor.attach_static_channel(cliprdr);
+    }
+
+    if let Some(factory) = sound_factory {
+        let backend = factory.build_backend();
+
+        acceptor.attach_static_channel(RdpsndServer::new(backend));
+    }
+
+    // RDPDR (drive redirection). MS-RDPEFS requires it be co-advertised with
+    // rdpsnd, so it's attached right after the sound channel. build_rdpdr
+    // wires the backend's RdpdrHandle to this connection's event sender so it
+    // can issue device-I/O requests.
+    if let Some(factory) = rdpdr_factory {
+        let rdpdr = crate::rdpdr::build_rdpdr(factory, ev_sender.clone());
+        acceptor.attach_static_channel(rdpdr);
+    }
+
+    let dcs_backend = DisplayControlBackend::new(Arc::clone(display));
+    let dvc = dvc::DrdynvcServer::new()
+        .with_dynamic_channel(AInputHandler {
+            handler: Arc::clone(handler),
+        })
+        .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+
+    let dvc = {
+        let echo_handle = echo_handle.clone();
+        dvc.with_dynamic_channel(EchoDvcBridge::new(echo_handle))
+    };
+
+    #[cfg(feature = "egfx")]
+    let (dvc, gfx_handle) = {
+        let mut dvc = dvc;
+        let mut gfx_handle = None;
+        if let Some(gfx_factory) = gfx_factory {
+            if let Some((bridge, handle)) = gfx_factory.build_server_with_handle() {
+                gfx_handle = Some(handle);
+                dvc = dvc.with_dynamic_channel(bridge);
+            } else {
+                let handler = gfx_factory.build_gfx_handler();
+                let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
+                dvc = dvc.with_dynamic_channel(gfx_server);
+            }
+        }
+        (dvc, gfx_handle)
+    };
+    #[cfg(not(feature = "egfx"))]
+    let gfx_handle = ();
+
+    // (vendored, feature=multitransport, P2.4b) Dual audio output DVC for lossy
+    // UDP audio. Registered only when the application supplied a format list
+    // (macrdp does so when `--enable-aac` + the lossy UDP offer are both on).
+    // mstsc tears down if it receives Server Audio Formats on the `_LOSSY_`
+    // channel (over TCP *or* the tunnel — verified), so we open BOTH: the
+    // reliable `AUDIO_PLAYBACK_DVC` runs the format/quality/training handshake
+    // over TCP and publishes the negotiated format index; the lossy
+    // `AUDIO_PLAYBACK_LOSSY_DVC` is Soft-Synced onto the lossy/DTLS tunnel and
+    // carries only Wave2 data stamped with that index. See the "Multitransport
+    // is a normal-path-only channel" note on this function's doc comment.
+    #[cfg(feature = "multitransport")]
+    let dvc = {
+        use crate::multitransport::audio_dvc::AudioLossyDvc;
+        let mut dvc = dvc;
+        if let Some(formats) = multitransport_lossy_audio_formats {
+            dvc = dvc.with_dynamic_channel(AudioLossyDvc::reliable(formats, lossy_audio_format.clone()));
+            dvc = dvc.with_dynamic_channel(AudioLossyDvc::lossy());
+        }
+        dvc
+    };
+
+    // (divergence 16) server-direction MS-RDPEUSB (URBDRC) USB redirection.
+    // Advertised only when a factory is installed; byte-identical when None.
+    let dvc = {
+        let mut dvc = dvc;
+        if let Some(usb_factory) = usb_factory {
+            dvc = dvc.with_dynamic_channel(usb_factory.build_processor());
+        }
+        dvc
+    };
+
+    // (divergence 19) server-direction MS-RDPECAM camera redirection (Phase-0
+    // gate). Advertised only when a factory is installed; byte-identical when None.
+    let dvc = {
+        let mut dvc = dvc;
+        if let Some(camera_factory) = camera_factory {
+            dvc = dvc.with_dynamic_channel(camera_factory.build_processor());
+        }
+        dvc
+    };
+
+    acceptor.attach_static_channel(dvc);
+
+    gfx_handle
+}
+
+/// (vendored, divergence 23) A cheap, `Rc`/`Arc`-cloned snapshot of everything
+/// [`negotiate_candidate`] needs to run a preempting candidate's TLS+CredSSP
+/// negotiation concurrently with the live connection's `run_connection`
+/// (which holds `&mut self` for the whole race — see `RdpServer::run`'s
+/// preemption branch). Built once per race via `RdpServer::negotiation_context`.
+///
+/// Deliberately does NOT carry multitransport state (`self.multitransport*`,
+/// `self.link_rtt_ms`, `self.current_offer_cookie`): those fields are
+/// process-wide, per-connection-mutated bookkeeping shared with the live
+/// connection's own negotiation, so a candidate touching them concurrently
+/// would corrupt whichever runs second. A candidate that wins via preemption
+/// always negotiates plain TCP (no UDP multitransport offer, no lossy-audio
+/// DVC) — see the doc comment on `attach_channels_impl`.
+struct NegotiationContext {
+    opts: RdpServerOptions,
+    creds: Option<Credentials>,
+    honor_client_desktop_size: bool,
+    honor_client_desktop_size_max: Option<DesktopSize>,
+    display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    echo_handle: EchoServerHandle,
+    ev_sender: mpsc::UnboundedSender<ServerEvent>,
+    cliprdr_factory: Option<Rc<dyn CliprdrServerFactory>>,
+    sound_factory: Option<Rc<dyn SoundServerFactory>>,
+    rdpdr_factory: Option<Rc<dyn crate::RdpdrServerFactory>>,
+    usb_factory: Option<Rc<dyn crate::UrbdrcServerFactory>>,
+    camera_factory: Option<Rc<dyn crate::RdCameraServerFactory>>,
+    #[cfg(feature = "egfx")]
+    gfx_factory: Option<Rc<dyn GfxServerFactory>>,
+    connection_handler: Option<Rc<RefCell<Box<dyn ConnectionHandler>>>>,
+}
+
+/// (vendored, divergence 23) The result of a successful [`negotiate_candidate`]
+/// call: TLS is up, CredSSP authenticated (or the security mode doesn't use
+/// CredSSP at all — see that function's doc comment), and static/dynamic
+/// channels are attached. Everything needed to jump straight into
+/// `RdpServer::accept_finalize` — [`RdpServer::serve_negotiated`] does exactly
+/// that for the winner of a preemption race, skipping the negotiation this
+/// struct already completed.
+struct NegotiatedCandidate {
+    framed: TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>,
+    acceptor: Acceptor,
+    gfx_handle: AttachedGfxHandle,
+}
+
+/// (vendored, divergence 23) Negotiate and authenticate `stream` from `peer`
+/// against a cloned `ctx`, WITHOUT touching the live connection's `self` at
+/// all — this is what lets it run concurrently, inside `RdpServer::run`'s
+/// preemption race, against the live connection's own `run_connection` (which
+/// holds `&mut self`).
+///
+/// Returns `Some` only once the candidate has genuinely proven itself: TLS
+/// established AND (for macrdp's always-Hybrid security — see
+/// [`RdpServerSecurity`]) CredSSP/NLA authentication succeeded. On any
+/// failure — TLS rejected, CredSSP rejected, a malformed/non-RDP negotiation,
+/// or a security mode this fast path doesn't know how to authenticate for
+/// (defensive; macrdp always configures Hybrid) — returns `None` and the live
+/// connection is left completely undisturbed. This is the fix for
+/// "an unauthenticated connection shouldn't be able to disconnect the live
+/// session": the old TPKT-header-only probe proved a candidate was
+/// *attempting* an RDP handshake, not that it would succeed, so a connection
+/// that failed authentication entirely — or even one that was simply still
+/// negotiating when a second, unrelated connection arrived — could still
+/// evict the active session before either side finished.
+///
+/// This duplicates the pre-`accept_finalize` portion of `run_connection`
+/// (X.224 negotiate → attach real channels → TLS → CredSSP) rather than
+/// sharing code with it, because `run_connection` is generic over any
+/// `AsyncRead + AsyncWrite` stream and takes `&mut self`; this is
+/// `TcpStream`-specific (the only stream type `RdpServer::run`'s accept loop
+/// ever sees) and takes `&NegotiationContext` instead, precisely so it can
+/// run alongside a live `&mut self` borrow. Keep the two in sync by hand if
+/// the negotiation sequence ever changes upstream.
+async fn negotiate_candidate(ctx: &NegotiationContext, stream: TcpStream, peer: SocketAddr) -> Option<NegotiatedCandidate> {
+    let framed = TokioFramed::new(stream);
+
+    let size = ctx.display.lock().await.size().await;
+    let capabilities = capabilities::capabilities(&ctx.opts, size);
+    let mut acceptor = Acceptor::new(ctx.opts.security.flag(), size, capabilities, ctx.creds.clone());
+    acceptor.set_honor_client_desktop_size(ctx.honor_client_desktop_size);
+    acceptor.set_honor_client_desktop_size_max(ctx.honor_client_desktop_size_max);
+
+    let gfx_handle = attach_channels_impl(
+        &mut acceptor,
+        ctx.cliprdr_factory.as_deref(),
+        ctx.sound_factory.as_deref(),
+        ctx.rdpdr_factory.as_deref(),
+        ctx.usb_factory.as_deref(),
+        ctx.camera_factory.as_deref(),
+        #[cfg(feature = "egfx")]
+        ctx.gfx_factory.as_deref(),
+        // No multitransport offer for a candidate (see the struct doc on
+        // `NegotiationContext`), so the lossy-audio DVC — which is only
+        // useful paired with that offer — is never attached here either.
+        #[cfg(feature = "multitransport")]
+        None,
+        #[cfg(feature = "multitransport")]
+        crate::multitransport::audio_dvc::NegotiatedAudioFormat::new(),
+        &ctx.display,
+        &ctx.handler,
+        &ctx.echo_handle,
+        &ctx.ev_sender,
+    );
+
+    let res = match ironrdp_acceptor::accept_begin(framed, &mut acceptor).await {
+        Ok(res) => res,
+        Err(error) => {
+            debug!(?peer, ?error, "candidate accept_begin failed — not eligible to preempt");
+            return None;
+        }
+    };
+
+    let stream = match res {
+        BeginResult::ShouldUpgrade(stream) => stream,
+        BeginResult::Continue(_) => {
+            // No TLS in this security mode, so there's nothing to
+            // authenticate against — matches `RdpServerSecurity::None`,
+            // which macrdp never configures. Conservatively not eligible to
+            // preempt rather than guessing at a meaning for "authenticated"
+            // that doesn't apply here.
+            debug!(?peer, "candidate connection did not upgrade to TLS — not eligible to preempt");
+            return None;
+        }
+    };
+
+    let tls_acceptor = match &ctx.opts.security {
+        RdpServerSecurity::Tls(acceptor) => acceptor,
+        RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
+        RdpServerSecurity::None => unreachable!("ShouldUpgrade implies a TLS-capable security mode"),
+    };
+    let accept = match tls_acceptor.accept(stream).await {
+        Ok(accept) => accept,
+        Err(error) => {
+            debug!(?peer, ?error, "candidate TLS accept failed — not eligible to preempt");
+            return None;
+        }
+    };
+    let mut framed = TokioFramed::new(accept);
+
+    acceptor.mark_security_upgrade_as_done();
+
+    let hybrid_pub_key = match &ctx.opts.security {
+        RdpServerSecurity::Hybrid((_, pub_key)) => Some(pub_key.clone()),
+        _ => None,
+    };
+    if let Some(pub_key) = hybrid_pub_key {
+        let client_name = "rdp-client".to_owned();
+
+        let auth_result = ironrdp_acceptor::accept_credssp(
+            &mut framed,
+            &mut acceptor,
+            &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+            client_name.into(),
+            pub_key,
+            None,
+        )
+        .await;
+
+        // (vendored, divergence 18) Same audit hook `run_connection` uses for
+        // the live connection — reachable here via the `Rc<RefCell<..>>`
+        // clone in `ctx`. Fires for a REJECTED candidate too (unlike the old
+        // TPKT probe, which had no auth outcome to report at all), so a
+        // failed preemption attempt against a real macrdp deployment still
+        // shows up in the audit log / AuthGuardHandler lockout accounting.
+        if let Some(handler) = ctx.connection_handler.as_ref() {
+            match &auth_result {
+                Ok(()) => handler.borrow_mut().on_authenticated(true, None),
+                Err(e) => handler.borrow_mut().on_authenticated(false, Some(&e.to_string())),
+            }
+        }
+
+        if let Err(error) = auth_result {
+            debug!(?peer, ?error, "candidate CredSSP authentication failed — not preempting the live session");
+            return None;
+        }
+    }
+
+    debug!(?peer, "candidate authenticated — eligible to preempt the live session");
+    Some(NegotiatedCandidate {
+        framed,
+        acceptor,
+        gfx_handle,
+    })
+}
+
 impl RdpServer {
     pub fn new(
         opts: RdpServerOptions,
@@ -762,14 +1051,18 @@ impl RdpServer {
             handler: Arc::new(Mutex::new(handler)),
             display: Arc::new(Mutex::new(display)),
             static_channels: StaticChannelSet::new(),
-            sound_factory,
-            cliprdr_factory,
-            rdpdr_factory,
-            usb_factory,
-            camera_factory,
+            // Wrapped into `Rc` here (after the one-time `set_sender` setup
+            // above, which needs `&mut` on the still-owned `Box`) so a
+            // preempting candidate's trial negotiation can hold its own
+            // cheap clone — see the field doc comment.
+            sound_factory: sound_factory.map(Rc::from),
+            cliprdr_factory: cliprdr_factory.map(Rc::from),
+            rdpdr_factory: rdpdr_factory.map(Rc::from),
+            usb_factory: usb_factory.map(Rc::from),
+            camera_factory: camera_factory.map(Rc::from),
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
             #[cfg(feature = "egfx")]
-            gfx_factory,
+            gfx_factory: gfx_factory.map(Rc::from),
             #[cfg(feature = "egfx")]
             gfx_handle: None,
             ev_sender,
@@ -1023,98 +1316,80 @@ impl RdpServer {
     }
 
     fn attach_channels(&mut self, acceptor: &mut Acceptor) {
-        if let Some(cliprdr_factory) = self.cliprdr_factory.as_deref() {
-            let backend = cliprdr_factory.build_cliprdr_backend();
-
-            let cliprdr = CliprdrServer::new(backend);
-
-            acceptor.attach_static_channel(cliprdr);
-        }
-
-        if let Some(factory) = self.sound_factory.as_deref() {
-            let backend = factory.build_backend();
-
-            acceptor.attach_static_channel(RdpsndServer::new(backend));
-        }
-
-        // RDPDR (drive redirection). MS-RDPEFS requires it be co-advertised with
-        // rdpsnd, so it's attached right after the sound channel. build_rdpdr
-        // wires the backend's RdpdrHandle to this connection's event sender so it
-        // can issue device-I/O requests.
-        if let Some(factory) = self.rdpdr_factory.as_deref() {
-            let rdpdr = crate::rdpdr::build_rdpdr(factory, self.ev_sender.clone());
-            acceptor.attach_static_channel(rdpdr);
-        }
-
-        let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-        let dvc = dvc::DrdynvcServer::new()
-            .with_dynamic_channel(AInputHandler {
-                handler: Arc::clone(&self.handler),
-            })
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
-
-        let dvc = {
-            let echo_handle = self.echo_handle.clone();
-            dvc.with_dynamic_channel(EchoDvcBridge::new(echo_handle))
-        };
-
+        let gfx_handle = attach_channels_impl(
+            acceptor,
+            self.cliprdr_factory.as_deref(),
+            self.sound_factory.as_deref(),
+            self.rdpdr_factory.as_deref(),
+            self.usb_factory.as_deref(),
+            self.camera_factory.as_deref(),
+            #[cfg(feature = "egfx")]
+            self.gfx_factory.as_deref(),
+            #[cfg(feature = "multitransport")]
+            self.multitransport_lossy_audio_formats.clone(),
+            #[cfg(feature = "multitransport")]
+            self.lossy_audio_format.clone(),
+            &self.display,
+            &self.handler,
+            &self.echo_handle,
+            &self.ev_sender,
+        );
         #[cfg(feature = "egfx")]
-        let dvc = {
-            let mut dvc = dvc;
-            if let Some(gfx_factory) = self.gfx_factory.as_deref() {
-                if let Some((bridge, handle)) = gfx_factory.build_server_with_handle() {
-                    self.gfx_handle = Some(handle);
-                    dvc = dvc.with_dynamic_channel(bridge);
-                } else {
-                    let handler = gfx_factory.build_gfx_handler();
-                    let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
-                    dvc = dvc.with_dynamic_channel(gfx_server);
-                }
-            }
-            dvc
-        };
+        {
+            self.gfx_handle = gfx_handle;
+        }
+        #[cfg(not(feature = "egfx"))]
+        let _ = gfx_handle;
+    }
 
-        // (vendored, feature=multitransport, P2.4b) Dual audio output DVC for lossy
-        // UDP audio. Registered only when the application supplied a format list
-        // (macrdp does so when `--enable-aac` + the lossy UDP offer are both on).
-        // mstsc tears down if it receives Server Audio Formats on the `_LOSSY_`
-        // channel (over TCP *or* the tunnel — verified), so we open BOTH: the
-        // reliable `AUDIO_PLAYBACK_DVC` runs the format/quality/training handshake
-        // over TCP and publishes the negotiated format index; the lossy
-        // `AUDIO_PLAYBACK_LOSSY_DVC` is Soft-Synced onto the lossy/DTLS tunnel and
-        // carries only Wave2 data stamped with that index.
-        #[cfg(feature = "multitransport")]
-        let dvc = {
-            use crate::multitransport::audio_dvc::AudioLossyDvc;
-            let mut dvc = dvc;
-            if let Some(formats) = self.multitransport_lossy_audio_formats.clone() {
-                dvc = dvc.with_dynamic_channel(AudioLossyDvc::reliable(formats, self.lossy_audio_format.clone()));
-                dvc = dvc.with_dynamic_channel(AudioLossyDvc::lossy());
-            }
-            dvc
-        };
+    /// (vendored, divergence 23) Build a cheap, `Rc`/`Arc`-cloned snapshot for
+    /// a candidate's concurrent negotiation — see [`NegotiationContext`].
+    fn negotiation_context(&self) -> NegotiationContext {
+        NegotiationContext {
+            opts: self.opts.clone(),
+            creds: self.creds.clone(),
+            honor_client_desktop_size: self.honor_client_desktop_size,
+            honor_client_desktop_size_max: self.honor_client_desktop_size_max,
+            display: Arc::clone(&self.display),
+            handler: Arc::clone(&self.handler),
+            echo_handle: self.echo_handle.clone(),
+            ev_sender: self.ev_sender.clone(),
+            cliprdr_factory: self.cliprdr_factory.clone(),
+            sound_factory: self.sound_factory.clone(),
+            rdpdr_factory: self.rdpdr_factory.clone(),
+            usb_factory: self.usb_factory.clone(),
+            camera_factory: self.camera_factory.clone(),
+            #[cfg(feature = "egfx")]
+            gfx_factory: self.gfx_factory.clone(),
+            connection_handler: self.connection_handler.clone(),
+        }
+    }
 
-        // (divergence 16) server-direction MS-RDPEUSB (URBDRC) USB redirection.
-        // Advertised only when a factory is installed; byte-identical when None.
-        let dvc = {
-            let mut dvc = dvc;
-            if let Some(usb_factory) = self.usb_factory.as_deref() {
-                dvc = dvc.with_dynamic_channel(usb_factory.build_processor());
-            }
-            dvc
-        };
+    /// (vendored, divergence 23) Phase 2 for a candidate that already won the
+    /// preemption race in [`negotiate_candidate`] — TLS and CredSSP are
+    /// already done. Installs the winner's GFX handle (deferred until now:
+    /// only the actual winner should claim it, see `attach_channels_impl`'s
+    /// doc comment) and resets the auto-reconnect-cookie guard (mirroring the
+    /// top of `run_connection`), then hands off to the same `accept_finalize`
+    /// the normal path uses — from here on a preemption-won connection is
+    /// indistinguishable from a normally-accepted one.
+    async fn serve_negotiated(&mut self, candidate: NegotiatedCandidate) -> Result<()> {
+        self.auto_reconnect_sent = false;
+        #[cfg(feature = "egfx")]
+        {
+            self.gfx_handle = candidate.gfx_handle;
+        }
+        #[cfg(not(feature = "egfx"))]
+        let _ = candidate.gfx_handle;
 
-        // (divergence 19) server-direction MS-RDPECAM camera redirection (Phase-0
-        // gate). Advertised only when a factory is installed; byte-identical when None.
-        let dvc = {
-            let mut dvc = dvc;
-            if let Some(camera_factory) = self.camera_factory.as_deref() {
-                dvc = dvc.with_dynamic_channel(camera_factory.build_processor());
-            }
-            dvc
-        };
+        let framed = self.accept_finalize(candidate.framed, candidate.acceptor).await?;
+        debug!("Shutting down TLS connection");
+        let (mut tls_stream, _) = framed.into_inner();
+        if let Err(e) = tls_stream.shutdown().await {
+            debug!(?e, "TLS shutdown error");
+        }
 
-        acceptor.attach_static_channel(dvc);
+        Ok(())
     }
 
     pub async fn run_connection<S>(&mut self, stream: S) -> Result<()>
@@ -1354,17 +1629,26 @@ impl RdpServer {
         debug!("Listening for connections on {local_addr}");
         self.local_addr = Some(local_addr);
 
-        // (vendored, divergence 22) A connection that arrives while a session is
-        // live PREEMPTS it (see `probe_preempting_client`). The preempting stream
-        // is carried here so the next iteration serves it instead of accepting a
-        // fresh one — it still goes through the RTT sample below, exactly like
-        // any other connection, but NOT `on_accept` again (see `from_pending`):
-        // it already cleared that gate once, as a candidate, during the race.
-        let mut pending: Option<(tokio::net::TcpStream, SocketAddr)> = None;
+        // (vendored, divergence 23) A candidate that wins a preemption race
+        // (see `negotiate_candidate`) has ALREADY cleared `on_accept` and
+        // fully authenticated (TLS + CredSSP) by the time it lands here — the
+        // whole point of the auth-gated redesign is that nothing gets to
+        // preempt the live session without proving itself first. So `pending`
+        // carries a `NegotiatedCandidate`, not a raw stream: the next
+        // iteration skips straight to `serve_negotiated` (Phase 2), with no
+        // second `on_accept` call (would double-count a stateful handler like
+        // `AuthGuardHandler`, see `NegotiationContext`'s doc comment) and no
+        // renegotiation (already done).
+        let mut pending: Option<(NegotiatedCandidate, SocketAddr)> = None;
 
         loop {
-            let (stream, peer, from_pending) = match pending.take() {
-                Some((stream, peer)) => (stream, peer, true),
+            enum Entry {
+                Fresh(TcpStream, SocketAddr),
+                Negotiated(NegotiatedCandidate, SocketAddr),
+            }
+
+            let entry = match pending.take() {
+                Some((candidate, peer)) => Entry::Negotiated(candidate, peer),
                 None => {
                     let ev_receiver = Arc::clone(&self.ev_receiver);
                     let mut ev_receiver = ev_receiver.lock().await;
@@ -1393,20 +1677,25 @@ impl RdpServer {
                         },
                         else => break,
                     };
-                    (stream, peer, false)
+                    Entry::Fresh(stream, peer)
                 }
             };
 
+            let peer = match &entry {
+                Entry::Fresh(_, peer) | Entry::Negotiated(_, peer) => *peer,
+            };
             debug!(?peer, "Received connection");
 
-            // A `pending` winner already ran (and passed) `on_accept` once,
-            // as a candidate, inside the preemption race below. Re-running it
-            // here would be a silent double-count for a STATEFUL handler —
-            // macrdp's own `AuthGuardHandler::on_accept` records the accept
-            // toward its per-source-IP rate-limit window and writes an audit
-            // line, so calling it twice for the one physical connection would
-            // inflate both without a second real attempt behind it.
-            let accepted = from_pending
+            // A `Negotiated` winner already ran (and passed) `on_accept` once,
+            // as a candidate, inside the preemption race below — its
+            // negotiation wouldn't even have started otherwise (see
+            // `negotiate_candidate`'s caller). Re-running it here would be a
+            // silent double-count for a STATEFUL handler — macrdp's own
+            // `AuthGuardHandler::on_accept` records the accept toward its
+            // per-source-IP rate-limit window and writes an audit line, so
+            // calling it twice for the one physical connection would inflate
+            // both without a second real attempt behind it.
+            let accepted = matches!(entry, Entry::Negotiated(..))
                 || self
                     .connection_handler
                     .as_ref()
@@ -1414,7 +1703,9 @@ impl RdpServer {
 
             if !accepted {
                 debug!(?peer, "Connection rejected by handler");
-                drop(stream);
+                if let Entry::Fresh(stream, _) = entry {
+                    drop(stream);
+                }
             } else {
                 // (vendored, divergence 15) Sample the kernel's smoothed TCP
                 // RTT here — the accept loop is the only point the concrete
@@ -1422,45 +1713,67 @@ impl RdpServer {
                 // takes a generic stream and wraps it immediately. The
                 // handshake-seeded srtt is available right away and is what
                 // link-adaptive consumers key on. 0 = unknown (kept on error).
-                if let Some(cell) = &self.link_rtt_ms {
-                    let rtt = tcp_srtt_ms(&stream).unwrap_or(0);
-                    cell.store(rtt, Ordering::Relaxed);
-                    debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
+                //
+                // Not sampled for a `Negotiated` winner: its raw `TcpStream`
+                // is already wrapped in TLS by the time it gets here (and its
+                // negotiation ran against a `NegotiationContext` snapshot that
+                // deliberately excludes `link_rtt_ms` — see that struct's doc
+                // comment on why candidates don't touch shared connection
+                // state). Accepted limitation, same shape as candidates
+                // skipping the multitransport offer: a preemption-won
+                // connection's RTT-dependent behavior (blank-recovery gating,
+                // adaptive-bitrate seeding) falls back to whatever was last
+                // observed rather than a fresh sample.
+                if let Entry::Fresh(stream, _) = &entry {
+                    if let Some(cell) = &self.link_rtt_ms {
+                        let rtt = tcp_srtt_ms(stream).unwrap_or(0);
+                        cell.store(rtt, Ordering::Relaxed);
+                        debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
+                    }
                 }
                 let started = tokio::time::Instant::now();
 
-                // (vendored, divergence 22) Serve this connection, but keep
-                // accepting meanwhile: a NEW client must be able to take over
-                // an existing session instead of hanging in the backlog behind
-                // it (the accept loop used to `await` the whole connection, so
-                // a second client saw a silent hang until the first left).
-                // A candidate that clears `on_accept` (the auth guard's
-                // rate-limit/lockout — see below) AND passes
-                // `probe_preempting_client` wins: the in-flight connection
+                // (vendored, divergence 22/23) Serve this connection, but
+                // keep accepting meanwhile: a NEW client must be able to take
+                // over an existing session instead of hanging in the backlog
+                // behind it (the accept loop used to `await` the whole
+                // connection, so a second client saw a silent hang until the
+                // first left). A candidate wins only once it clears
+                // `on_accept` (the auth guard's rate-limit/lockout — checked
+                // before it's even allowed to start negotiating, see the next
+                // comment) AND fully authenticates via `negotiate_candidate`
+                // (TLS + CredSSP) — an unauthenticated connection, or one that
+                // merely started a handshake, can never preempt the live
+                // session (Devolutions/IronRDP#1476 review + a real
+                // regression this exact gap caused, see divergence 23's log
+                // entry). Once a candidate wins, the in-flight connection
                 // future is dropped (cancelled — its socket closes and every
                 // per-connection resource unwinds via Drop, the same teardown
                 // a client-side disconnect takes) and the newcomer is served
-                // on the next iteration.
+                // on the next iteration via `serve_negotiated`, which resumes
+                // straight from its already-completed negotiation.
                 //
                 // Clone the shared `connection_handler` handle first (a cheap
-                // `Rc` bump): `conn` below captures `&mut self` for the whole
-                // race, so the candidate's `on_accept` — which needs to run
-                // concurrently with `conn`, see the next comment — can't go
-                // through `self.connection_handler` directly. It's `Rc<RefCell<..>>`
-                // rather than a bare `Option<Box<..>>` for exactly this reason:
-                // a `self.connection_handler.take()` here (the first cut of
-                // this fix) would have made it inaccessible to `conn` too —
-                // silently breaking `on_authenticated`/`on_client_fingerprint`,
-                // which `run_connection` calls through this same field
-                // mid-connection, for the WHOLE race, not just an instant.
+                // `Rc` bump) and snapshot a `NegotiationContext`: `conn` below
+                // captures `&mut self` for the whole race, so a candidate's
+                // `on_accept` + negotiation — which needs to run concurrently
+                // with `conn` — can't go through `self` directly.
                 let handler = self.connection_handler.clone();
+                let ctx = self.negotiation_context();
 
                 let outcome = {
-                    let mut conn = core::pin::pin!(self.run_connection(stream));
-                    let mut probe: core::pin::Pin<
-                        Box<dyn core::future::Future<Output = Option<(tokio::net::TcpStream, SocketAddr)>>>,
-                    > = Box::pin(core::future::pending());
+                    let mut conn: core::pin::Pin<Box<dyn Future<Output = Result<()>> + '_>> = match entry {
+                        Entry::Fresh(stream, _) => Box::pin(self.run_connection(stream)),
+                        Entry::Negotiated(candidate, _) => Box::pin(self.serve_negotiated(candidate)),
+                    };
+                    let mut probe: core::pin::Pin<Box<dyn Future<Output = Option<NegotiatedCandidate>>>> =
+                        Box::pin(core::future::pending());
                     let mut probing = false;
+                    // The peer being probed — `negotiate_candidate`'s Output
+                    // doesn't carry it (it's already known to the caller), so
+                    // it's tracked alongside `probing` and reattached to
+                    // whatever `probe` resolves to.
+                    let mut probing_peer: Option<SocketAddr> = None;
 
                     loop {
                         // The select must only YIELD here, never mutate
@@ -1474,16 +1787,18 @@ impl RdpServer {
 
                         match race {
                             // The session ended on its own. A candidate still
-                            // being probed is NOT dropped on the floor — that
-                            // would silently reset a legitimate client that
-                            // happened to connect right as the old session
-                            // left; finish the probe and serve it next.
+                            // being negotiated is NOT dropped on the floor —
+                            // that would silently reset a legitimate client
+                            // that happened to connect right as the old
+                            // session left; finish its negotiation and serve
+                            // it next if it authenticates.
                             PreemptRace::Ended(res) => {
                                 if probing {
                                     // Not a preemption (nothing was taken from
                                     // anyone) — hand it straight to the next
                                     // iteration.
-                                    pending = probe.await;
+                                    let peer = probing_peer.expect("probing implies probing_peer is set");
+                                    pending = probe.await.map(|candidate| (candidate, peer));
                                 }
                                 break (res, None);
                             }
@@ -1491,20 +1806,19 @@ impl RdpServer {
                                 // Gate the candidate through `on_accept`
                                 // (the AuthGuardHandler's per-source-IP
                                 // rate-limit/lockout) BEFORE it's allowed to
-                                // start probing — and so before it can ever
-                                // preempt anything. Without this, a candidate
-                                // the guard would reject could still evict the
-                                // live session just by winning the TPKT
-                                // probe, since `on_accept` would only run
-                                // afterward once it became the next
-                                // iteration's connection — the exact ordering
-                                // bug Devolutions/IronRDP#1476 review caught
-                                // in the upstreamed shape of this fix.
+                                // start negotiating — and so before it can
+                                // ever preempt anything. Without this, a
+                                // candidate the guard would reject could
+                                // still evict the live session just by
+                                // authenticating, since `on_accept` would
+                                // only run afterward once it became the next
+                                // iteration's connection.
                                 let candidate_accepted =
                                     handler.as_ref().is_none_or(|h| h.borrow_mut().on_accept(next_peer));
                                 if candidate_accepted {
                                     probing = true;
-                                    probe = Box::pin(probe_preempting_client(next_stream, next_peer));
+                                    probing_peer = Some(next_peer);
+                                    probe = Box::pin(negotiate_candidate(&ctx, next_stream, next_peer));
                                 } else {
                                     debug!(
                                         ?next_peer,
@@ -1519,8 +1833,12 @@ impl RdpServer {
                             PreemptRace::Probed(candidate) => {
                                 probing = false;
                                 probe = Box::pin(core::future::pending());
-                                if let Some(next) = candidate {
-                                    break (Ok(()), Some(next));
+                                let peer = probing_peer.take().expect("probing_peer set alongside probing");
+                                match candidate {
+                                    Some(candidate) => break (Ok(()), Some((candidate, peer))),
+                                    None => {
+                                        debug!(?peer, "candidate did not authenticate — live session unaffected");
+                                    }
                                 }
                             }
                         }
@@ -1530,13 +1848,13 @@ impl RdpServer {
                 let (result, preempted_by) = outcome;
                 let duration = started.elapsed();
 
-                if let Some((next_stream, next_peer)) = preempted_by {
+                if let Some((candidate, new_peer)) = preempted_by {
                     info!(
                         old_peer = ?peer,
-                        new_peer = ?next_peer,
-                        "another client connected — dropping the existing session in its favor"
+                        new_peer = ?new_peer,
+                        "an authenticated candidate connected — dropping the existing session in its favor"
                     );
-                    pending = Some((next_stream, next_peer));
+                    pending = Some((candidate, new_peer));
                 }
 
                 if let Err(ref error) = result {
