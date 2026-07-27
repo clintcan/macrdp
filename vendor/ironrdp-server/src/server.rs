@@ -1,3 +1,4 @@
+use core::cell::RefCell;
 use core::net::SocketAddr;
 use core::time::Duration;
 use std::rc::Rc;
@@ -500,7 +501,19 @@ pub struct RdpServer {
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
-    connection_handler: Option<Box<dyn ConnectionHandler>>,
+    // (vendored, divergence 22) `Rc<RefCell<..>>`, not a bare `Option<Box<..>>`:
+    // the preemption race in `run()` needs to call `on_accept` on a candidate
+    // while `self` is ALSO mutably borrowed for the whole race by the live
+    // connection's `run_connection` future (which itself calls
+    // `on_authenticated`/`on_client_fingerprint` through this same field
+    // mid-connection). A bare `.take()` of the field for the race's duration
+    // — the first cut of this fix — silently broke those two hooks for
+    // EVERY connection (not just preempted ones), since macrdp's preemption
+    // is unconditional: caught by the audit-log CI integration test showing
+    // zero `event="auth"` records. Sharing via `Rc<RefCell<..>>` lets a
+    // cheap clone reach the handler for the candidate's `on_accept` without
+    // taking it away from the connection that's using it concurrently.
+    connection_handler: Option<Rc<RefCell<Box<dyn ConnectionHandler>>>>,
     /// True when the client has sent `SuppressOutput { desktop_rect: None }`
     /// — the standard RDP "I am minimized / don't need display updates"
     /// signal (e.g., mstsc on window-minimize). Cleared on
@@ -765,7 +778,7 @@ impl RdpServer {
             creds: None,
             local_addr: None,
             autodetect: None,
-            connection_handler,
+            connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
             link_rtt_ms: None,
@@ -1283,10 +1296,10 @@ impl RdpServer {
                     // validated, Err = auth did not complete (dominated by bad
                     // credentials). Reactivation reuses the connection and does not
                     // re-run accept_credssp, so this fires exactly once per login.
-                    if let Some(handler) = self.connection_handler.as_mut() {
+                    if let Some(handler) = self.connection_handler.as_ref() {
                         match &auth_result {
-                            Ok(()) => handler.on_authenticated(true, None),
-                            Err(e) => handler.on_authenticated(false, Some(&e.to_string())),
+                            Ok(()) => handler.borrow_mut().on_authenticated(true, None),
+                            Err(e) => handler.borrow_mut().on_authenticated(false, Some(&e.to_string())),
                         }
                     }
 
@@ -1393,8 +1406,11 @@ impl RdpServer {
             // toward its per-source-IP rate-limit window and writes an audit
             // line, so calling it twice for the one physical connection would
             // inflate both without a second real attempt behind it.
-            let accepted =
-                from_pending || self.connection_handler.as_mut().is_none_or(|h| h.on_accept(peer));
+            let accepted = from_pending
+                || self
+                    .connection_handler
+                    .as_ref()
+                    .is_none_or(|h| h.borrow_mut().on_accept(peer));
 
             if !accepted {
                 debug!(?peer, "Connection rejected by handler");
@@ -1426,12 +1442,18 @@ impl RdpServer {
                 // a client-side disconnect takes) and the newcomer is served
                 // on the next iteration.
                 //
-                // Take `connection_handler` out of `self` first: `conn` below
-                // captures `&mut self` for the whole race, and the candidate's
-                // `on_accept` must still be callable alongside it — see the
-                // next comment for why that ordering matters. Restored into
-                // `self` once the race ends (`conn`'s scope closes here).
-                let mut handler = self.connection_handler.take();
+                // Clone the shared `connection_handler` handle first (a cheap
+                // `Rc` bump): `conn` below captures `&mut self` for the whole
+                // race, so the candidate's `on_accept` — which needs to run
+                // concurrently with `conn`, see the next comment — can't go
+                // through `self.connection_handler` directly. It's `Rc<RefCell<..>>`
+                // rather than a bare `Option<Box<..>>` for exactly this reason:
+                // a `self.connection_handler.take()` here (the first cut of
+                // this fix) would have made it inaccessible to `conn` too —
+                // silently breaking `on_authenticated`/`on_client_fingerprint`,
+                // which `run_connection` calls through this same field
+                // mid-connection, for the WHOLE race, not just an instant.
+                let handler = self.connection_handler.clone();
 
                 let outcome = {
                     let mut conn = core::pin::pin!(self.run_connection(stream));
@@ -1478,7 +1500,8 @@ impl RdpServer {
                                 // iteration's connection — the exact ordering
                                 // bug Devolutions/IronRDP#1476 review caught
                                 // in the upstreamed shape of this fix.
-                                let candidate_accepted = handler.as_mut().is_none_or(|h| h.on_accept(next_peer));
+                                let candidate_accepted =
+                                    handler.as_ref().is_none_or(|h| h.borrow_mut().on_accept(next_peer));
                                 if candidate_accepted {
                                     probing = true;
                                     probe = Box::pin(probe_preempting_client(next_stream, next_peer));
@@ -1504,7 +1527,6 @@ impl RdpServer {
                     }
                 };
 
-                self.connection_handler = handler;
                 let (result, preempted_by) = outcome;
                 let duration = started.elapsed();
 
@@ -1585,8 +1607,8 @@ impl RdpServer {
                     }
                 }
 
-                if let Some(ref mut handler) = self.connection_handler {
-                    let action = handler.on_disconnected(
+                if let Some(handler) = self.connection_handler.as_ref() {
+                    let action = handler.borrow_mut().on_disconnected(
                         peer,
                         duration,
                         result.as_ref().err(),
@@ -2747,8 +2769,8 @@ impl RdpServer {
             // Surface it to the application's ConnectionHandler (macrdp's
             // AuthGuardHandler emits an `event="fingerprint"` audit record for
             // the SIEM JSON stream).
-            if let Some(handler) = self.connection_handler.as_mut() {
-                handler.on_client_fingerprint(
+            if let Some(handler) = self.connection_handler.as_ref() {
+                handler.borrow_mut().on_client_fingerprint(
                     &result.client_name,
                     result.client_version,
                     result.client_build,
