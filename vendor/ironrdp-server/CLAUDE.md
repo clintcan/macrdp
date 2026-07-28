@@ -1607,3 +1607,61 @@ AND released — #1276 landing is NOT sufficient.
     macrdp-specific for now, since it needed the `Box`→`Rc` factory change
     which isn't obviously desirable upstream). Revisit upstreaming once (22)'s
     design has had more real-world runway.
+
+    **Eviction must tell the loser WHY, or the two clients ping-pong forever
+    (2026-07-27, found in live testing of the above — the failure that made
+    this a two-part fix).** With auth-gating in place, preemption worked
+    exactly as designed and was still unusable: two real clients on a LAN
+    (.44 and .46) traded the session back and forth every ~1-2 s,
+    indefinitely. The loop is entirely self-inflicted and obvious in
+    hindsight: macrdp provisions the **Server Auto-Reconnect Cookie** by
+    default (divergence 13, so a blank-recovery drop heals seamlessly), so a
+    client dropped for ANY reason silently auto-reconnects about a second
+    later. A preemption drop was indistinguishable from a blank-recovery drop,
+    so the evicted client came straight back, authenticated (legitimately —
+    it's a real client with real credentials, so the auth gate is no defense
+    here), and preempted the client that had just replaced it. Repeat forever.
+    Note this is a case where each individual component behaved *correctly*
+    and the composition was broken; nothing was going to catch it short of
+    running two real clients.
+
+    Two layers now:
+
+    1. **`ServerEvent::EvictedByOtherConnection` (the real fix).** A new event
+       distinct from `Quit`: `dispatch_server_events` (which has the writer +
+       channel ids) sends a Server Set Error Info PDU carrying
+       `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` (0x05, MS-RDPBCGR 2.2.5.1.1 —
+       the exact code real Windows RDS uses for a session takeover) before
+       returning `Disconnect`. A client that receives an administrative
+       disconnect reason shows it ("another user connected…") and does NOT
+       auto-reconnect. `run()`'s preemption path sends this and then keeps
+       polling the incumbent for `EVICTION_GRACE` (750 ms) so the PDU actually
+       reaches the wire, instead of cancelling the future outright; on timeout
+       it degrades to exactly the hard cancellation it replaced, so a
+       wedged/half-dead peer can't stall the takeover. Uses the same
+       `encode_share_data_pdu` helper the ARC cookie does.
+    2. **`recently_evicted` + `REPREEMPT_COOLDOWN` (the net).** Whether a
+       given client honors the error info is client-dependent and unverified
+       across the field, and an *infinite* flap is a bad enough failure to be
+       worth a structural bound. So a peer evicted moments ago may not
+       immediately preempt back: keyed on source IP (the source PORT changes
+       on every reconnect, so it can't be part of the key), 5 s, and — the
+       load-bearing detail — **each refused attempt RE-ARMS the window**. An
+       auto-reconnect storm at ~1 s cadence therefore can never win the
+       session back no matter how long it runs, while a human who closes the
+       client and reconnects (a gap well over 5 s) still can. Cleared when a
+       session ends on its own rather than being replaced. **Known
+       limitation:** IP-keyed, so two distinct clients behind one NAT/public
+       IP will briefly (≤5 s, re-armed) block each other's takeover right
+       after an eviction. Accepted — it's a net under the real fix, not the
+       mechanism itself, and the alternative (no bound at all) is worse.
+
+    Covered by `src/conn_test.rs::second_client_preempts_the_live_session`
+    (extended: now asserts the evicted session actually RECEIVES
+    `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION`, decoding the PDU rather than
+    just checking the socket closed) and `::
+    a_just_evicted_peer_cannot_immediately_preempt_back` (reproduces the live
+    ping-pong: A connects, B preempts, A immediately reconnects → refused, B
+    survives; note every loopback peer is 127.0.0.1, which is exactly the
+    source-IP key the net uses). Both verified to fail without their
+    respective fix and pass with it.

@@ -649,23 +649,76 @@ async fn second_client_preempts_the_live_session() -> anyhow::Result<()> {
                 "second client should complete its own handshake"
             );
 
-            // ...and the first session is gone: its socket is closed, so the
-            // next read fails rather than blocking forever.
-            let dropped =
-                tokio::time::timeout(std::time::Duration::from_secs(10), framed_a.read_pdu())
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("first session was left alive after being preempted")
-                    })?;
+            // ...and the first session is told WHY it's going away, then torn
+            // down. The reason matters as much as the teardown: macrdp
+            // provisions the auto-reconnect cookie by default, so a client
+            // dropped with no explanation just reconnects a second later and
+            // preempts back — an infinite ping-pong (observed live before this
+            // was added). ERRINFO_DISCONNECTED_BY_OTHERCONNECTION is what tells
+            // it to stay away.
+            let mut saw_eviction_reason = false;
+            let closed = loop {
+                let read =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), framed_a.read_pdu())
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!("first session was left alive after being preempted")
+                        })?;
+                match read {
+                    Ok((_action, bytes)) => {
+                        if is_disconnected_by_other_connection(&bytes) {
+                            saw_eviction_reason = true;
+                        }
+                    }
+                    // Socket closed — the session is gone.
+                    Err(e) => break e,
+                }
+            };
             assert!(
-                dropped.is_err(),
-                "preempted session should be torn down, got {dropped:?}"
+                saw_eviction_reason,
+                "the preempted session must be told it was replaced \
+                 (ERRINFO_DISCONNECTED_BY_OTHERCONNECTION) so it doesn't auto-reconnect and \
+                 preempt straight back; instead the connection just closed with {closed:?}"
             );
 
             server_task.abort();
             anyhow::Ok(())
         })
         .await
+}
+
+/// Is this raw server PDU a Server Set Error Info carrying
+/// `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` (MS-RDPBCGR 2.2.5.1.1) — i.e. the
+/// "another connection took your session" notice? Anything that isn't that
+/// exact PDU (including anything that fails to decode — the session is full of
+/// unrelated traffic) is simply `false`.
+fn is_disconnected_by_other_connection(bytes: &[u8]) -> bool {
+    use ironrdp_core::decode;
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::rdp::headers::{ShareControlPdu, ShareDataPdu};
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_pdu::x224::X224;
+
+    let Ok(x224) = decode::<X224<McsMessage<'_>>>(bytes) else {
+        return false;
+    };
+    let McsMessage::SendDataIndication(data) = x224.0 else {
+        return false;
+    };
+    let Ok(ctrl) = decode::<ironrdp_pdu::rdp::headers::ShareControlHeader>(&data.user_data) else {
+        return false;
+    };
+    let ShareControlPdu::Data(share_data) = ctrl.share_control_pdu else {
+        return false;
+    };
+    matches!(
+        share_data.share_data_pdu,
+        ShareDataPdu::ServerSetErrorInfo(pdu)
+            if pdu.0
+                == ErrorInfo::ProtocolIndependentCode(
+                    ProtocolIndependentCode::DisconnectedByOtherconnection
+                )
+    )
 }
 
 /// A `ConnectionHandler` that accepts exactly the first connection it sees
@@ -852,6 +905,87 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
                 2,
                 "on_accept should have fired exactly once for the winning candidate \
                  (once during the race, not again when served from `pending`)"
+            );
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// The safety net under the eviction-reason fix: a peer that was JUST evicted
+/// must not be able to immediately preempt its way back in.
+///
+/// This reproduces the live failure that motivated it. macrdp provisions the
+/// auto-reconnect cookie by default, so an evicted client reconnects ~1 s
+/// later; before this, that reconnect simply preempted the client that had
+/// replaced it, which then reconnected and preempted back — an endless
+/// ping-pong at ~1-2 s per cycle. `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION`
+/// (asserted in `second_client_preempts_the_live_session`) is the real fix,
+/// but it depends on the client honoring it; this bounds the damage if one
+/// doesn't.
+///
+/// Note every peer here is `127.0.0.1`, which is precisely the case the net
+/// keys on (source IP — the source PORT changes on every reconnect, so it
+/// can't be part of the key).
+#[tokio::test]
+async fn a_just_evicted_peer_cannot_immediately_preempt_back() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let mut server = build_test_server_full(
+                addr.port(),
+                1024,
+                768,
+                true,
+                None,
+                crate::bitmap_codecs(),
+                true,
+            );
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // A connects, then B preempts it — the normal takeover.
+            let a = connect_with_retry(addr).await?;
+            let (_size_a, _framed_a) = connect_client(a, 1280, 800).await?;
+
+            let b = connect_with_retry(addr).await?;
+            let (_size_b, mut framed_b) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connect_client(b, 1920, 1080),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("B hung instead of preempting A"))??;
+
+            // Now A "auto-reconnects" immediately, exactly as it did live.
+            // It must NOT be allowed to take the session back from B.
+            let a2 = connect_with_retry(addr).await?;
+            let bounced = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                connect_client(a2, 1280, 800),
+            )
+            .await;
+            assert!(
+                matches!(bounced, Ok(Err(_)) | Err(_)),
+                "a just-evicted peer must not complete a handshake and retake the session, got a \
+                 successful connect back"
+            );
+
+            // ...and B is still alive: reading times out (nothing to say)
+            // rather than reporting the session was torn down under it.
+            let b_still_alive =
+                tokio::time::timeout(std::time::Duration::from_millis(500), framed_b.read_pdu())
+                    .await;
+            assert!(
+                b_still_alive.is_err(),
+                "B's session must survive the evicted peer's reconnect, got {b_still_alive:?}"
             );
 
             server_task.abort();

@@ -1,5 +1,5 @@
 use core::cell::RefCell;
-use core::net::SocketAddr;
+use core::net::{IpAddr, SocketAddr};
 use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -45,6 +45,21 @@ use crate::{SoundServerFactory, builder, capabilities};
 
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
+
+/// (vendored, divergence 23) How long an evicted session gets to send its
+/// `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` and wind down on its own before
+/// it's cancelled outright. Short: the preempting client is already
+/// authenticated and waiting, and a half-dead peer must not stall the
+/// takeover. Exceeding it is not an error — it just degrades to the hard
+/// cancellation this grace period replaced.
+const EVICTION_GRACE: Duration = Duration::from_millis(750);
+
+/// (vendored, divergence 23) How long a just-evicted peer is barred from
+/// preempting its way back in — see [`RdpServer::recently_evicted`]. Sized to
+/// sit comfortably above a client's automatic reconnect cadence (~1 s) and
+/// comfortably below the time a human takes to close a window and reconnect,
+/// so it filters retry storms without blocking a deliberate retake.
+const REPREEMPT_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// (vendored, divergence 22) What resolved first while a session was live: the
 /// session itself ending, a new inbound connection, or the verdict on a
@@ -456,6 +471,19 @@ pub struct RdpServer {
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
+    /// (vendored, divergence 23) Anti-ping-pong net for session preemption:
+    /// the peer most recently EVICTED by a takeover, and when it last tried to
+    /// come back.
+    ///
+    /// `EvictedByOtherConnection` is the real fix for the eviction loop (it
+    /// tells the loser not to auto-reconnect), but whether a given client
+    /// honors it is client-dependent. This bounds the damage if one doesn't:
+    /// a peer that was just evicted may not immediately re-preempt, and each
+    /// refused attempt RE-ARMS the window. An auto-reconnect storm (~1 s
+    /// cadence) therefore can never win the session back, while a human who
+    /// closes and reconnects — a gap far longer than
+    /// [`REPREEMPT_COOLDOWN`] — still can. Cleared once a takeover sticks.
+    recently_evicted: Option<(IpAddr, Instant)>,
     // (vendored, divergence 22) `Rc<RefCell<..>>`, not a bare `Option<Box<..>>`:
     // the preemption race in `run()` needs to call `on_accept` on a candidate
     // while `self` is ALSO mutably borrowed for the whole race by the live
@@ -628,6 +656,21 @@ pub struct RdpServer {
 #[derive(Debug)]
 pub enum ServerEvent {
     Quit(String),
+    /// (vendored, divergence 23) End this connection because an authenticated
+    /// candidate is taking the session over — a preemption, not a plain quit.
+    ///
+    /// Unlike [`Self::Quit`], this sends a Server Set Error Info PDU
+    /// (`ERRINFO_DISCONNECTED_BY_OTHERCONNECTION`, MS-RDPBCGR 2.2.5.1.1 — the
+    /// same code real Windows RDS uses for a session takeover) before
+    /// disconnecting. That distinction is LOAD-BEARING, not cosmetic: macrdp
+    /// provisions the Server Auto-Reconnect Cookie by default (divergence 13,
+    /// for blank-recovery), so a client dropped with no explanation silently
+    /// auto-reconnects a second later. With preemption in play that produced
+    /// an infinite ping-pong — each evicted client bounced straight back,
+    /// authenticated, and preempted the other, forever (observed live at
+    /// ~1-2 s per cycle). Telling the loser WHY it was disconnected is what
+    /// makes it stay away.
+    EvictedByOtherConnection,
     Clipboard(ClipboardMessage),
     /// File-copy initiation that bypasses `ClipboardMessage::SendInitiateCopy`
     /// and reaches `CliprdrServer::initiate_file_copy` directly. The only
@@ -1071,6 +1114,7 @@ impl RdpServer {
             creds: None,
             local_addr: None,
             autodetect: None,
+            recently_evicted: None,
             connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
@@ -1760,6 +1804,13 @@ impl RdpServer {
                 // with `conn` — can't go through `self` directly.
                 let handler = self.connection_handler.clone();
                 let ctx = self.negotiation_context();
+                // Same reason as `handler`/`ctx`: `conn` borrows `self` for the
+                // whole race, so the eviction event has to be sent through a
+                // clone of the sender rather than `self.ev_sender`.
+                let self_ev_sender = self.ev_sender.clone();
+                // Likewise moved out of `self` for the race, and written back
+                // after it (the loop below both reads and re-arms it).
+                let mut recently_evicted = self.recently_evicted.take();
 
                 let outcome = {
                     let mut conn: core::pin::Pin<Box<dyn Future<Output = Result<()>> + '_>> = match entry {
@@ -1813,12 +1864,37 @@ impl RdpServer {
                                 // authenticating, since `on_accept` would
                                 // only run afterward once it became the next
                                 // iteration's connection.
-                                let candidate_accepted =
-                                    handler.as_ref().is_none_or(|h| h.borrow_mut().on_accept(next_peer));
+                                //
+                                // Ahead of even that: a peer evicted moments
+                                // ago may not bounce straight back and take
+                                // the session again. Each attempt re-arms the
+                                // window, so an auto-reconnect storm can never
+                                // win — see `recently_evicted`. This is the
+                                // net under `EvictedByOtherConnection`, which
+                                // is what should normally stop the loop.
+                                let bounced_back = match &mut recently_evicted {
+                                    Some((ip, last_try)) if *ip == next_peer.ip() => {
+                                        let within = last_try.elapsed() < REPREEMPT_COOLDOWN;
+                                        if within {
+                                            *last_try = Instant::now();
+                                        }
+                                        within
+                                    }
+                                    _ => false,
+                                };
+                                let candidate_accepted = !bounced_back
+                                    && handler.as_ref().is_none_or(|h| h.borrow_mut().on_accept(next_peer));
                                 if candidate_accepted {
                                     probing = true;
                                     probing_peer = Some(next_peer);
                                     probe = Box::pin(negotiate_candidate(&ctx, next_stream, next_peer));
+                                } else if bounced_back {
+                                    info!(
+                                        ?next_peer,
+                                        "ignoring a reconnect from the peer just evicted — it is auto-reconnecting \
+                                         into the session that replaced it; not letting it bounce back"
+                                    );
+                                    drop(next_stream);
                                 } else {
                                     debug!(
                                         ?next_peer,
@@ -1833,11 +1909,47 @@ impl RdpServer {
                             PreemptRace::Probed(candidate) => {
                                 probing = false;
                                 probe = Box::pin(core::future::pending());
-                                let peer = probing_peer.take().expect("probing_peer set alongside probing");
+                                let new_peer = probing_peer.take().expect("probing_peer set alongside probing");
                                 match candidate {
-                                    Some(candidate) => break (Ok(()), Some((candidate, peer))),
+                                    Some(candidate) => {
+                                        // The candidate has authenticated and is
+                                        // taking over. Tell the incumbent WHY
+                                        // it's going away, and give it a moment
+                                        // to actually send that + shut down,
+                                        // instead of cancelling it outright: a
+                                        // client dropped with no reason
+                                        // auto-reconnects off the ARC cookie
+                                        // and preempts straight back, forever
+                                        // (see `EvictedByOtherConnection`).
+                                        info!(
+                                            old_peer = ?peer,
+                                            ?new_peer,
+                                            "an authenticated candidate connected — evicting the existing session in its favor"
+                                        );
+                                        let _ = self_ev_sender.send(ServerEvent::EvictedByOtherConnection);
+                                        // Arm the net against this peer
+                                        // bouncing straight back in.
+                                        recently_evicted = Some((peer.ip(), Instant::now()));
+                                        // Keep polling the incumbent so it can
+                                        // observe the event, write the PDU and
+                                        // return on its own. Bounded, because a
+                                        // wedged/half-dead peer must not stall
+                                        // the takeover — on timeout `conn` is
+                                        // simply dropped, i.e. exactly the hard
+                                        // cancellation this replaces.
+                                        match tokio::time::timeout(EVICTION_GRACE, &mut conn).await {
+                                            Ok(res) => break (res, Some((candidate, new_peer))),
+                                            Err(_) => {
+                                                debug!(
+                                                    old_peer = ?peer,
+                                                    "evicted session did not wind down in time — cancelling it"
+                                                );
+                                                break (Ok(()), Some((candidate, new_peer)));
+                                            }
+                                        }
+                                    }
                                     None => {
-                                        debug!(?peer, "candidate did not authenticate — live session unaffected");
+                                        debug!(?new_peer, "candidate did not authenticate — live session unaffected");
                                     }
                                 }
                             }
@@ -1847,14 +1959,18 @@ impl RdpServer {
 
                 let (result, preempted_by) = outcome;
                 let duration = started.elapsed();
+                self.recently_evicted = recently_evicted;
 
+                // The eviction itself is logged inside the race, where the
+                // decision is made; here it's just carried to the next
+                // iteration.
                 if let Some((candidate, new_peer)) = preempted_by {
-                    info!(
-                        old_peer = ?peer,
-                        new_peer = ?new_peer,
-                        "an authenticated candidate connected — dropping the existing session in its favor"
-                    );
                     pending = Some((candidate, new_peer));
+                } else {
+                    // This session ended on its own terms rather than being
+                    // replaced, so nobody is mid-eviction any more — let a
+                    // previously-evicted peer connect again freely.
+                    self.recently_evicted = None;
                 }
 
                 if let Err(ref error) = result {
@@ -2106,6 +2222,35 @@ impl RdpServer {
             match event {
                 ServerEvent::Quit(reason) => {
                     debug!("Got quit event: {reason}");
+                    return Ok(RunState::Disconnect);
+                }
+                // (vendored, divergence 23) Session takeover: tell the client
+                // WHY it's being disconnected before dropping it, so it does
+                // not treat this as an unexpected drop and auto-reconnect off
+                // the ARC cookie (which ping-pongs forever against the
+                // preempting client — see the variant's doc comment).
+                ServerEvent::EvictedByOtherConnection => {
+                    debug!("evicting this connection — another client took the session over");
+                    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(
+                        rdp::server_error_info::ServerSetErrorInfoPdu(
+                            rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+                                rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
+                            ),
+                        ),
+                    );
+                    // Best-effort: if the evicted peer's socket is already
+                    // half-dead the write fails, which is fine — it's leaving
+                    // either way, and the caller falls back to cancelling it.
+                    match encode_share_data_pdu(pdu, io_channel_id, user_channel_id) {
+                        Ok(bytes) => {
+                            if let Err(error) = writer.write_all(&bytes).await {
+                                debug!(?error, "could not send the eviction reason; disconnecting anyway");
+                            }
+                        }
+                        Err(error) => {
+                            warn!(?error, "could not encode the eviction reason; disconnecting anyway");
+                        }
+                    }
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
