@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
@@ -43,6 +44,15 @@ type Paths = Arc<Mutex<Vec<PathBuf>>>;
 /// authenticated peer that paste-pumped a multi-gig DIB at us could
 /// otherwise exhaust memory before any other check kicks in.
 const MAX_INCOMING_PAYLOAD: usize = 50 * 1024 * 1024;
+
+/// How long `on_ready`'s very first (connect-time) call defers our own
+/// Mac->client advertise, so it lands safely after the client's own
+/// FormatListResponse::Ok ack instead of racing it through the shared
+/// writer (see `MacCliprdrBackend::initial_advertise_pending`). Comfortably
+/// past any realistic ack-write latency (microseconds to low-single-digit
+/// ms, even under the write contention that provokes the race) while still
+/// being imperceptible to the user.
+const CONNECT_ADVERTISE_DELAY: Duration = Duration::from_millis(300);
 
 /// Convert PNG/TIFF bytes from NSPasteboard into a CF_DIB payload: a
 /// `BITMAPINFOHEADER` (40 bytes) followed by 32bpp BGRA pixels in
@@ -445,11 +455,15 @@ struct MacCliprdrBackend {
     // full-frame video paint happening at the same moment), our advertise
     // or the client-clipboard fetch it can crowd out may reach the wire
     // before the client's own ack. See the clipboard preconnect-sync quirk
-    // note this fix is paired with. Skipping just this first advertise
-    // avoids injecting a second, unrelated FormatList exchange into the
-    // client's still-open initialization handshake; the pasteboard poller
-    // (already running once a client connects) advertises the Mac's own
-    // clipboard within ~1s regardless, well after the handshake settles.
+    // note this fix is paired with.
+    //
+    // We DEFER (not skip) this first advertise, via a short `tokio::spawn`
+    // sleep — CONNECT_ADVERTISE_DELAY, comfortably past when the ack write
+    // completes — so it still reaches a reconnecting/second client whose
+    // Mac clipboard hasn't changed since the last advertise (the
+    // changeCount poller only fires on a CHANGE, so skipping outright would
+    // silently drop Mac->client sync for that case; caught in review on
+    // #173).
     initial_advertise_pending: bool,
 }
 
@@ -680,9 +694,17 @@ impl CliprdrBackend for MacCliprdrBackend {
         if self.initial_advertise_pending {
             self.initial_advertise_pending = false;
             debug!(
-                "skipping connect-time pasteboard advertise (racing the client's own \
-                 initial FormatList ack); the pasteboard poller will pick it up shortly"
+                delay_ms = CONNECT_ADVERTISE_DELAY.as_millis() as u64,
+                "deferring connect-time pasteboard advertise past the client's own \
+                 initial FormatList ack (racing it through the shared writer would \
+                 confuse the client's still-open init handshake)"
             );
+            let sender = self.sender.clone();
+            let file_paths = self.file_paths.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(CONNECT_ADVERTISE_DELAY).await;
+                advertise_pasteboard(&sender, &file_paths);
+            });
             return;
         }
         advertise_pasteboard(&self.sender, &self.file_paths);
@@ -1386,25 +1408,61 @@ mod tests {
     /// client's FormatListResponse::Ok ack. A same-tick Mac->client
     /// advertise from `on_ready` races that ack through ironrdp-server's
     /// shared writer. The very first `on_ready` call per connection must
-    /// therefore be a no-op on the wire; later calls (e.g. after the
-    /// handshake has settled) must behave as before.
-    #[test]
+    /// therefore put nothing on the wire immediately — but (per review on
+    /// #173) it must NOT be dropped outright either, since the changeCount
+    /// poller only re-advertises on a CHANGE: a reconnecting/second client
+    /// whose Mac clipboard hasn't changed since the last advertise would
+    /// otherwise never receive it. So it must fire, just after a short
+    /// deferral past the ack race.
+    // Real (not paused) time: getting a spawned task to observe a manually
+    // advanced paused clock needs runtime-version-sensitive yield dancing,
+    // which is more fragile than it's worth for one 300 ms wait. Costs this
+    // test ~0.3 s of real wall-clock; everything else in the suite is
+    // effectively instant, so that's a non-issue.
+    #[tokio::test]
     #[cfg(target_os = "macos")]
-    fn on_ready_skips_only_the_connect_time_advertise() {
+    async fn on_ready_defers_the_connect_time_advertise_past_the_ack_race() {
         let (mut backend, mut rx) = test_backend();
 
         backend.on_ready();
         assert!(
             rx.try_recv().is_err(),
-            "connect-time on_ready must not put anything on the wire"
+            "connect-time on_ready must not put anything on the wire immediately"
         );
         assert!(!backend.initial_advertise_pending);
 
-        pb::write_string("on_ready_second_call_probe");
+        pb::write_string("on_ready_deferred_probe");
+        tokio::time::sleep(CONNECT_ADVERTISE_DELAY + Duration::from_millis(100)).await;
+
+        match rx
+            .try_recv()
+            .expect("the deferred advertise must eventually fire")
+        {
+            ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
+                assert!(formats
+                    .iter()
+                    .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// Once the connect-time handshake has settled (`initial_advertise_pending`
+    /// already false — set up directly here rather than via a real first
+    /// `on_ready()` call, so this test doesn't have to interact with that
+    /// call's spawned deferred task), `on_ready` must advertise immediately,
+    /// exactly as it did before the connect-time fix.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn on_ready_advertises_immediately_once_settled() {
+        let (mut backend, mut rx) = test_backend();
+        backend.initial_advertise_pending = false;
+
+        pb::write_string("on_ready_settled_probe");
         backend.on_ready();
         match rx
             .try_recv()
-            .expect("post-handshake on_ready must advertise")
+            .expect("post-handshake on_ready must advertise immediately")
         {
             ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
                 assert!(formats
