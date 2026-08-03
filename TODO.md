@@ -739,6 +739,72 @@ then delete; promote a parked item to *In flight* when work actually starts.
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
   in it. **Watch items:** issue #1352 (pdu spec-line split would rename macrdp's direct
   `ironrdp-pdu` dep) and egfx breaking changes. Est. 1–2 focused days + verification.
+  - **▶▶▶ DRY-RUN RECON DONE 2026-08-03 (3-agent read-only sweep vs upstream `a5d1c682fd`; NOTHING
+    built/merged — a breakage MAP, not the bump).** Corrected facts (the guessed versions above were
+    low): pin `879ffed8`→`a5d1c682fd` = **133 commits** (May 25→Aug 3, mix 47 fix/47 feat/**6 refactor**
+    /13 breaking-`!`). Real version bumps: **core 0.1.5→0.2.1, pdu 0.7→0.9, dvc 0.5→0.8, svc 0.6→0.8,
+    egfx 0.1→0.3, graphics 0.7→0.9, rdpsnd 0.7→0.9, acceptor/async/tokio/connector 0.8→0.10,
+    server 0.10→0.13, rdpdr 0.5→0.7** (all breaking — all-or-nothing confirmed). **MSRV 1.89→1.94**
+    (local rustc 1.97.1 ✅ not a blocker). Toolchain adds: `rand 0.9` direct dep + tokio `time` feature.
+    **THE SINGLE MOST IMPORTANT FINDING: `ironrdp-core` 0.1→0.2 is ADDITIVE** — `Encode`/`Decode`
+    traits, `ReadCursor`/`WriteCursor`, `ensure_size!`/`invalid_field_err!`, `EncodeError`/`DecodeError`
+    all byte-identical (only a `NonEmpty` export added). So the foundational layer does NOT ripple —
+    every custom-PDU impl in the forks + rdpeudp re-compiles near-unchanged; the divergences are
+    RE-WIRING work, not rewrites. This caps the whole blast radius.
+    **src/ (macrdp own code) edit surface = SMALL-MEDIUM (~half day), only 2 release-path files:**
+    (i) `src/audio.rs` — rdpsnd handler rewrite for #1359's `NegotiatedFormat` API (`choose_format` +
+    fallible `start(&NegotiatedFormat)`); a NET SIMPLIFICATION — delete `choose_audio_format` + its
+    wFormatNo unit tests (the crate now owns that arithmetic; the client-vs-server-index footgun becomes
+    *unrepresentable*), return `common.first()` (AAC-ahead-of-PCM falls out). (ii) `src/h264.rs` —
+    `GraphicsPipelineHandler::on_frame_ack` gained a 3rd param `total_frames_decoded: u32` (#1345);
+    trivial add-and-ignore (resist wiring it into blank-recovery mid-bump). PLUS `src/conn_test.rs`
+    (test-only, INVISIBLE to `--release` — don't declare done pre-`cargo test`): `NoAudio` handler sig +
+    `Config { connection_type: gcc::ConnectionType::Lan, .. }` new required field. cliprdr
+    `ClipboardMessage` gained `SendInitiateFileCopy` — macrdp matches individual arms (no exhaustive
+    match) so should compile clean; verify it stays `#[non_exhaustive]`.
+    **Vendored forks — retirement map (verified present at `a5d1c682fd`, not just from logs):**
+    • **rdpeusb → FULLY RETIRES** (first whole fork to go): all 4 divs upstream (div1 #1418 newtype+
+      `USB_32`, div2 #1513 narrowed `usb_device` match, div3 #1420 `trailing`, div4 #1321 guards). BUT
+      upstream is `publish=false` → "retire" = convert path-dep to a **git-pin `[patch]` entry** (keep the
+      `ironrdp-str` pin), NOT a crates.io version. `SupportedUsbVer::Usb32`→`::USB_32` at call sites.
+    • **rdpdr → stays vendored, near-TRIVIAL re-apply** — upstream still strictly client-only (no
+      `SvcServerProcessor`, no server-dir MS-RDPESC); the exact files macrdp augments (`pdu/efs.rs`,
+      `pdu/esc/`, `pdu/mod.rs`) have ZERO churn between the revs.
+    • **rdpeudp → keep-forever, compiles CLEAN** — no upstream twin; depends only on `ironrdp-core`,
+      every imported symbol still exported, no sig changes. Just bump its internal `[patch]` rev in lockstep.
+    • **dvc → sheds div2 (close-hook, upstream #1302 Drop-based close), keeps Soft-Sync (div1)** —
+      `pdu.rs` unchanged so the Soft-Sync structs re-apply trivially; only two small `process()` arms
+      re-place onto churned `server.rs`(+181)/`client.rs`(+110). RE-APPLY-easy/medium.
+    • **acceptor → RE-APPLY-MEDIUM (highest-effort survivor after server)** — read divs all retire
+      (honor-size unified into `set_honor_client_desktop_size(Option<DesktopSize>)` w/ #1404 clamp; KLID
+      #1397; MT-flags #1453). Persists for the **M3c UDP-offer machinery + client-fingerprint fields**,
+      re-applying onto a **+252-churned `connection.rs`** (`finalization.rs` unchanged → channel-skip clean).
+    • **server → 6 delete-free, ~15 re-apply.** DELETE: (5)SuppressOutput #1319, (6)NSCodec #1332,
+      (7)QOI #1335/#1341, (9)honor-size #1373/#1404, (13)ARC #1405/#1509, (17)wheel-decode (now fixed in
+      ironrdp-pdu `input/mouse.rs` itself). Each of (6)/(9)/(13) still costs a small macrdp-side wiring
+      change (enable `nscodec` feature; `bool`+`_max`→`Option<DesktopSize>`; `(logon_id,random_bits)`→
+      `Option<ServerAutoReconnect>`). **The 3 HARDEST re-applies (where the effort concentrates):**
+      **(23) auth-gated 2nd-client preemption** — restructures `run()` into a race loop + `Box→Rc` for ALL
+      factories + hand-duplicates a `run_connection` that **upstream itself just refactored** into
+      `run_connection_with(TransportTls{Managed,AlreadyDone})`; **(12) UDP multitransport** module wired
+      into that same moved `run_connection`/`run` path; **(2)+(3) audio `dispatch_audio` carve-out** —
+      rebuild over the changed rdpsnd `start()` API (upstream may have independently fixed the
+      wFormatNo-indexes-client-list bug we documented). Sharp cross-cutting hazards: the
+      `run_connection_with`/`TransportTls` refactor (hits div-18 `on_authenticated` + div-23), `run()` now
+      TRIPLE-purposed (upstream `GetLocalAddr`/`AutoDetectRttRequest` + div-15 RTT sample + div-23 race),
+      the **`ServerEvent` enum union** (upstream added `SetAutoReconnectCookie`/`GetLocalAddr`/
+      `AutoDetectRttRequest`; fork added `Rdpdr`/`Urbdrc`/`Camera`/`EvictedByOtherConnection` — merge both,
+      reconcile every dispatch arm), and egfx churn (compositor.rs +1217, so the div-14 `on_ready` AVC seam
+      may have shifted). Also note **#1501** (session-resume via ARC, `pdu,session,connector,server!`)
+      overlaps our div-13/div-18 ARC surface — upstream now owns cookie send+validate+rotate (#1405/#1509),
+      so most of the ARC divergence is upstream; re-check what's left. **Graph risk:** `ironrdp-error 0.1→0.2`
+      ripples every crate's error type — lockfile-check nothing pins error 0.1.
+    **REVISED EFFORT (supersedes "1–2 days"):** src/ ~half day; rdpeusb retire + rdpeudp/dvc/rdpdr re-sync
+    ~1 day (mechanical); acceptor M3c re-apply ~1 day; **server fork ~15 re-applies incl. the 3 hard ones
+    = the bulk, several days.** Realistically **~1 focused week**, dominated by the server fork, still gated
+    behind soak sign-off. STEP 1 of the real bump = an empirical `cargo build` to convert this map into
+    ground-truth compiler errors (the dry-run was analytical, no build attempted). See
+    `[[project_pin_bump_dry_run]]`.
 - Upstream-ability of the remaining divergences was surveyed 2026-07-01 (don't re-survey; ranking
   in `project_upstream_ironrdp_open_prs` memory). The other "quick" items (RDPDR decode halves,
   AudioWave `duration_ms`, keyboard-layout handle) are **held** — no upstream consumer yet, so they
