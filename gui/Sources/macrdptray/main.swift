@@ -38,8 +38,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var timer: Timer?
 
+    /// The tabbed Settings window (SettingsWindow.swift); nil while closed.
+    var settingsWindowController: SettingsWindowController?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
+        installMainMenu() // so the Settings window's text fields get edit shortcuts
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "macrdp")
             button.image?.isTemplate = true
@@ -146,6 +150,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
+        // Show the tabbed Settings window (where all the config options now live).
+        menu.addItem(item("Show macrdp…", #selector(showSettings)))
+        menu.addItem(.separator())
+
         let running = st.pid != nil
         if running {
             menu.addItem(item("Stop", #selector(stop)))
@@ -155,218 +163,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // first run, so it's always actionable (no Terminal step needed).
             menu.addItem(item(st.loaded ? "Start" : "Start (first run sets up)", #selector(start)))
         }
-        let cfg = readConfig()
-        // One-click recommended setup: a headless virtual display with the
-        // physical panel detached (so your real apps move onto the remote
-        // desktop) + H.264 — the responsive "remote into my Mac" config that's
-        // otherwise non-obvious to assemble. Shown until it's already applied.
-        let isRemoteDesktop = cfg["VIRTUAL_DISPLAY"] == "1" && cfg["PRIMARY_MODE"] == "detach"
-        if !isRemoteDesktop {
-            menu.addItem(item("Set Up Remote Desktop", #selector(presetRemoteDesktop)))
-        }
         menu.addItem(.separator())
-
-        let opts = NSMenu()
-        opts.addItem(toggle("H.264 video", key: "ENABLE_H264", cfg: cfg, sel: #selector(toggleH264)))
-        opts.addItem(toggle("AAC audio", key: "ENABLE_AAC", cfg: cfg, sel: #selector(toggleAAC)))
-        opts.addItem(toggle("HiDPI capture", key: "HIDPI", cfg: cfg, sel: #selector(toggleHiDPI)))
-        opts.addItem(toggle(
-            "Un-minimize on Cmd+Tab", key: "UNMINIMIZE", cfg: cfg, sel: #selector(toggleUnminimize)))
-        opts.addItem(toggle(
-            "App-switcher HUD", key: "APP_SWITCHER_HUD", cfg: cfg, sel: #selector(toggleAppSwitcherHud)))
-        // RDP UDP multitransport (experimental). Offers an auxiliary UDP transport;
-        // the sub-option moves H.264 video onto it.
-        opts.addItem(toggle(
-            "UDP multitransport (experimental)", key: "ENABLE_UDP_MULTITRANSPORT", cfg: cfg,
-            sel: #selector(toggleUdpMultitransport)))
-        opts.addItem(toggle(
-            "  ↳ Move video to UDP (clean link only)", key: "UDP_MIGRATE_EGFX", cfg: cfg,
-            sel: #selector(toggleUdpMigrateEgfx)))
-        opts.addItem(toggle(
-            "Option+Tab switches apps", key: "ALT_TAB_SWITCH", cfg: cfg, sel: #selector(toggleAltTabSwitch)))
-        // Ctrl→Cmd Windows-shortcut remap + the per-app exclude list (apps where
-        // Ctrl stays Ctrl, e.g. editors with an embedded terminal so Ctrl+C =
-        // SIGINT). Standalone terminals are auto-excluded; this list is for the
-        // ones that can't be auto-detected.
-        opts.addItem(toggle(
-            "Windows shortcuts (Ctrl→Cmd)", key: "MAP_CTRL_TO_CMD", cfg: cfg,
-            sel: #selector(toggleMapCtrlToCmd)))
-        let excl = remapExcludeList(cfg)
-        let exclSet = Set(excl)
-        let exclMenu = NSMenu()
-        var shownBundles = Set<String>()
-        for (bundle, label) in Self.remapExcludeApps {
-            let mi = NSMenuItem(
-                title: label, action: #selector(toggleRemapExclude(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = bundle
-            mi.state = exclSet.contains(bundle) ? .on : .off
-            exclMenu.addItem(mi)
-            shownBundles.insert(bundle)
-        }
-        // Custom entries the user added that aren't in the curated list — shown so
-        // they can be unchecked/removed too.
-        let extras = excl.filter { !shownBundles.contains($0) }
-        if !extras.isEmpty {
-            exclMenu.addItem(.separator())
-            for bundle in extras {
-                let mi = NSMenuItem(
-                    title: bundle, action: #selector(toggleRemapExclude(_:)), keyEquivalent: "")
-                mi.target = self
-                mi.representedObject = bundle
-                mi.state = .on
-                exclMenu.addItem(mi)
-            }
-        }
-        exclMenu.addItem(.separator())
-        exclMenu.addItem(item("Add an app…", #selector(addRemapExcludeApp)))
-        if !excl.isEmpty { exclMenu.addItem(item("Clear list", #selector(clearRemapExclude))) }
-        let exclItem = NSMenuItem(title: "Keep Ctrl in (no remap)", action: nil, keyEquivalent: "")
-        exclItem.submenu = exclMenu
-        opts.addItem(exclItem)
-        opts.addItem(.separator())
-        // Redirection (the connecting client must opt in too).
-        opts.addItem(toggle(
-            "Drive redirection", key: "ENABLE_DRIVE_REDIRECTION", cfg: cfg,
-            sel: #selector(toggleDriveRedirection)))
-        opts.addItem(toggle(
-            "Smart-card redirection", key: "ENABLE_SMARTCARD_REDIRECTION", cfg: cfg,
-            sel: #selector(toggleSmartcardRedirection)))
-        opts.addItem(item("Install smart-card handler…", #selector(installSmartcardHandler)))
-        opts.addItem(toggle(
-            "Camera redirection", key: "ENABLE_CAMERA_REDIRECTION", cfg: cfg,
-            sel: #selector(toggleCameraRedirection)))
-        opts.addItem(item("Enable macrdp Camera…", #selector(enableCameraRedirection)))
-        opts.addItem(.separator())
-        // Keyboard layout (radio) — translate the client's keys against a
-        // non-US layout without changing the Mac's own input source.
-        let curLayout = cfg["KEYBOARD_LAYOUT"] ?? ""
-        let kbMenu = NSMenu()
-        for (spec, label) in Self.keyboardLayouts {
-            let mi = NSMenuItem(title: label, action: #selector(setKeyboardLayout(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = spec
-            mi.state = (curLayout == spec) ? .on : .off
-            kbMenu.addItem(mi)
-        }
-        let kbItem = NSMenuItem(title: "Keyboard layout", action: nil, keyEquivalent: "")
-        kbItem.submenu = kbMenu
-        opts.addItem(kbItem)
-        opts.addItem(.separator())
-        let bind = cfg["BIND"] ?? "127.0.0.1:3390"
-        let net = item("Allow network connections", #selector(toggleNetwork))
-        net.state = bind.hasPrefix("0.0.0.0") ? .on : .off
-        opts.addItem(net)
-        let bindItem = NSMenuItem(title: "Listening on: \(bind)", action: nil, keyEquivalent: "")
-        bindItem.isEnabled = false
-        opts.addItem(bindItem)
-        let optsItem = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
-        optsItem.submenu = opts
-        menu.addItem(optsItem)
-
-        // Display: headless virtual display + blank-screen + resolution. A
-        // virtual display at the client's resolution is captured 1:1 (no
-        // scaling) and is snappier than mirroring a non-matching panel.
-        let disp = NSMenu()
-        let vdOn = cfg["VIRTUAL_DISPLAY"] == "1"
-        let vd = item("Virtual display (headless)", #selector(toggleVirtualDisplay))
-        vd.state = vdOn ? .on : .off
-        disp.addItem(vd)
-        // Primary-screen handling (radio). "detach" moves your apps onto the
-        // virtual display so you can see/use them remotely; "shield" and
-        // "capture" just blank the panel (apps stay on it). All need the virtual
-        // display, so picking one auto-enables it.
-        //
-        // shield vs capture — the labels spell out the difference because it is
-        // a SECURITY one, not a preference: while `capture` is engaged the Mac
-        // CANNOT BE LOCKED (Lock Screen silently does nothing, since macOS
-        // cannot draw the lock screen onto a captured display), so the machine
-        // is physically unsecured. `shield` covers the panel with a black window
-        // instead, leaves locking working, and also avoids the ~250 ms desktop
-        // flash a client resize causes under `capture`. `capture` is kept as the
-        // fallback for the case it was originally added for — a machine where
-        // the window-based blanking doesn't take.
-        let curMode: String = {
-            if let m = cfg["PRIMARY_MODE"], !m.isEmpty { return m }
-            return cfg["CAPTURE_PRIMARY"] == "1" ? "capture" : "none" // back-compat
-        }()
-        let primary = NSMenu()
-        for (mode, label) in [
-            ("none", "Keep local screen on"),
-            ("detach", "Detach — move apps to remote"),
-            ("shield", "Blank — keep apps on Mac (lockable)"),
-            ("capture", "Blank — keep apps on Mac (can't lock)"),
-        ] {
-            let mi = NSMenuItem(title: label, action: #selector(setPrimaryMode(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = mode
-            mi.state = (curMode == mode) ? .on : .off
-            primary.addItem(mi)
-        }
-        let primaryItem = NSMenuItem(title: "Primary screen", action: nil, keyEquivalent: "")
-        primaryItem.submenu = primary
-        disp.addItem(primaryItem)
-        disp.addItem(.separator())
-        let curW = cfg["VD_WIDTH"] ?? "1920"
-        let curH = cfg["VD_HEIGHT"] ?? "1080"
-        let resMenu = NSMenu()
-        for (w, h, label) in Self.resolutions {
-            let mi = NSMenuItem(title: label, action: #selector(setResolution(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = "\(w)x\(h)"
-            mi.state = (curW == "\(w)" && curH == "\(h)") ? .on : .off
-            resMenu.addItem(mi)
-        }
-        let resItem = NSMenuItem(title: "Virtual display resolution", action: nil, keyEquivalent: "")
-        resItem.submenu = resMenu
-        disp.addItem(resItem)
-        let dispItem = NSMenuItem(title: "Display", action: nil, keyEquivalent: "")
-        dispItem.submenu = disp
-        menu.addItem(dispItem)
-
-        menu.addItem(item("Edit config…", #selector(editConfig)))
-        let pwTitle = hasKeychainPassword() ? "Change Account Password…" : "Set Account Password…"
-        menu.addItem(item(pwTitle, #selector(setPassword)))
-        menu.addItem(.separator())
-
-        menu.addItem(item("Open Logs", #selector(openLogs)))
-        // Permissions with live status parsed from the server log (✓ / needs
-        // grant / unknown). Clicking opens the relevant System Settings pane.
-        let ps = permissionStatus()
-        let perm = NSMenu()
-        perm.addItem(permItem("Screen Recording", ps.screen, #selector(openScreenRecording)))
-        perm.addItem(permItem("Accessibility", ps.accessibility, #selector(openAccessibility)))
-        let permRoot = NSMenuItem(title: "Permissions", action: nil, keyEquivalent: "")
-        permRoot.submenu = perm
-        menu.addItem(permRoot)
-        menu.addItem(.separator())
-
         menu.addItem(item("Quit Controller", #selector(quit)))
     }
 
     func item(_ title: String, _ sel: Selector) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
         i.target = self
-        return i
-    }
-
-    func toggle(_ title: String, key: String, cfg: [String: String], sel: Selector) -> NSMenuItem {
-        let i = item(title, sel)
-        i.state = (cfg[key] == "1") ? .on : .off
-        return i
-    }
-
-    /// A permission row with live status (✓ granted / needs grant / unknown).
-    /// Always clickable — opens the relevant System Settings pane.
-    func permItem(_ name: String, _ granted: Bool?, _ sel: Selector) -> NSMenuItem {
-        let mark: String
-        switch granted {
-        case .some(true): mark = "✓"
-        case .some(false): mark = "✗ needs grant"
-        case .none: mark = "— open to grant"
-        }
-        let i = item("\(name): \(mark)", sel)
-        i.state = (granted == true) ? .on : .off
         return i
     }
 
@@ -399,22 +202,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func restart() { start() }
-
-    /// One-click "remote into my Mac": headless virtual display + detach the
-    /// physical panel (apps move to the virtual display) + H.264 + the
-    /// app-switcher HUD, then start. The mstsc reconnect-blank is handled by the
-    /// server's in-place blank-recovery (reactivation) — no extra flag needed.
-    @objc func presetRemoteDesktop() {
-        writeConfig(key: "VIRTUAL_DISPLAY", value: "1")
-        writeConfig(key: "PRIMARY_MODE", value: "detach")
-        writeConfig(key: "CAPTURE_PRIMARY", value: "0")
-        writeConfig(key: "ENABLE_H264", value: "1")
-        writeConfig(key: "APP_SWITCHER_HUD", value: "1")
-        let cfg = readConfig()
-        if cfg["VD_WIDTH"] == nil { writeConfig(key: "VD_WIDTH", value: "1920") }
-        if cfg["VD_HEIGHT"] == nil { writeConfig(key: "VD_HEIGHT", value: "1080") }
-        start() // self-install + password onboarding + launch
-    }
 
     func ensureLoaded() {
         guard !agentState().loaded, FileManager.default.fileExists(atPath: plistURL.path) else { return }
@@ -566,120 +353,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = a.runModal()
     }
 
-    @objc func toggleH264() { flip("ENABLE_H264") }
-    @objc func toggleAAC() { flip("ENABLE_AAC") }
-    @objc func toggleHiDPI() { flip("HIDPI") }
-    @objc func toggleUnminimize() { flip("UNMINIMIZE") }
-    @objc func toggleAppSwitcherHud() { flip("APP_SWITCHER_HUD") }
-
-    /// RDP UDP multitransport (MS-RDPEMT). Turning it off also clears the
-    /// video-migrate sub-option (which needs the transport).
-    @objc func toggleUdpMultitransport() {
-        let cfg = readConfig()
-        let enabling = cfg["ENABLE_UDP_MULTITRANSPORT"] != "1"
-        if enabling {
-            writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "1")
-        } else {
-            writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "0")
-            if cfg["UDP_MIGRATE_EGFX"] == "1" {
-                writeConfig(key: "UDP_MIGRATE_EGFX", value: "0")
-            }
-        }
-        applyIfRunning()
-    }
-
-    /// Migrate the EGFX (H.264) video channel onto the reliable UDP tunnel. Needs
-    /// UDP multitransport + H.264 (auto-enabled). CLEAN-LINK ONLY: under packet
-    /// loss the ordered tunnel head-of-line-blocks and the picture can freeze with
-    /// no recovery until reconnect (audio survives on TCP).
-    @objc func toggleUdpMigrateEgfx() {
-        let cfg = readConfig()
-        let enabling = cfg["UDP_MIGRATE_EGFX"] != "1"
-        if enabling {
-            var autoEnabled: [String] = []
-            if cfg["ENABLE_UDP_MULTITRANSPORT"] != "1" {
-                writeConfig(key: "ENABLE_UDP_MULTITRANSPORT", value: "1")
-                autoEnabled.append("UDP multitransport")
-            }
-            if cfg["ENABLE_H264"] != "1" {
-                writeConfig(key: "ENABLE_H264", value: "1")
-                autoEnabled.append("H.264 video")
-            }
-            let extra = autoEnabled.isEmpty
-                ? "" : "\n\nAlso enabled: \(autoEnabled.joined(separator: ", "))."
-            alert(style: .warning, "Video over UDP — clean-link only",
-                  "H.264 video will ride the reliable UDP tunnel. This helps on a clean, "
-                  + "low-latency link, but under packet loss the picture can freeze with no "
-                  + "recovery until you reconnect (audio keeps playing on TCP). Use only on a "
-                  + "trusted, low-loss network." + extra)
-            writeConfig(key: "UDP_MIGRATE_EGFX", value: "1")
-        } else {
-            writeConfig(key: "UDP_MIGRATE_EGFX", value: "0")
-        }
-        applyIfRunning()
-    }
-
-    @objc func toggleAltTabSwitch() { flip("ALT_TAB_SWITCH") }
-    @objc func toggleDriveRedirection() { flip("ENABLE_DRIVE_REDIRECTION") }
-    @objc func toggleSmartcardRedirection() { flip("ENABLE_SMARTCARD_REDIRECTION") }
-    @objc func toggleCameraRedirection() { flip("ENABLE_CAMERA_REDIRECTION") }
-    @objc func toggleMapCtrlToCmd() { flip("MAP_CTRL_TO_CMD") }
-
-    /// Parse NO_REMAP_APPS (comma-separated bundle ids) into an ordered list.
-    func remapExcludeList(_ cfg: [String: String]) -> [String] {
-        (cfg["NO_REMAP_APPS"] ?? "")
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-    }
-
-    /// Write the exclude list back to NO_REMAP_APPS (de-duped, order preserved).
-    func setRemapExcludeList(_ apps: [String]) {
-        var seen = Set<String>()
-        let deduped = apps.filter { !$0.isEmpty && seen.insert($0).inserted }
-        writeConfig(key: "NO_REMAP_APPS", value: deduped.joined(separator: ","))
-        applyIfRunning()
-    }
-
-    /// Add/remove a bundle id from the Ctrl→Cmd exclude list (checkable menu item).
-    @objc func toggleRemapExclude(_ sender: NSMenuItem) {
-        guard let bundle = sender.representedObject as? String else { return }
-        var list = remapExcludeList(readConfig())
-        if let idx = list.firstIndex(of: bundle) {
-            list.remove(at: idx)
-        } else {
-            list.append(bundle)
-        }
-        setRemapExcludeList(list)
-    }
-
-    /// Pick any .app and add its bundle id to the exclude list — reads the id off
-    /// the bundle, so the user never has to know or type it.
-    @objc func addRemapExcludeApp() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose an app to keep Ctrl unmapped in"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.application]
-        panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard let bundle = Bundle(url: url)?.bundleIdentifier else {
-            alert(style: .warning, "Couldn't read that app",
-                  "macOS didn't report a bundle identifier for the selected app.")
-            return
-        }
-        var list = remapExcludeList(readConfig())
-        list.append(bundle)
-        setRemapExcludeList(list)
-    }
-
-    @objc func clearRemapExclude() {
-        writeConfig(key: "NO_REMAP_APPS", value: "")
-        applyIfRunning()
-    }
-
     /// An attached USB device, for the smart-card trigger picker.
     struct UsbDevice {
         let vid: String // "0x2174" (4-digit lowercase hex)
@@ -803,37 +476,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func flip(_ key: String) {
-        let cfg = readConfig()
-        let next = (cfg[key] == "1") ? "0" : "1"
-        writeConfig(key: key, value: next)
-        // Apply live if the server is running.
-        if agentState().pid != nil {
-            _ = run("/bin/launchctl", ["kickstart", "-k", service])
-        }
-    }
-
-    /// Flip BIND between loopback-only (127.0.0.1) and all-interfaces (0.0.0.0),
-    /// preserving the port. Confirms before exposing to the network.
-    @objc func toggleNetwork() {
-        let bind = readConfig()["BIND"] ?? "127.0.0.1:3390"
-        let port = bind.split(separator: ":").last.map(String.init) ?? "3390"
-        let enabling = !bind.hasPrefix("0.0.0.0")
-        if enabling {
-            let a = NSAlert()
-            a.messageText = "Allow connections from the network?"
-            a.informativeText = "macrdp will listen on all interfaces (0.0.0.0:\(port)), so "
-                + "other devices on your network can connect. Access still requires TLS and your "
-                + "macOS account password — but only enable this on a network you trust."
-            a.addButton(withTitle: "Allow")
-            a.addButton(withTitle: "Cancel")
-            NSApp.activate(ignoringOtherApps: true)
-            guard a.runModal() == .alertFirstButtonReturn else { return }
-        }
-        writeConfig(key: "BIND", value: "\(enabling ? "0.0.0.0" : "127.0.0.1"):\(port)")
-        applyIfRunning()
-    }
-
     // Standard 16:9 virtual-display resolutions, highest 1440p; default 1920×1080.
     static let resolutions: [(Int, Int, String)] = [
         (1280, 720, "1280 × 720"),
@@ -876,47 +518,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ("czech", "Czech"),
         ("hungarian", "Hungarian"),
     ]
-
-    @objc func toggleVirtualDisplay() {
-        let on = readConfig()["VIRTUAL_DISPLAY"] == "1"
-        writeConfig(key: "VIRTUAL_DISPLAY", value: on ? "0" : "1")
-        // Turning the virtual display OFF resets the primary-screen mode to
-        // none — detach/capture both require --virtual-display.
-        if on {
-            writeConfig(key: "PRIMARY_MODE", value: "none")
-            writeConfig(key: "CAPTURE_PRIMARY", value: "0")
-        }
-        applyIfRunning()
-    }
-
-    /// Set how the physical screen is handled while connected:
-    /// none / detach (move apps to the virtual display) / capture (blank it).
-    @objc func setPrimaryMode(_ sender: NSMenuItem) {
-        guard let mode = sender.representedObject as? String else { return }
-        // detach/capture require the virtual display, so enable it.
-        if mode != "none" { writeConfig(key: "VIRTUAL_DISPLAY", value: "1") }
-        writeConfig(key: "PRIMARY_MODE", value: mode)
-        // Clear the legacy boolean so it can't conflict with PRIMARY_MODE.
-        writeConfig(key: "CAPTURE_PRIMARY", value: "0")
-        applyIfRunning()
-    }
-
-    @objc func setResolution(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? String else { return }
-        let parts = s.split(separator: "x")
-        guard parts.count == 2 else { return }
-        writeConfig(key: "VD_WIDTH", value: String(parts[0]))
-        writeConfig(key: "VD_HEIGHT", value: String(parts[1]))
-        applyIfRunning()
-    }
-
-    /// Pick the keyboard layout the server interprets the client's keys as.
-    /// Empty value = no translation (US ANSI / positional keycodes).
-    @objc func setKeyboardLayout(_ sender: NSMenuItem) {
-        guard let spec = sender.representedObject as? String else { return }
-        writeConfig(key: "KEYBOARD_LAYOUT", value: spec)
-        applyIfRunning()
-    }
 
     /// Re-exec the agent so config.env changes take effect, if it's running.
     func applyIfRunning() {
