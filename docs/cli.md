@@ -143,6 +143,10 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Reuses the Ctrl+Alt+G gather machinery. Config:
                           #   RESTORE_WINDOWS_ON_DISCONNECT. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
+--bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
+                          #   --enable-h264). With --adaptive-bitrate it's the
+                          #   ceiling the encoder backs off from under congestion;
+                          #   otherwise a fixed target. Config key: BITRATE.
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
                           #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
@@ -360,6 +364,16 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   naming a file. AUDIT_LOG=1 (default) still gates
                           #   whether the events emit at all. Config key: AUDIT_FILE.
                           #   Schema + collector configs: docs/siem-forwarding.md.
+--stats-endpoint          # Expose a loopback (127.0.0.1) READ-ONLY live-telemetry
+                          #   endpoint that the menu-bar controller's Status pane
+                          #   reads: current H.264 bitrate + ceiling, link RTT,
+                          #   standing queue, fps, frames sent, session size. Writes
+                          #   one JSON line per connect then closes — NO disk writes;
+                          #   the snapshot is in-memory, updated in the encode path.
+                          #   Default OFF; the runtime path is a byte-identical no-op
+                          #   when off. Loopback-only, carries no client IP/hostname.
+                          #   Port MACRDP_STATS_PORT (default 40245). Config keys:
+                          #   STATS_ENDPOINT, STATS_PORT. macOS-built; cross-platform.
 ```
 
 Auth hardening (env-only, **on by default**). macrdp rate-limits and briefly

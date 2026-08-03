@@ -98,7 +98,9 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           clients that don't negotiate H.264. See [video.md](video.md).
 --bitrate N               Target H.264 bitrate in Mbps (default 6; only with
                           --enable-h264). Raise it (8–12) for sharper detail if
-                          you have bandwidth headroom.
+                          you have bandwidth headroom. With --adaptive-bitrate it
+                          is the ceiling, not a fixed target. Config key: BITRATE
+                          (the menu-bar controller's Video tab sets it).
 --keyframe-interval SECS  H.264 periodic keyframe (IDR) interval in seconds
                           (default 2; only with --enable-h264). Safety net for
                           transient decode glitches; fractional values OK.
@@ -273,6 +275,15 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           dedups), so an independent-loss link of rate p drops a
                           payload only at p^2. Verified smooth on mstsc at
                           5/10/15% loss where single-send glitches. Off by default.
+--stats-endpoint          Expose a loopback (127.0.0.1) READ-ONLY live-telemetry
+                          endpoint the menu-bar controller's Status pane reads:
+                          current H.264 bitrate + ceiling, link RTT, standing
+                          queue, fps, frames sent, session size. One JSON line per
+                          connect, then closes — NO disk writes (the snapshot is
+                          in-memory, updated in the encode path). Default OFF; the
+                          runtime path is a byte-identical no-op when off. Carries
+                          no client IP/hostname. Port MACRDP_STATS_PORT (40245).
+                          Config keys: STATS_ENDPOINT, STATS_PORT.
 ```
 
 `RUST_LOG=debug` for verbose logging.
