@@ -83,7 +83,9 @@ static GLOBAL: OnceLock<Arc<SessionStats>> = OnceLock::new();
 /// Turn telemetry on: create (idempotently) the shared snapshot and return it.
 /// Called once from `main.rs` when the endpoint is enabled.
 pub fn enable() -> Arc<SessionStats> {
-    GLOBAL.get_or_init(|| Arc::new(SessionStats::default())).clone()
+    GLOBAL
+        .get_or_init(|| Arc::new(SessionStats::default()))
+        .clone()
 }
 
 /// The shared snapshot iff telemetry is enabled, else `None`. Hot-path update
