@@ -35,6 +35,7 @@ mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod shield;
+mod stats;
 mod switcher_hud;
 mod usb_redirect;
 mod videotoolbox;
@@ -374,6 +375,12 @@ struct Args {
     /// Reuses the same window-gather machinery as the Ctrl+Alt+G hotkey.
     #[arg(long)]
     restore_windows_on_disconnect: bool,
+
+    /// Expose a loopback (127.0.0.1) read-only live-telemetry endpoint for the
+    /// menu-bar controller's Status pane (bitrate/RTT/fps). Default off. No disk
+    /// writes. macOS-only concern but cross-platform code.
+    #[arg(long)]
+    stats_endpoint: bool,
 
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
@@ -1577,6 +1584,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("RESTORE_WINDOWS_ON_DISCONNECT", false) {
         argv.push("--restore-windows-on-disconnect".into());
     }
+    if on("STATS_ENDPOINT", false) {
+        argv.push("--stats-endpoint".into());
+    }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
     }
@@ -1766,6 +1776,10 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // on disconnect (macOS 26.x won't do it in-process), restart under
         // launchd to restore it. Env-read at the disconnect edge.
         ("DETACH_RESTART_ON_STUCK", "MACRDP_DETACH_RESTART_ON_STUCK"),
+        // Loopback live-telemetry endpoint port (--stats-endpoint). Read via
+        // getenv() in stats::default_port(); bridged like the USB/camera knobs
+        // above so STATS_PORT can be set from config.env.
+        ("STATS_PORT", "MACRDP_STATS_PORT"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
@@ -1774,11 +1788,27 @@ fn args_from_config(path: &Path) -> Result<Args> {
         }
     }
 
-    // EXTRA_FLAGS: space-separated escape hatch, appended verbatim.
+    // BITRATE (H.264 ceiling, Mbit/s), the dedicated key. When set it is
+    // AUTHORITATIVE: any `--bitrate N` left in EXTRA_FLAGS is dropped below, so
+    // clap never sees a duplicated `--bitrate` (which it rejects with an error
+    // rather than taking the last). Unset/empty → EXTRA_FLAGS or the default (6).
+    let bitrate = cfg.get("BITRATE").filter(|b| !b.is_empty());
+
+    // EXTRA_FLAGS: space-separated escape hatch, appended verbatim — except a
+    // `--bitrate <val>` pair is skipped when the dedicated BITRATE key is set.
     if let Some(extra) = cfg.get("EXTRA_FLAGS") {
-        for tok in extra.split_whitespace() {
+        let mut toks = extra.split_whitespace();
+        while let Some(tok) = toks.next() {
+            if bitrate.is_some() && tok == "--bitrate" {
+                toks.next(); // consume its value so it isn't pushed either
+                continue;
+            }
             argv.push(tok.to_string());
         }
+    }
+    if let Some(bitrate) = bitrate {
+        argv.push("--bitrate".into());
+        argv.push(bitrate.clone());
     }
 
     // Re-parse through clap so every value is validated exactly as a CLI arg
@@ -1867,6 +1897,19 @@ async fn async_main() -> Result<()> {
             tokio::runtime::Handle::current(),
             health::HealthConfig::from_env(),
         );
+    }
+
+    // Opt-in loopback read-only live-telemetry endpoint (--stats-endpoint,
+    // default OFF). When off, stats::global() returns None and every encode-path
+    // update site is a no-op, so the default runtime path is unchanged.
+    if args.stats_endpoint {
+        let stats = crate::stats::enable();
+        // The h264 path can't see the audio codec; seed it here from the args.
+        stats
+            .aac
+            .store(args.enable_aac, std::sync::atomic::Ordering::Relaxed);
+        let port = crate::stats::default_port();
+        tokio::spawn(crate::stats::serve(port, stats));
     }
 
     if args.make_primary && !args.virtual_display {
@@ -2945,6 +2988,32 @@ mod config_tests {
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
         assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn bitrate_config_bridge() {
+        // BITRATE alone maps to --bitrate.
+        let p = write_temp("br1", "BITRATE=8\n");
+        assert_eq!(args_from_config(&p).unwrap().bitrate, 8);
+        fs::remove_file(&p).ok();
+
+        // BITRATE wins over a stale `--bitrate` in EXTRA_FLAGS (which is dropped
+        // so clap never sees a duplicate) WITHOUT eating the other EXTRA_FLAGS.
+        let p = write_temp("br2", "EXTRA_FLAGS=\"--fps 24 --bitrate 6\"\nBITRATE=12\n");
+        let a = args_from_config(&p).unwrap();
+        assert_eq!(a.bitrate, 12);
+        assert_eq!(a.fps, Some(24)); // the non-bitrate flag survived the strip
+        fs::remove_file(&p).ok();
+
+        // Unset → the server default (6).
+        let p = write_temp("br3", "ENABLE_H264=1\n");
+        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
+        fs::remove_file(&p).ok();
+
+        // Empty BITRATE is ignored (no arg pushed) → default, not an error.
+        let p = write_temp("br4", "BITRATE=\n");
+        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
+        fs::remove_file(&p).ok();
     }
 
     #[test]

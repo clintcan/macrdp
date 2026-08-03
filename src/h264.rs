@@ -2249,6 +2249,20 @@ impl Gfx {
             }
             IdrBackoff::Hold => {}
         }
+        // stats: publish the live per-interval values (no-op unless --stats-endpoint).
+        // Runs ~once per adaptive_interval, not per frame. No fps cap is computed
+        // here (the P2b floor lives elsewhere), so report the configured fps.
+        if let Some(s) = crate::stats::global() {
+            s.bitrate_bps
+                .store(ctx.adaptive_target_bps, Ordering::Relaxed);
+            s.queue_delay_ms
+                .store(sample_ms.round() as u32, Ordering::Relaxed);
+            s.rtt_ms
+                .store(self.link_rtt_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+            s.fps.store(self.fps, Ordering::Relaxed);
+            s.frames_sent
+                .store(ctx.last_shipped_frame_id.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
         actions
     }
 
@@ -2359,6 +2373,17 @@ impl Gfx {
                 .spawn(move || gfx.ship_loop(rx, shipped))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
+        }
+        // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
+        if let Some(s) = crate::stats::global() {
+            let (w, h) = ctx.dims;
+            s.connected.store(true, Ordering::Relaxed);
+            s.width.store(u32::from(w), Ordering::Relaxed);
+            s.height.store(u32::from(h), Ordering::Relaxed);
+            s.ceiling_bps.store(self.bitrate_bps, Ordering::Relaxed);
+            s.bitrate_bps.store(self.bitrate_bps, Ordering::Relaxed);
+            s.fps.store(self.fps, Ordering::Relaxed);
+            s.adaptive.store(self.adaptive_enabled, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -3099,6 +3124,13 @@ impl GraphicsPipelineHandler for GfxHandler {
                      detector disarms once the nonzero run is sustained, and re-arms if it \
                      lapses back to zero)"
                 );
+            }
+            // stats: keep frames/RTT live for mstsc sessions even without
+            // --adaptive-bitrate (no-op unless --stats-endpoint). ~8/s.
+            if let Some(s) = crate::stats::global() {
+                s.frames_sent
+                    .store(ctx.last_shipped_frame_id.load(Ordering::Relaxed), Ordering::Relaxed);
+                s.rtt_ms.store(ctx.link_rtt_ms, Ordering::Relaxed);
             }
         }
     }
