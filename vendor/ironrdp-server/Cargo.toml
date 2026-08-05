@@ -1,13 +1,13 @@
 [package]
 name = "ironrdp-server"
-version = "0.10.0"
+version = "0.13.0"
 readme = "README.md"
 description = "Extendable skeleton for implementing custom RDP servers"
 # Vendored copy of upstream master ironrdp-server (rebased 2026-05-17 against
 # Devolutions/IronRDP@0282d18). Workspace-inherited fields are inlined below
 # because we're not inside the IronRDP cargo workspace.
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Devolutions/IronRDP"
 repository = "https://github.com/Devolutions/IronRDP"
@@ -26,6 +26,9 @@ rayon = ["dep:rayon"]
 qoi = ["dep:qoicoubeh", "ironrdp-pdu/qoi"]
 qoiz = ["dep:zstd-safe", "qoi", "ironrdp-pdu/qoiz"]
 egfx = ["dep:ironrdp-egfx"]
+# NSCodec encoder (was vendored divergence 6 — now upstream #1332's ironrdp-nscodec
+# crate). macrdp enables it (the macOS Windows App's legacy codec list is NSCodec-only).
+nscodec = ["dep:ironrdp-nscodec"]
 # (vendored) RDP UDP multitransport (MS-RDPEMT) server support. Default off so
 # the standard build is byte-identical. M1 performs the negotiation handshake;
 # M3 adds the UDP listener + RDPEUDP SYN/SYN+ACK handshake (pulls in the
@@ -44,20 +47,22 @@ async-trait = "0.1"
 # path = "../ironrdp-*" entries dropped — we live outside the upstream
 # workspace, so cargo resolves these via the root macrdp Cargo.toml's
 # [patch.crates-io] redirects (git pin to upstream master).
-ironrdp-async = "0.8"
-ironrdp-ainput = "0.5"
-ironrdp-core = "0.1"
-ironrdp-pdu = "0.7" # public
-ironrdp-svc = "0.6" # public
-ironrdp-cliprdr = "0.5" # public
-ironrdp-displaycontrol = "0.5" # public
-ironrdp-echo = "0.1" # public
-ironrdp-dvc = "0.5" # public
-ironrdp-tokio = { version = "0.8", features = ["reqwest"] }
-ironrdp-acceptor = "0.8" # public
-ironrdp-graphics = "0.7" # public
-ironrdp-rdpsnd = "0.7" # public
-ironrdp-rdpdr = "0.5" # public (vendored — server-direction RDPDR)
+ironrdp-async = "0.10"
+ironrdp-ainput = "0.8"
+ironrdp-core = "0.2"
+ironrdp-pdu = "0.9" # public
+ironrdp-svc = "0.8" # public
+ironrdp-cliprdr = "0.7" # public
+ironrdp-displaycontrol = "0.8" # public
+ironrdp-echo = "0.4" # public
+ironrdp-dvc = "0.8" # public
+ironrdp-tokio = { version = "0.10", features = ["reqwest"] }
+ironrdp-acceptor = "0.10" # public
+ironrdp-graphics = "0.9" # public
+ironrdp-rdpsnd = "0.9" # public
+ironrdp-rdpdr = "0.7" # public (vendored — server-direction RDPDR)
+# NSCodec encoder (upstream #1332's crate; enabled via the `nscodec` feature).
+ironrdp-nscodec = { version = "0.2", optional = true, features = ["encoder"] }
 # (USB redirection, divergence 16) MS-RDPEUSB PDU codecs — VENDORED at
 # vendor/ironrdp-rdpeusb (extends SupportedUsbVer with USB 3.x so a modern
 # device's ADD_DEVICE caps parse). Resolved via the root [patch.crates-io]
@@ -84,7 +89,7 @@ bytes = "1"
 visibility = { version = "0.1", optional = true }
 qoicoubeh = { version = "0.5", optional = true }
 zstd-safe = { version = "7.2", optional = true }
-ironrdp-egfx = { version = "0.1", optional = true }
+ironrdp-egfx = { version = "0.3", optional = true }
 
 # (vendored, divergence 15) kernel TCP RTT sample at accept (TCP_CONNECTION_INFO).
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -95,3 +100,33 @@ tokio = { version = "1", features = ["sync"] }
 
 # [lints] workspace = true — inlined as empty since we're not in the workspace.
 [lints]
+
+# Honored ONLY when this crate is built standalone (isolated validation during a
+# pin bump); IGNORED when it's a path dependency of macrdp (the root Cargo.toml's
+# [patch] wins). Mirrors the root's wiring: vendored siblings by path, the rest
+# git-pinned to the same rev, + the two-sided ironrdp-dvc patch (the git crates
+# depend on it within the IronRDP workspace). Keep the rev in sync with the root.
+[patch.crates-io]
+ironrdp-acceptor       = { path = "../ironrdp-acceptor" }
+ironrdp-rdpdr          = { path = "../ironrdp-rdpdr" }
+ironrdp-dvc            = { path = "../ironrdp-dvc" }
+ironrdp-core           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-pdu            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-svc            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-cliprdr        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-echo           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-async          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-ainput         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-tokio          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-graphics       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-rdpsnd         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-egfx           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-rdpeusb        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-nscodec        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-connector      = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-str            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-error          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+
+[patch."https://github.com/Devolutions/IronRDP.git"]
+ironrdp-dvc = { path = "../ironrdp-dvc" }
