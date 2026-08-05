@@ -192,17 +192,6 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           flowing through a minimize (preserves "minimized
                           YouTube keeps playing on the Mac speakers") at the
                           cost of accepting that drift on refocus. See [audio.md](audio.md).
---qoi-force-rgb           Force QOI BitmapUpdates to emit `Channels::Rgb` instead
-                          of the natural `Channels::Rgba` mapping from a *A32
-                          capture. Default OFF (matches upstream ironrdp-server).
-                          Only matters if you connect with an IronRDP-based viewer
-                          built against ironrdp-session WITHOUT the RGBA decode
-                          patch (currently every published release, until
-                          Devolutions/IronRDP#1341 lands) — without this flag those
-                          viewers will render blank with one "Unsupported RGBA QOI
-                          data" warning per frame. mstsc / Microsoft Remote Desktop
-                          / Windows App / FreeRDP don't advertise QOI and are
-                          unaffected either way.
 --cert-dir PATH           Persisted self-signed TLS cert (default ~/Library/Application Support/macrdp)
 --cert PATH / --key PATH  Operator-supplied TLS cert + key (PEM) — serve a real CA / ACME /
                           Let's Encrypt cert instead of self-signed. Both required; no

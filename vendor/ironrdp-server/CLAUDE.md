@@ -3,8 +3,8 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21)/(22)/(23) below are upstreamed
-AND released — #1276 landing is NOT sufficient.
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21)/(22)/(23) below are upstreamed
+AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 
 (1) The original "keep newest queued waves on per-batch overflow"
     direction-flip LANDED upstream (PR #1276, merged 2026-05-21) — do NOT
@@ -97,25 +97,18 @@ AND released — #1276 landing is NOT sufficient.
     published `ironrdp-nscodec` crate + enable the `nscodec` feature on
     `ironrdp-server`.
 
-(7) Opt-in QOI Rgb-only workaround for pre-PR-#1335 `ironrdp-session` clients
-    (process-global `QOI_FORCE_RGB: AtomicBool`, public setter
-    `set_qoi_force_rgb`, wired through macrdp's `--qoi-force-rgb` CLI flag —
-    default OFF, so `qoi_encode` emits the natural `*a` `qoi::RawChannels`
-    matching the source PixelFormat, identical to upstream). When the flag is
-    set, every 4-byte input maps to its `*x` sibling so the QOI header
-    advertises `Channels::Rgb` instead of `Channels::Rgba`. Context: upstream
-    `ironrdp-session`'s `fast_path.rs::qoi_apply` Rgba arm is
-    `warn!("Unsupported RGBA QOI data")` and drops the frame, so any client
-    carrying that code negotiates QOI, gets `Rgba`, and renders blank (412
-    RGBA-warn lines in ~12s on the loopback repro). PR #1335 ✅ MERGED 2026-06-01
-    (commit `8a9ee626`) upstreams the Rgb behaviour as the default; the companion
-    client-side patch landed as PR #1341 ✅ MERGED 2026-06-01 (commit `ef20ea4e`,
-    branch `feat-client-rgba-qoi`) adding Rgba decode to `ironrdp-session` (plus a
-    size-guard in `qoi_apply` against oversized payloads). Both are MERGED but NOT
-    yet released — once a release ships them, the workaround + `--qoi-force-rgb`
-    flag (commit `e22a617`) can be deleted. Until then, users pointing
-    `ironrdp-viewer` at macrdp should pass `--qoi-force-rgb`; mstsc / MS Remote
-    Desktop / Windows App / FreeRDP don't advertise QOI and are unaffected.
+(7) Opt-in QOI Rgb-only workaround — **HARVESTED / DELETED at the a5d1c682 pin
+    bump (2026-08-06).** PR #1335 (commit `8a9ee626`, server-side always-Rgb) and
+    #1341 (commit `ef20ea4e`, client-side Rgba decode) are BOTH in a5d1c682, so the
+    `--qoi-force-rgb` workaround was redundant. `qoi_encode` here now converges to
+    upstream's exact form (every 4-byte input → its `*x` variant, so the QOI header
+    always advertises `Channels::Rgb`, the only variant `ironrdp-session`'s
+    `fast_path.rs::qoi_apply` decodes without blanking). Removed: the
+    `QOI_FORCE_RGB` static + `set_qoi_force_rgb` setter + the `lib.rs` re-export
+    (here), and macrdp's `--qoi-force-rgb` CLI flag + wiring + `docs/configuration.md`
+    entry. The old default (emit natural `*a`/Rgba, which blanked pre-#1341 clients)
+    is gone — always-Rgb, matching upstream. mstsc / MS Remote Desktop / Windows
+    App / FreeRDP don't advertise QOI and are unaffected either way.
 
 (8) AudioWave carries an explicit per-wave duration (NOT upstreamed): the
     `AudioWave` tuple in `src/sound.rs` gained a third field

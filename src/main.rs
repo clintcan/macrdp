@@ -700,18 +700,6 @@ struct Args {
     #[arg(long = "no-remap-apps", value_delimiter = ',')]
     no_remap_apps: Vec<String>,
 
-    /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
-    /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
-    /// PixelFormat, matching upstream `ironrdp-server`. Upstream
-    /// `ironrdp-session` (every published `ironrdp-viewer` to date) drops
-    /// RGBA QOI frames with `WARN: Unsupported RGBA QOI data` — so pass this
-    /// flag when you're serving an IronRDP-based client that hasn't picked
-    /// up the RGBA-decode patch yet, or your viewer will render blank.
-    /// mstsc / Microsoft Remote Desktop / Windows App / FreeRDP don't
-    /// advertise QOI and are unaffected either way.
-    #[arg(long)]
-    qoi_force_rgb: bool,
-
     /// Keyboard layout to interpret the client's keystrokes as, for non-US
     /// clients. By default the layout is **auto-detected** from the client's
     /// announced KLID (US/unknown keep the plain positional-keycode path, so
@@ -2368,7 +2356,6 @@ async fn async_main() -> Result<()> {
         );
     }
 
-    ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);

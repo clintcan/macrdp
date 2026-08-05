@@ -1,7 +1,5 @@
 use core::fmt;
 use core::num::NonZeroU16;
-#[cfg(feature = "qoi")]
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result, anyhow};
 use ironrdp_acceptor::DesktopSize;
@@ -697,58 +695,29 @@ impl BitmapUpdateHandler for NsCodecHandler {
 }
 
 /// Opt-in QOI Rgb-only workaround for pre-PR-#1335 `ironrdp-session` clients.
-/// When `true`, every `*A32` capture format is encoded as its `*x` sibling so
-/// the QOI header advertises `Channels::Rgb` — the only variant the upstream
-/// client decoder accepts today (the `Rgba` arm in `fast_path.rs::qoi_apply`
-/// is `warn!("Unsupported RGBA QOI data")` and drops the frame). Default
-/// `false` so we emit RGBA naturally (matching upstream), which is correct
-/// against clients carrying the matching RGBA decode patch.
-#[cfg(feature = "qoi")]
-static QOI_FORCE_RGB: AtomicBool = AtomicBool::new(false);
-
-/// Toggle the opt-in QOI Rgb-only workaround. See [`QOI_FORCE_RGB`].
-#[cfg(feature = "qoi")]
-pub fn set_qoi_force_rgb(enabled: bool) {
-    QOI_FORCE_RGB.store(enabled, Ordering::Relaxed);
-}
-
 #[cfg(feature = "qoi")]
 fn qoi_encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>> {
     use ironrdp_graphics::image_processing::PixelFormat::*;
-    let force_rgb = QOI_FORCE_RGB.load(Ordering::Relaxed);
+    // Map every 4-byte input — whether it nominally has an alpha byte or
+    // an "X" filler — to the 3-channel-output `*x` variant of
+    // `RawChannels`. The qoi crate selects `Channels::Rgb` vs
+    // `Channels::Rgba` for the QOI header from this enum: `*x` and `*r/g/b`
+    // produce `Rgb`; `*a` produces `Rgba`. The `ironrdp-session` NSCodec-
+    // free decode path in `fast_path.rs::qoi_apply` only supports
+    // `Channels::Rgb` and explicitly drops `Channels::Rgba` frames with
+    // `WARN: Unsupported RGBA QOI data`, so the previous "honest" mapping
+    // (`BgrA32 -> Bgra`, etc.) produced output that no IronRDP client
+    // could decode — every QOI session rendered a blank screen.
+    //
+    // Server-side bitmap captures are functionally opaque (the alpha byte
+    // is either always 0xFF or treated as filler), so discarding it is
+    // safe and matches what every successful legacy bitmap path
+    // already does.
     let raw_channels = match bitmap.format {
-        ARgb32 => {
-            if force_rgb {
-                qoi::RawChannels::Xrgb
-            } else {
-                qoi::RawChannels::Argb
-            }
-        }
-        XRgb32 => qoi::RawChannels::Xrgb,
-        ABgr32 => {
-            if force_rgb {
-                qoi::RawChannels::Xbgr
-            } else {
-                qoi::RawChannels::Abgr
-            }
-        }
-        XBgr32 => qoi::RawChannels::Xbgr,
-        BgrA32 => {
-            if force_rgb {
-                qoi::RawChannels::Bgrx
-            } else {
-                qoi::RawChannels::Bgra
-            }
-        }
-        BgrX32 => qoi::RawChannels::Bgrx,
-        RgbA32 => {
-            if force_rgb {
-                qoi::RawChannels::Rgbx
-            } else {
-                qoi::RawChannels::Rgba
-            }
-        }
-        RgbX32 => qoi::RawChannels::Rgbx,
+        ARgb32 | XRgb32 => qoi::RawChannels::Xrgb,
+        ABgr32 | XBgr32 => qoi::RawChannels::Xbgr,
+        BgrA32 | BgrX32 => qoi::RawChannels::Bgrx,
+        RgbA32 | RgbX32 => qoi::RawChannels::Rgbx,
     };
     let enc = qoi::EncoderBuilder::new(&bitmap.data, bitmap.width.get().into(), bitmap.height.get().into())
         .stride(bitmap.stride.get())
