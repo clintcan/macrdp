@@ -121,9 +121,9 @@ ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 # divergences merged upstream (div1 #1418 SupportedUsbVer newtype + USB_32, div2
 # #1513 usb_device match, div3 #1420 UsbConfigDesc.trailing, div4 #1321 completion
 # guards). Upstream is publish=false (git-workspace crate), so it stays a git-pin
-# rather than a crates.io version. vendor/ironrdp-rdpeusb/ can be deleted.
+# rather than a crates.io version. vendor/ironrdp-rdpeusb/ was DELETED at the bump.
 ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-# ironrdp-str isn't depended on directly by macrdp, but the vendored
+# ironrdp-str isn't depended on directly by macrdp, but the git
 # ironrdp-rdpeusb names it as a crates.io dep (it's a git-workspace crate, never
 # published); pin it to the same git rev so it resolves + unifies with the copy
 # the other ironrdp crates pull transitively. (Same shape as ironrdp-error above.)

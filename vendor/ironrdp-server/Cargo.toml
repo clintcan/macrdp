@@ -63,11 +63,11 @@ ironrdp-rdpsnd = "0.9" # public
 ironrdp-rdpdr = "0.7" # public (vendored — server-direction RDPDR)
 # NSCodec encoder (upstream #1332's crate; enabled via the `nscodec` feature).
 ironrdp-nscodec = { version = "0.2", optional = true, features = ["encoder"] }
-# (USB redirection, divergence 16) MS-RDPEUSB PDU codecs — VENDORED at
-# vendor/ironrdp-rdpeusb (extends SupportedUsbVer with USB 3.x so a modern
-# device's ADD_DEVICE caps parse). Resolved via the root [patch.crates-io]
-# path redirect, same as the other vendored ironrdp-* crates. The
-# server-direction `UrbdrcServer` DVC processor lives in src/rdpeusb.rs.
+# (USB redirection, divergence 16) MS-RDPEUSB / URBDRC PDU codecs. The fork was
+# RETIRED at the a5d1c682 pin bump (its lenient USB-3 caps decode landed upstream);
+# now resolved via a git-rev [patch.crates-io], NOT the deleted vendor/ironrdp-rdpeusb
+# path. The server-direction DVC processor (ported to a5d1c682's split URBDRC PDUs)
+# lives in src/rdpeusb.rs.
 ironrdp-rdpeusb = "0.1"
 # (vendored, multitransport-only) sans-I/O RDPEUDP/RDPEUDP2 wire codecs +
 # reliability state machine. Local path crate (not on crates.io); its own
