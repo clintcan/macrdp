@@ -35,20 +35,28 @@ use ironrdp_core::{Encode, EncodeResult, ReadCursor, WriteCursor, decode, impl_a
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
 use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityRequest};
-use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{TsUrbResultPayload, TsUrbSelectConfigResult, UsbdPipeType};
-use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, Mask, SharedMsgHeader};
+use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{
+    TsUrbResultPayload, TsUrbSelectConfigResult, UsbdPipeType,
+};
+use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, SharedMsgHeader};
+use ironrdp_rdpeusb::pdu::iface_manipulation::InterfaceRelease;
 use ironrdp_rdpeusb::pdu::notify::{ChannelCreated, Direction};
 use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::{
     SetupPacket, TsUrbHeader, TsUsbdInterfaceInfo, TsUsbdPipeInfo, UrbFunction, UsbConfigDesc,
 };
 use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{
-    TsUrb, TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbControlFeatRequest,
+    TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbControlFeatRequest,
     TsUrbControlGetConfigRequest, TsUrbControlGetInterfaceRequest, TsUrbControlGetStatusRequest,
-    TsUrbControlTransferEx, TsUrbControlVendorClassRequest, TsUrbSelectConfig,
+    TsUrbControlTransferEx, TsUrbControlVendorClassRequest, TsUrbIn, TsUrbInKind, TsUrbOut,
+    TsUrbOutKind, TsUrbSelectConfig,
 };
-use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest, TransferOutRequest};
+use ironrdp_rdpeusb::pdu::usb_dev::{
+    RegisterRequestCallback, TransferInRequest, TransferOutRequest,
+};
 use ironrdp_rdpeusb::pdu::utils::RequestIdTransferInOut;
-use ironrdp_rdpeusb::pdu::{UrbdrcClientPdu, UrbdrcServerPdu};
+use ironrdp_rdpeusb::pdu::{
+    UrbdrcClientControlPdu, UrbdrcClientDevicePdu, UrbdrcServerControlPdu, UrbdrcServerDevicePdu,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
@@ -77,11 +85,6 @@ const USBD_SHORT_TRANSFER_OK: u32 = 0x2;
 /// predates the upstream `CHANNEL_NAME` const, so it's spelled out here).
 pub const URBDRC_CHANNEL_NAME: &str = "URBDRC";
 
-/// Per-connection ceiling on server-opened per-device `URBDRC` DVCs. Each client
-/// `ADD_VIRTUAL_CHANNEL` opens one channel (never pruned within a connection), so
-/// this bounds a hostile/buggy client that spams announcements from growing the
-/// DRDYNVC slab without limit. Far above any real device count.
-
 /// Server-loop actions requested by the `URBDRC` processor / [`UsbHandle`] that
 /// they can't perform themselves (they need `&mut DrdynvcServer`, which only the
 /// event loop holds). Delivered via [`ServerEvent::Urbdrc`].
@@ -91,7 +94,10 @@ pub enum UrbdrcServerMessage {
     OpenDeviceChannel,
     /// Ship DVC messages (a transfer request originated by a [`UsbHandle`]) on an
     /// already-open per-device channel. The loop DVC-frames them and writes them.
-    SendMessages { channel_id: u32, messages: Vec<DvcMessage> },
+    SendMessages {
+        channel_id: u32,
+        messages: Vec<DvcMessage>,
+    },
 }
 
 impl fmt::Debug for UrbdrcServerMessage {
@@ -99,7 +105,10 @@ impl fmt::Debug for UrbdrcServerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OpenDeviceChannel => write!(f, "OpenDeviceChannel"),
-            Self::SendMessages { channel_id, messages } => f
+            Self::SendMessages {
+                channel_id,
+                messages,
+            } => f
                 .debug_struct("SendMessages")
                 .field("channel_id", channel_id)
                 .field("messages", &messages.len())
@@ -108,19 +117,23 @@ impl fmt::Debug for UrbdrcServerMessage {
     }
 }
 
-/// Wrap a server→client `UrbdrcServerPdu` as a [`DvcMessage`]. The PDU implements
-/// `Encode` but not `DvcEncode` (orphan rules), so we hold it and delegate —
-/// the DVC layer adds only its own framing around the encoded bytes. Mirrors
-/// `OwnedAudioPdu` in `multitransport/audio_dvc.rs`.
-struct UsbDvcPdu(UrbdrcServerPdu);
+/// Adapt any server→client `Encode` PDU to a [`DvcMessage`]. The individual URBDRC
+/// PDU types (`TransferInRequest`, `RegisterRequestCallback`, `RimExchangeCapabilityRequest`,
+/// `ChannelCreated`, `InterfaceRelease`, …) and the per-channel envelope enums
+/// (`UrbdrcServerControlPdu` / `UrbdrcServerDevicePdu`) all implement `Encode`; the
+/// DVC layer only adds its own framing around the encoded bytes, so one generic
+/// wrapper serves them all. (Post pin bump the pinned crate impls `DvcEncode` on the
+/// wire types directly — this wrapper just uniformly covers those AND the envelope
+/// enums.) Mirrors `OwnedAudioPdu` in `multitransport/audio_dvc.rs`.
+struct UsbDvc<T: Encode>(T);
 
-impl Encode for UsbDvcPdu {
+impl<T: Encode> Encode for UsbDvc<T> {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         self.0.encode(dst)
     }
 
     fn name(&self) -> &'static str {
-        "UrbdrcServerPdu"
+        self.0.name()
     }
 
     fn size(&self) -> usize {
@@ -128,52 +141,36 @@ impl Encode for UsbDvcPdu {
     }
 }
 
-impl DvcEncode for UsbDvcPdu {}
+impl<T: Encode + Send> DvcEncode for UsbDvc<T> {}
 
-fn dvc_msg(pdu: UrbdrcServerPdu) -> DvcMessage {
-    Box::new(UsbDvcPdu(pdu))
+fn dvc_msg<T: Encode + Send + 'static>(pdu: T) -> DvcMessage {
+    Box::new(UsbDvc(pdu))
 }
 
-/// A bare [`SharedMsgHeader`] message with no body — used for `RIMCALL_RELEASE`,
-/// which the pinned `ironrdp-rdpeusb` has no dedicated server PDU for (it's a
-/// generic RPCE "release interface" call: just the shared header). The header
-/// itself implements `Encode`.
-struct UsbHeaderMsg(SharedMsgHeader);
-
-impl Encode for UsbHeaderMsg {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        self.0.encode(dst)
-    }
-
-    fn name(&self) -> &'static str {
-        "SharedMsgHeader"
-    }
-
-    fn size(&self) -> usize {
-        self.0.size()
-    }
-}
-
-impl DvcEncode for UsbHeaderMsg {}
-
-/// Build a `RIMCALL_RELEASE` message (channel-notification interface, no body).
+/// Build a `RIMCALL_RELEASE` message as a first-class [`InterfaceRelease`] PDU.
 /// FreeRDP's `urbdrc_device_control_channel` uses it as a ready barrier: on the
 /// main channel it triggers `ADD_VIRTUAL_CHANNEL`; on a per-device channel it
-/// triggers `ADD_DEVICE`.
+/// triggers `ADD_DEVICE`. `iface_id` is the notify-client interface (`0x2`) OR-ed
+/// with the stream-id-proxy mask (`0x1` in the top two bits) — the exact value the
+/// old `SharedMsgHeader { interface_id: NOTIFY_CLIENT, mask: StreamIdProxy }`
+/// encoded, now that the pinned crate folds the mask into a pre-combined
+/// `SharedMsgHeader.iface_id: u32` and keeps `Mask` `pub(crate)`.
+const RIMCALL_RELEASE_IFACE_ID: u32 = 0x4000_0002;
+
 fn rimcall_release(msg_id: u32) -> DvcMessage {
-    Box::new(UsbHeaderMsg(SharedMsgHeader {
-        interface_id: InterfaceId::NOTIFY_CLIENT,
-        mask: Mask::StreamIdProxy,
+    dvc_msg(InterfaceRelease {
+        iface_id: RIMCALL_RELEASE_IFACE_ID,
         msg_id,
-        function_id: Some(FunctionId::RIMCALL_RELEASE),
-    }))
+    })
 }
 
 /// Best-effort identify a client PDU by decoding just its shared header (used to
 /// log meaningfully when the full body decode fails). Uses the pinned header
 /// decoder only — no parallel wire parsing.
 fn peek_function_id(payload: &[u8]) -> Option<FunctionId> {
-    decode::<SharedMsgHeader>(payload).ok().and_then(|h| h.function_id)
+    decode::<SharedMsgHeader>(payload)
+        .ok()
+        .and_then(|h| h.function_id)
 }
 
 /// The fields of a standard 18-byte USB device descriptor we surface. Keeps the
@@ -182,8 +179,8 @@ fn peek_function_id(payload: &[u8]) -> Option<FunctionId> {
 pub struct DeviceDescriptor {
     pub usb_version: u16, // bcdUSB
     pub device_class: u8,
-    pub vendor_id: u16,  // idVendor
-    pub product_id: u16, // idProduct
+    pub vendor_id: u16,      // idVendor
+    pub product_id: u16,     // idProduct
     pub device_release: u16, // bcdDevice
 }
 
@@ -323,7 +320,11 @@ impl UsbHandle {
     /// pend forever (wedging the presenting driver mid-transfer, leaking the
     /// controller + the dedup slot until process restart). `biased` so a completion
     /// that raced the close is still delivered.
-    async fn await_reply(&self, rx: oneshot::Receiver<UrbReply>, what: &'static str) -> Result<UrbReply> {
+    async fn await_reply(
+        &self,
+        rx: oneshot::Receiver<UrbReply>,
+        what: &'static str,
+    ) -> Result<UrbReply> {
         tokio::select! {
             biased;
             reply = rx => reply.with_context(|| format!("URBDRC: connection closed before {what} completion")),
@@ -334,9 +335,22 @@ impl UsbHandle {
     /// Fetch a descriptor via a `GET_DESCRIPTOR` control transfer (IN) and return
     /// its raw bytes. `desc_type`/`index`/`lang_id` are the standard
     /// `SETUP.wValue`/`wIndex`; `max_len` bounds the reply.
-    pub async fn get_descriptor(&self, desc_type: u8, index: u8, lang_id: u16, max_len: u32) -> Result<Vec<u8>> {
+    pub async fn get_descriptor(
+        &self,
+        desc_type: u8,
+        index: u8,
+        lang_id: u16,
+        max_len: u32,
+    ) -> Result<Vec<u8>> {
         let (req_id, rx) = self.router.register();
-        let messages = get_descriptor_request(self.device_iface, req_id, desc_type, index, lang_id, max_len);
+        let messages = get_descriptor_request(
+            self.device_iface,
+            req_id,
+            desc_type,
+            index,
+            lang_id,
+            max_len,
+        );
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -349,7 +363,10 @@ impl UsbHandle {
             // A device may legitimately stall an unsupported descriptor request; the
             // caller turns this into a stall (NOT a success-with-0-bytes, which makes
             // the local kernel retry the same request instead of moving on).
-            anyhow::bail!("URBDRC: GET_DESCRIPTOR failed (hresult {:#010x})", reply.hresult);
+            anyhow::bail!(
+                "URBDRC: GET_DESCRIPTOR failed (hresult {:#010x})",
+                reply.hresult
+            );
         }
         Ok(reply.output_buffer)
     }
@@ -387,7 +404,10 @@ impl UsbHandle {
             .context("URBDRC: server event loop gone")?;
         let reply = self.await_reply(rx, "SelectConfiguration").await?;
         if reply.hresult != 0 {
-            anyhow::bail!("URBDRC: SelectConfiguration failed (hresult {:#010x})", reply.hresult);
+            anyhow::bail!(
+                "URBDRC: SelectConfiguration failed (hresult {:#010x})",
+                reply.hresult
+            );
         }
         let result = TsUrbSelectConfigResult::decode(&mut ReadCursor::new(&reply.urb_result))
             .map_err(|e| anyhow::anyhow!("URBDRC: malformed SelectConfiguration result: {e}"))?;
@@ -408,7 +428,14 @@ impl UsbHandle {
     /// from [`select_configuration`](Self::select_configuration).
     pub async fn bulk_transfer_in(&self, pipe_handle: u32, length: u32) -> Result<Vec<u8>> {
         let (req_id, rx) = self.router.register();
-        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, Dir::In, length, Vec::new());
+        let messages = bulk_transfer_request(
+            self.device_iface,
+            req_id,
+            pipe_handle,
+            Dir::In,
+            length,
+            Vec::new(),
+        );
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -428,7 +455,8 @@ impl UsbHandle {
     pub async fn bulk_transfer_out(&self, pipe_handle: u32, data: Vec<u8>) -> Result<usize> {
         let n = data.len();
         let (req_id, rx) = self.router.register();
-        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, Dir::Out, 0, data);
+        let messages =
+            bulk_transfer_request(self.device_iface, req_id, pipe_handle, Dir::Out, 0, data);
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -453,7 +481,14 @@ impl UsbHandle {
     /// i.e. `wLength`).
     pub async fn control_transfer_in(&self, setup: [u8; 8], max_len: u32) -> Result<Vec<u8>> {
         let (req_id, rx) = self.router.register();
-        let messages = control_transfer_request(self.device_iface, req_id, setup, Dir::In, max_len, Vec::new());
+        let messages = control_transfer_request(
+            self.device_iface,
+            req_id,
+            setup,
+            Dir::In,
+            max_len,
+            Vec::new(),
+        );
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -463,7 +498,10 @@ impl UsbHandle {
             .context("URBDRC: server event loop gone")?;
         let reply = self.await_reply(rx, "control-IN").await?;
         if reply.hresult != 0 {
-            anyhow::bail!("URBDRC: control IN failed (hresult {:#010x})", reply.hresult);
+            anyhow::bail!(
+                "URBDRC: control IN failed (hresult {:#010x})",
+                reply.hresult
+            );
         }
         Ok(reply.output_buffer)
     }
@@ -476,7 +514,8 @@ impl UsbHandle {
     /// (empty for the no-data requests, which is the common case).
     pub async fn control_transfer_out(&self, setup: [u8; 8], data: Vec<u8>) -> Result<()> {
         let (req_id, rx) = self.router.register();
-        let messages = control_transfer_request(self.device_iface, req_id, setup, Dir::Out, 0, data);
+        let messages =
+            control_transfer_request(self.device_iface, req_id, setup, Dir::Out, 0, data);
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -486,7 +525,10 @@ impl UsbHandle {
             .context("URBDRC: server event loop gone")?;
         let reply = self.await_reply(rx, "control-OUT").await?;
         if reply.hresult != 0 {
-            anyhow::bail!("URBDRC: control OUT failed (hresult {:#010x})", reply.hresult);
+            anyhow::bail!(
+                "URBDRC: control OUT failed (hresult {:#010x})",
+                reply.hresult
+            );
         }
         Ok(())
     }
@@ -519,7 +561,8 @@ fn bulk_transfer_request(
         udev_iface: device_iface,
         request_completion: Some(device_iface),
     };
-    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let ts_req_id =
+        RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
     let transfer_flags = match dir {
         // Bulk/interrupt IN: accept a short packet (see USBD_SHORT_TRANSFER_OK) — video
         // payloads and HID reports are routinely shorter than the read buffer.
@@ -527,29 +570,39 @@ fn bulk_transfer_request(
         Dir::Out => 0,
     };
     let urb = TsUrbBulkOrInterruptTransfer {
-        header: TsUrbHeader {
-            func: UrbFunction::BulkOrInterruptTransfer,
-            req_id: ts_req_id,
-            no_ack: false,
-        },
         pipe_handle,
         transfer_flags,
     };
+    // The TS_URB header is now hoisted out of the payload onto TsUrbIn/TsUrbOut.
+    // `ts_urb_size` is recomputed from the payload size at encode time
+    // (`encode_with_size`), so the constructed value is a placeholder.
+    let header = TsUrbHeader {
+        ts_urb_size: 0,
+        func: UrbFunction::URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
+        req_id: ts_req_id,
+        no_ack: false,
+    };
     let transfer = match dir {
-        Dir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
+        Dir::In => dvc_msg(UrbdrcServerDevicePdu::TransferIn(TransferInRequest {
             msg_id: 0,
             udev_iface: device_iface,
-            ts_urb: TsUrb::BulkInterruptTransfer(urb),
+            ts_urb: TsUrbIn {
+                header,
+                kind: TsUrbInKind::BulkInterruptTransfer(urb),
+            },
             output_buffer_size: in_length,
         })),
-        Dir::Out => dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
+        Dir::Out => dvc_msg(UrbdrcServerDevicePdu::TransferOut(TransferOutRequest {
             msg_id: 0,
             udev_iface: device_iface,
-            ts_urb: TsUrb::BulkInterruptTransfer(urb),
+            ts_urb: TsUrbOut {
+                header,
+                kind: TsUrbOutKind::BulkInterruptTransfer(urb),
+            },
             output_buffer: out_data,
         })),
     };
-    vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
+    vec![dvc_msg(UrbdrcServerDevicePdu::RegReqCb(reg)), transfer]
 }
 
 /// Build a generic EP0 control transfer request: a `RegisterRequestCallback` + a
@@ -573,7 +626,8 @@ fn control_transfer_request(
         udev_iface: device_iface,
         request_completion: Some(device_iface),
     };
-    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let ts_req_id =
+        RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
     let transfer_flags = match dir {
         Dir::In => USBD_TRANSFER_DIRECTION_IN,
         Dir::Out => 0,
@@ -583,39 +637,59 @@ fn control_transfer_request(
     // USB drivers issue these typed URBs, and mstsc's URBDRC only accepts them —
     // the generic URB_FUNCTION_CONTROL_TRANSFER_EX is rejected with 0x80070057
     // (E_INVALIDARG). FreeRDP accepted CONTROL_TRANSFER_EX, which is why it "worked"
-    // there; kept as the fallback for any request we don't map.
-    let ts_urb = setup_to_typed_urb(setup, transfer_flags, ts_req_id);
+    // there; kept as the fallback for any request we don't map. The header is built
+    // here from the returned func (it's hoisted onto TsUrbIn/TsUrbOut now).
+    let (func, in_kind) = setup_to_typed_urb(setup, transfer_flags);
+    let header = TsUrbHeader {
+        ts_urb_size: 0, // recomputed from payload size on encode
+        func,
+        req_id: ts_req_id,
+        no_ack: false,
+    };
     // A few typed control URBs are no-data-stage requests the MS-RDPEUSB codec only
     // accepts inside a TRANSFER_IN_REQUEST (with OutputBufferSize 0), even though the
     // underlying USB transfer is host->device (Dir::Out) — the URB *function* carries the
     // direction, not the envelope. TS_URB_CONTROL_FEATURE_REQUEST (SET/CLEAR_FEATURE) is
     // the one that reaches here as a control-OUT: mstsc issues
     // SET_FEATURE(DEVICE_REMOTE_WAKEUP) when the Xbox controller's Guide button is pressed.
-    // Routing it as TRANSFER_OUT makes TsUrb::encode reject it ("only used with
-    // TRANSFER_IN_REQUEST"), and that encode error would otherwise propagate out of the
-    // dispatch loop and tear down the whole session.
-    let force_transfer_in = matches!(ts_urb, TsUrb::CtlFeatReq(_));
-    let transfer = match dir {
-        _ if force_transfer_in => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
+    // The new codec enforces this at the type level — TsUrbOutKind has no CtlFeatReq — so
+    // a feature request MUST ride TRANSFER_IN, exactly as the old force_transfer_in did.
+    let force_transfer_in = matches!(in_kind, TsUrbInKind::CtlFeatReq(_));
+    let transfer = if force_transfer_in || matches!(dir, Dir::In) {
+        dvc_msg(UrbdrcServerDevicePdu::TransferIn(TransferInRequest {
             msg_id: 0,
             udev_iface: device_iface,
-            ts_urb,
-            output_buffer_size: 0,
-        })),
-        Dir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
-            msg_id: 0,
-            udev_iface: device_iface,
-            ts_urb,
-            output_buffer_size: in_length,
-        })),
-        Dir::Out => dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
-            msg_id: 0,
-            udev_iface: device_iface,
-            ts_urb,
-            output_buffer: out_data,
-        })),
+            ts_urb: TsUrbIn {
+                header,
+                kind: in_kind,
+            },
+            output_buffer_size: if force_transfer_in { 0 } else { in_length },
+        }))
+    } else {
+        // Dir::Out: the typed kinds a control-OUT produces all have a TRANSFER_OUT form;
+        // anything without one falls back to TRANSFER_IN so the request is never dropped.
+        match in_kind_to_out_kind(in_kind) {
+            Ok(out_kind) => dvc_msg(UrbdrcServerDevicePdu::TransferOut(TransferOutRequest {
+                msg_id: 0,
+                udev_iface: device_iface,
+                ts_urb: TsUrbOut {
+                    header,
+                    kind: out_kind,
+                },
+                output_buffer: out_data,
+            })),
+            Err(in_kind) => dvc_msg(UrbdrcServerDevicePdu::TransferIn(TransferInRequest {
+                msg_id: 0,
+                udev_iface: device_iface,
+                ts_urb: TsUrbIn {
+                    header,
+                    kind: in_kind,
+                },
+                output_buffer_size: in_length,
+            })),
+        }
     };
-    vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
+    vec![dvc_msg(UrbdrcServerDevicePdu::RegReqCb(reg)), transfer]
 }
 
 /// Translate a standard 8-byte USB SETUP packet into the specific **typed** URB
@@ -625,7 +699,7 @@ fn control_transfer_request(
 /// have a typed mapping for falls back to `CONTROL_TRANSFER_EX` (FreeRDP-friendly,
 /// and better than dropping the request). `setup` = `[bmRequestType, bRequest,
 /// wValueLo, wValueHi, wIndexLo, wIndexHi, wLengthLo, wLengthHi]`.
-fn setup_to_typed_urb(setup: [u8; 8], transfer_flags: u32, req_id: RequestIdTransferInOut) -> TsUrb {
+fn setup_to_typed_urb(setup: [u8; 8], transfer_flags: u32) -> (UrbFunction, TsUrbInKind) {
     let bm_request_type = setup[0];
     let b_request = setup[1];
     let w_value = u16::from_le_bytes([setup[2], setup[3]]);
@@ -637,122 +711,132 @@ fn setup_to_typed_urb(setup: [u8; 8], transfer_flags: u32, req_id: RequestIdTran
     let req_type = (bm_request_type >> 5) & 0x03;
     let recipient = bm_request_type & 0x1f;
 
-    let header = |func: UrbFunction| TsUrbHeader {
-        func,
-        req_id,
-        no_ack: false,
-    };
+    // The TS_URB header (which carries the URB function) is now hoisted onto TsUrbIn/
+    // TsUrbOut, so this returns (func, kind) and the caller builds the header.
     let control_transfer_ex = || {
-        TsUrb::CtlTransferEx(TsUrbControlTransferEx {
-            header: header(UrbFunction::ControlTransferEx),
-            pipe: 0, // default control endpoint (EP0)
-            transfer_flags,
-            timeout: 0,
-            setup_packet: SetupPacket {
-                request_type: bm_request_type,
-                request: b_request,
-                value: w_value,
-                index: w_index,
-                length: w_length,
-            },
-        })
+        (
+            UrbFunction::URB_FUNCTION_CONTROL_TRANSFER_EX,
+            TsUrbInKind::CtlTransferEx(TsUrbControlTransferEx {
+                pipe: 0, // default control endpoint (EP0)
+                transfer_flags,
+                timeout: 0,
+                setup_packet: SetupPacket {
+                    request_type: bm_request_type,
+                    request: b_request,
+                    value: w_value,
+                    index: w_index,
+                    length: w_length,
+                },
+            }),
+        )
     };
 
     match req_type {
         // Class (1) / vendor (2) request → URB_FUNCTION_{CLASS,VENDOR}_{DEVICE,INTERFACE,ENDPOINT,OTHER}.
         1 | 2 => {
-            use UrbFunction::*;
+            use UrbFunction as F;
             let func = match (req_type, recipient) {
-                (1, 0) => ClassDevice,
-                (1, 1) => ClassInterface,
-                (1, 2) => ClassEndpoint,
-                (1, _) => ClassOther,
-                (2, 0) => VendorDevice,
-                (2, 1) => VendorInterface,
-                (2, 2) => VendorEndpoint,
-                (_, _) => VendorOther,
+                (1, 0) => F::URB_FUNCTION_CLASS_DEVICE,
+                (1, 1) => F::URB_FUNCTION_CLASS_INTERFACE,
+                (1, 2) => F::URB_FUNCTION_CLASS_ENDPOINT,
+                (1, _) => F::URB_FUNCTION_CLASS_OTHER,
+                (2, 0) => F::URB_FUNCTION_VENDOR_DEVICE,
+                (2, 1) => F::URB_FUNCTION_VENDOR_INTERFACE,
+                (2, 2) => F::URB_FUNCTION_VENDOR_ENDPOINT,
+                (_, _) => F::URB_FUNCTION_VENDOR_OTHER,
             };
-            TsUrb::VendorClassReq(TsUrbControlVendorClassRequest {
-                header: header(func),
-                transfer_flags,
-                request: b_request,
-                value: w_value,
-                index: w_index,
-            })
+            (
+                func,
+                TsUrbInKind::VendorClassReq(TsUrbControlVendorClassRequest {
+                    transfer_flags,
+                    request: b_request,
+                    value: w_value,
+                    index: w_index,
+                }),
+            )
         }
         // Standard request (0): pick the typed function by bRequest.
         0 => {
-            use UrbFunction::*;
+            use UrbFunction as F;
             match b_request {
                 // GET_DESCRIPTOR (0x06) — wValue = (descType << 8) | index, wIndex = langid.
                 0x06 => {
                     let func = match recipient {
-                        1 => GetDescriptorFromInterface,
-                        2 => GetDescriptorFromEndpoint,
-                        0 => GetDescriptorFromDevice,
+                        1 => F::URB_FUNCTION_GET_DESCRIPTOR_FROM_INTERFACE,
+                        2 => F::URB_FUNCTION_GET_DESCRIPTOR_FROM_ENDPOINT,
+                        0 => F::URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE,
                         _ => return control_transfer_ex(),
                     };
-                    TsUrb::CtlDescReq(TsUrbControlDescRequest {
-                        header: header(func),
-                        index: setup[2],
-                        desc_type: setup[3],
-                        lang_id: w_index,
-                    })
+                    (
+                        func,
+                        TsUrbInKind::CtlDescReq(TsUrbControlDescRequest {
+                            index: setup[2],
+                            desc_type: setup[3],
+                            lang_id: w_index,
+                        }),
+                    )
                 }
                 // SET_DESCRIPTOR (0x07).
                 0x07 => {
                     let func = match recipient {
-                        1 => SetDescriptorToInterface,
-                        2 => SetDescriptorToEndpoint,
-                        0 => SetDescriptorToDevice,
+                        1 => F::URB_FUNCTION_SET_DESCRIPTOR_TO_INTERFACE,
+                        2 => F::URB_FUNCTION_SET_DESCRIPTOR_TO_ENDPOINT,
+                        0 => F::URB_FUNCTION_SET_DESCRIPTOR_TO_DEVICE,
                         _ => return control_transfer_ex(),
                     };
-                    TsUrb::CtlDescReq(TsUrbControlDescRequest {
-                        header: header(func),
-                        index: setup[2],
-                        desc_type: setup[3],
-                        lang_id: w_index,
-                    })
+                    (
+                        func,
+                        TsUrbInKind::CtlDescReq(TsUrbControlDescRequest {
+                            index: setup[2],
+                            desc_type: setup[3],
+                            lang_id: w_index,
+                        }),
+                    )
                 }
                 // CLEAR_FEATURE (0x01) / SET_FEATURE (0x03) — wValue = feature selector.
                 0x01 | 0x03 => {
                     let func = match (b_request, recipient) {
-                        (0x03, 0) => SetFeatureToDevice,
-                        (0x03, 1) => SetFeatureToInterface,
-                        (0x03, 2) => SetFeatureToEndpoint,
-                        (0x01, 0) => ClearFeatureToDevice,
-                        (0x01, 1) => ClearFeatureToInterface,
-                        (0x01, 2) => ClearFeatureToEndpoint,
+                        (0x03, 0) => F::URB_FUNCTION_SET_FEATURE_TO_DEVICE,
+                        (0x03, 1) => F::URB_FUNCTION_SET_FEATURE_TO_INTERFACE,
+                        (0x03, 2) => F::URB_FUNCTION_SET_FEATURE_TO_ENDPOINT,
+                        (0x01, 0) => F::URB_FUNCTION_CLEAR_FEATURE_TO_DEVICE,
+                        (0x01, 1) => F::URB_FUNCTION_CLEAR_FEATURE_TO_INTERFACE,
+                        (0x01, 2) => F::URB_FUNCTION_CLEAR_FEATURE_TO_ENDPOINT,
                         _ => return control_transfer_ex(),
                     };
-                    TsUrb::CtlFeatReq(TsUrbControlFeatRequest {
-                        header: header(func),
-                        feat_selector: w_value,
-                        index: w_index,
-                    })
+                    (
+                        func,
+                        TsUrbInKind::CtlFeatReq(TsUrbControlFeatRequest {
+                            feat_selector: w_value,
+                            index: w_index,
+                        }),
+                    )
                 }
                 // GET_STATUS (0x00) — wIndex = interface / endpoint.
                 0x00 => {
                     let func = match recipient {
-                        0 => GetStatusFromDevice,
-                        1 => GetStatusFromInterface,
-                        2 => GetStatusFromEndpoint,
+                        0 => F::URB_FUNCTION_GET_STATUS_FROM_DEVICE,
+                        1 => F::URB_FUNCTION_GET_STATUS_FROM_INTERFACE,
+                        2 => F::URB_FUNCTION_GET_STATUS_FROM_ENDPOINT,
                         _ => return control_transfer_ex(),
                     };
-                    TsUrb::CtlGetStatus(TsUrbControlGetStatusRequest {
-                        header: header(func),
-                        index: w_index,
-                    })
+                    (
+                        func,
+                        TsUrbInKind::CtlGetStatus(TsUrbControlGetStatusRequest { index: w_index }),
+                    )
                 }
                 // GET_CONFIGURATION (0x08).
-                0x08 => TsUrb::CtlGetConfig(TsUrbControlGetConfigRequest {
-                    header: header(GetConfiguration),
-                }),
+                0x08 => (
+                    F::URB_FUNCTION_GET_CONFIGURATION,
+                    TsUrbInKind::CtlGetConfig(TsUrbControlGetConfigRequest),
+                ),
                 // GET_INTERFACE (0x0a) — wIndex = interface.
-                0x0a => TsUrb::CtlGetIface(TsUrbControlGetInterfaceRequest {
-                    header: header(GetInterface),
-                    interface: w_index,
-                }),
+                0x0a => (
+                    F::URB_FUNCTION_GET_INTERFACE,
+                    TsUrbInKind::CtlGetIface(TsUrbControlGetInterfaceRequest {
+                        interface: w_index,
+                    }),
+                ),
                 // Everything else standard (SET_CONFIGURATION/SET_INTERFACE/SET_ADDRESS are
                 // handled elsewhere and shouldn't reach here) → generic fallback.
                 _ => control_transfer_ex(),
@@ -761,6 +845,25 @@ fn setup_to_typed_urb(setup: [u8; 8], transfer_flags: u32, req_id: RequestIdTran
         // Unreachable (req_type is 2 bits and 3 is caught by the vendor arm), but be safe.
         _ => control_transfer_ex(),
     }
+}
+
+/// Convert a TRANSFER_IN URB kind to its TRANSFER_OUT counterpart for a host→device
+/// control transfer. Only the kinds a `Dir::Out` control transfer actually produces
+/// (`VendorClassReq` / `CtlDescReq` / `CtlTransferEx` — plus the transfer kinds for
+/// completeness) exist in [`TsUrbOutKind`]; a feature request is never `Dir::Out`
+/// (the caller's `force_transfer_in` handles it, which is also why `TsUrbOutKind` has
+/// no `CtlFeatReq`). Any kind without an OUT form is returned as `Err` so the caller
+/// can fall back to TRANSFER_IN rather than dropping the request.
+fn in_kind_to_out_kind(kind: TsUrbInKind) -> Result<TsUrbOutKind, TsUrbInKind> {
+    Ok(match kind {
+        TsUrbInKind::VendorClassReq(x) => TsUrbOutKind::VendorClassReq(x),
+        TsUrbInKind::CtlDescReq(x) => TsUrbOutKind::CtlDescReq(x),
+        TsUrbInKind::CtlTransferEx(x) => TsUrbOutKind::CtlTransferEx(x),
+        TsUrbInKind::CtlTransfer(x) => TsUrbOutKind::CtlTransfer(x),
+        TsUrbInKind::BulkInterruptTransfer(x) => TsUrbOutKind::BulkInterruptTransfer(x),
+        TsUrbInKind::IsochTransfer(x) => TsUrbOutKind::IsochTransfer(x),
+        other => return Err(other),
+    })
 }
 
 /// One endpoint pipe opened by [`UsbHandle::select_configuration`]: its USB
@@ -779,7 +882,10 @@ pub struct UsbPipe {
 /// same order). Walks the standard TLV descriptor chain (config 9.6.3).
 fn parse_configuration(buf: &[u8]) -> Result<(UsbConfigDesc, Vec<TsUsbdInterfaceInfo>)> {
     if buf.len() < 9 || buf[1] != USB_DESCRIPTOR_TYPE_CONFIGURATION {
-        anyhow::bail!("URBDRC: not a configuration descriptor ({} bytes)", buf.len());
+        anyhow::bail!(
+            "URBDRC: not a configuration descriptor ({} bytes)",
+            buf.len()
+        );
     }
     let u16le = |i: usize| u16::from_le_bytes([buf[i], buf[i + 1]]);
     let total_length = u16le(2);
@@ -865,24 +971,28 @@ fn select_config_request(
         udev_iface: device_iface,
         request_completion: Some(device_iface),
     };
-    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let ts_req_id =
+        RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
     let select = TransferInRequest {
         msg_id: 0,
         udev_iface: device_iface,
-        ts_urb: TsUrb::SelectConfig(TsUrbSelectConfig {
+        ts_urb: TsUrbIn {
             header: TsUrbHeader {
-                func: UrbFunction::SelectConfiguration,
+                ts_urb_size: 0, // recomputed from payload size on encode
+                func: UrbFunction::URB_FUNCTION_SELECT_CONFIGURATION,
                 req_id: ts_req_id,
                 no_ack: false,
             },
-            usbd_ifaces: ifaces,
-            desc: Some(desc),
-        }),
+            kind: TsUrbInKind::SelectConfig(TsUrbSelectConfig {
+                usbd_ifaces: ifaces,
+                desc: Some(desc),
+            }),
+        },
         output_buffer_size: 0,
     };
     vec![
-        dvc_msg(UrbdrcServerPdu::RegReqCb(reg)),
-        dvc_msg(UrbdrcServerPdu::TransferIn(select)),
+        dvc_msg(UrbdrcServerDevicePdu::RegReqCb(reg)),
+        dvc_msg(UrbdrcServerDevicePdu::TransferIn(select)),
     ]
 }
 
@@ -905,25 +1015,29 @@ fn get_descriptor_request(
         udev_iface: device_iface,
         request_completion: Some(device_iface),
     };
-    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let ts_req_id =
+        RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
     let get_desc = TransferInRequest {
         msg_id: 0,
         udev_iface: device_iface,
-        ts_urb: TsUrb::CtlDescReq(TsUrbControlDescRequest {
+        ts_urb: TsUrbIn {
             header: TsUrbHeader {
-                func: UrbFunction::GetDescriptorFromDevice,
+                ts_urb_size: 0, // recomputed from payload size on encode
+                func: UrbFunction::URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE,
                 req_id: ts_req_id,
                 no_ack: false,
             },
-            index,
-            desc_type,
-            lang_id,
-        }),
+            kind: TsUrbInKind::CtlDescReq(TsUrbControlDescRequest {
+                index,
+                desc_type,
+                lang_id,
+            }),
+        },
         output_buffer_size: max_len,
     };
     vec![
-        dvc_msg(UrbdrcServerPdu::RegReqCb(reg)),
-        dvc_msg(UrbdrcServerPdu::TransferIn(get_desc)),
+        dvc_msg(UrbdrcServerDevicePdu::RegReqCb(reg)),
+        dvc_msg(UrbdrcServerDevicePdu::TransferIn(get_desc)),
     ]
 }
 
@@ -934,6 +1048,10 @@ fn get_descriptor_request(
 /// Sync` so a device processor on any connection can call it.
 pub type UsbDeviceCallback = Arc<dyn Fn(UsbHandle) + Send + Sync>;
 
+/// Per-connection ceiling on server-opened per-device `URBDRC` DVCs. Each client
+/// `ADD_VIRTUAL_CHANNEL` opens one channel (never pruned within a connection), so
+/// this bounds a hostile/buggy client that spams announcements from growing the
+/// DRDYNVC slab without limit. Far above any real device count.
 const MAX_DEVICE_CHANNELS: u32 = 32;
 
 /// Main server-side `URBDRC` DVC processor: drives the init handshake and, on each
@@ -997,12 +1115,14 @@ impl DvcProcessor for UrbdrcServer {
             msg_id: self.take_msg_id(),
             capability: Capability::RimCapabilityVersion01,
         };
-        Ok(vec![dvc_msg(UrbdrcServerPdu::Caps(req))])
+        Ok(vec![dvc_msg(UrbdrcServerControlPdu::Caps(req))])
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        // Never tear down the session on a URBDRC decode error (opt-in feature).
-        let pdu = match decode::<UrbdrcClientPdu>(payload) {
+        // Never tear down the session on a URBDRC decode error (opt-in feature). The
+        // pinned crate splits the client PDUs by channel role; the main channel speaks
+        // the CONTROL set (caps / channel-created / add-virtual-channel).
+        let pdu = match decode::<UrbdrcClientControlPdu>(payload) {
             Ok(pdu) => pdu,
             Err(e) => {
                 warn!(channel_id, error = %e, "URBDRC main-channel PDU decode failed (tolerated)");
@@ -1010,7 +1130,7 @@ impl DvcProcessor for UrbdrcServer {
             }
         };
         match pdu {
-            UrbdrcClientPdu::Caps(resp) => {
+            UrbdrcClientControlPdu::Caps(resp) => {
                 info!(
                     channel_id,
                     result = format_args!("{:#010x}", resp.result),
@@ -1020,22 +1140,28 @@ impl DvcProcessor for UrbdrcServer {
                 // CHANNEL_CREATED. This is the message that makes the client ANNOUNCE
                 // its redirected devices (ADD_DEVICE / ADD_VIRTUAL_CHANNEL) — without
                 // it the client registers the device locally but never tells us.
-                info!(channel_id, "URBDRC sending CHANNEL_CREATED (triggers device announcement)");
+                info!(
+                    channel_id,
+                    "URBDRC sending CHANNEL_CREATED (triggers device announcement)"
+                );
                 let created = ChannelCreated {
                     msg_id: self.take_msg_id(),
                     direction: Direction::ToClient,
                 };
-                return Ok(vec![dvc_msg(UrbdrcServerPdu::ChanCreated(created))]);
+                return Ok(vec![dvc_msg(UrbdrcServerControlPdu::ChanCreated(created))]);
             }
-            UrbdrcClientPdu::ChanCreated(cc) => {
+            UrbdrcClientControlPdu::ChanCreated(cc) => {
                 debug!(channel_id, direction = ?cc.direction, "URBDRC CHANNEL_CREATED");
                 // With the channel-created handshake done, send RIMCALL_RELEASE — the
                 // ready barrier (FreeRDP: urbdrc_device_control_channel, INIT_CHANNEL_IN)
                 // that makes the client announce its devices via ADD_VIRTUAL_CHANNEL.
-                info!(channel_id, "URBDRC sending RIMCALL_RELEASE (device-announce barrier)");
+                info!(
+                    channel_id,
+                    "URBDRC sending RIMCALL_RELEASE (device-announce barrier)"
+                );
                 return Ok(vec![rimcall_release(self.take_msg_id())]);
             }
-            UrbdrcClientPdu::AddChan(add) => {
+            UrbdrcClientControlPdu::AddChan(add) => {
                 // The client announced a device and wants a per-device channel. We
                 // can't open a DVC from here (no DrdynvcServer handle), so ask the
                 // event loop to (Phase 3.1a). ADD_DEVICE with the descriptors follows
@@ -1052,27 +1178,27 @@ impl DvcProcessor for UrbdrcServer {
                         "URBDRC: per-connection device-channel cap reached, ignoring ADD_VIRTUAL_CHANNEL"
                     );
                 } else if let Some(sender) = self.sender.clone() {
-                    if sender.send(ServerEvent::Urbdrc(UrbdrcServerMessage::OpenDeviceChannel)).is_err() {
-                        warn!(channel_id, "URBDRC: server event loop gone, cannot open device channel");
+                    if sender
+                        .send(ServerEvent::Urbdrc(UrbdrcServerMessage::OpenDeviceChannel))
+                        .is_err()
+                    {
+                        warn!(
+                            channel_id,
+                            "URBDRC: server event loop gone, cannot open device channel"
+                        );
                     } else {
                         self.device_channels_opened = self.device_channels_opened.saturating_add(1);
                     }
                 } else {
-                    debug!(channel_id, "URBDRC observe-only (no sender) — not opening a device channel");
+                    debug!(
+                        channel_id,
+                        "URBDRC observe-only (no sender) — not opening a device channel"
+                    );
                 }
             }
-            UrbdrcClientPdu::AddDev(dev) => {
-                // ADD_DEVICE normally arrives on the per-device channel
-                // (UrbdrcDeviceProcessor); handle it here too for robustness.
-                info!(
-                    channel_id,
-                    usb_device = %dev.usb_device,
-                    device_instance_id = %dev.device_instance_id,
-                    usb_version = ?dev.usb_device_caps.supported_usb_ver,
-                    speed = ?dev.usb_device_caps.device_speed,
-                    "URBDRC AddDevice on the main channel — client announced a redirected USB device (GO)"
-                );
-            }
+            // ADD_DEVICE arrives on the per-device channel (UrbdrcDeviceProcessor); the
+            // main channel decodes the CONTROL set, which can't represent it — an
+            // AddDevice mistakenly on the main channel would decode-fail and be tolerated.
             _ => {
                 debug!(channel_id, "URBDRC client PDU (unhandled)");
             }
@@ -1114,7 +1240,10 @@ pub struct UrbdrcDeviceProcessor {
 }
 
 impl UrbdrcDeviceProcessor {
-    pub fn new(sender: mpsc::UnboundedSender<ServerEvent>, device_cb: Option<UsbDeviceCallback>) -> Self {
+    pub fn new(
+        sender: mpsc::UnboundedSender<ServerEvent>,
+        device_cb: Option<UsbDeviceCallback>,
+    ) -> Self {
         Self {
             sender,
             router: UsbRouter::new(),
@@ -1132,7 +1261,12 @@ impl UrbdrcDeviceProcessor {
     }
 
     /// Hand the presenting side a [`UsbHandle`] onto the newly-announced device.
-    fn notify_device(&self, channel_id: u32, device_iface: InterfaceId, device_instance_id: Arc<str>) {
+    fn notify_device(
+        &self,
+        channel_id: u32,
+        device_iface: InterfaceId,
+        device_instance_id: Arc<str>,
+    ) {
         let handle = UsbHandle::new(
             self.sender.clone(),
             self.router.clone(),
@@ -1143,7 +1277,10 @@ impl UrbdrcDeviceProcessor {
         );
         match &self.device_cb {
             Some(cb) => cb(handle),
-            None => debug!(channel_id, "URBDRC device announced but no presenting side is wired"),
+            None => debug!(
+                channel_id,
+                "URBDRC device announced but no presenting side is wired"
+            ),
         }
     }
 }
@@ -1167,41 +1304,41 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
         // channel's RIMCALL_RELEASE). So kick off the caps exchange here; process()
         // drives CHANNEL_CREATED then RIMCALL_RELEASE, after which the client sends
         // ADD_DEVICE (the real descriptors).
-        info!(channel_id, "URBDRC device channel opened — sending capability request (per-channel handshake)");
+        info!(
+            channel_id,
+            "URBDRC device channel opened — sending capability request (per-channel handshake)"
+        );
         let req = RimExchangeCapabilityRequest {
             msg_id: self.take_msg_id(),
             capability: Capability::RimCapabilityVersion01,
         };
-        Ok(vec![dvc_msg(UrbdrcServerPdu::Caps(req))])
+        // The capability request rides the CAPABILITIES interface (the CONTROL set has
+        // no device-scoped counterpart), even though it's sent on the per-device DVC.
+        Ok(vec![dvc_msg(UrbdrcServerControlPdu::Caps(req))])
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
         // A decode error on this opt-in, non-critical channel must NEVER tear down
         // the RDP session (same lesson as the ironrdp-dvc Soft-Sync divergence).
-        // Tolerate it, and still recognize ADD_DEVICE from its header.
-        match decode::<UrbdrcClientPdu>(payload) {
-            Ok(UrbdrcClientPdu::Caps(resp)) => {
-                // Per-channel capability exchange done — advance to CHANNEL_CREATED,
-                // exactly as the main channel does (see `start`).
-                info!(
-                    channel_id,
-                    result = format_args!("{:#010x}", resp.result),
-                    "URBDRC per-device capability response — sending CHANNEL_CREATED"
-                );
-                let created = ChannelCreated {
-                    msg_id: self.take_msg_id(),
-                    direction: Direction::ToClient,
-                };
-                return Ok(vec![dvc_msg(UrbdrcServerPdu::ChanCreated(created))]);
-            }
-            Ok(UrbdrcClientPdu::ChanCreated(cc)) => {
+        // Tolerate it, and still recognize ADD_DEVICE from its header. The pinned crate
+        // splits the client PDUs by channel role: the per-device channel speaks the
+        // DEVICE set (CHANNEL_CREATED / ADD_DEVICE / URB completions / the per-request
+        // RIMCALL_RELEASE), EXCEPT the per-channel capability RESPONSE, which rides the
+        // CAPABILITIES interface and only decodes as the CONTROL set — so decode DEVICE
+        // first, then fall back to CONTROL to catch the caps response (the per-device
+        // handshake mstsc REQUIRES — see divergence 16).
+        match decode::<UrbdrcClientDevicePdu>(payload) {
+            Ok(UrbdrcClientDevicePdu::ChanCreated(cc)) => {
                 // Channel-created handshake done — send RIMCALL_RELEASE, the barrier
                 // that makes the client send ADD_DEVICE (the descriptors) on THIS channel.
                 debug!(channel_id, direction = ?cc.direction, "URBDRC per-device CHANNEL_CREATED reply");
-                info!(channel_id, "URBDRC per-device handshake complete — sending RIMCALL_RELEASE for ADD_DEVICE");
+                info!(
+                    channel_id,
+                    "URBDRC per-device handshake complete — sending RIMCALL_RELEASE for ADD_DEVICE"
+                );
                 return Ok(vec![rimcall_release(self.take_msg_id())]);
             }
-            Ok(UrbdrcClientPdu::AddDev(dev)) => {
+            Ok(UrbdrcClientDevicePdu::AddDev(dev)) => {
                 info!(
                     channel_id,
                     usb_device = %dev.usb_device,
@@ -1212,11 +1349,12 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                 );
                 if !self.announced {
                     self.announced = true;
-                    let instance_id: Arc<str> = Arc::from(dev.device_instance_id.to_native_lossy().as_ref());
+                    let instance_id: Arc<str> =
+                        Arc::from(dev.device_instance_id.to_native_lossy().as_ref());
                     self.notify_device(channel_id, dev.usb_device, instance_id);
                 }
             }
-            Ok(UrbdrcClientPdu::UrbComp(comp)) => {
+            Ok(UrbdrcClientDevicePdu::UrbComp(comp)) => {
                 let urb_result = match comp.ts_urb_result.payload {
                     TsUrbResultPayload::Raw(bytes) => bytes,
                     _ => Vec::new(),
@@ -1230,7 +1368,7 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     },
                 );
             }
-            Ok(UrbdrcClientPdu::UrbCompNoData(comp)) => {
+            Ok(UrbdrcClientDevicePdu::UrbCompNoData(comp)) => {
                 // No data buffer; wake the waiter so it doesn't hang. The URB result
                 // (e.g. SelectConfiguration's pipe handles) still rides here.
                 debug!(
@@ -1251,30 +1389,56 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     },
                 );
             }
-            Ok(_) => {
-                debug!(channel_id, "URBDRC device-channel PDU (unhandled)");
-            }
-            Err(e) if peek_function_id(payload) == Some(FunctionId::ADD_DEVICE) => {
-                // The device IS being announced — decode only stumbled on the body
-                // (e.g. an even newer caps value the vendored decoder doesn't name).
-                // The forward works; log it as a GO from the header.
-                warn!(
-                    channel_id,
-                    error = %e,
-                    "URBDRC ADD_DEVICE received — real device announced (GO); caps body not fully parsed"
-                );
-            }
-            Err(_) if peek_function_id(payload) == Some(FunctionId::RIMCALL_RELEASE) => {
+            Ok(UrbdrcClientDevicePdu::IfaceRelease(_)) => {
                 // mstsc sends a RIMCALL_RELEASE (RPC-interface release) on the device
                 // interface after each request completes, to release the completion
                 // callback we registered with RegisterRequestCallback. It carries no
                 // data and needs no action — we don't hold per-request callback state —
                 // so recognize and ignore it quietly (real mstsc emits one per transfer,
-                // which would otherwise flood the log). FreeRDP doesn't send these.
-                debug!(channel_id, "URBDRC RIMCALL_RELEASE (per-request callback release) — ignored");
+                // which would otherwise flood the log). FreeRDP doesn't send these. (In
+                // the pinned crate this now decodes cleanly as IfaceRelease instead of a
+                // header-peeked decode error.)
+                debug!(
+                    channel_id,
+                    "URBDRC RIMCALL_RELEASE (per-request callback release) — ignored"
+                );
             }
-            Err(e) => {
-                warn!(channel_id, error = %e, "URBDRC device-channel PDU decode failed (tolerated)");
+            Ok(_) => {
+                debug!(channel_id, "URBDRC device-channel PDU (unhandled)");
+            }
+            Err(dev_err) => {
+                // Not a device PDU. The per-channel capability RESPONSE rides the
+                // CAPABILITIES interface (CONTROL set) — try that before treating it as
+                // an error, so the per-device handshake completes on mstsc.
+                match decode::<UrbdrcClientControlPdu>(payload) {
+                    Ok(UrbdrcClientControlPdu::Caps(resp)) => {
+                        // Per-channel capability exchange done — advance to CHANNEL_CREATED,
+                        // exactly as the main channel does (see `start`).
+                        info!(
+                            channel_id,
+                            result = format_args!("{:#010x}", resp.result),
+                            "URBDRC per-device capability response — sending CHANNEL_CREATED"
+                        );
+                        let created = ChannelCreated {
+                            msg_id: self.take_msg_id(),
+                            direction: Direction::ToClient,
+                        };
+                        return Ok(vec![dvc_msg(UrbdrcServerDevicePdu::ChanCreated(created))]);
+                    }
+                    _ if peek_function_id(payload) == Some(FunctionId::ADD_DEVICE) => {
+                        // The device IS being announced — decode only stumbled on the body
+                        // (e.g. an even newer caps value the decoder doesn't name). The
+                        // forward works; log it as a GO from the header.
+                        warn!(
+                            channel_id,
+                            error = %dev_err,
+                            "URBDRC ADD_DEVICE received — real device announced (GO); caps body not fully parsed"
+                        );
+                    }
+                    _ => {
+                        warn!(channel_id, error = %dev_err, "URBDRC device-channel PDU decode failed (tolerated)");
+                    }
+                }
             }
         }
         Ok(Vec::new())
@@ -1289,7 +1453,10 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
         // duplicate of a corpse. (Without this, the stale presentation drove a
         // dead channel forever — observed live as a drive that never came back
         // after resetting behind a flaky hub.)
-        info!(channel_id, "URBDRC per-device channel closed by the client (device unplugged/reset) — releasing the presenting side");
+        info!(
+            channel_id,
+            "URBDRC per-device channel closed by the client (device unplugged/reset) — releasing the presenting side"
+        );
         self.alive.send_replace(true);
     }
 }

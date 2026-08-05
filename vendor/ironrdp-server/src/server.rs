@@ -1141,6 +1141,7 @@ impl RdpServer {
             udp_tunnel_bound: None,
             #[cfg(feature = "multitransport")]
             egfx_on_lossy_handle: None,
+            #[cfg(feature = "multitransport")]
             egfx_on_udp_handle: None,
             #[cfg(feature = "multitransport")]
             demigrate_request: None,
