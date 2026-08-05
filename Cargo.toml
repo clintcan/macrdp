@@ -37,30 +37,30 @@ x509-cert = { version = "0.2", default-features = false }
 der = "0.7"
 
 # RDP protocol — ironrdp is split into many sub-crates; add only what you use.
-ironrdp = "0.14"
-ironrdp-server = { version = "0.10", features = ["egfx", "multitransport"] }  # patched locally — see [patch.crates-io] below
-ironrdp-acceptor = "0.8"
-ironrdp-pdu = "0.7"
+ironrdp = "0.17"
+ironrdp-server = { version = "0.13", features = ["egfx", "multitransport"] }  # patched locally — see [patch.crates-io] below
+ironrdp-acceptor = "0.10"
+ironrdp-pdu = "0.9"
 # MS-RDPEDISP monitor-layout PDU types (read-only use: CaptureDisplay::request_layout
 # decodes the client's live-resize request). The DVC processor itself is already
 # wired up unconditionally inside vendor/ironrdp-server; this just gets us the PDU
 # accessors (DisplayControlMonitorLayout::monitors()).
-ironrdp-displaycontrol = "0.5"
+ironrdp-displaycontrol = "0.8"
 # CSPRNG for the Server Auto-Reconnect Cookie random bits (already in the tree
 # via rustls/aws-lc-rs); a direct dep so the base build doesn't rely on the
 # multitransport feature for it.
 getrandom = "0.2"
-ironrdp-cliprdr = "0.5"
-ironrdp-core = "0.1"
-ironrdp-rdpsnd = "0.7"
+ironrdp-cliprdr = "0.7"
+ironrdp-core = "0.2"
+ironrdp-rdpsnd = "0.9"
 # RDPDR drive redirection (gated at runtime by --enable-drive-redirection).
 # Vendored locally for the server-direction encode/decode halves — see
 # vendor/ironrdp-rdpdr/CLAUDE.md.
-ironrdp-rdpdr = "0.5"
+ironrdp-rdpdr = "0.7"
 # EGFX / H.264 video pipeline (gated at runtime by --enable-h264).
-ironrdp-egfx = "0.1"
-ironrdp-dvc = "0.5"
-ironrdp-svc = "0.6"
+ironrdp-egfx = "0.3"
+ironrdp-dvc = "0.8"
+ironrdp-svc = "0.8"
 nfsserve = "0.11.0"
 
 # Test-only: drive a real IronRDP client through the connect/negotiation
@@ -68,8 +68,8 @@ nfsserve = "0.11.0"
 # src/conn_test.rs). Both are redirected to the pinned git rev by the
 # [patch.crates-io] section below, same as the runtime ironrdp-* deps.
 [dev-dependencies]
-ironrdp-connector = "0.8"
-ironrdp-tokio = "0.8"
+ironrdp-connector = "0.10"
+ironrdp-tokio = "0.10"
 # For the UDP multitransport loopback test: decode the listener's SYN+ACK reply.
 ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
 
@@ -117,32 +117,34 @@ ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
 # tunnel. Upstream is client-oriented and errors on the server-inbound
 # SoftSyncResponse. See vendor/ironrdp-dvc/CLAUDE.md.
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
-# ironrdp-rdpeusb is vendored (same upstream rev) for server-direction USB
-# redirection: extend SupportedUsbVer with the USB 3.x versions so a modern
-# device's ADD_DEVICE caps parse. See vendor/ironrdp-rdpeusb/CLAUDE.md.
-ironrdp-rdpeusb = { path = "vendor/ironrdp-rdpeusb" }
+# ironrdp-rdpeusb: FORK RETIRED at the a5d1c682 pin bump — all four vendored
+# divergences merged upstream (div1 #1418 SupportedUsbVer newtype + USB_32, div2
+# #1513 usb_device match, div3 #1420 UsbConfigDesc.trailing, div4 #1321 completion
+# guards). Upstream is publish=false (git-workspace crate), so it stays a git-pin
+# rather than a crates.io version. vendor/ironrdp-rdpeusb/ can be deleted.
+ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 # ironrdp-str isn't depended on directly by macrdp, but the vendored
 # ironrdp-rdpeusb names it as a crates.io dep (it's a git-workspace crate, never
 # published); pin it to the same git rev so it resolves + unifies with the copy
 # the other ironrdp crates pull transitively. (Same shape as ironrdp-error above.)
-ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 # ironrdp-error isn't depended on directly by macrdp, but the vendored
 # ironrdp-rdpdr names it as a crates.io dep; pin it to the same git rev as the
 # rest so it unifies with the copy the other ironrdp crates pull transitively.
-ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 
 # The git-pinned ironrdp crates above (egfx, displaycontrol, echo, …) depend on
 # ironrdp-dvc as a path dep WITHIN the git workspace, so the [patch.crates-io]
