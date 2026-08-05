@@ -125,7 +125,19 @@ AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1
 
 (9) Honor-client-desktop-size plumbing (UPSTREAMED as #1373, MERGED 2026-07-02
     — DROP ON PIN BUMP; pairs with the `vendor/ironrdp-acceptor` divergence (1),
-    also #1373): `RdpServer` gains a
+    also #1373). **HARVEST ASSESSED 2026-08-06 (a5d1c682 has #1373 + #1404
+    in-base) but DEFERRED:** unlike the acceptor half (already converged at the
+    bump to the upstream `Option<DesktopSize>` form), the SERVER half still carries
+    macrdp's older TWO-field shape (`honor: bool` + `max: Option<DesktopSize>`) +
+    two runtime setters, and upstream a5d1c682 exposes only a single
+    `Option<DesktopSize>` via the `with_honor_client_desktop_size` BUILDER (no
+    runtime setter). Converging means reshaping the fields/setters, updating
+    divergence-(23)'s `NegotiationContext` (which threads both honor-size fields —
+    the preemption path), and restructuring `main.rs` to compute the `Option` before
+    the builder — mechanical + low behavioral risk (same value forwarded to the
+    already-converged acceptor) but multi-site + touching preemption, so it wants a
+    real-client resolution-adopt pass. Do it as a focused follow-up, not on the
+    soaking pin-bump branch. `RdpServer` gains a
     `honor_client_desktop_size: bool` (default false) + setter
     `set_honor_client_desktop_size`, forwarded in `run_connection` to each
     connection's `Acceptor` via the vendored
