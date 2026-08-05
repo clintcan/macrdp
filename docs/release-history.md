@@ -6,7 +6,7 @@ tags, dates, and downloadable artifacts.)
 
 ## Unreleased (on `main`, since v0.9.4)
 
-Nothing tagged yet.
+- **Maintenance: the IronRDP dependency pin was bumped `879ffed8` → `a5d1c682` (133 commits), and vendored divergence *shrank*.** No user-facing behavior change — the default runtime path is functionally unchanged; this keeps macrdp current with upstream and retires two vendored forks. Highlights: the vendored **`ironrdp-rdpeusb` fork is retired** (its lenient USB-3 caps decode landed upstream) and the USB URBDRC server (`src/rdpeusb.rs`) was ported to a5d1c682's split control/device PDUs — the **mstsc Xbox-controller redirect is live-verified on the bumped build**, proving the hard-won mstsc-strict interop fixes survived the port; the upstream API changes for honor-client-desktop-size, **rdpsnd format selection (#1359)** — the crate now owns it, so macrdp's local `choose_audio_format` divergence is gone — and the **egfx frame-ack signature (#1345)** are absorbed into `src/`; and **`vendor/ironrdp-async` (the v0.9.4 DoS guard) is dropped**, since a5d1c682 already carries upstream **#1515**'s `find_size` hardening — the framing DoS is now fixed upstream in the pin, not by a local vendor. Verified end-to-end on FreeRDP (CredSSP/audit, rdpsnd AAC, EGFX H.264) and mstsc (USB), plus the three in-tree abuse-fuzz harnesses (including the `find_size` decoder fuzz that motivated v0.9.4). Soaked on the Mac mini before landing.
 
 ## v0.9.4 — security hotfix: a pre-auth remote DoS in the RDP framing reader
 
