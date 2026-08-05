@@ -1,9 +1,35 @@
 # vendor/ironrdp-acceptor — divergence log
 
-Local fork of ironrdp-acceptor 0.8.0, copied 2026-06-12 from upstream master
-(Devolutions/IronRDP@879ffed — the same rev the rest of the ironrdp git pins
-use) and pulled in via `[patch.crates-io]` in the root Cargo.toml. Keep this
-vendor dir until divergence (1) is upstreamed AND released.
+Local fork of ironrdp-acceptor 0.10.0, **re-vendored 2026-08-05 from upstream
+Devolutions/IronRDP@a5d1c682** (the pin-bump rev). Originally copied 2026-06-12
+from @879ffed. connection.rs was refreshed verbatim from a5d1c682 and the surviving
+divergences re-applied on top (142 pure additions + 2 intended modifications:
+`let mut written`, and `create_gcc_blocks`'s `multi_transport_channel` populate);
+lib.rs keeps only the `MultitransportOffer` re-export; finalization.rs keeps only the
+channel-skip (upstream unchanged there); channel_connection/credssp/util are byte-
+identical to a5d1c682. Has a standalone `[patch]` (core/pdu/svc/connector/async →
+a5d1c682) for isolated build, ignored in the macrdp workspace. Keep the rev in sync.
+
+**▶▶▶ STATE AT THE a5d1c682 PIN BUMP (2026-08-05): divergences (1), (2), and the
+READ-side of (3) all RETIRED — upstream now provides them.** a5d1c682 carries:
+`honor_client_desktop_size: Option<DesktopSize>` (unified honor + #1404 max;
+setter `set_honor_client_desktop_size(Option<DesktopSize>)` — so div (1) incl. the
+operator ceiling is upstream, #1373+#1404), `keyboard_layout: u32` (div (2), #1397),
+`multitransport_flags` on `Acceptor`+`AcceptorResult` (div (3) read-side, #1453),
+**AND the MCS message-channel allocation + `SC_MCS_MSGCHANNEL` grant + join**
+(`message_channel_id`, allocated when the client sends `CS_MESSAGE_CHANNEL`), plus an
+**unconditional `EXTENDED_CLIENT_DATA_SUPPORTED`** advertise. So macrdp's
+`advertise_extended_client_data` field ALSO retired (upstream always advertises), as
+did macrdp's own message-channel allocation. **What REMAINS vendored: the M3c OFFER
+half of (3)** (`multitransport_offer`/`multitransport_offered` + `set_multitransport_offer`,
+the `MultitransportOffer` type, the `SC_MULTITRANSPORT` advertise in `create_gcc_blocks`
+now gated on `multitransport_offer.is_some()`, the Server-Initiate-Multitransport emit
+in `LicensingExchange` riding upstream's `message_channel_id` and gated on upstream's
+`multitransport_flags`, and the `CapabilitiesWaitConfirm` + finalization.rs channel-skip)
+**+ divergence (4) fingerprint**. The historical divergence notes below are kept for
+context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size forward)
++ main.rs must adopt the `set_honor_client_desktop_size(Option<DesktopSize>)` signature
+(bool→Option) — a downstream server/src change.
 
 (1) Honor the client's requested desktop size from Client Core Data
     (UPSTREAMED as #1373, MERGED 2026-07-02 — DROP ON PIN BUMP; still vendored

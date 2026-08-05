@@ -1,6 +1,6 @@
 [package]
 name = "ironrdp-acceptor"
-version = "0.8.0"
+version = "0.10.0"
 readme = "README.md"
 description = "State machines to drive an RDP connection acceptance sequence"
 # Vendored copy of upstream master ironrdp-acceptor (copied 2026-06-12 from
@@ -8,7 +8,7 @@ description = "State machines to drive an RDP connection acceptance sequence"
 # because we're not inside the IronRDP cargo workspace. See CLAUDE.md in this
 # directory for the divergence log.
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Devolutions/IronRDP"
 repository = "https://github.com/Devolutions/IronRDP"
@@ -24,9 +24,19 @@ test = false
 # path = "../ironrdp-*" entries dropped — we live outside the upstream
 # workspace, so cargo resolves these via the root macrdp Cargo.toml's
 # [patch.crates-io] redirects (git pin to upstream master).
-ironrdp-core = { version = "0.1", features = ["alloc"] } # public
-ironrdp-pdu = "0.7" # public
-ironrdp-svc = "0.6" # public
-ironrdp-connector = "0.8" # public
-ironrdp-async = "0.8" # public
+ironrdp-core = { version = "0.2", features = ["alloc"] } # public
+ironrdp-pdu = "0.9" # public
+ironrdp-svc = "0.8" # public
+ironrdp-connector = "0.10" # public
+ironrdp-async = "0.10" # public
 tracing = { version = "0.1", features = ["log"] }
+
+# Honored ONLY when this crate is built standalone (isolated validation); ignored
+# when it's a path dependency of macrdp (the root Cargo.toml's [patch] wins). Keep
+# the rev in sync with the root Cargo.toml when bumping the IronRDP pin.
+[patch.crates-io]
+ironrdp-core      = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-pdu       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-svc       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-async     = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
