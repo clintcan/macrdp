@@ -681,10 +681,7 @@ struct NsCodecHandler {
 
 impl NsCodecHandler {
     fn new(codec_id: u8, color_loss_level: u8) -> Self {
-        debug!(
-            codec_id,
-            color_loss_level, "NSCodec encoder selected for this session"
-        );
+        debug!(codec_id, color_loss_level, "NSCodec encoder selected for this session");
         Self {
             codec_id,
             color_loss_level,

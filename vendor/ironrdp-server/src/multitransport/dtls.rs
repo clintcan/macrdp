@@ -81,7 +81,9 @@ impl DtlsServerContext {
         // SSL_OP_COOKIE_EXCHANGE — we demux peers ourselves.
         b.set_verify(SslVerifyMode::NONE);
 
-        Ok(Self { ctx: Arc::new(b.build()) })
+        Ok(Self {
+            ctx: Arc::new(b.build()),
+        })
     }
 
     /// One DTLS endpoint per RDPEUDP lossy peer/flow.

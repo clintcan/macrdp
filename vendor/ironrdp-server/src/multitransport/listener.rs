@@ -36,8 +36,8 @@ use std::io;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ironrdp_rdpeudp::datagram::Datagram;
 use ironrdp_rdpeudp::pdu::FecFlags;
@@ -146,9 +146,9 @@ struct Peer {
 /// it we scan for the 3-byte signature — specific enough for a diagnostic. Returns
 /// the matched version bytes for the log, if any.
 fn sniff_dtls_client_hello(datagram: &[u8]) -> Option<[u8; 2]> {
-    datagram.windows(3).find_map(|w| {
-        (w[0] == 0x16 && w[1] == 0xFE && (w[2] == 0xFF || w[2] == 0xFD)).then_some([w[1], w[2]])
-    })
+    datagram
+        .windows(3)
+        .find_map(|w| (w[0] == 0x16 && w[1] == 0xFE && (w[2] == 0xFF || w[2] == 0xFD)).then_some([w[1], w[2]]))
 }
 
 /// A running UDP multitransport listener. The receive loop runs on a spawned
@@ -303,6 +303,7 @@ const PEER_IDLE_TIMEOUT_MS: u64 = 60_000;
 ///   the new connection gets NO multitransport offer and lands plain-TCP,
 ///   breaking the observed reset→reconnect→reset cycle (live 2026-07-04
 ///   over ZeroTier).
+///
 /// The flag is cleared after firing so a peer is declared dead exactly once;
 /// the 60 s idle GC still evicts it later. O(peers) per tick.
 ///
@@ -343,10 +344,10 @@ fn check_dead_tunnels(
             // ambiguous and intentionally reads as teardown.)
             let _ = peer.bound_flag.take();
             if idle_ms > dead_ms {
-                if cooldown_secs > 0 {
-                    if let Some(reg) = cookie_registry {
-                        reg.suppress_multitransport(std::time::Duration::from_secs(cooldown_secs));
-                    }
+                if cooldown_secs > 0
+                    && let Some(reg) = cookie_registry
+                {
+                    reg.suppress_multitransport(std::time::Duration::from_secs(cooldown_secs));
                 }
                 warn!(
                     peer_addr = %addr,
@@ -370,10 +371,10 @@ fn check_dead_tunnels(
         }
         let flag = peer.bound_flag.take().expect("checked is_some above");
         flag.store(false, core::sync::atomic::Ordering::Relaxed);
-        if cooldown_secs > 0 {
-            if let Some(reg) = cookie_registry {
-                reg.suppress_multitransport(std::time::Duration::from_secs(cooldown_secs));
-            }
+        if cooldown_secs > 0
+            && let Some(reg) = cookie_registry
+        {
+            reg.suppress_multitransport(std::time::Duration::from_secs(cooldown_secs));
         }
         warn!(
             peer_addr = %addr,
@@ -396,11 +397,7 @@ fn check_dead_tunnels(
 /// forever (`pump_peers_on_timer`), and over a long-running server dead peers
 /// accumulate unbounded. Activity-based, so it covers graceful, abrupt, and crashed
 /// disconnects uniformly. O(peers) on each `retransmit_tick`; peers is a handful.
-fn gc_idle_peers(
-    peers: &mut HashMap<SocketAddr, Peer>,
-    bound_addrs: &mut HashMap<[u8; 16], SocketAddr>,
-    now_ms: u64,
-) {
+fn gc_idle_peers(peers: &mut HashMap<SocketAddr, Peer>, bound_addrs: &mut HashMap<[u8; 16], SocketAddr>, now_ms: u64) {
     let gone: Vec<SocketAddr> = peers
         .iter()
         .filter(|(_, p)| now_ms.saturating_sub(p.last_seen_ms) > PEER_IDLE_TIMEOUT_MS)
@@ -631,10 +628,10 @@ async fn run_recv_loop(
     // Accumulate reliable retransmits into the shared loss-signal counter (no-op
     // when not wired). Closure over the Option so the 3 step sites stay one-liners.
     let bump_loss = |n: usize| {
-        if n > 0 {
-            if let Some(c) = &congestion_retransmits {
-                c.fetch_add(n as u64, Ordering::Relaxed);
-            }
+        if n > 0
+            && let Some(c) = &congestion_retransmits
+        {
+            c.fetch_add(n as u64, Ordering::Relaxed);
         }
     };
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
@@ -694,9 +691,7 @@ async fn run_recv_loop(
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(600);
     if lossy_dup {
-        debug!(
-            "MACRDP_UDP_LOSSY_AUDIO_DUP set — lossy flows will duplicate each source datagram (1+1 redundancy)"
-        );
+        debug!("MACRDP_UDP_LOSSY_AUDIO_DUP set — lossy flows will duplicate each source datagram (1+1 redundancy)");
     }
 
     // (Soak fix) Periodic clock for the reliability state machines. The SM only
@@ -711,8 +706,7 @@ async fn run_recv_loop(
     // emits due retransmits / queued data / an owed ACK), so the cost is negligible.
     let tick_ms = (cfg.rto_ms / 4).clamp(20, 100);
     let mut retransmit_tick = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
-    retransmit_tick
-        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retransmit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // (M5c) The recv loop is now bidirectional: it reads inbound datagrams AND
@@ -780,25 +774,24 @@ async fn run_recv_loop(
 
         // Log the client's SYN cookie hash + negotiated version (cookie check is
         // soft in M3b — this is the data the future strict-validation work needs).
-        if is_syn_family(data) {
-            if let Ok(dg) = Datagram::decode(data) {
-                if let Some(ex) = dg.syn_ex {
-                    // Log the full client cookie hash (hex). Cookie validation is
-                    // still soft; pair this with the server's logged issued cookie
-                    // ("sent Server Initiate Multitransport Request", cookie=…) from
-                    // a live run to derive the hash formula, then tighten.
-                    let cookie_hash = ex
-                        .cookie_hash
-                        .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
-                        .unwrap_or_else(|| "none".to_owned());
-                    debug!(
-                        %peer_addr,
-                        version = ?ex.udp_version,
-                        %cookie_hash,
-                        "RDPEUDP SYN received (cookie validation is soft; correlate cookie_hash with the issued cookie)"
-                    );
-                }
-            }
+        if is_syn_family(data)
+            && let Ok(dg) = Datagram::decode(data)
+            && let Some(ex) = dg.syn_ex
+        {
+            // Log the full client cookie hash (hex). Cookie validation is
+            // still soft; pair this with the server's logged issued cookie
+            // ("sent Server Initiate Multitransport Request", cookie=…) from
+            // a live run to derive the hash formula, then tighten.
+            let cookie_hash = ex
+                .cookie_hash
+                .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                .unwrap_or_else(|| "none".to_owned());
+            debug!(
+                %peer_addr,
+                version = ?ex.udp_version,
+                %cookie_hash,
+                "RDPEUDP SYN received (cookie validation is soft; correlate cookie_hash with the issued cookie)"
+            );
         }
 
         // (P2.2 step 2) Classify the flow at creation from its opening SYN: a
@@ -806,8 +799,8 @@ async fn run_recv_loop(
         // always its SYN (RDPEUDP opens with one), so peeking here is reliable. Only
         // promotes to lossy delivery when the experimental env is set; otherwise (and
         // for the reliable flow) it stays `Reliable`.
-        let use_lossy = lossy_delivery
-            && Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::SYN_LOSSY));
+        let use_lossy =
+            lossy_delivery && Datagram::peek_fec_flags(data).is_some_and(|f| f.contains(FecFlags::SYN_LOSSY));
 
         // (M3c) Port reuse on reconnect: if a *new* RDPEUDP flow opens (a SYN) on
         // the source address of an already-ESTABLISHED peer, the previous
@@ -886,21 +879,21 @@ async fn run_recv_loop(
         // ClientHello. This fires on a *lossy* flow regardless of whether the
         // reliable SM delivers the payload, so it's the most robust go/no-go
         // signal: if this logs, modern mstsc DID open a lossy UDP flow (GREEN).
-        if !peer.dtls_observed {
-            if let Some(ver) = sniff_dtls_client_hello(data) {
-                peer.dtls_observed = true;
-                let dtls = match ver {
-                    [0xFE, 0xFF] => "DTLS 1.0",
-                    [0xFE, 0xFD] => "DTLS 1.2",
-                    _ => "DTLS",
-                };
-                debug!(
-                    %peer_addr, %dtls,
-                    "P2.0 SPIKE GREEN: client opened a LOSSY (UdpFecL) UDP flow — \
-                     it sent a {dtls} ClientHello. Lossy multitransport is reachable; \
-                     observe-only (no DTLS implemented). See feasibility doc P2.0."
-                );
-            }
+        if !peer.dtls_observed
+            && let Some(ver) = sniff_dtls_client_hello(data)
+        {
+            peer.dtls_observed = true;
+            let dtls = match ver {
+                [0xFE, 0xFF] => "DTLS 1.0",
+                [0xFE, 0xFD] => "DTLS 1.2",
+                _ => "DTLS",
+            };
+            debug!(
+                %peer_addr, %dtls,
+                "P2.0 SPIKE GREEN: client opened a LOSSY (UdpFecL) UDP flow — \
+                 it sent a {dtls} ClientHello. Lossy multitransport is reachable; \
+                 observe-only (no DTLS implemented). See feasibility doc P2.0."
+            );
         }
 
         let was_established = peer.sm.is_established();
@@ -939,11 +932,7 @@ async fn run_recv_loop(
             // Sniff for a TLS ClientHello (handshake record 0x16, version 0x03xx)
             // — confirms the client is starting the MS-RDPEMT-over-TLS handshake
             // and that our v1 receive path reassembled mstsc's V2 stream correctly.
-            if !peer.tls_hello_logged
-                && peer.inbound.len() >= 3
-                && peer.inbound[0] == 0x16
-                && peer.inbound[1] == 0x03
-            {
+            if !peer.tls_hello_logged && peer.inbound.len() >= 3 && peer.inbound[0] == 0x16 && peer.inbound[1] == 0x03 {
                 peer.tls_hello_logged = true;
                 debug!(
                     %peer_addr,
@@ -959,98 +948,98 @@ async fn run_recv_loop(
             // the EMT tunnel + lossy audio DVC over it are P2.4+). Mutually
             // exclusive with the rustls block below (that one is gated on
             // `!dtls_observed`).
-            if peer.dtls_observed {
-                if let Some(dtls_ctx) = dtls_config.as_ref() {
-                    if peer.dtls.is_none() {
-                        match dtls_ctx.new_conn() {
-                            Ok(c) => peer.dtls = Some(c),
-                            Err(e) => warn!(%peer_addr, error = %e, "failed to create DTLS server conn"),
+            if peer.dtls_observed
+                && let Some(dtls_ctx) = dtls_config.as_ref()
+            {
+                if peer.dtls.is_none() {
+                    match dtls_ctx.new_conn() {
+                        Ok(c) => peer.dtls = Some(c),
+                        Err(e) => warn!(%peer_addr, error = %e, "failed to create DTLS server conn"),
+                    }
+                }
+                let Peer {
+                    sm,
+                    dtls: dtls_opt,
+                    dtls_done_logged,
+                    emt_inbound,
+                    tunnel_created,
+                    inbound_sink,
+                    bound_flag,
+                    ..
+                } = peer;
+                if let Some(conn) = dtls_opt.as_mut() {
+                    let mut dtls_err = false;
+                    for chunk in &out.delivered {
+                        if conn.is_handshake_done() {
+                            // (P2.4) Post-handshake: decrypt the DTLS app record
+                            // and accumulate the MS-RDPEMT plaintext for parsing.
+                            match conn.recv(chunk) {
+                                Ok(Some(pt)) => emt_inbound.extend_from_slice(&pt),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!(%peer_addr, error = %e, "DTLS app-record decrypt error on lossy flow");
+                                    dtls_err = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Handshake flights: feed one datagram, ship the
+                            // resulting datagram(s) (DTLS MTU < RDPEUDP MTU so
+                            // each is never split across two).
+                            match conn.read_datagram(chunk) {
+                                Ok(outs) => {
+                                    for dg in outs {
+                                        let o = sm.enqueue(now_ms, &dg);
+                                        send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(%peer_addr, error = %e, "DTLS handshake error on lossy flow");
+                                    dtls_err = true;
+                                    break;
+                                }
+                            }
                         }
                     }
-                    let Peer {
-                        sm,
-                        dtls: dtls_opt,
-                        dtls_done_logged,
-                        emt_inbound,
-                        tunnel_created,
-                        inbound_sink,
-                        bound_flag,
-                        ..
-                    } = peer;
-                    if let Some(conn) = dtls_opt.as_mut() {
-                        let mut dtls_err = false;
-                        for chunk in &out.delivered {
-                            if conn.is_handshake_done() {
-                                // (P2.4) Post-handshake: decrypt the DTLS app record
-                                // and accumulate the MS-RDPEMT plaintext for parsing.
-                                match conn.recv(chunk) {
-                                    Ok(Some(pt)) => emt_inbound.extend_from_slice(&pt),
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        warn!(%peer_addr, error = %e, "DTLS app-record decrypt error on lossy flow");
-                                        dtls_err = true;
-                                        break;
-                                    }
-                                }
-                            } else {
-                                // Handshake flights: feed one datagram, ship the
-                                // resulting datagram(s) (DTLS MTU < RDPEUDP MTU so
-                                // each is never split across two).
-                                match conn.read_datagram(chunk) {
-                                    Ok(outs) => {
-                                        for dg in outs {
-                                            let o = sm.enqueue(now_ms, &dg);
-                                            send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(%peer_addr, error = %e, "DTLS handshake error on lossy flow");
-                                        dtls_err = true;
-                                        break;
-                                    }
-                                }
-                            }
+                    if !dtls_err && conn.is_handshake_done() && !*dtls_done_logged {
+                        *dtls_done_logged = true;
+                        debug!(
+                            %peer_addr,
+                            "P2.1 GREEN: DTLS 1.2 handshake COMPLETE on the LOSSY (UdpFecL) flow — MS-RDPEMT-over-DTLS reachable"
+                        );
+                    }
+                    // (P2.4a) Once DTLS is established, parse any accumulated
+                    // MS-RDPEMT PDUs and answer the tunnel CREATEREQUEST —
+                    // encrypted back through DTLS. handle_emt_tunnel gates the
+                    // response on !tunnel_created, so it's sent exactly once.
+                    if !dtls_err && conn.is_handshake_done() && !emt_inbound.is_empty() {
+                        let outcome = handle_emt_tunnel(
+                            peer_addr,
+                            emt_inbound,
+                            tunnel_created,
+                            cookie_registry.as_ref(),
+                            inbound_sink,
+                            bound_flag,
+                        );
+                        if let Some(cookie) = outcome.bound_cookie {
+                            bound_addrs.insert(cookie, peer_addr);
                         }
-                        if !dtls_err && conn.is_handshake_done() && !*dtls_done_logged {
-                            *dtls_done_logged = true;
-                            debug!(
-                                %peer_addr,
-                                "P2.1 GREEN: DTLS 1.2 handshake COMPLETE on the LOSSY (UdpFecL) flow — MS-RDPEMT-over-DTLS reachable"
-                            );
-                        }
-                        // (P2.4a) Once DTLS is established, parse any accumulated
-                        // MS-RDPEMT PDUs and answer the tunnel CREATEREQUEST —
-                        // encrypted back through DTLS. handle_emt_tunnel gates the
-                        // response on !tunnel_created, so it's sent exactly once.
-                        if !dtls_err && conn.is_handshake_done() && !emt_inbound.is_empty() {
-                            let outcome = handle_emt_tunnel(
-                                peer_addr,
-                                emt_inbound,
-                                tunnel_created,
-                                cookie_registry.as_ref(),
-                                inbound_sink,
-                                bound_flag,
-                            );
-                            if let Some(cookie) = outcome.bound_cookie {
-                                bound_addrs.insert(cookie, peer_addr);
-                            }
-                            if let Some(resp) = outcome.response {
-                                match conn.send(&resp) {
-                                    Ok(dgs) => {
-                                        for dg in dgs {
-                                            let o = sm.enqueue(now_ms, &dg);
-                                            send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
-                                        }
-                                        debug!(
-                                            %peer_addr,
-                                            "P2.4 GREEN: MS-RDPEMT tunnel ESTABLISHED over DTLS (lossy flow) — CREATERESPONSE(S_OK) sent"
-                                        );
+                        if let Some(resp) = outcome.response {
+                            match conn.send(&resp) {
+                                Ok(dgs) => {
+                                    for dg in dgs {
+                                        let o = sm.enqueue(now_ms, &dg);
+                                        send_datagrams(&socket, peer_addr, o.to_send, cfg.mtu).await;
                                     }
-                                    Err(e) => warn!(
-                                        %peer_addr, error = %e,
-                                        "failed to encrypt MS-RDPEMT CREATERESPONSE through DTLS"
-                                    ),
+                                    debug!(
+                                        %peer_addr,
+                                        "P2.4 GREEN: MS-RDPEMT tunnel ESTABLISHED over DTLS (lossy flow) — CREATERESPONSE(S_OK) sent"
+                                    );
                                 }
+                                Err(e) => warn!(
+                                    %peer_addr, error = %e,
+                                    "failed to encrypt MS-RDPEMT CREATERESPONSE through DTLS"
+                                ),
                             }
                         }
                     }
@@ -1139,10 +1128,10 @@ async fn run_recv_loop(
                         // tunnel data (keyed by the same cookie) reaches it.
                         bound_addrs.insert(cookie, peer_addr);
                     }
-                    if let Some(resp) = outcome.response {
-                        if tls.writer().write_all(&resp).is_err() {
-                            warn!(%peer_addr, "failed to write MS-RDPEMT CREATERESPONSE into TLS");
-                        }
+                    if let Some(resp) = outcome.response
+                        && tls.writer().write_all(&resp).is_err()
+                    {
+                        warn!(%peer_addr, "failed to write MS-RDPEMT CREATERESPONSE into TLS");
                     }
 
                     while tls.wants_write() {

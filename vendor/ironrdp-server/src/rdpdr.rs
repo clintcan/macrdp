@@ -21,20 +21,20 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context as _, Result};
-use ironrdp_core::{impl_as_any, ReadCursor};
+use anyhow::{Context as _, Result, anyhow};
+use ironrdp_core::{ReadCursor, impl_as_any};
 use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::utils::CharacterSet;
-use ironrdp_pdu::{decode_err, PduResult};
+use ironrdp_pdu::{PduResult, decode_err};
 use ironrdp_rdpdr::pdu::efs::{
     Boolean, Capabilities, ClientDeviceListAnnounce, ClientNameRequest, CoreCapability, CoreCapabilityKind,
-    CreateDisposition, CreateOptions, DeviceCloseRequest, DeviceCreateRequest, DeviceCreateResponse, DeviceIoRequest,
-    DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceType, DesiredAccess, DeviceWriteRequest,
+    CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest, DeviceCreateRequest, DeviceCreateResponse,
+    DeviceIoRequest, DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceType, DeviceWriteRequest,
     DeviceWriteResponse, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
     FileEndOfFileInformation, FileInformationClass, FileInformationClassLevel, FileRenameInformation, MajorFunction,
     MinorFunction, NtStatus, ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
-    ServerDriveSetInformationRequest, SharedAccess, VersionAndIdPdu, VersionAndIdPduKind, VERSION_MAJOR,
-    VERSION_MINOR_RDP51,
+    ServerDriveSetInformationRequest, SharedAccess, VERSION_MAJOR, VERSION_MINOR_RDP51, VersionAndIdPdu,
+    VersionAndIdPduKind,
 };
 use ironrdp_rdpdr::pdu::esc::{
     CardProtocol, CardStateFlags, ConnectCall, ConnectCommon, ConnectReturn, ContextCall, EstablishContextCall,
@@ -248,7 +248,7 @@ impl RdpdrHandle {
                 CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
             )
             .await?;
-        let result = (|| async {
+        let result = async {
             let mut file = std::fs::File::create(dst).map_err(|e| anyhow!("create {dst:?}: {e}"))?;
             let mut offset = 0u64;
             loop {
@@ -263,7 +263,7 @@ impl RdpdrHandle {
                 }
             }
             Ok(offset)
-        })()
+        }
         .await;
         let _ = self.close(device_id, file_id).await;
         result
@@ -519,8 +519,14 @@ impl RdpdrHandle {
         desired_access: DesiredAccess,
         create_options: CreateOptions,
     ) -> Result<u32> {
-        self.open_with(device_id, path, desired_access, CreateDisposition::FILE_OPEN, create_options)
-            .await
+        self.open_with(
+            device_id,
+            path,
+            desired_access,
+            CreateDisposition::FILE_OPEN,
+            create_options,
+        )
+        .await
     }
 
     /// General IRP_MJ_CREATE: open `path` with an explicit `create_disposition`
@@ -689,12 +695,11 @@ impl RdpdrHandle {
                         last_used: self.cache.tick.fetch_add(1, Ordering::Relaxed),
                     },
                 );
-                if map.len() > MAX_OPEN_HANDLES {
-                    if let Some(evk) = map.iter().min_by_key(|(_, h)| h.last_used).map(|(k, _)| k.clone()) {
-                        if let Some(ev) = map.remove(&evk) {
-                            to_close.push((evk.device_id, ev.file_id));
-                        }
-                    }
+                if map.len() > MAX_OPEN_HANDLES
+                    && let Some(evk) = map.iter().min_by_key(|(_, h)| h.last_used).map(|(k, _)| k.clone())
+                    && let Some(ev) = map.remove(&evk)
+                {
+                    to_close.push((evk.device_id, ev.file_id));
                 }
                 file_id
             }
@@ -765,7 +770,9 @@ impl RdpdrHandle {
     /// `SCardEstablishContext(SCARD_SCOPE_SYSTEM)` — a resource-manager context.
     pub async fn scard_establish_context(&self, device_id: u32) -> Result<ScardContext> {
         let call = ScardCall::EstablishContextCall(EstablishContextCall { scope: Scope::System });
-        let buf = self.scard_call(device_id, ScardIoCtlCode::EstablishContext, call, 256).await?;
+        let buf = self
+            .scard_call(device_id, ScardIoCtlCode::EstablishContext, call, 256)
+            .await?;
         let ret = EstablishContextReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
         scard_ok(ret.return_code, "establish_context")?;
         Ok(ret.context)
@@ -774,7 +781,9 @@ impl RdpdrHandle {
     /// `SCardReleaseContext`.
     pub async fn scard_release_context(&self, device_id: u32, context: ScardContext) -> Result<()> {
         let call = ScardCall::ContextCall(ContextCall { context });
-        let buf = self.scard_call(device_id, ScardIoCtlCode::ReleaseContext, call, 256).await?;
+        let buf = self
+            .scard_call(device_id, ScardIoCtlCode::ReleaseContext, call, 256)
+            .await?;
         let ret = LongReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
         scard_ok(ret.return_code, "release_context")
     }
@@ -790,7 +799,9 @@ impl RdpdrHandle {
             readers_is_null: false,
             readers_size: 0xFFFF_FFFF, // SCARD_AUTOALLOCATE
         });
-        let buf = self.scard_call(device_id, ScardIoCtlCode::ListReadersW, call, 4096).await?;
+        let buf = self
+            .scard_call(device_id, ScardIoCtlCode::ListReadersW, call, 4096)
+            .await?;
         let ret = ListReadersReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
         scard_ok(ret.return_code, "list_readers")?;
         Ok(ret.readers)
@@ -827,7 +838,9 @@ impl RdpdrHandle {
             states_length: states_len,
             states,
         });
-        let buf = self.scard_call(device_id, ScardIoCtlCode::GetStatusChangeW, call, 4096).await?;
+        let buf = self
+            .scard_call(device_id, ScardIoCtlCode::GetStatusChangeW, call, 4096)
+            .await?;
         let ret = GetStatusChangeReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
         scard_ok(ret.return_code, "get_status_change")?;
         Ok(ret.reader_states)
@@ -865,7 +878,8 @@ impl RdpdrHandle {
             atr_length: 32,
         });
         let buf = self.scard_call(device_id, ScardIoCtlCode::StatusW, call, 4096).await?;
-        let ret = StatusReturn::decode(&mut ReadCursor::new(&buf), CharacterSet::Unicode).map_err(|e| anyhow!("{e}"))?;
+        let ret =
+            StatusReturn::decode(&mut ReadCursor::new(&buf), CharacterSet::Unicode).map_err(|e| anyhow!("{e}"))?;
         scard_ok(ret.return_code, "status")?;
         Ok(ret)
     }
@@ -910,7 +924,9 @@ impl RdpdrHandle {
     /// `SCardDisconnect` with one of the `SCARD_*_CARD` dispositions.
     pub async fn scard_disconnect(&self, device_id: u32, handle: ScardCardHandle, disposition: u32) -> Result<()> {
         let call = ScardCall::HCardAndDispositionCall(HCardAndDispositionCall { handle, disposition });
-        let buf = self.scard_call(device_id, ScardIoCtlCode::Disconnect, call, 256).await?;
+        let buf = self
+            .scard_call(device_id, ScardIoCtlCode::Disconnect, call, 256)
+            .await?;
         let ret = LongReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
         scard_ok(ret.return_code, "disconnect")
     }
@@ -1127,10 +1143,7 @@ fn query_pattern(dir: &str) -> String {
 
 /// Build the channel processor + wire the backend's [`RdpdrHandle`]. Called from
 /// `RdpServer::attach_channels` with the connection's `ServerEvent` sender.
-pub(crate) fn build_rdpdr(
-    factory: &dyn RdpdrServerFactory,
-    sender: mpsc::UnboundedSender<ServerEvent>,
-) -> RdpdrServer {
+pub(crate) fn build_rdpdr(factory: &dyn RdpdrServerFactory, sender: mpsc::UnboundedSender<ServerEvent>) -> RdpdrServer {
     let mut backend = factory.build_backend();
     let router = IoRouter::new();
     backend.set_handle(RdpdrHandle::new(sender, router.clone()));

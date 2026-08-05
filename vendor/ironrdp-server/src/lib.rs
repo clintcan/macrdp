@@ -27,40 +27,42 @@ mod server;
 mod sound;
 
 pub use clipboard::CliprdrServerFactory;
-#[cfg(feature = "qoi")]
-pub use encoder::set_qoi_force_rgb;
 pub use display::{
     BitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, Framebuffer, PixelFormat, RGBAPointer, RdpServerDisplay,
     RdpServerDisplayUpdates,
 };
 pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoServerMessage};
+#[cfg(feature = "qoi")]
+pub use encoder::set_qoi_force_rgb;
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+#[cfg(feature = "helper")]
+pub use helper::TlsIdentityCtx;
 #[cfg(feature = "multitransport")]
 pub use multitransport::dtls::DtlsServerContext;
 #[cfg(feature = "multitransport")]
 pub use multitransport::listener::{ListenerConfig, UdpMultitransportListener};
 #[cfg(feature = "multitransport")]
-pub use multitransport::{CookieRegistry, MultitransportProvider, TunnelSender, encode_initiate_request, tunnel_channel};
+pub use multitransport::{
+    CookieRegistry, MultitransportProvider, TunnelSender, encode_initiate_request, tunnel_channel,
+};
+pub use rdcamera::{
+    CameraSampleSink, CameraServerMessage, RDCAMERA_CHANNEL_NAME, RdCameraDeviceProcessor, RdCameraServer,
+    RdCameraServerFactory,
+};
 pub use rdpdr::{
     AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrHandle, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler,
     RdpdrServerMessage, RdpdrStatus, SCARD_EJECT_CARD, SCARD_LEAVE_CARD, SCARD_RESET_CARD, SCARD_SHARE_DIRECT,
     SCARD_SHARE_EXCLUSIVE, SCARD_SHARE_SHARED, SCARD_UNPOWER_CARD,
 };
-pub use rdcamera::{
-    CameraSampleSink, CameraServerMessage, RdCameraDeviceProcessor, RdCameraServer,
-    RdCameraServerFactory, RDCAMERA_CHANNEL_NAME,
-};
 pub use rdpeusb::{
     DeviceDescriptor, URBDRC_CHANNEL_NAME, UrbdrcServer, UrbdrcServerFactory, UrbdrcServerMessage, UsbDeviceCallback,
     UsbHandle, UsbPipe,
 };
-#[cfg(feature = "helper")]
-pub use helper::TlsIdentityCtx;
 pub use server::{
-    tcp_srtt_ms, ConnectionHandler, Credentials, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity,
-    ServerEvent, ServerEventSender,
+    ConnectionHandler, Credentials, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
+    ServerEventSender, tcp_srtt_ms,
 };
 pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 

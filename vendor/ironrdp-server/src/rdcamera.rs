@@ -33,10 +33,10 @@
 //! TOLERANT (log + `Ok(vec![])` on any decode issue) so a malformed PDU never
 //! tears down the whole RDP session for an opt-in feature.
 
-use tokio::sync::mpsc;
 use std::time::Instant;
+use tokio::sync::mpsc;
 
-use ironrdp_core::{impl_as_any, Encode, EncodeResult, WriteCursor};
+use ironrdp_core::{Encode, EncodeResult, WriteCursor, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
 use tracing::{debug, info, warn};
@@ -110,6 +110,9 @@ struct CameraMsg {
 }
 
 impl CameraMsg {
+    // Returns the boxed DvcMessage wire form, not Self — an intentional
+    // message-constructor shape (mirrors rdpeusb.rs's dvc_msg helpers).
+    #[allow(clippy::new_ret_no_self)]
     fn new(version: u8, msg_id: u8, body: Vec<u8>) -> DvcMessage {
         Box::new(Self { version, msg_id, body })
     }
@@ -169,13 +172,19 @@ pub struct RdCameraServer {
 
 impl RdCameraServer {
     pub fn new() -> Self {
-        Self { sender: None, negotiated_version: 1 }
+        Self {
+            sender: None,
+            negotiated_version: 1,
+        }
     }
 
     /// Build a processor wired to the connection's server-event sender so it can
     /// request per-device channel creation.
     pub fn with_sender(sender: Option<mpsc::UnboundedSender<ServerEvent>>) -> Self {
-        Self { sender, negotiated_version: 1 }
+        Self {
+            sender,
+            negotiated_version: 1,
+        }
     }
 }
 
@@ -202,20 +211,27 @@ impl DvcProcessor for RdCameraServer {
         // TOLERANT: never propagate — a decode error would tear down the whole
         // session for an opt-in feature.
         let Some((version, message_id, body)) = split_header(payload) else {
-            warn!(len = payload.len(), "MS-RDPECAM enumerator message too short — ignoring");
+            warn!(
+                len = payload.len(),
+                "MS-RDPECAM enumerator message too short — ignoring"
+            );
             return Ok(Vec::new());
         };
 
         match message_id {
             msg_id::SELECT_VERSION_REQUEST => {
-                let selected = version.min(OUR_MAX_VERSION).max(1);
+                let selected = version.clamp(1, OUR_MAX_VERSION);
                 self.negotiated_version = selected;
                 info!(
                     client_version = version,
                     selected_version = selected,
                     "MS-RDPECAM SelectVersionRequest — replying SelectVersionResponse"
                 );
-                Ok(vec![CameraMsg::new(selected, msg_id::SELECT_VERSION_RESPONSE, Vec::new())])
+                Ok(vec![CameraMsg::new(
+                    selected,
+                    msg_id::SELECT_VERSION_RESPONSE,
+                    Vec::new(),
+                )])
             }
             msg_id::DEVICE_ADDED_NOTIFICATION => {
                 // Layout after the header: DeviceName (null-term UTF-16LE) then
@@ -353,7 +369,9 @@ impl RdCameraDeviceProcessor {
 
     /// `n` SampleRequests to fill the pipeline (or one, to keep it full).
     fn sample_requests(&self, n: u32) -> Vec<DvcMessage> {
-        (0..n).map(|_| self.msg(msg_id::SAMPLE_REQUEST, vec![self.stream_index])).collect()
+        (0..n)
+            .map(|_| self.msg(msg_id::SAMPLE_REQUEST, vec![self.stream_index]))
+            .collect()
     }
 }
 
@@ -417,7 +435,10 @@ impl DvcProcessor for RdCameraDeviceProcessor {
             msg_id::STREAM_LIST_RESPONSE => {
                 // The response is an array of STREAM_DESCRIPTIONs; Phase 1 drives
                 // the first stream (index 0), the camera's main video stream.
-                info!(len = body.len(), "MS-RDPECAM StreamListResponse — requesting media types for stream 0");
+                info!(
+                    len = body.len(),
+                    "MS-RDPECAM StreamListResponse — requesting media types for stream 0"
+                );
                 self.stream_index = 0;
                 self.state = DeviceState::ListingMediaTypes;
                 Ok(vec![self.msg(msg_id::MEDIA_TYPE_LIST_REQUEST, vec![self.stream_index])])
@@ -427,7 +448,10 @@ impl DvcProcessor for RdCameraDeviceProcessor {
                 // we'll be able to decode (H264 ≫ MJPG ≫ NV12/I420), copy that
                 // 26-byte descriptor verbatim into StartStreamsRequest.
                 let Some(chosen) = pick_media_type(body) else {
-                    warn!(len = body.len(), "MS-RDPECAM MediaTypeListResponse had no usable media type — stopping");
+                    warn!(
+                        len = body.len(),
+                        "MS-RDPECAM MediaTypeListResponse had no usable media type — stopping"
+                    );
                     self.state = DeviceState::Done;
                     return Ok(Vec::new());
                 };
@@ -440,7 +464,8 @@ impl DvcProcessor for RdCameraDeviceProcessor {
                 // Tell the sink the negotiated format + dimensions so it can
                 // configure its decoder before the first sample.
                 if let Some(sink) = self.sink.as_mut() {
-                    let u32_at = |o: usize| u32::from_le_bytes([chosen[o], chosen[o + 1], chosen[o + 2], chosen[o + 3]]);
+                    let u32_at =
+                        |o: usize| u32::from_le_bytes([chosen[o], chosen[o + 1], chosen[o + 2], chosen[o + 3]]);
                     sink.on_media_type(chosen[0], u32_at(1), u32_at(5));
                 }
                 // StartStreamsRequest body = one START_STREAM_INFO =
@@ -471,7 +496,11 @@ impl DvcProcessor for RdCameraDeviceProcessor {
                 let now = Instant::now();
                 let first = *self.first_sample_at.get_or_insert(now);
                 // Throttled ≤1/s summary at info, so it shows under the default filter.
-                if self.last_log_at.map(|t| now.saturating_duration_since(t).as_millis() >= 1000).unwrap_or(true) {
+                if self
+                    .last_log_at
+                    .map(|t| now.saturating_duration_since(t).as_millis() >= 1000)
+                    .unwrap_or(true)
+                {
                     self.last_log_at = Some(now);
                     let secs = now.saturating_duration_since(first).as_secs_f64().max(0.001);
                     let fps = self.samples as f64 / secs;

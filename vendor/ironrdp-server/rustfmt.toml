@@ -1,0 +1,10 @@
+# The vendored fork follows IronRDP's formatting so re-vendored files stay clean.
+# IronRDP's repo-root config also sets imports_granularity="Module" +
+# group_imports="StdExternalCrate", but those are nightly-only unstable options;
+# the stable-safe subset below (matching upstream's max_width) is what's enforced
+# here, and it keeps both the verbatim upstream files and macrdp's divergences clean.
+# macrdp is a single package, so `cargo fmt --all` from the repo root does NOT reach
+# this vendored crate — run `cargo fmt --manifest-path vendor/ironrdp-server/Cargo.toml`
+# to check/format it.
+max_width = 120
+reorder_imports = true

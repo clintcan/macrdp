@@ -180,10 +180,7 @@ impl CookieRegistry {
     /// listener can forward this tunnel's client→server channel data). Returns
     /// `None` for an unknown cookie. One-time use — a retransmitted/replayed
     /// CREATEREQUEST with the same cookie won't bind a second tunnel.
-    pub fn take(
-        &self,
-        cookie: &[u8; 16],
-    ) -> Option<(tokio::sync::mpsc::UnboundedSender<Vec<u8>>, Arc<AtomicBool>)> {
+    pub fn take(&self, cookie: &[u8; 16]) -> Option<(tokio::sync::mpsc::UnboundedSender<Vec<u8>>, Arc<AtomicBool>)> {
         let removed = match self.entries.lock() {
             Ok(mut map) => map.remove(cookie),
             Err(_) => None,

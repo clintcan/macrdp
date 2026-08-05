@@ -106,10 +106,10 @@ impl DvcProcessor for GfxDvcBridge {
         // flag is current for the PDU just handled. Discarding the output here
         // (rather than not processing) keeps the inner server's state machine
         // consistent while the client is never told the pipeline came up.
-        if let Some(declined) = &self.decline_output {
-            if declined.load(Ordering::Relaxed) {
-                return Ok(Vec::new());
-            }
+        if let Some(declined) = &self.decline_output
+            && declined.load(Ordering::Relaxed)
+        {
+            return Ok(Vec::new());
         }
         Ok(out)
     }
