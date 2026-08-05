@@ -2,7 +2,7 @@
 # Build output + lock of vendored crates built STANDALONE (e.g. ironrdp-rdpeudp,
 # tested via `cargo test --manifest-path …`); the in-macrdp build uses the root.
 vendor/*/target/
-vendor/ironrdp-rdpeudp/Cargo.lock
+vendor/*/Cargo.lock
 **/*.rs.bk
 Cargo.lock.bak
 

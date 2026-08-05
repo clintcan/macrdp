@@ -1,9 +1,13 @@
 # vendor/ironrdp-rdpdr — divergence log
 
-Local fork of ironrdp-rdpdr 0.5.0, copied 2026-06-16 from upstream
-Devolutions/IronRDP@879ffed (the same rev as the other git pins) and pulled in
-via `[patch.crates-io]` in the root `Cargo.toml`. Keep this vendor dir until
-divergence (1) is upstreamed AND released.
+Local fork of ironrdp-rdpdr 0.7.0, copied 2026-06-16 from upstream
+Devolutions/IronRDP@879ffed and **re-synced 2026-08-05 to the a5d1c682 pin bump**
+(upstream had ZERO source churn between the two revs — only Cargo.toml/CHANGELOG —
+so the fork's source was already current; just the dep versions bumped). Pulled in
+via `[patch.crates-io]` in the root `Cargo.toml`; has a standalone
+`[patch.crates-io]` (core/error/pdu/svc → a5d1c682) for isolated build, ignored in
+the macrdp workspace. Keep this vendor dir until divergence (1) is upstreamed AND
+released.
 
 Upstream `ironrdp-rdpdr` is **client-oriented**: `Rdpdr` is a
 `SvcClientProcessor`, and the PDU `Encode`/`Decode` impls in `pdu::efs` only

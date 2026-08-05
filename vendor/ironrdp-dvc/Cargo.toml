@@ -1,6 +1,6 @@
 [package]
 name = "ironrdp-dvc"
-version = "0.5.0"
+version = "0.8.0"
 readme = "README.md"
 description = "DRDYNVC static channel implementation and traits to implement dynamic virtual channels"
 # Vendored copy of upstream master ironrdp-dvc (copied 2026-06-26 from
@@ -11,7 +11,7 @@ description = "DRDYNVC static channel implementation and traits to implement dyn
 # server's SoftSyncRequest) needed to move dynamic virtual channels onto the UDP
 # multitransport tunnel. See CLAUDE.md for the divergence log.
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Devolutions/IronRDP"
 repository = "https://github.com/Devolutions/IronRDP"
@@ -31,8 +31,15 @@ std = []
 # path = "../ironrdp-*" entries dropped — we live outside the upstream
 # workspace, so cargo resolves these via the root macrdp Cargo.toml's
 # [patch.crates-io] redirects (git pin to upstream master).
-ironrdp-core = { version = "0.1", features = ["alloc"] } # public
-ironrdp-svc = { version = "0.6" } # public
-ironrdp-pdu = { version = "0.7", features = ["alloc"] } # public
+ironrdp-core = { version = "0.2", features = ["alloc"] } # public
+ironrdp-svc = { version = "0.8" } # public
+ironrdp-pdu = { version = "0.9", features = ["alloc"] } # public
 tracing = { version = "0.1", features = ["log"] }
-slab = "0.4"
+
+# Honored ONLY when this crate is built standalone (isolated validation); ignored
+# when it's a path dependency of macrdp (the root Cargo.toml's [patch] wins). Keep
+# the rev in sync with the root Cargo.toml when bumping the IronRDP pin.
+[patch.crates-io]
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-svc  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-pdu  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }

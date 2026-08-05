@@ -1,9 +1,13 @@
 # vendor/ironrdp-dvc — divergence log
 
-Local fork of ironrdp-dvc 0.5.0, copied 2026-06-26 from upstream
-Devolutions/IronRDP@879ffed (the same rev as the other git pins) and pulled in
-via the root `Cargo.toml`. Keep this vendor dir until the divergences below are
-upstreamed AND released.
+Local fork of ironrdp-dvc 0.8.0, **re-vendored 2026-08-05 from upstream
+Devolutions/IronRDP@a5d1c682** (the pin-bump rev; the churned `lib.rs`/`client.rs`/
+`server.rs` were refreshed verbatim from a5d1c682, `pdu.rs`/`complete_data.rs` are
+upstream-unchanged and keep the div1 additions). Originally copied 2026-06-26 from
+@879ffed. Keep this vendor dir until divergence (1) is upstreamed AND released —
+**divergence (2) was RETIRED at this bump** (upstream #1302 now owns it; see below).
+Has a standalone `[patch.crates-io]` (core/svc/pdu → a5d1c682) for isolated build,
+ignored in the macrdp workspace (root `[patch]` wins). Keep that rev in sync.
 
 **Patch wiring is two-sided.** Unlike the other vendored crates, ironrdp-dvc is a
 **path dependency of the git-pinned ironrdp crates** (egfx / displaycontrol /
@@ -91,7 +95,15 @@ since the lib is `test = false`.
     M5b-1 hand-rolled copies in `vendor/ironrdp-rdpeudp/src/softsync.rs` were
     removed in favor of this (correct) layer; see that crate's CLAUDE.md.
 
-(2) Invoke `DvcProcessor::close` on a client-initiated channel close (2026-07-07).
+(2) **RETIRED 2026-08-05 at the a5d1c682 pin bump — no longer applied.** Upstream
+    #1302 (`196d18df`, present in a5d1c682) supersedes it: the `DrdynvcClientPdu::Close`
+    arm now calls `self.remove_by_channel_id(channel_id)`, which drops the channel and
+    fires `processor.close` via `impl Drop for DynamicChannel` — a cleaner, more robust
+    form. The USB per-device teardown still fires. The historical note is kept below for
+    context; the inline `c.processor.close(...)` line was NOT re-applied onto the fresh
+    server.rs.
+
+    ~~Invoke `DvcProcessor::close` on a client-initiated channel close (2026-07-07).~~
     In `src/server.rs` `DrdynvcServer::process`, the `DrdynvcClientPdu::Close` arm
     set the channel state to `Closed` but **never called the processor's `close`
     hook** — the trait method (`DvcProcessor::close`, default no-op, already in the

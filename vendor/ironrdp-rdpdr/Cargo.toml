@@ -1,6 +1,6 @@
 [package]
 name = "ironrdp-rdpdr"
-version = "0.5.0"
+version = "0.7.0"
 readme = "README.md"
 description = "RDPDR channel implementation."
 # Vendored copy of upstream master ironrdp-rdpdr (copied 2026-06-16 from
@@ -9,7 +9,7 @@ description = "RDPDR channel implementation."
 # IronRDP cargo workspace, and the server-direction encode/decode halves needed
 # for a server-side RDPDR are added here. See CLAUDE.md for the divergence log.
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Devolutions/IronRDP"
 repository = "https://github.com/Devolutions/IronRDP"
@@ -25,9 +25,18 @@ test = false
 # path = "../ironrdp-*" entries dropped — we live outside the upstream
 # workspace, so cargo resolves these via the root macrdp Cargo.toml's
 # [patch.crates-io] redirects (git pin to upstream master).
-ironrdp-core = { version = "0.1" } # public
-ironrdp-error = { version = "0.1" } # public
-ironrdp-pdu = "0.7" # public
-ironrdp-svc = "0.6" # public
+ironrdp-core = { version = "0.2" } # public
+ironrdp-error = { version = "0.2" } # public
+ironrdp-pdu = "0.9" # public
+ironrdp-svc = "0.8" # public
 tracing = { version = "0.1", features = ["log"] }
 bitflags = "2.11"
+
+# Honored ONLY when this crate is built standalone (for isolated validation / CI);
+# ignored when it's a path dependency of macrdp (the root Cargo.toml's [patch] wins).
+# Keep the rev in sync with the root Cargo.toml when bumping the IronRDP pin.
+[patch.crates-io]
+ironrdp-core  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-error = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-pdu   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-svc   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
