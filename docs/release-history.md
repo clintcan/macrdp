@@ -4,9 +4,15 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
-## Unreleased (on `main`, since v0.9.3)
+## Unreleased (on `main`, since v0.9.4)
 
 Nothing tagged yet.
+
+## v0.9.4 — security hotfix: a pre-auth remote DoS in the RDP framing reader
+
+A single-fix security release. **The default runtime path is otherwise unchanged** (no `src/` change — the fix is a vendored guard in the framing crate).
+
+- **Fix (security): an unauthenticated remote client can no longer wedge the entire server with one malformed frame.** A 2-byte fast-path header (`04 00` / `00 00` — first byte `& 0b11 == 0`, length byte 0) made the vendored IronRDP framing reader (`ironrdp-async`'s `Framed::read_by_hint`) skip a **zero-length unmatched** PDU by reading `read_exact(0)` — no I/O, no forward progress, no `.await` yield — in an infinite loop, spinning a worker at 100% CPU **and wedging the acceptor's connection loop, so the whole server stops accepting = full outage**. It is reachable **before TLS/CredSSP**, so the connection-rate/lockout auth-guard never sees it, and the health-check watchdog misses it (the trivial runtime probe still runs on the other workers). macrdp now **vendors `ironrdp-async`** (a 4-file crate) at the current pin and guards `read_by_hint` to **fail on a zero-length unmatched PDU** — `Some((matched: false, length: 0))` → an `InvalidData` error → a clean per-connection rejection — instead of spinning. This is macrdp's own upstream PR **#1556** (commit `c541d09e`), complementing upstream **#1515**'s `find_size` hardening; either fix alone breaks the loop, and `ironrdp-async` is the lighter vendor. **Verified:** the exact 2-byte trigger fired ×10 at the fixed server left CPU at 0.0% (no spin, no pegged thread), the accept loop live (still accepting), and each connection cleanly rejected (the guard fires → `accept_begin failed` in the log). Found by the in-tree `soak_abuse3` decoder-fuzz harness (it had wedged a soak instance on the old build). The vendor dir drops when the IronRDP pin bumps past #1515 + #1556. See `vendor/ironrdp-async/CLAUDE.md`.
 
 ## v0.9.3 — storm-guard fix + the connection/input batch
 

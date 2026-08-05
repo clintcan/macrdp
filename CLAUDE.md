@@ -21,7 +21,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.9.3** (storm-guard fix + the connection/input batch —
+(VPN/ZeroTier). **Latest release: v0.9.4** (security hotfix — an UNAUTH, pre-TLS remote DoS: a single
+malformed 2-byte fast-path frame (`04 00`/`00 00`) spun the vendored `ironrdp-async`
+`Framed::read_by_hint` at 100% CPU (`read_exact(0)` in a non-yielding loop) and wedged the
+acceptor's accept loop = whole-server outage; reachable before TLS/CredSSP so the auth-guard
+never sees it and the health watchdog misses it (single-worker spin, runtime probe still
+passes). Fixed by **vendoring `ironrdp-async`** (4-file crate, two-sided `[patch]` like
+`ironrdp-dvc`) + the `read_by_hint` zero-length-unmatched-PDU guard = macrdp PR #1556
+(commit `c541d09e`), complementing upstream #1515's `find_size` hardening. NO `src/` change.
+Found by `soak_abuse3` decoder-fuzz. LIVE-VERIFIED: the 2-byte trigger ×10 → CPU 0.0% (no
+spin/pegged thread), accept loop live, guard fires (`accept_begin failed`) = clean
+per-connection rejection. Drop the vendor dir when the pin bumps past #1515+#1556. See
+`vendor/ironrdp-async/CLAUDE.md`.) Earlier: **v0.9.3** (storm-guard fix + the connection/input batch —
 a blank-recovery reliability fix plus four merged @antonmos contributions; **default runtime
 path unchanged**. Headline: the mstsc/Windows-App reconnect-blank drop loop can no longer run
 away. The reconnect-storm guard (`MAX_CONSECUTIVE_DROPS`) reset its counter whenever a
