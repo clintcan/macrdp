@@ -943,8 +943,14 @@ async fn negotiate_candidate(ctx: &NegotiationContext, stream: TcpStream, peer: 
     let size = ctx.display.lock().await.size().await;
     let capabilities = capabilities::capabilities(&ctx.opts, size);
     let mut acceptor = Acceptor::new(ctx.opts.security.flag(), size, capabilities, ctx.creds.clone());
-    acceptor.set_honor_client_desktop_size(ctx.honor_client_desktop_size);
-    acceptor.set_honor_client_desktop_size_max(ctx.honor_client_desktop_size_max);
+    // (vendored) Reconcile macrdp's (honor: bool, max: Option<DesktopSize>) onto the
+    // acceptor's unified Option<DesktopSize> API (upstream #1373+#1404): Some(max) =
+    // honor + clamp to max; None = don't honor. No explicit max honors up to the
+    // protocol ceiling (8192), where the clamp is a no-op.
+    acceptor.set_honor_client_desktop_size(
+        ctx.honor_client_desktop_size
+            .then(|| ctx.honor_client_desktop_size_max.unwrap_or(DesktopSize { width: 8192, height: 8192 })),
+    );
 
     let gfx_handle = attach_channels_impl(
         &mut acceptor,
@@ -1457,8 +1463,10 @@ impl RdpServer {
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
         // (vendored) Let the acceptor adopt the client's requested desktop
         // size from Client Core Data before Demand Active goes out.
-        acceptor.set_honor_client_desktop_size(self.honor_client_desktop_size);
-        acceptor.set_honor_client_desktop_size_max(self.honor_client_desktop_size_max);
+        acceptor.set_honor_client_desktop_size(
+            self.honor_client_desktop_size
+                .then(|| self.honor_client_desktop_size_max.unwrap_or(DesktopSize { width: 8192, height: 8192 })),
+        );
 
         // (vendored, feature=multitransport) When offering UDP multitransport:
         // (1) advertise EXTENDED_CLIENT_DATA_SUPPORTED so the client actually
@@ -2302,6 +2310,10 @@ impl RdpServer {
                         ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
                         ClipboardMessage::SendFileContentsRequest(request) => cliprdr.request_file_contents(request),
                         ClipboardMessage::SendFileContentsResponse(response) => cliprdr.submit_file_contents(response),
+                        // (pin-bump a5d1c682) upstream added this variant. macrdp drives
+                        // file copy via its own ServerEvent::ClipboardFileCopy, but the
+                        // match must cover it; same call the upstream arm makes.
+                        ClipboardMessage::SendInitiateFileCopy(files) => cliprdr.initiate_file_copy(files),
                         ClipboardMessage::Error(error) => {
                             error!(?error, "Handling clipboard event");
                             continue;
@@ -2528,11 +2540,19 @@ impl RdpServer {
                     if let Some(ref mut ad) = self.autodetect {
                         ad.expire_stale_probes(crate::autodetect::RTT_PROBE_MAX_AGE);
                         let request = ad.send_rtt_request();
-                        let data = encode_share_data_pdu(
-                            rdp::headers::ShareDataPdu::AutoDetectReq(request),
-                            io_channel_id,
-                            user_channel_id,
-                        )?;
+                        // (pin-bump a5d1c682) Autodetect moved out of ShareDataPdu into
+                        // rdp::autodetect and onto the MCS message channel. macrdp does
+                        // NOT use RDP network-autodetect (div-15 kernel TCP RTT replaces
+                        // it), so self.autodetect is never enabled and this is unreached;
+                        // adapt to the new PDU type so it compiles. No message channel is
+                        // plumbed here — harmless as it never runs.
+                        let pdu = rdp::autodetect::AutoDetectReqPdu::new(request);
+                        let mcs_pdu = SendDataIndication {
+                            initiator_id: user_channel_id,
+                            channel_id: io_channel_id,
+                            user_data: encode_vec(&pdu)?.into(),
+                        };
+                        let data = encode_vec(&X224(mcs_pdu))?;
                         writer.write_all(&data).await?;
                     }
                 }
@@ -3512,15 +3532,12 @@ impl RdpServer {
                     return Ok(true);
                 }
 
-                rdp::headers::ShareDataPdu::AutoDetectRsp(response) => {
-                    if let Some(ref mut ad) = self.autodetect {
-                        if let Some(rtt_ms) = ad.handle_response(&response) {
-                            debug!(rtt_ms, seq = response.sequence_number(), "RTT measured");
-                        } else {
-                            trace!(seq = response.sequence_number(), "Unmatched auto-detect response");
-                        }
-                    }
-                }
+                // (pin-bump a5d1c682) The auto-detect RESPONSE is no longer a
+                // ShareDataPdu variant — it rides the MCS message channel
+                // (handle_message_channel_data upstream). macrdp doesn't use RDP
+                // network-autodetect (div-15 kernel TCP RTT), so the response is never
+                // received; the arm is removed rather than re-plumbed onto the message
+                // channel.
 
                 // Client requests the server stop or resume sending display
                 // updates. mstsc sends `desktop_rect: None` on minimize and
