@@ -94,11 +94,19 @@ impl ironrdp_server::SoundServerFactory for KeepAliveSound {
             fn get_formats(&self) -> &[ironrdp_rdpsnd::pdu::AudioFormat] {
                 &[]
             }
+            fn choose_format<'a>(
+                &mut self,
+                _common: &'a [ironrdp_rdpsnd::server::NegotiatedFormat],
+            ) -> Option<&'a ironrdp_rdpsnd::server::NegotiatedFormat> {
+                // No server formats (get_formats is empty), so the crate never
+                // negotiates audio and never calls this — decline explicitly.
+                None
+            }
             fn start(
                 &mut self,
-                _client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu,
-            ) -> Option<u16> {
-                None
+                _format: &ironrdp_rdpsnd::server::NegotiatedFormat,
+            ) -> Result<(), Box<dyn ironrdp_rdpsnd::server::RdpsndError>> {
+                Ok(())
             }
             fn stop(&mut self) {}
         }
@@ -195,7 +203,7 @@ fn server_tls_acceptor() -> tokio_rustls::TlsAcceptor {
 /// (no CredSSP). Field set mirrors IronRDP's own `examples/screenshot.rs` for
 /// this pinned rev.
 fn client_config(width: u16, height: u16) -> Config {
-    use ironrdp_pdu::gcc::KeyboardType;
+    use ironrdp_pdu::gcc::{ConnectionType, KeyboardType};
     use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
     use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 
@@ -207,6 +215,9 @@ fn client_config(width: u16, height: u16) -> Config {
         domain: None,
         enable_tls: true,
         enable_credssp: false,
+        // Added to connector Config in the a5d1c682 pin bump; Lan is the canonical
+        // default (client config / testsuite / web all use it).
+        connection_type: ConnectionType::Lan,
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
         keyboard_layout: 0,

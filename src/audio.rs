@@ -11,8 +11,8 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use ironrdp_rdpsnd::pdu::{AudioFormat, ClientAudioFormatPdu, WaveFormat};
-use ironrdp_rdpsnd::server::RdpsndServerHandler;
+use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
+use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler};
 // Only the macOS capture path ships waves via the unified ServerEvent fallback;
 // on the Linux cross-compile stub this name is unused.
 #[cfg(target_os = "macos")]
@@ -196,69 +196,39 @@ struct MacRdpsndBackend {
     target_display_id: Option<u32>,
 }
 
-/// Negotiate the audio format to send the client.
-///
-/// Walks the `server` list (which is ordered by our preference — AAC ahead of
-/// PCM) and picks the first format the `client` also advertised. Returns
-/// `(server_idx, wFormatNo)` where `server_idx` indexes our list (so the caller
-/// knows what to encode) and `wFormatNo` is that format's position in the
-/// **client's** list — the value that goes on the wire.
-///
-/// `wFormatNo` MUST index the client's own Client Audio Formats list, NOT our
-/// server list: the client resolves each wave's codec as
-/// `ClientFormats[wFormatNo]`, and FreeRDP/Thincast hard-reject
-/// `wFormatNo >= NumberOfClientFormats` (verified in `rdpsnd_recv_wave2_pdu`).
-/// A PCM-only client (1 format) silently dropped every wave when we sent PCM's
-/// *server* index (1, once AAC took slot 0); mstsc tolerated the server index
-/// only because the lists coincided while we advertised a single format.
-///
-/// Pure (no platform deps, no shared state) so it's unit-tested on every
-/// target. Returns `None` when the client accepted none of our formats.
-fn choose_audio_format(server: &[AudioFormat], client: &[AudioFormat]) -> Option<(usize, u16)> {
-    let fmt_eq = |a: &AudioFormat, b: &AudioFormat| {
-        a.format == b.format
-            && a.n_channels == b.n_channels
-            && a.n_samples_per_sec == b.n_samples_per_sec
-            && a.bits_per_sample == b.bits_per_sample
-    };
-    let server_idx = server
-        .iter()
-        .position(|sf| client.iter().any(|cf| fmt_eq(cf, sf)))?;
-    let chosen = &server[server_idx];
-    // Can't fail in practice — `chosen` was matched from `client` above — but
-    // fold it into the Option rather than panicking on a hostile/odd list.
-    let format_no = client.iter().position(|cf| fmt_eq(cf, chosen))?;
-    let format_no = u16::try_from(format_no).ok()?;
-    Some((server_idx, format_no))
-}
+// Note: format negotiation (server-preference selection + the client-list
+// `wFormatNo` index arithmetic that used to live in a local `choose_audio_format`)
+// is now owned by ironrdp-rdpsnd (PR #1359): the crate hands `choose_format` the
+// mutually-supported formats in our preference order, each carrying the correct
+// `wFormatNo`, so the load-bearing "wFormatNo indexes the CLIENT's list" rule is
+// enforced upstream. macrdp only picks the top entry (see `choose_format`).
 
 impl RdpsndServerHandler for MacRdpsndBackend {
     fn get_formats(&self) -> &[AudioFormat] {
         &self.formats
     }
 
-    fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
-        // Negotiate which format to send (see `choose_audio_format`): server
-        // preference (AAC ahead of PCM), returning the wire `wFormatNo` indexed
-        // against the CLIENT's list. The capture loop then encodes `chosen`.
-        let Some((server_idx, format_no)) =
-            choose_audio_format(&self.formats, &client_format.formats)
-        else {
-            warn!(
-                client_formats = client_format.formats.len(),
-                "client accepted none of the server audio formats; no audio"
-            );
-            return None;
-        };
-        let chosen = &self.formats[server_idx];
-        let use_aac = chosen.format == WaveFormat::AAC_MS;
+    fn choose_format<'a>(
+        &mut self,
+        common: &'a [NegotiatedFormat],
+    ) -> Option<&'a NegotiatedFormat> {
+        // `common` is the mutually-supported formats in OUR preference order (AAC
+        // ahead of PCM — see `server_audio_formats`), each already carrying the
+        // client-list `wFormatNo` the crate stamps onto every wave. So the top entry
+        // is our preferred client-accepted format; the crate owns the index arithmetic
+        // `choose_audio_format` used to. `common` is never empty here — the crate skips
+        // this call when server and client share no format.
+        common.first()
+    }
+
+    fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        // `format` is the one `choose_format` just returned; the crate stamps its
+        // wFormatNo onto every wave, so we only need to know whether to encode AAC or
+        // ship PCM.
+        let use_aac = format.format().format == WaveFormat::AAC_MS;
         debug!(
-            format_no,
-            server_idx,
             use_aac,
-            client_formats = client_format.formats.len(),
-            version = ?client_format.version,
-            "rdpsnd audio format negotiated"
+            "rdpsnd audio streaming starting (format negotiated by the crate)"
         );
 
         // Claim a fresh generation. Any capture loop from a previous
@@ -316,7 +286,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                 });
             })
             .expect("spawn audio capture thread");
-        Some(format_no)
+        Ok(())
     }
 
     fn stop(&mut self) {
@@ -903,36 +873,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefers_aac_when_client_supports_both() {
-        // Server advertises [AAC, PCM]; a client that takes both → AAC chosen.
-        let server = [aac_format(128_000), pcm_format()];
-        let client = [aac_format(128_000), pcm_format()];
-        let (server_idx, format_no) = choose_audio_format(&server, &client).unwrap();
-        assert_eq!(server_idx, 0, "AAC is our top preference");
-        assert_eq!(format_no, 0, "AAC is at client index 0 here");
-        assert_eq!(server[server_idx].format, WaveFormat::AAC_MS);
-    }
+    fn server_formats_prefer_aac_ahead_of_pcm() {
+        // The macrdp-side invariant `choose_format` (= `common.first()`) relies on:
+        // when AAC is enabled we advertise it AHEAD of PCM, so the crate's
+        // server-preference-ordered `common` list puts AAC first. (The client-list
+        // `wFormatNo` arithmetic once tested here now lives in ironrdp-rdpsnd, #1359.)
+        let with_aac = server_audio_formats(true, 128_000);
+        assert_eq!(with_aac.len(), 2);
+        assert_eq!(
+            with_aac[0].format,
+            WaveFormat::AAC_MS,
+            "AAC is our top preference"
+        );
+        assert_eq!(with_aac[1].format, WaveFormat::PCM);
 
-    #[test]
-    fn pcm_only_client_gets_correct_client_list_index() {
-        // The regression that silenced PCM clients: server is [AAC, PCM] so PCM
-        // is at SERVER index 1, but a PCM-only client lists PCM at index 0. The
-        // wire wFormatNo must be the CLIENT index (0), not the server index (1).
-        let server = [aac_format(128_000), pcm_format()];
-        let client = [pcm_format()];
-        let (server_idx, format_no) = choose_audio_format(&server, &client).unwrap();
-        assert_eq!(server_idx, 1, "PCM is the second server format");
-        assert_eq!(format_no, 0, "but PCM is index 0 in the client's own list");
-        assert_eq!(server[server_idx].format, WaveFormat::PCM);
-    }
-
-    #[test]
-    fn no_common_format_returns_none() {
-        // Server only offers AAC; a PCM-only client shares nothing → no audio.
-        let server = [aac_format(128_000)];
-        let client = [pcm_format()];
-        assert!(choose_audio_format(&server, &client).is_none());
-        // Empty client list → also None.
-        assert!(choose_audio_format(&server, &[]).is_none());
+        let pcm_only = server_audio_formats(false, 128_000);
+        assert_eq!(pcm_only.len(), 1);
+        assert_eq!(pcm_only[0].format, WaveFormat::PCM);
     }
 }

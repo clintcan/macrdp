@@ -2986,7 +2986,10 @@ impl GraphicsPipelineHandler for GfxHandler {
         }
     }
 
-    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
+    // `_total_frames_decoded` (the client's cumulative decoded-frame count, added to
+    // the QoE/frame-ack callback upstream in #1345) is accepted but unused: macrdp
+    // derives its decode-backlog floor from `frame_id`/`last_acked_frame_id` below.
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, _total_frames_decoded: u32) {
         trace!(frame_id, queue_depth, "EGFX frame ack");
         // Feed ack-driven IDR recovery (EGFX-on-lossy): record liveness, and note
         // whether the client suspended acks (queueDepth == SUSPEND_FRAME_
