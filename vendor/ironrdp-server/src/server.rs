@@ -960,6 +960,10 @@ async fn negotiate_candidate(
         })
     }));
 
+    #[allow(
+        clippy::let_unit_value,
+        reason = "attach_channels_impl returns () when the egfx feature is off"
+    )]
     let gfx_handle = attach_channels_impl(
         &mut acceptor,
         ctx.cliprdr_factory.as_deref(),
@@ -1382,6 +1386,10 @@ impl RdpServer {
     }
 
     fn attach_channels(&mut self, acceptor: &mut Acceptor) {
+        #[allow(
+            clippy::let_unit_value,
+            reason = "attach_channels_impl returns () when the egfx feature is off"
+        )]
         let gfx_handle = attach_channels_impl(
             acceptor,
             self.cliprdr_factory.as_deref(),
@@ -1405,6 +1413,7 @@ impl RdpServer {
             self.gfx_handle = gfx_handle;
         }
         #[cfg(not(feature = "egfx"))]
+        #[allow(clippy::let_unit_value, reason = "gfx_handle is () when the egfx feature is off")]
         let _ = gfx_handle;
     }
 
@@ -1446,6 +1455,7 @@ impl RdpServer {
             self.gfx_handle = candidate.gfx_handle;
         }
         #[cfg(not(feature = "egfx"))]
+        #[allow(clippy::let_unit_value, reason = "gfx_handle is () when the egfx feature is off")]
         let _ = candidate.gfx_handle;
 
         let framed = self.accept_finalize(candidate.framed, candidate.acceptor).await?;
