@@ -1567,7 +1567,10 @@ impl RdpServer {
                 self.udp_tunnel_bound = Some(registry.register(offer.cookie, in_tx));
             }
             self.current_offer_cookie = Some(offer.cookie);
-            acceptor.set_advertise_extended_client_data(true);
+            // (pin bump a5d1c682) EXTENDED_CLIENT_DATA is now advertised unconditionally
+            // by the acceptor, so the old set_advertise_extended_client_data(true) call
+            // was retired from the re-vendored acceptor — the offer alone drives the
+            // multitransport negotiation now.
             acceptor.set_multitransport_offer(Some(offer));
         }
 
