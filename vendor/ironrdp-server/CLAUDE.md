@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21)/(22)/(23) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -1345,7 +1345,26 @@ AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1
     → per-device channel opened → `ADD_DEVICE` received (GO), session stays up
     (decode error tolerated). Off-path (`--enable-usb-redirection` absent) unchanged.
 
-(17) Wheel-rotation two's-complement decode fix (macrdp issue #113; NOT
+(17) **RETIRED 2026-08-09 — upstream fixed its decode at the a5d1c682 pin, and
+    leaving this compensation in place REGRESSED issue #113 in the opposite
+    direction.** `ironrdp-pdu` now decodes the 9-bit WheelRotationMask as
+    proper two's complement (`byte - 0x100`), so the delta arriving here is
+    already correct; re-applying `-v - 256` on top of it turned a gentle -1
+    into -255 — a max-speed scroll on every DOWNWARD tick — while upward
+    (positive, untouched) stayed correct. That asymmetry (down runs away, up
+    is fine) is the fingerprint. Shipped broken in v0.9.5 (the pin bump moved
+    past the upstream fix but did not delete this divergence, exactly as the
+    original note warned); the compensation is now removed and
+    `From<MousePdu> for MouseEvent` passes `number_of_wheel_rotation_units`
+    through unchanged. Guarded by
+    `src/conn_test.rs::wheel_rotation_survives_the_pdu_round_trip_in_both_directions`,
+    which pins the END-TO-END contract (encode → decode → MouseEvent) rather
+    than either half, so a future pin bump that changes upstream's decode in
+    either direction fails in CI instead of in a user's hands. If upstream
+    ever regresses, fix it in `ironrdp-pdu` — do NOT reintroduce a
+    compensation here. Original note follows for history:
+
+    Wheel-rotation two's-complement decode fix (macrdp issue #113; NOT
     upstreamed, real fix belongs in `ironrdp-pdu`). `From<MousePdu> for
     MouseEvent` in `handler.rs` re-decodes `number_of_wheel_rotation_units`
     as 9-bit two's complement (`WHEEL_NEGATIVE` is the sign bit); upstream's

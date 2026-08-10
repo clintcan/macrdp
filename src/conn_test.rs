@@ -1016,3 +1016,51 @@ async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpS
     }
     anyhow::bail!("server never started listening on {addr}")
 }
+
+/// The wheel-rotation delta must survive the PDU round-trip unchanged, and in
+/// particular a DOWNWARD scroll must not be inflated.
+///
+/// History (macrdp issue #113, twice): MS-RDPBCGR's WheelRotationMask (0x01FF)
+/// is a 9-bit TWO'S-COMPLEMENT field, so byte 0xFF with WHEEL_NEGATIVE set
+/// means -1. `ironrdp-pdu` originally decoded it as sign-magnitude (`-(byte)`),
+/// yielding -255, and the vendored server compensated (`-v - 256`). Upstream
+/// then fixed its decode at the a5d1c682 pin — at which point the compensation
+/// DOUBLE-corrected and every gentle downward tick became -255 again, i.e. a
+/// max-speed scroll, while upward (positive, untouched) stayed fine. That
+/// asymmetry is the fingerprint of this bug.
+///
+/// This pins the end-to-end contract instead of either half, so a future pin
+/// bump that changes upstream's decode — in either direction — fails here
+/// rather than in the user's hands.
+#[test]
+fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
+    use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
+    use ironrdp_server::MouseEvent;
+
+    for units in [-1_i16, -3, -120, 1, 3, 120] {
+        let mut flags = PointerFlags::VERTICAL_WHEEL;
+        if units < 0 {
+            flags |= PointerFlags::WHEEL_NEGATIVE;
+        }
+        let pdu = MousePdu {
+            flags,
+            number_of_wheel_rotation_units: units,
+            x_position: 0,
+            y_position: 0,
+        };
+
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse pdu");
+        let decoded: MousePdu = ironrdp_core::decode(&encoded).expect("decode mouse pdu");
+
+        match MouseEvent::from(decoded) {
+            MouseEvent::VerticalScroll { value } => assert_eq!(
+                value, units,
+                "wheel delta {units} came back as {value}: a scroll-down that is \
+                 inflated while scroll-up is correct means the vendored \
+                 two's-complement compensation is being applied on top of an \
+                 already-correct upstream decode (macrdp #113)"
+            ),
+            other => panic!("expected VerticalScroll for {units}, got {other:?}"),
+        }
+    }
+}

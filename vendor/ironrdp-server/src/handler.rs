@@ -161,23 +161,19 @@ impl From<MousePdu> for MouseEvent {
                 MouseEvent::RightReleased
             }
         } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
-            // MS-RDPBCGR's WheelRotationMask (0x01FF) is a 9-bit TWO'S-
-            // COMPLEMENT field — the WHEEL_NEGATIVE 0x0100 bit doubles as its
-            // sign bit (FreeRDP: `if negative: value = -(0x100 - byte)`), so
-            // byte 0xFF with the flag set means -1, not -255. ironrdp-pdu's
-            // MousePdu decode instead computes -(byte), inflating every
-            // negative delta's magnitude (its encode side IS correct two's
-            // complement, so the codec doesn't even round-trip). mstsc masked
-            // this by scrolling in whole ±120 notches (decodes as -136 vs the
-            // true -120 — same result after downstream scaling); the macOS
-            // Windows App sends fine-grained ±1..±3 trackpad deltas, which
-            // arrived here as -255..-253 — a max-speed scroll for every gentle
-            // downward tick (macrdp issue #113). Recover the true value:
-            // decode produced -(byte), so byte = -v, and the 9-bit sign
-            // extension of the byte is byte - 256.
-            let v = value.number_of_wheel_rotation_units;
-            let corrected = if v < 0 { -v - 256 } else { v };
-            MouseEvent::VerticalScroll { value: corrected }
+            // NO correction here — see the retired divergence (17). ironrdp-pdu
+            // used to decode the 9-bit WheelRotationMask as sign-magnitude
+            // (`-(byte)`), so a gentle -1 arrived as -255 and this site had to
+            // undo it. As of the a5d1c682 pin, upstream decodes proper two's
+            // complement (`byte - 0x100`), so the delta is already correct and
+            // re-applying the old compensation would inflate every DOWNWARD
+            // scroll ~255x while leaving upward untouched (macrdp issue #113,
+            // reintroduced by the pin bump in v0.9.5 and fixed here). If a
+            // future pin regresses upstream's decode, fix it in ironrdp-pdu
+            // rather than compensating here.
+            MouseEvent::VerticalScroll {
+                value: value.number_of_wheel_rotation_units,
+            }
         } else {
             MouseEvent::Move {
                 x: value.x_position,
