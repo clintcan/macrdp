@@ -61,6 +61,37 @@ const EVICTION_GRACE: Duration = Duration::from_millis(750);
 /// so it filters retry storms without blocking a deliberate retake.
 const REPREEMPT_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// (vendored, divergence 23) Absolute cap on that bar, measured from the
+/// eviction itself. The re-arm below is what stops a reconnect storm winning
+/// the session back, but left uncapped it also permanently locks out the
+/// feature's own headline case: a client whose link dropped, whose stale
+/// session is still live, auto-reconnecting to reclaim it. Past this cap the
+/// bar lifts even under a continuing storm — by then the evicted peer has had
+/// its `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION`, which is the real fix.
+const REPREEMPT_MAX_LOCKOUT: Duration = Duration::from_secs(30);
+
+/// (vendored, divergence 23) How long a candidate gets to complete negotiation
+/// and authentication before it is abandoned.
+///
+/// LOAD-BEARING, not tidiness: `negotiate_candidate` blocks on socket reads
+/// from an as-yet-unauthenticated peer. Without this bound, a peer that
+/// completes the TCP handshake and then sends NOTHING parks the probe forever
+/// — which stalls accepts for the rest of the session (the accept arm is gated
+/// on `!probing`) and, once the live session ends, hangs the accept loop on the
+/// handoff await with no way left to observe `ServerEvent::Quit`. Generous for
+/// TLS + CredSSP over a slow link; sub-second on a healthy one.
+const CANDIDATE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// (vendored, divergence 23) How long the accept loop waits, AFTER the live
+/// session has ended, for a candidate still mid-negotiation.
+///
+/// Deliberately short and separate from `CANDIDATE_NEGOTIATION_TIMEOUT`: during
+/// this wait the loop services nothing — no accepts, no `ServerEvent`s, not
+/// even `Quit` — so it is the window in which an unauthenticated peer can make
+/// the server look hung. A candidate that cannot finish within it is dropped
+/// and simply reconnects; holding the whole listener for it is the worse trade.
+const CANDIDATE_HANDOFF_GRACE: Duration = Duration::from_millis(750);
+
 /// (vendored, divergence 22) What resolved first while a session was live: the
 /// session itself ending, a new inbound connection, or the verdict on a
 /// previously accepted candidate. The `select!` yields one of these and does
@@ -480,7 +511,7 @@ pub struct RdpServer {
     /// cadence) therefore can never win the session back, while a human who
     /// closes and reconnects — a gap far longer than
     /// [`REPREEMPT_COOLDOWN`] — still can. Cleared once a takeover sticks.
-    recently_evicted: Option<(IpAddr, Instant)>,
+    recently_evicted: Option<(IpAddr, Instant, Instant)>,
     // (vendored, divergence 22) `Rc<RefCell<..>>`, not a bare `Option<Box<..>>`:
     // the preemption race in `run()` needs to call `on_accept` on a candidate
     // while `self` is ALSO mutably borrowed for the whole race by the live
@@ -939,6 +970,32 @@ struct NegotiatedCandidate {
 /// ever sees) and takes `&NegotiationContext` instead, precisely so it can
 /// run alongside a live `&mut self` borrow. Keep the two in sync by hand if
 /// the negotiation sequence ever changes upstream.
+/// (vendored, divergence 23) [`negotiate_candidate`] under a hard deadline.
+///
+/// The negotiation blocks on socket reads from an as-yet-unauthenticated peer,
+/// so it MUST NOT be awaited unbounded anywhere in the accept loop: a peer that
+/// connects and then says nothing would otherwise stall accepts for the rest of
+/// the session and hang the loop outright once the session ended. A timeout is
+/// treated exactly like a failed negotiation — the candidate is dropped and the
+/// live session is untouched.
+async fn negotiate_candidate_bounded(
+    ctx: &NegotiationContext,
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> Option<NegotiatedCandidate> {
+    match tokio::time::timeout(CANDIDATE_NEGOTIATION_TIMEOUT, negotiate_candidate(ctx, stream, peer)).await {
+        Ok(candidate) => candidate,
+        Err(_) => {
+            debug!(
+                ?peer,
+                timeout = ?CANDIDATE_NEGOTIATION_TIMEOUT,
+                "candidate did not finish negotiating in time — abandoning it, the live session is untouched"
+            );
+            None
+        }
+    }
+}
+
 async fn negotiate_candidate(
     ctx: &NegotiationContext,
     stream: TcpStream,
@@ -1419,6 +1476,45 @@ impl RdpServer {
 
     /// (vendored, divergence 23) Build a cheap, `Rc`/`Arc`-cloned snapshot for
     /// a candidate's concurrent negotiation — see [`NegotiationContext`].
+    /// (vendored, divergence 23) Drop any `EvictedByOtherConnection` still
+    /// queued on the server-global event channel, putting every other event
+    /// back in arrival order.
+    ///
+    /// Called immediately before serving a preemption winner. The eviction
+    /// event is addressed to the connection being replaced, but the channel is
+    /// shared across connections and read by whoever drains it next — so an
+    /// event the outgoing session never got around to consuming would be
+    /// delivered to its replacement, which would dutifully disconnect itself.
+    async fn discard_stale_eviction_events(&mut self) {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let ev_receiver = Arc::clone(&self.ev_receiver);
+        let mut ev_receiver = ev_receiver.lock().await;
+
+        // Collect first, re-send after: re-sending during the drain would push
+        // events onto the back of the very queue being drained.
+        let mut keep = Vec::new();
+        let mut discarded = 0usize;
+        loop {
+            match ev_receiver.try_recv() {
+                Ok(ServerEvent::EvictedByOtherConnection) => discarded += 1,
+                Ok(other) => keep.push(other),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if discarded > 0 {
+            debug!(
+                discarded,
+                "dropped eviction events the replaced session never consumed — they must not reach its replacement"
+            );
+        }
+
+        for event in keep {
+            let _ = self.ev_sender.send(event);
+        }
+    }
+
     fn negotiation_context(&self) -> NegotiationContext {
         NegotiationContext {
             opts: self.opts.clone(),
@@ -1727,7 +1823,18 @@ impl RdpServer {
             }
 
             let entry = match pending.take() {
-                Some((candidate, peer)) => Entry::Negotiated(candidate, peer),
+                Some((candidate, peer)) => {
+                    // The eviction event rides the server-global channel but is
+                    // consumed by whichever connection drains it next. If the
+                    // incumbent was too wedged to take it within
+                    // `EVICTION_GRACE` (being wedged is why it was evicted),
+                    // it is still queued now — and the WINNER's `client_loop`
+                    // would drain it and disconnect itself, reporting a bogus
+                    // `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` to the client
+                    // that just took over. Drop leftovers; requeue the rest.
+                    self.discard_stale_eviction_events().await;
+                    Entry::Negotiated(candidate, peer)
+                }
                 None => {
                     let ev_receiver = Arc::clone(&self.ev_receiver);
                     let mut ev_receiver = ev_receiver.lock().await;
@@ -1884,7 +1991,20 @@ impl RdpServer {
                                     // anyone) — hand it straight to the next
                                     // iteration.
                                     let peer = probing_peer.expect("probing implies probing_peer is set");
-                                    pending = probe.await.map(|candidate| (candidate, peer));
+                                    // BOUNDED: nothing else is serviced during
+                                    // this await, so a candidate that is not
+                                    // nearly done is dropped rather than
+                                    // allowed to stall the listener.
+                                    pending = match tokio::time::timeout(CANDIDATE_HANDOFF_GRACE, &mut probe).await {
+                                        Ok(candidate) => candidate.map(|c| (c, peer)),
+                                        Err(_) => {
+                                            debug!(
+                                                ?peer,
+                                                "a candidate was still negotiating when the session ended —                                                  dropping it rather than stalling the accept loop; it can reconnect"
+                                            );
+                                            None
+                                        }
+                                    };
                                 }
                                 break (res, None);
                             }
@@ -1908,8 +2028,14 @@ impl RdpServer {
                                 // net under `EvictedByOtherConnection`, which
                                 // is what should normally stop the loop.
                                 let bounced_back = match &mut recently_evicted {
-                                    Some((ip, last_try)) if *ip == next_peer.ip() => {
-                                        let within = last_try.elapsed() < REPREEMPT_COOLDOWN;
+                                    Some((ip, evicted_at, last_try)) if *ip == next_peer.ip() => {
+                                        // Capped: the re-arm throttles a storm,
+                                        // but must not bar a peer forever —
+                                        // that locks out the very case this
+                                        // feature exists for (a dropped client
+                                        // reclaiming its own stale session).
+                                        let within = last_try.elapsed() < REPREEMPT_COOLDOWN
+                                            && evicted_at.elapsed() < REPREEMPT_MAX_LOCKOUT;
                                         if within {
                                             *last_try = Instant::now();
                                         }
@@ -1922,7 +2048,10 @@ impl RdpServer {
                                 if candidate_accepted {
                                     probing = true;
                                     probing_peer = Some(next_peer);
-                                    probe = Box::pin(negotiate_candidate(&ctx, next_stream, next_peer));
+                                    // BOUNDED: see `CANDIDATE_NEGOTIATION_TIMEOUT`.
+                                    // An unbounded probe is a remote hang of
+                                    // the whole accept loop.
+                                    probe = Box::pin(negotiate_candidate_bounded(&ctx, next_stream, next_peer));
                                 } else if bounced_back {
                                     info!(
                                         ?next_peer,
@@ -1964,7 +2093,8 @@ impl RdpServer {
                                         let _ = self_ev_sender.send(ServerEvent::EvictedByOtherConnection);
                                         // Arm the net against this peer
                                         // bouncing straight back in.
-                                        recently_evicted = Some((peer.ip(), Instant::now()));
+                                        let now = Instant::now();
+                                        recently_evicted = Some((peer.ip(), now, now));
                                         // Keep polling the incumbent so it can
                                         // observe the event, write the PDU and
                                         // return on its own. Bounded, because a

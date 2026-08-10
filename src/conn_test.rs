@@ -1005,6 +1005,81 @@ async fn a_just_evicted_peer_cannot_immediately_preempt_back() -> anyhow::Result
         .await
 }
 
+/// A silent candidate MUST NOT be able to wedge the accept loop.
+///
+/// `negotiate_candidate` blocks on socket reads from a peer that has not
+/// authenticated. Before `CANDIDATE_NEGOTIATION_TIMEOUT` /
+/// `CANDIDATE_HANDOFF_GRACE` (vendored divergence 23) the probe was awaited
+/// unbounded: a peer that completed the TCP handshake and then sent NOTHING
+/// parked it forever, and once the live session ended the accept loop blocked
+/// on the handoff await with no `select!` left — no further accepts, no event
+/// drain, so the server stopped answering entirely until restarted. That is an
+/// unauthenticated remote denial of service, and the health watchdog does not
+/// catch it (the tokio runtime stays healthy; only the accept loop is stuck).
+///
+/// Drive exactly that: a live session, a silent candidate, end the session, and
+/// require the server to still accept a fresh client afterwards.
+#[tokio::test]
+async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let mut server = build_test_server_full(
+                addr.port(),
+                1024,
+                768,
+                true,
+                None,
+                crate::bitmap_codecs(),
+                true,
+            );
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // A: the live session.
+            let a = connect_with_retry(addr).await?;
+            let (_size_a, framed_a) = connect_client(a, 1280, 800).await?;
+
+            // B: connects and says NOTHING, parking the candidate probe
+            // mid-negotiation.
+            let _silent = connect_with_retry(addr).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // The live session ends. This is the branch that used to await the
+            // probe unbounded and never come back.
+            drop(framed_a);
+
+            // The server must still accept and serve a fresh client. With the
+            // unbounded await this never completes.
+            let c = connect_with_retry(addr).await?;
+            let served = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                connect_client(c, 1280, 800),
+            )
+            .await;
+            let outcome = match &served {
+                Ok(Ok(_)) => "served",
+                Ok(Err(e)) => &format!("handshake error: {e}"),
+                Err(_) => "TIMED OUT — the loop never accepted it",
+            };
+            assert!(
+                matches!(served, Ok(Ok(_))),
+                "the accept loop was wedged by an unauthenticated silent peer; a later client got {outcome}"
+            );
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
 /// The listener needs a moment to bind after `run()` is spawned; retry briefly
 /// so the test isn't racy on a loaded machine.
 async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {

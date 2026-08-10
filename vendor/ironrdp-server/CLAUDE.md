@@ -1733,3 +1733,54 @@ AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1
     survives; note every loopback peer is 127.0.0.1, which is exactly the
     source-IP key the net uses). Both verified to fail without their
     respective fix and pass with it.
+
+    **AMENDMENT 2026-08-09 — three bugs in the above, found by the automated
+    reviewer on the upstream PR (Devolutions/IronRDP#1476) and confirmed
+    present here.** The upstream and vendored copies had drifted only
+    cosmetically, so all three applied verbatim:
+
+    (a) **CRITICAL — unauthenticated remote hang of the accept loop.**
+        `negotiate_candidate` blocks on socket reads, and `PreemptRace::Ended`
+        did a bare `pending = probe.await`. A peer that completed the TCP
+        handshake, cleared `on_accept` and then sent NOTHING parked
+        `accept_begin` forever: accepts were already disabled for the rest of
+        the session (the accept arm is gated on `!probing`), and once the live
+        session ended the loop blocked on that await with no `select!` left —
+        no accepts, no event drain, so not even `ServerEvent::Quit` could stop
+        the server. One silent TCP connection wedged the listener until the
+        process was restarted. **The health watchdog does NOT catch this**: the
+        tokio runtime stays healthy and its probe still runs; only the accept
+        loop is stuck, so `src/health.rs` sees nothing wrong. Fixed with TWO
+        deliberately separate bounds — `CANDIDATE_NEGOTIATION_TIMEOUT` (10 s)
+        caps the negotiation itself, and `CANDIDATE_HANDOFF_GRACE` (750 ms)
+        caps the post-session-end wait, which is the window where the loop
+        services nothing at all. Capping only the first is NOT enough (the
+        loop is then deaf for the full negotiation budget). A candidate that
+        can't finish inside the grace is dropped and simply reconnects.
+
+    (b) **The eviction event could kill the WINNER.**
+        `EvictedByOtherConnection` rides the server-global `ev_sender` but is
+        consumed by whichever connection drains it next. An incumbent too
+        wedged to take it within `EVICTION_GRACE` — and being wedged is
+        precisely why it is being evicted — left it queued, and the winner's
+        `client_loop` then drained it and disconnected itself, putting a bogus
+        `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` on the wire to the client
+        that had just taken over. `RdpServer::discard_stale_eviction_events()`
+        drops leftovers immediately before serving a winner, re-queuing every
+        other event in arrival order (collect-then-resend, so the re-sends
+        don't land back in the queue being drained).
+
+    (c) **The anti-storm cooldown locked out its own headline case.** The
+        re-arm had no cap, so a client whose link dropped could never reclaim
+        its own stale session while auto-reconnecting — exactly the scenario
+        this feature exists for. `REPREEMPT_MAX_LOCKOUT` (30 s) bounds it from
+        the eviction; within the cap the re-arm still throttles a storm, past
+        it the bar lifts even under a continuing storm. The
+        `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` notice remains the real fix
+        for the loop; this heuristic is only a backstop, so bounding it is the
+        right trade. `recently_evicted` is now `(IpAddr, evicted_at, last_try)`.
+
+    Covered by `src/conn_test.rs::a_silent_candidate_cannot_wedge_the_accept_loop`
+    (live session + a silent candidate + session end → a later client must
+    still be served), verified to fail without the fix — it times out with
+    "the loop never accepted it" — and pass with it.
