@@ -71,7 +71,7 @@ use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
@@ -375,6 +375,22 @@ struct Args {
     /// Reuses the same window-gather machinery as the Ctrl+Alt+G hotkey.
     #[arg(long)]
     restore_windows_on_disconnect: bool,
+
+    /// Lock the local macOS session when the last RDP client genuinely
+    /// disconnects (opt-in; only meaningful with --detach-primary/
+    /// --capture-primary/--shield-primary). Fires via `open
+    /// ScreenSaverEngine.app` after the existing disconnect-confirmation
+    /// grace PLUS an additional tunable safety buffer
+    /// (MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
+    /// LOCK_ON_DISCONNECT_DELAY_MS, default ~25s total) to reduce — not
+    /// eliminate — the chance of locking mid a blank-recovery self-heal
+    /// reconnect. Only an actual password-required lock if the account has
+    /// "require password" set to Immediately; otherwise this just starts
+    /// the screensaver. Heuristic, not a guarantee; see
+    /// docs/known-quirks.md. Never fires on server shutdown/kill, only on a
+    /// genuine watcher-observed last-client-disconnect. macOS-only.
+    #[arg(long)]
+    lock_on_disconnect: bool,
 
     /// Expose a loopback (127.0.0.1) read-only live-telemetry endpoint for the
     /// menu-bar controller's Status pane (bitrate/RTT/fps). Default off. No disk
@@ -1162,6 +1178,335 @@ fn restore_gather_windows(_display_id: u32) -> usize {
     0
 }
 
+/// Extra safety buffer on top of the overlay watcher's `REACTIVATION_GRACE`
+/// before `--lock-on-disconnect` actually locks the screen. Default chosen to
+/// clear the documented blank-recovery worst case (~12-15s drop-then-ARC-
+/// reconnect cycle, see docs/known-quirks.md) with real margin — a false-
+/// positive lock mid a legitimate self-heal is a worse outcome than staying
+/// unlocked a bit longer than strictly necessary after a genuine disconnect.
+/// Tunable via MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
+/// LOCK_ON_DISCONNECT_DELAY_MS.
+const LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS: u64 = 22_500; // + 2.5s grace ≈ 25s total
+
+fn parse_lock_on_disconnect_delay_ms(env_override: Option<&str>) -> u64 {
+    env_override
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS)
+}
+
+fn lock_on_disconnect_delay_ms() -> u64 {
+    parse_lock_on_disconnect_delay_ms(
+        std::env::var("MACRDP_LOCK_ON_DISCONNECT_DELAY_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Lock the local macOS session by launching `ScreenSaverEngine.app`
+/// (no special TCC/entitlement needed beyond what `open` itself needs).
+/// **Note the older `CGSession -suspend` menu-extra trick documented widely
+/// online does NOT work here** — as of macOS 26 the `Menu Extras/User.menu`
+/// bundle that historically shipped `CGSession` no longer exists (confirmed
+/// live: only `AirPort.menu`/`VPN.menu`/etc. remain under `Menu Extras/`).
+/// `open -a ScreenSaverEngine` engages the screensaver, which macOS then
+/// treats as an actual password-required lock **only if the account has
+/// "require password" set to Immediately** (`sysadminctl -screenLock
+/// status`) — macrdp does not check or change that setting (changing
+/// security settings is out of scope), so this is a best-effort action: on
+/// an account configured with a delayed password requirement, this merely
+/// starts the screensaver rather than truly locking. Returns whether the
+/// launch command itself succeeded (best-effort — we can't independently
+/// confirm the screen actually locked, only that `open` didn't fail).
+#[cfg(target_os = "macos")]
+fn lock_session() -> bool {
+    const SCREEN_SAVER_ENGINE: &str = "/System/Library/CoreServices/ScreenSaverEngine.app";
+    if !std::path::Path::new(SCREEN_SAVER_ENGINE).exists() {
+        tracing::warn!(
+            path = SCREEN_SAVER_ENGINE,
+            "lock-on-disconnect: ScreenSaverEngine not found — cannot lock the screen"
+        );
+        return false;
+    }
+    match std::process::Command::new("/usr/bin/open")
+        .arg(SCREEN_SAVER_ENGINE)
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            tracing::warn!(
+                ?status,
+                "lock-on-disconnect: open ScreenSaverEngine.app exited non-zero"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("lock-on-disconnect: failed to launch ScreenSaverEngine.app: {e}");
+            false
+        }
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn lock_session() -> bool {
+    false
+}
+
+/// Pure parse for the `MACRDP_AUTO_UNLOCK` escape hatch — default ON (no
+/// flag/config surface by design; see the auto-unlock note below), so this
+/// only needs to recognize an explicit disable.
+fn auto_unlock_enabled(env_override: Option<&str>) -> bool {
+    !matches!(
+        env_override
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+/// Consecutive auto-unlock failures for the CURRENT lock (reset to 0 on a
+/// success). Capped at 2 — see the reasoning in docs/known-quirks.md: a
+/// failure here is far more likely a wake/timing mechanical issue than a
+/// wrong password (the password is the same one PAM already validated at
+/// startup and every connecting RDP client has proven knowledge of via
+/// CredSSP), so one retry is worth allowing — but macOS's PAM throttle
+/// counts failed submissions regardless of cause, and gives only 3 free
+/// attempts before an escalating delay, so 2 stays inside that margin
+/// rather than risking real lockout escalation from a stuck bug.
+static AUTO_UNLOCK_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const AUTO_UNLOCK_MAX_CONSECUTIVE_FAILURES: u32 = 2;
+// Compile-time guarantee that the cap above never regresses past macOS's
+// 3-free-attempts PAM/OpenDirectory throttle margin.
+const _: () = assert!(AUTO_UNLOCK_MAX_CONSECUTIVE_FAILURES < 3);
+
+/// Best-effort, loud alert that auto-unlock has given up for this lock —
+/// deliberately NOT just a log line, since this is exactly the moment the
+/// user needs to know they may have to unlock manually. Layered the way
+/// this project already handles unreliable notification delivery for the
+/// self-signed build (see `file_promise.rs`'s afplay + best-effort osascript
+/// combo): a system alert SOUND is the reliable channel here, a notification
+/// banner is attempted best-effort on top of it.
+#[cfg(target_os = "macos")]
+fn alert_auto_unlock_gave_up() {
+    let _ = std::process::Command::new("/usr/bin/afplay")
+        .arg("/System/Library/Sounds/Basso.aiff")
+        .status();
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "display notification \"auto-unlock stopped after repeated failures — the \
+             screen may need to be unlocked manually\" with title \"macrdp\" sound name \
+             \"Basso\"",
+        ])
+        .status();
+}
+#[cfg(not(target_os = "macos"))]
+fn alert_auto_unlock_gave_up() {}
+
+/// Attempt to unlock the local session by typing `password` into the
+/// screensaver lock screen, if (and only if) it's currently locked
+/// ([`virtual_display::screen_is_locked`]). Types it as REAL per-character
+/// keycode events (see below) followed by Return. This is the same class of
+/// mechanism Apple's own Screen Sharing/VNC and Apple Remote Desktop use to
+/// unlock a screensaver-locked Mac remotely — see docs/known-quirks.md for
+/// the SecureEventInput research behind why synthetic input is accepted here
+/// at all. Returns `true` if nothing needed to be done or the unlock
+/// succeeded; `false` if it was locked and is still locked afterward.
+///
+/// **Three failed live iterations are baked into the current shape — read
+/// before changing any of it (full write-up in docs/known-quirks.md):**
+/// 1. Leading with a synthetic Return as a "wake gesture" before typing
+///    submitted an EMPTY password (field visibly shook) and left the real
+///    password landing in a still-settling field. Never reintroduce a
+///    keypress before the password.
+/// 2. Filling the field with one bulk `set_string_from_utf16_unchecked`
+///    event then posting Return did nothing — retried Returns and longer
+///    settle delays did not help either, because…
+/// 3. …the bulk fill leaves the field INERT: the text is displayed but the
+///    field's own text-change bookkeeping never fires, so it ignores every
+///    subsequent Return — **including a REAL Return typed on the physical
+///    keyboard**, until a character was manually added and deleted. That
+///    observation is what ruled out timing entirely and forced the current
+///    approach: only genuine per-character keycode events (what a physical
+///    keyboard sends, and what the original successful manual test used)
+///    make the field accept a submit.
+#[cfg(target_os = "macos")]
+fn attempt_auto_unlock(password: &str) -> bool {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    // macOS virtual keycode for Return (matches the constant already named
+    // in the keyboard-layout translation notes in known-quirks.md).
+    const VK_RETURN: u16 = 0x24;
+
+    if !virtual_display::screen_is_locked() {
+        return true;
+    }
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        warn!("auto-unlock: CGEventSource::new failed");
+        return false;
+    };
+    // Modifier state has to be posted on both sources — see `post_flags` below.
+    let Ok(source_hid) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        warn!("auto-unlock: CGEventSource::new (HID) failed");
+        return false;
+    };
+
+    // Resolve EVERY character to a real keystroke before typing anything —
+    // if any character can't be produced on this Mac's active layout, bail
+    // without typing rather than submit a partial/wrong password (which
+    // would shake the field and burn one of macOS's 3 free PAM attempts).
+    let Some(mut layout) = keyboard_layout::KeyboardLayout::current() else {
+        warn!("auto-unlock: could not read the Mac's active keyboard layout — skipping");
+        return false;
+    };
+    let map = layout.reverse_map();
+    let mut plan: Vec<(u16, bool, bool)> = Vec::with_capacity(password.len());
+    for ch in password.chars() {
+        let Some(&keystroke) = map.get(&ch) else {
+            // Deliberately does NOT log the character — it's password material.
+            warn!(
+                "auto-unlock: a password character has no keystroke on the Mac's \
+                 active keyboard layout — skipping the attempt rather than \
+                 submitting an incomplete password"
+            );
+            return false;
+        };
+        plan.push(keystroke);
+    }
+
+    // Wake/focus the field BEFORE typing. LIVE-TESTED 2026-08-28 (round 5):
+    // with per-character typing the field finally accepted a submit, but the
+    // password arrived one character SHORT (8 of 9) — the first keystroke is
+    // consumed waking/focusing the lock screen instead of entering text.
+    // Round 1's mistake was using RETURN as that wake (it submitted an empty
+    // password); a bare SHIFT tap cannot insert text and cannot submit, so
+    // it wakes the field harmlessly. Posted as FlagsChanged on BOTH event
+    // sources, the pattern `input.rs::post_flags_changed` established —
+    // `[NSEvent modifierFlags]` and the HID-level state are backed by
+    // different sources and both need to see it.
+    const VK_SHIFT: u16 = 0x38;
+    let post_flags = |flags: CGEventFlags| {
+        for src in [&source, &source_hid] {
+            if let Ok(ev) = CGEvent::new_keyboard_event(src.clone(), VK_SHIFT, true) {
+                ev.set_flags(flags);
+                ev.set_type(CGEventType::FlagsChanged);
+                ev.post(CGEventTapLocation::HID);
+            }
+        }
+    };
+    post_flags(CGEventFlags::CGEventFlagShift);
+    post_flags(CGEventFlags::empty());
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    // Clear anything the wake (or a previous rejected attempt) may have left
+    // behind, so a stray character can't corrupt the password we're about to
+    // type. Backspace on an empty field is a harmless no-op, which is why
+    // this is safe to do unconditionally.
+    const VK_DELETE: u16 = 0x33;
+    for _ in 0..(plan.len() + 4).min(64) {
+        if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), VK_DELETE, true) {
+            down.post(CGEventTapLocation::HID);
+        }
+        if let Ok(up) = CGEvent::new_keyboard_event(source.clone(), VK_DELETE, false) {
+            up.post(CGEventTapLocation::HID);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Type it as real per-character keycode events. LIVE-TESTED 2026-08-28:
+    // a single bulk `set_string_from_utf16_unchecked` event fills the field
+    // VISIBLY but leaves it inert — even a REAL Return on the physical
+    // keyboard was then ignored, until a character was manually added and
+    // deleted. So the field's text-change bookkeeping only fires for genuine
+    // keystrokes; no amount of settle delay or Return-retry fixes a bulk
+    // fill. Modifiers are held across runs via real FlagsChanged events (not
+    // just per-event flags) so a shifted character can't come out unshifted
+    // — same reasoning as `input.rs::post_flags_changed`.
+    let mut shift_held = false;
+    let mut option_held = false;
+    let flags_for = |shift: bool, option: bool| {
+        let mut f = CGEventFlags::empty();
+        if shift {
+            f |= CGEventFlags::CGEventFlagShift;
+        }
+        if option {
+            f |= CGEventFlags::CGEventFlagAlternate;
+        }
+        f
+    };
+    for (vk, shift, option) in &plan {
+        let (shift, option) = (*shift, *option);
+        if shift != shift_held || option != option_held {
+            post_flags(flags_for(shift, option));
+            shift_held = shift;
+            option_held = option;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let flags = flags_for(shift, option);
+        if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), *vk, true) {
+            down.set_flags(flags);
+            down.post(CGEventTapLocation::HID);
+        }
+        if let Ok(up) = CGEvent::new_keyboard_event(source.clone(), *vk, false) {
+            up.set_flags(flags);
+            up.post(CGEventTapLocation::HID);
+        }
+        // Inter-key gap so the field processes each keystroke in order and
+        // two identical adjacent characters aren't coalesced into one.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if shift_held || option_held {
+        post_flags(CGEventFlags::empty());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // LIVE-TESTED 2026-08-28 (round 2): a single Return here is flaky — one
+    // connect unlocked cleanly, the next (same code, same settle) left the
+    // password visibly typed-but-not-submitted again. So the "field not
+    // ready yet" window isn't reliably cleared by any one fixed delay before
+    // Return; retry the SUBMIT keypress itself instead of chasing a bigger
+    // magic number. Deliberately does NOT retype the password (which is
+    // already sitting correctly in the field per the observed symptom) —
+    // just re-sends Return a few times with its own settle between
+    // attempts, polling `screen_is_locked()` throughout so a successful
+    // attempt (whichever one it is) resolves immediately rather than
+    // waiting out the rest of the budget. Same backoff-retry shape already
+    // used for exactly this class of "helper/field needs more time"
+    // flakiness in ShieldedPrimary::install's SHOW_BACKOFF_MS loop.
+    const RETURN_ATTEMPTS: u32 = 3;
+    const RETURN_ATTEMPT_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
+    const UNLOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    for attempt in 1..=RETURN_ATTEMPTS {
+        if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), VK_RETURN, true) {
+            down.post(CGEventTapLocation::HID);
+        }
+        if let Ok(up) = CGEvent::new_keyboard_event(source.clone(), VK_RETURN, false) {
+            up.post(CGEventTapLocation::HID);
+        }
+        let deadline = std::time::Instant::now() + RETURN_ATTEMPT_BUDGET;
+        loop {
+            if !virtual_display::screen_is_locked() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(UNLOCK_POLL_INTERVAL);
+        }
+        if attempt < RETURN_ATTEMPTS {
+            tracing::debug!(
+                attempt,
+                "auto-unlock: Return not acknowledged yet — retrying"
+            );
+        }
+    }
+    false
+}
+#[cfg(not(target_os = "macos"))]
+fn attempt_auto_unlock(_password: &str) -> bool {
+    true
+}
+
 /// Exit code used when a stuck `--detach-primary` disconnect bounces the process
 /// so launchd restarts it (#168). **Deliberately non-zero** (`EX_UNAVAILABLE`,
 /// distinct from the health watchdog's `70`): with the shipped LaunchAgent
@@ -1191,6 +1536,7 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
@@ -1203,6 +1549,15 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     // reconnect (so the client sees them without Ctrl+Alt+G). No-op otherwise.
     restore_windows: bool,
     physical_main_id: u32,
+    // (--lock-on-disconnect) When true, lock the local session on a genuine
+    // last-client-disconnect (after an extra safety buffer beyond the
+    // REACTIVATION_GRACE poll above). No-op otherwise.
+    lock_on_disconnect: bool,
+    // Auto-unlock on reconnect (always-on default behavior, not a flag —
+    // see the MACRDP_AUTO_UNLOCK escape hatch). The exact same validated
+    // credential used for RDP auth; a no-op if the screen isn't locked.
+    password: Arc<Zeroizing<String>>,
+    auto_unlock: bool,
 ) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
@@ -1279,6 +1634,55 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                             "restore-windows: gathered windows onto the \
                                              virtual display on connect"
                                         );
+                                    }
+                                });
+                            }
+                            // Auto-unlock: if the screen happens to be locked
+                            // (for any reason — a lock-on-disconnect lock, one
+                            // set manually, or macOS's own idle policy), try to
+                            // unlock it now that a client is connected. No-op
+                            // instantly if it isn't locked. Off-thread so the
+                            // watcher loop isn't blocked by the settle delays
+                            // inside attempt_auto_unlock.
+                            if auto_unlock {
+                                let password = Arc::clone(&password);
+                                std::thread::spawn(move || {
+                                    use std::sync::atomic::Ordering as AtomicOrdering;
+                                    if AUTO_UNLOCK_FAILURES.load(AtomicOrdering::SeqCst)
+                                        >= AUTO_UNLOCK_MAX_CONSECUTIVE_FAILURES
+                                    {
+                                        return;
+                                    }
+                                    if attempt_auto_unlock(password.as_str()) {
+                                        let prev =
+                                            AUTO_UNLOCK_FAILURES.swap(0, AtomicOrdering::SeqCst);
+                                        if prev > 0 {
+                                            info!(label, "auto-unlock: succeeded");
+                                        }
+                                        return;
+                                    }
+                                    let failures = AUTO_UNLOCK_FAILURES
+                                        .fetch_add(1, AtomicOrdering::SeqCst)
+                                        + 1;
+                                    warn!(
+                                        label,
+                                        failures,
+                                        "auto-unlock: attempt did not unlock the screen \
+                                         — likely a wake/timing issue rather than a \
+                                         wrong password (the same credential was \
+                                         already validated by PAM and by this \
+                                         connection's own RDP auth)"
+                                    );
+                                    if failures >= AUTO_UNLOCK_MAX_CONSECUTIVE_FAILURES {
+                                        error!(
+                                            label,
+                                            "auto-unlock: {failures} consecutive \
+                                             failures — giving up until the next \
+                                             successful unlock or a macrdp restart, \
+                                             to avoid tripping macOS's password-retry \
+                                             lockout"
+                                        );
+                                        alert_auto_unlock_gave_up();
                                     }
                                 });
                             }
@@ -1397,6 +1801,45 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                         display_id = physical_main_id,
                                         "restore-windows: swept windows back onto the \
                                          built-in display on disconnect"
+                                    );
+                                }
+                            });
+                        }
+                        // (--lock-on-disconnect) Lock the local session after an
+                        // EXTRA safety buffer on top of the REACTIVATION_GRACE poll
+                        // above. That poll only absorbs a fast in-place flap (a core
+                        // reactivation); it can't distinguish a genuine disconnect
+                        // from blank-recovery's slower fallback (a full connection
+                        // drop + ARC auto-reconnect, documented up to ~12-15s worst
+                        // case) — so this waits longer still and re-checks
+                        // `tracker.count` before actually locking, canceling if the
+                        // session came back. Off-thread so the watcher loop isn't
+                        // blocked; naturally abandoned (never fires) if the process
+                        // exits in the meantime (e.g. the #168 restart-on-stuck
+                        // path) — lock-on-disconnect only ever fires on a genuine
+                        // watcher-observed last-client-disconnect, never on server
+                        // shutdown/kill. Heuristic, not a guarantee — see
+                        // docs/known-quirks.md.
+                        if lock_on_disconnect {
+                            let tracker_for_lock = tracker.clone();
+                            std::thread::spawn(move || {
+                                let delay = Duration::from_millis(lock_on_disconnect_delay_ms());
+                                std::thread::sleep(delay);
+                                if tracker_for_lock.count.load(Ordering::SeqCst) > 0 {
+                                    info!(
+                                        label,
+                                        "lock-on-disconnect: session came back during \
+                                         the safety buffer — skipping lock (treating \
+                                         as a delayed reconnect/self-heal)"
+                                    );
+                                    return;
+                                }
+                                info!(label, "lock-on-disconnect: locking the local session");
+                                if !lock_session() {
+                                    warn!(
+                                        label,
+                                        "lock-on-disconnect: failed to lock the \
+                                         session (see warning above)"
                                     );
                                 }
                             });
@@ -1571,6 +2014,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("RESTORE_WINDOWS_ON_DISCONNECT", false) {
         argv.push("--restore-windows-on-disconnect".into());
+    }
+    if on("LOCK_ON_DISCONNECT", false) {
+        argv.push("--lock-on-disconnect".into());
     }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
@@ -1764,6 +2210,17 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // on disconnect (macOS 26.x won't do it in-process), restart under
         // launchd to restore it. Env-read at the disconnect edge.
         ("DETACH_RESTART_ON_STUCK", "MACRDP_DETACH_RESTART_ON_STUCK"),
+        // Extra safety-buffer delay (--lock-on-disconnect) on top of the
+        // overlay watcher's REACTIVATION_GRACE before actually locking the
+        // screen. Env-read at the disconnect edge via lock_on_disconnect_delay_ms().
+        (
+            "LOCK_ON_DISCONNECT_DELAY_MS",
+            "MACRDP_LOCK_ON_DISCONNECT_DELAY_MS",
+        ),
+        // Low-visibility escape hatch for the always-on reconnect auto-unlock
+        // (paired with --lock-on-disconnect, but active independently of it).
+        // Env-read at the reconnect edge via auto_unlock_enabled().
+        ("AUTO_UNLOCK", "MACRDP_AUTO_UNLOCK"),
         // Loopback live-telemetry endpoint port (--stats-endpoint). Read via
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
@@ -1945,13 +2402,14 @@ async fn async_main() -> Result<()> {
              (pick one mechanism for going headless)"
         ));
     }
-    if args.restore_windows_on_disconnect
+    if (args.restore_windows_on_disconnect || args.lock_on_disconnect)
         && !(args.detach_primary || args.capture_primary || args.shield_primary)
     {
         warn!(
-            "--restore-windows-on-disconnect has no effect without \
-             --detach-primary, --capture-primary or --shield-primary (it needs \
-             the headless session watcher); ignoring"
+            "--restore-windows-on-disconnect / --lock-on-disconnect have no \
+             effect without --detach-primary, --capture-primary or \
+             --shield-primary (they need the headless session watcher); \
+             ignoring"
         );
     }
 
@@ -2093,7 +2551,56 @@ async fn async_main() -> Result<()> {
     // guard on 0→≥1 client transitions and drops it on ≥1→0. Both
     // flags subsume --make-primary (each puts the virtual display
     // at (0,0)), so if both are set, only the lazy path runs.
+    let username = args
+        .username
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
+    let password: Zeroizing<String> = if args.keychain {
+        read_password_from_keychain(&username)?
+    } else if let Some(p) = args.password.take() {
+        warn!(
+            "--password is visible to any local user via `ps` and may be saved in \
+             shell history; prefer --keychain (headless) or the interactive prompt. \
+             Kept only for compatibility / scripted tests."
+        );
+        Zeroizing::new(p)
+    } else {
+        Zeroizing::new(
+            rpassword::prompt_password(format!("Password for {username}: "))
+                .context("read password from terminal")?,
+        )
+    };
+    // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
+    // exact validated credential without a second Keychain read — works
+    // identically regardless of which branch above produced it.
+    let password: Arc<Zeroizing<String>> = Arc::new(password);
+    if !args.skip_auth {
+        auth::authenticate(&username, password.as_str())
+            .with_context(|| format!("PAM auth failed for {username}"))?;
+        info!(user = %username, "PAM auth ok");
+    } else {
+        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
+        // listener is reachable beyond loopback so a fat-fingered config
+        // can't accidentally expose an unauth'd RDP server to the LAN.
+        if !args.bind.ip().is_loopback() {
+            return Err(anyhow!(
+                "--skip-auth refused on non-loopback bind {} — \
+                 remove --skip-auth or rebind to 127.0.0.1",
+                args.bind,
+            ));
+        }
+        warn!("--skip-auth set; using --password verbatim without PAM check (loopback only)");
+    }
+
     let session_tracker = capture::SessionTracker::default();
+    // Auto-unlock is always-on default behavior (no CLI flag — see the
+    // Context in the lock-on-disconnect design), except: skipped entirely
+    // under --skip-auth, since in that mode `password` was never validated
+    // by PAM and isn't trustworthy to auto-type (see attempt_auto_unlock's
+    // docs). MACRDP_AUTO_UNLOCK=0 is the low-visibility escape hatch.
+    let auto_unlock =
+        !args.skip_auth && auto_unlock_enabled(std::env::var("MACRDP_AUTO_UNLOCK").ok().as_deref());
     if args.detach_primary {
         let vd_id = virtual_display
             .as_ref()
@@ -2109,6 +2616,9 @@ async fn async_main() -> Result<()> {
             virtual_display::DetachedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
+            args.lock_on_disconnect,
+            Arc::clone(&password),
+            auto_unlock,
         );
     } else if args.capture_primary {
         let vd_id = virtual_display
@@ -2125,6 +2635,9 @@ async fn async_main() -> Result<()> {
             virtual_display::CapturedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
+            args.lock_on_disconnect,
+            Arc::clone(&password),
+            auto_unlock,
         );
     } else if args.shield_primary {
         let vd_id = virtual_display
@@ -2141,6 +2654,9 @@ async fn async_main() -> Result<()> {
             virtual_display::ShieldedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
+            args.lock_on_disconnect,
+            Arc::clone(&password),
+            auto_unlock,
         );
     } else if args.make_primary {
         let vd_id = virtual_display
@@ -2167,44 +2683,6 @@ async fn async_main() -> Result<()> {
                 );
             }
         }
-    }
-
-    let username = args
-        .username
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
-    let password: Zeroizing<String> = if args.keychain {
-        read_password_from_keychain(&username)?
-    } else if let Some(p) = args.password.take() {
-        warn!(
-            "--password is visible to any local user via `ps` and may be saved in \
-             shell history; prefer --keychain (headless) or the interactive prompt. \
-             Kept only for compatibility / scripted tests."
-        );
-        Zeroizing::new(p)
-    } else {
-        Zeroizing::new(
-            rpassword::prompt_password(format!("Password for {username}: "))
-                .context("read password from terminal")?,
-        )
-    };
-    if !args.skip_auth {
-        auth::authenticate(&username, password.as_str())
-            .with_context(|| format!("PAM auth failed for {username}"))?;
-        info!(user = %username, "PAM auth ok");
-    } else {
-        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
-        // listener is reachable beyond loopback so a fat-fingered config
-        // can't accidentally expose an unauth'd RDP server to the LAN.
-        if !args.bind.ip().is_loopback() {
-            return Err(anyhow!(
-                "--skip-auth refused on non-loopback bind {} — \
-                 remove --skip-auth or rebind to 127.0.0.1",
-                args.bind,
-            ));
-        }
-        warn!("--skip-auth set; using --password verbatim without PAM check (loopback only)");
     }
 
     let cert_dir = match args.cert_dir.clone() {
@@ -2824,7 +3302,7 @@ async fn async_main() -> Result<()> {
     // Our Zeroizing<String> still wipes its own allocation at scope exit.
     server.set_credentials(Some(Credentials {
         username: username.clone(),
-        password: (*password).clone(),
+        password: (**password).clone(),
         domain: None,
     }));
 
@@ -2888,6 +3366,70 @@ mod detach_restart_tests {
         // An unrecognized value falls back to the headless default.
         assert!(detach_restart_on_stuck(false, Some("maybe")));
         assert!(!detach_restart_on_stuck(true, Some("maybe")));
+    }
+}
+
+#[cfg(test)]
+mod lock_on_disconnect_tests {
+    use super::{parse_lock_on_disconnect_delay_ms, LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS};
+
+    #[test]
+    fn defaults_when_unset_or_garbage() {
+        assert_eq!(
+            parse_lock_on_disconnect_delay_ms(None),
+            LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS
+        );
+        assert_eq!(
+            parse_lock_on_disconnect_delay_ms(Some("not-a-number")),
+            LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS
+        );
+        assert_eq!(
+            parse_lock_on_disconnect_delay_ms(Some("")),
+            LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS
+        );
+    }
+
+    #[test]
+    fn honors_a_valid_override() {
+        assert_eq!(parse_lock_on_disconnect_delay_ms(Some("5000")), 5000);
+        // Surrounding whitespace tolerated (matches env_u64 elsewhere).
+        assert_eq!(parse_lock_on_disconnect_delay_ms(Some(" 100 ")), 100);
+        assert_eq!(parse_lock_on_disconnect_delay_ms(Some("0")), 0);
+    }
+
+    #[test]
+    fn lock_on_disconnect_alone_parses_without_a_headless_mode() {
+        // The flag is accepted by clap on its own; the no-headless-mode case
+        // is a runtime warn!, not a parse error (mirrors
+        // --restore-windows-on-disconnect's validation).
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["macrdp", "--lock-on-disconnect"]);
+        assert!(args.is_ok());
+        assert!(args.unwrap().lock_on_disconnect);
+    }
+}
+
+#[cfg(test)]
+mod auto_unlock_tests {
+    use super::auto_unlock_enabled;
+
+    #[test]
+    fn defaults_on_when_unset() {
+        assert!(auto_unlock_enabled(None));
+        // Unrecognized values fall back to the default (on), not off.
+        assert!(auto_unlock_enabled(Some("maybe")));
+        assert!(auto_unlock_enabled(Some("1")));
+    }
+
+    #[test]
+    fn recognizes_the_escape_hatch() {
+        assert!(!auto_unlock_enabled(Some("0")));
+        assert!(!auto_unlock_enabled(Some("off")));
+        assert!(!auto_unlock_enabled(Some("OFF")));
+        assert!(!auto_unlock_enabled(Some("false")));
+        assert!(!auto_unlock_enabled(Some("no")));
+        // Surrounding whitespace tolerated (matches other env helpers).
+        assert!(!auto_unlock_enabled(Some(" 0 ")));
     }
 }
 

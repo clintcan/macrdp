@@ -14,14 +14,14 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
+    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -60,6 +60,14 @@ mod macos {
     /// (see [`DETACH_REENABLE_FAILED`]). Returns true at most once per failure.
     pub fn take_detach_reenable_failed() -> bool {
         DETACH_REENABLE_FAILED.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the local macOS session is currently screen-locked. Thin
+    /// re-export of the quarantined private-API touch — see
+    /// `private_api::screen_is_locked` for the mechanism and its
+    /// maintenance/fallback notes.
+    pub fn screen_is_locked() -> bool {
+        private_api::screen_is_locked()
     }
 
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
@@ -1083,11 +1091,29 @@ mod macos {
                     targets = mirrored.into_iter().map(|id| (id, (0, 0))).collect();
                 }
             }
+            // If STILL empty after the online-display fallback above, there is
+            // no physical panel in ANY state (active, mirrored, or disabled) —
+            // not merely inactive. This is the lid-closed case: a closed lid
+            // removes the built-in panel from the display subsystem entirely
+            // (unlike sleep/idle, which leaves it "online but inactive" and
+            // caught by the fallback above). With no panel present at all,
+            // there is nothing rendering a desktop for anyone to see, so
+            // there's genuinely nothing to shield — proceed with `targets`
+            // empty rather than failing. `install` naturally degrades to a
+            // no-op shield (SHOW's `need` is 0, trivially satisfied; the
+            // mirror-break/displace/arrangement blocks below are all gated on
+            // a non-empty `targets`/`broke_mirror` so they no-op too), which
+            // matters because failing here means the whole watcher's
+            // `Ok(ovr) =>` branch — restore-windows, the connect-time window
+            // gather, and auto-unlock — never runs (see the auto-unlock note
+            // in docs/known-quirks.md).
             if targets.is_empty() {
-                return Err(anyhow!(
-                    "no physical display to shield — the virtual display is \
-                     the only online one already"
-                ));
+                tracing::info!(
+                    "no physical display found in any state (not even online-but- \
+                     inactive) — likely the lid is closed. Nothing is showing the \
+                     desktop, so there's nothing to shield; proceeding with an \
+                     empty shield."
+                );
             }
 
             // Break any mirror a physical shares with the vd BEFORE shielding.
@@ -1588,6 +1614,11 @@ mod stub {
 
     /// No detach path off macOS, so nothing ever leaves a panel stuck.
     pub fn take_detach_reenable_failed() -> bool {
+        false
+    }
+
+    /// No screen-lock concept off macOS.
+    pub fn screen_is_locked() -> bool {
         false
     }
 
