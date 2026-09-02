@@ -92,6 +92,35 @@ const CANDIDATE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// and simply reconnects; holding the whole listener for it is the worse trade.
 const CANDIDATE_HANDOFF_GRACE: Duration = Duration::from_millis(750);
 
+/// (vendored, divergence 24) How long ONE `accept_finalize` handshake pass gets
+/// before the connection is dropped.
+///
+/// The companion to `CANDIDATE_NEGOTIATION_TIMEOUT` on the other half of the
+/// accept path. That one bounds a *candidate* being negotiated alongside a live
+/// session; this one bounds the connection actually being served, which was
+/// still an unbounded await. A client can authenticate and then wedge before
+/// the handshake completes, and nothing timed it out.
+///
+/// Observed in the field (macrdp, 2026-09-02): Windows App for macOS build
+/// 68614 intermittently completes X.224, TLS, CredSSP, MCS Connect, Erect
+/// Domain, Attach User and every channel join, then never sends its Client Info
+/// PDU. `tcpdump` during a live hang captured nothing at all and the socket sat
+/// ESTABLISHED with both queues empty, so this is a client-side wedge, cleared
+/// only by restarting the client — but the server still parked on the read and
+/// held the live-session slot, in one case for 45 minutes.
+///
+/// Applies per pass, so a deactivation–reactivation gets its own budget rather
+/// than sharing one with the initial handshake; a reactivation that wedges the
+/// same way is bounded too. It must NOT be hoisted to the `accept_finalize`
+/// LOOP or to its callers: `client_accepted` runs the entire live session
+/// inside that loop, so a timeout there would cap session length.
+///
+/// Generous — a healthy finalize is sub-second, and the slowest observed real
+/// handshake (cellular, heavy retransmits) spent 12 s in CredSSP alone, well
+/// before this point. A false timeout is cheap anyway: the connection drops and
+/// the auto-reconnect cookie brings the client straight back.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// (vendored, divergence 22) What resolved first while a session was live: the
 /// session itself ending, a new inbound connection, or the verdict on a
 /// previously accepted candidate. The `select!` yields one of these and does
@@ -3828,9 +3857,21 @@ impl RdpServer {
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
         loop {
-            let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
-                .await
-                .context("failed to accept client during finalize")?;
+            // (vendored, divergence 24) Bounded: see `FINALIZE_TIMEOUT`. An
+            // authenticated client that wedges mid-handshake used to park this
+            // await forever and hold the live-session slot with it.
+            let finalize = ironrdp_acceptor::accept_finalize(framed, &mut acceptor);
+            let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
+                Ok(res) => res.context("failed to accept client during finalize")?,
+                Err(_) => {
+                    warn!(
+                        timeout = ?FINALIZE_TIMEOUT,
+                        "client went silent during the finalize handshake — dropping the connection so it cannot hold \
+                         the session slot; the client can reconnect"
+                    );
+                    bail!("client stalled during finalize");
+                }
+            };
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
