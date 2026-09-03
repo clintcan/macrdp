@@ -1139,3 +1139,96 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
         }
     }
 }
+
+/// Complete X.224 negotiation + the TLS upgrade, then STOP — deliberately never
+/// sending the MCS Connect Initial that `accept_finalize` is waiting for.
+///
+/// This is the exact shape of the field wedge that motivated
+/// `FINALIZE_TIMEOUT`: the client is authenticated and its socket is healthy,
+/// it has simply stopped producing PDUs.
+async fn connect_client_halted_after_tls<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+) -> anyhow::Result<tokio_rustls::client::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    let mut connector = ClientConnector::new(
+        client_config(client_w, client_h),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    );
+    let mut framed = TokioFramed::new(client_io);
+    let _should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+    let initial = framed.into_inner_no_leftover();
+
+    let mut tls_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+        .with_no_client_auth();
+    tls_cfg.resumption = rustls::client::Resumption::disabled();
+    let tls_connector = TlsConnector::from(Arc::new(tls_cfg));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
+    Ok(tls_connector.connect(server_name, initial).await?)
+}
+
+/// (vendored, divergence 24) A client that authenticates and then goes silent
+/// mid-handshake must be dropped, not parked on forever.
+///
+/// History (macrdp, 2026-09-02): Windows App for macOS build 68614
+/// intermittently completes X.224, TLS, CredSSP, MCS Connect, Erect Domain,
+/// Attach User and every channel join, then never sends its Client Info PDU.
+/// `tcpdump` during a live hang captured nothing and the socket sat ESTABLISHED
+/// with both queues empty — a client-side wedge, cleared only by restarting the
+/// client. But `accept_finalize` was an unbounded await, so the server parked on
+/// the read and held the live-session slot with it; one such connection sat
+/// there for 45 minutes. `CANDIDATE_NEGOTIATION_TIMEOUT` (#180) bounds only the
+/// pre-auth candidate probe on the other half of the accept path, not this.
+///
+/// Time is paused so the 30 s bound costs the suite nothing: tokio auto-advances
+/// the clock whenever the runtime is idle, which — once the client deliberately
+/// stops talking — is exactly the state under test.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_wedges_during_finalize_is_dropped() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let mut server = build_test_server_full(
+                addr.port(),
+                1024,
+                768,
+                true,
+                None,
+                crate::bitmap_codecs(),
+                true,
+            );
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            let sock = connect_with_retry(addr).await?;
+            let mut wedged = connect_client_halted_after_tls(sock, 1280, 800).await?;
+
+            // The server is now parked in `accept_finalize` waiting for a
+            // Connect Initial that will never come. It must give up and close.
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = [0u8; 1];
+            let closed = wedged.read(&mut buf).await;
+
+            assert!(
+                matches!(closed, Ok(0)) || closed.is_err(),
+                "server never dropped a client wedged in finalize — it read {closed:?} instead of \
+                 EOF, so the connection (and the session slot) is held indefinitely"
+            );
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
