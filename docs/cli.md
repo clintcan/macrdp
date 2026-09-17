@@ -45,7 +45,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   equivalents so Windows muscle memory drives macOS
                           #   copy/paste. Off by default (Q excluded; nav keys
                           #   untouched). Auto-suppressed when a terminal is
-                          #   frontmost so Ctrl+C stays SIGINT. macOS-only.
+                          #   frontmost so Ctrl+C stays SIGINT. Also remaps a
+                          #   LEFT Ctrl+click -> Cmd+click, so a Windows-style
+                          #   Ctrl+click on a link opens it in a new tab instead
+                          #   of a secondary click (right/middle click and
+                          #   scroll keep the real modifiers). macOS-only.
 --no-remap-apps LIST      # Comma-separated bundle ids where --map-ctrl-to-cmd is
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
