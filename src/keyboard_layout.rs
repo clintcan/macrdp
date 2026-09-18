@@ -52,6 +52,7 @@ mod macos {
         static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
         fn TISCreateInputSourceList(properties: *const c_void, include_all: u8) -> *const c_void;
         fn TISCopyInputSourceForLanguage(language: CFStringRef) -> TISInputSourceRef;
+        fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
         fn TISGetInputSourceProperty(source: TISInputSourceRef, key: CFStringRef) -> *const c_void;
         fn LMGetKbdType() -> u8;
         fn UCKeyTranslate(
@@ -141,6 +142,78 @@ mod macos {
 
         pub fn label(&self) -> &str {
             &self.label
+        }
+
+        /// The Mac's CURRENTLY ACTIVE keyboard layout — as opposed to
+        /// [`resolve`], which looks up a caller-named layout. Used by the
+        /// reconnect auto-unlock path, which must synthesize keystrokes that
+        /// produce the right characters *on this Mac*, so the active layout is
+        /// the only correct reference.
+        pub fn current() -> Option<KeyboardLayout> {
+            let kbd_type = u32::from(unsafe { LMGetKbdType() });
+            unsafe {
+                let source = TISCopyCurrentKeyboardLayoutInputSource();
+                if source.is_null() {
+                    return None;
+                }
+                // `uchr_from_source` retains its own copy of the layout data,
+                // so the +1 reference from this TISCopy* is ours to release.
+                let uchr = uchr_from_source(source);
+                CFRelease(source as *const c_void);
+                Some(KeyboardLayout {
+                    uchr: uchr?,
+                    kbd_type,
+                    dead_key_state: 0,
+                    label: "current".to_string(),
+                })
+            }
+        }
+
+        /// Build a `character -> (keycode, shift, option)` lookup for this
+        /// layout by probing every character-producing keycode under each
+        /// modifier combination — the REVERSE of [`translate`].
+        ///
+        /// Exists because synthesizing text as one bulk
+        /// `CGEventKeyboardSetUnicodeString` event is NOT equivalent to typing
+        /// for macOS's secure password fields: the text appears, but the
+        /// field's own text-change bookkeeping never fires, so it ignores a
+        /// subsequent Return (live-confirmed 2026-08-28 — even a REAL Return
+        /// on the physical keyboard was ignored until a character was manually
+        /// added and deleted). Real per-character keycode events are what a
+        /// physical keyboard sends, and are what the field actually accepts.
+        ///
+        /// Deliberately probes with Shift rather than Caps Lock, and resets
+        /// `dead_key_state` around every probe so a dead key (which returns
+        /// `Some("")` and would otherwise compose into the next probe) can't
+        /// pollute the map. Multi-character results are skipped; the first
+        /// modifier combination to produce a character wins (unmodified before
+        /// shifted before option), so the simplest keystroke is preferred.
+        pub fn reverse_map(&mut self) -> std::collections::HashMap<char, (u16, bool, bool)> {
+            let mut map: std::collections::HashMap<char, (u16, bool, bool)> =
+                std::collections::HashMap::new();
+            for (shift, option) in [(false, false), (true, false), (false, true), (true, true)] {
+                // 0x00..=0x32 is the contiguous character-producing block (see
+                // `is_translatable_keycode`), minus Return/Tab which are keys
+                // rather than characters. Space (0x31) IS included here — it is
+                // excluded from `is_translatable_keycode` because the RDP input
+                // path must treat it as a key, but a password can contain one.
+                for vk in 0x00u16..=0x32 {
+                    if vk == 0x24 || vk == 0x30 {
+                        continue;
+                    }
+                    self.dead_key_state = 0;
+                    let translated = self.translate(vk, shift, option, false);
+                    self.dead_key_state = 0;
+                    let Some(text) = translated else { continue };
+                    let mut chars = text.chars();
+                    let (Some(ch), None) = (chars.next(), chars.next()) else {
+                        continue;
+                    };
+                    map.entry(ch).or_insert((vk, shift, option));
+                }
+            }
+            self.dead_key_state = 0;
+            map
         }
 
         /// Translate a virtual keycode under the current modifier state into the
@@ -412,6 +485,41 @@ mod macos {
                 Some("1")
             );
             assert_eq!(us.translate(0x12, true, false, false).as_deref(), Some("!"));
+        }
+
+        #[test]
+        fn reverse_map_round_trips_password_characters() {
+            // The reverse map is what the auto-unlock path types with, so it
+            // must resolve the character classes a real password contains —
+            // and every entry must translate back to the character it's
+            // filed under, or auto-unlock would type the wrong password.
+            let mut us = KeyboardLayout::resolve("us").expect("US layout resolves");
+            let map = us.reverse_map();
+
+            for ch in "abz".chars().chain("ABZ".chars()).chain("109".chars()) {
+                assert!(map.contains_key(&ch), "no keystroke mapped for {ch:?}");
+            }
+            // Symbols that commonly appear in passwords, including a shifted
+            // one and space (deliberately included despite being excluded
+            // from `is_translatable_keycode`).
+            for ch in ['!', '@', '-', '.', ' '] {
+                assert!(map.contains_key(&ch), "no keystroke mapped for {ch:?}");
+            }
+            // Known-good specifics on the US layout.
+            assert_eq!(map.get(&'a'), Some(&(0x00, false, false)));
+            assert_eq!(map.get(&'A'), Some(&(0x00, true, false)));
+            assert_eq!(map.get(&' '), Some(&(0x31, false, false)));
+
+            // Every mapping must actually produce its character.
+            let mut layout = KeyboardLayout::resolve("us").expect("US layout resolves");
+            for (ch, &(vk, shift, option)) in &map {
+                let got = layout.translate(vk, shift, option, false);
+                assert_eq!(
+                    got.as_deref(),
+                    Some(ch.to_string().as_str()),
+                    "keystroke for {ch:?} translates back to {got:?}"
+                );
+            }
         }
     }
 }
