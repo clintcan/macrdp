@@ -586,6 +586,18 @@ pub struct RdpServer {
     /// exactly once (after the first activation), not again on each
     /// deactivation-reactivation resize. Reset at the top of `run_connection`.
     auto_reconnect_sent: bool,
+    /// (vendored, divergence 24) Optional per-SERVED-connection signal for the
+    /// input handler: raised to `true` once at the top of `run_connection` and
+    /// `serve_negotiated` — the two entry points that each call `accept_finalize`
+    /// exactly once, with reactivations looping *inside* it — and drained by the
+    /// caller. Lets a process-lifetime input handler reset per-connection state
+    /// (held modifiers, button-down tracking) on a fresh connection WITHOUT
+    /// firing on a live resize / blank-recovery reactivation (which re-run the
+    /// display `updates()` path) and WITHOUT firing for a preemption *candidate*
+    /// (`on_accept` runs for those while the live session is still served).
+    /// `RdpServerInputHandler` has only `keyboard`/`mouse`, so this is the
+    /// narrowest seam that is truly once-per-served-connection.
+    input_reset_request: Option<Arc<AtomicBool>>,
     /// (vendored) Optional UDP-multitransport provider (MS-RDPEMT). When set,
     /// the server offers an auxiliary UDP transport to clients that advertise
     /// support in their GCC MultiTransportChannelData block. M1: negotiation
@@ -1208,6 +1220,7 @@ impl RdpServer {
             current_offer_cookie: None,
             auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
+            input_reset_request: None,
             honor_client_desktop_size: false,
             honor_client_desktop_size_max: None,
             #[cfg(feature = "multitransport")]
@@ -1272,6 +1285,16 @@ impl RdpServer {
     /// Must be called before any client connects.
     pub fn set_display_suppressed_handle(&mut self, handle: Arc<AtomicBool>) {
         self.display_suppressed = handle;
+    }
+
+    /// (vendored, divergence 24) Install a flag the server raises to `true`
+    /// once at the start of every SERVED connection (see the
+    /// `input_reset_request` field for exactly when, and why neither the
+    /// display `updates()` path nor `on_accept` is a substitute). The caller
+    /// drains it (`swap(false)`) to reset per-connection input state. Must be
+    /// called before any client connects.
+    pub fn set_input_reset_handle(&mut self, handle: Arc<AtomicBool>) {
+        self.input_reset_request = Some(handle);
     }
 
     /// (vendored) Serve each session at the desktop size the client
@@ -1546,6 +1569,11 @@ impl RdpServer {
     /// indistinguishable from a normally-accepted one.
     async fn serve_negotiated(&mut self, candidate: NegotiatedCandidate) -> Result<()> {
         self.auto_reconnect_sent = false;
+        // (vendored, divergence 24) Fresh served connection → tell the input
+        // handler to drop the previous connection's per-connection state.
+        if let Some(flag) = &self.input_reset_request {
+            flag.store(true, Ordering::Relaxed);
+        }
         #[cfg(feature = "egfx")]
         {
             self.gfx_handle = candidate.gfx_handle;
@@ -1577,6 +1605,12 @@ impl RdpServer {
         // auto-reconnect-cookie send (it's sent after the first activation, not
         // again on each deactivation-reactivation resize within this connection).
         self.auto_reconnect_sent = false;
+        // (vendored, divergence 24) Same lifecycle for the input handler's
+        // per-connection state: raise once per served connection, here and in
+        // `serve_negotiated`, never inside the reactivation loop.
+        if let Some(flag) = &self.input_reset_request {
+            flag.store(true, Ordering::Relaxed);
+        }
 
         let framed = TokioFramed::new(stream);
 
