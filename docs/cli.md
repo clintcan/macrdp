@@ -142,6 +142,61 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   virtual display the client sees (no Ctrl+Alt+G).
                           #   Reuses the Ctrl+Alt+G gather machinery. Config:
                           #   RESTORE_WINDOWS_ON_DISCONNECT. macOS-only.
+--lock-on-disconnect      # EXPERIMENTAL. Lock the local macOS session when the last
+                          #   RDP client genuinely disconnects (opt-in; needs
+                          #   --detach-primary/--capture-primary/--shield-primary).
+                          #   Fires via `open ScreenSaverEngine.app` after the
+                          #   existing disconnect-confirmation grace PLUS an extra
+                          #   tunable safety buffer (default ~25s total) to reduce
+                          #   the chance of locking mid a blank-recovery self-heal
+                          #   reconnect, which can legitimately take up to ~12-15s.
+                          #   NOTE: the older `CGSession -suspend` menu-extra trick
+                          #   no longer exists as of macOS 26 — ScreenSaverEngine is
+                          #   the current mechanism, and it's only an actual
+                          #   password-required lock if the account has "require
+                          #   password" set to Immediately (`sysadminctl
+                          #   -screenLock status`) — macrdp doesn't check or change
+                          #   that setting, but warns at startup if it isn't. This is
+                          #   a heuristic timer, not a guarantee — see the
+                          #   lock-on-disconnect note in known-quirks.md. Never fires
+                          #   on server shutdown/kill, only on a genuine
+                          #   last-client-disconnect. Config: LOCK_ON_DISCONNECT.
+                          #   MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
+                          #   LOCK_ON_DISCONNECT_DELAY_MS (default 22500 — the extra
+                          #   buffer beyond the ~2.5s reactivation grace) tunes the
+                          #   safety margin: lower for a snappier lock at higher
+                          #   false-positive risk, raise it on a slow/lossy link.
+                          #   Verified on one machine, one macOS version; rests on a
+                          #   private lock-state API. macOS-only.
+--auto-unlock             # EXPERIMENTAL, opt-in (default OFF; config AUTO_UNLOCK=1).
+                          #   When an RDP client reconnects while the local screen
+                          #   happens to be locked — for ANY reason, not just a lock
+                          #   --lock-on-disconnect caused — try to unlock it by
+                          #   typing the same password already validated by PAM at
+                          #   startup and proven by this connection's own RDP auth.
+                          #   Needs one of the three headless modes above (same
+                          #   watcher). Off by default: the effect lands on the
+                          #   PHYSICAL machine — once it fires, anyone standing at
+                          #   that Mac has a live desktop, and it undoes a lock it
+                          #   did not set (someone may have locked it deliberately).
+                          #   Skips the attempt (no submission spent, tries again on
+                          #   the next reconnect) if Caps Lock is on or the active
+                          #   keyboard layout can't produce every password character.
+                          #   Caps a shared, per-lock budget of actual Return
+                          #   submissions (not calls) at 2 — a failure is almost
+                          #   certainly a wake/timing issue rather than a wrong
+                          #   password, but macOS's PAM throttle gives only 3 free
+                          #   attempts, so this stays under that margin regardless of
+                          #   how many times a client reconnects while still locked.
+                          #   On exhausting the budget, a loud alert fires once
+                          #   (sound + best-effort notification + log) and it won't
+                          #   retry until a successful unlock or a macrdp restart.
+                          #   Skipped entirely under --skip-auth (no PAM-validated
+                          #   password to reuse). Verified on one machine, one macOS
+                          #   version, one keyboard layout; rests on typing real
+                          #   keycode events into a secure field and a private
+                          #   lock-state check. See the auto-unlock note in
+                          #   known-quirks.md. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
                           #   --enable-h264). With --adaptive-bitrate it's the

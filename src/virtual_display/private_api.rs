@@ -34,11 +34,66 @@
 use std::ffi::{c_void, CString};
 
 use anyhow::{anyhow, Result};
+use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+use core_foundation::string::CFString;
 use objc2::msg_send;
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2_foundation::{CGSize, NSString};
 
 type CGDirectDisplayID = u32;
+
+extern "C" {
+    fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+    fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
+}
+
+/// `CGSessionCopyCurrentDictionary()` — undocumented CoreGraphics/SkyLight
+/// symbol, the same "CGS" private-API family as `CGSConfigureDisplayEnabled`
+/// above. Returns a dictionary describing the current login-session state;
+/// the also-undocumented `CGSSessionScreenIsLocked` key reads `1` while the
+/// screen is locked. Used only as a READ gate before the reconnect-time
+/// auto-unlock attempt in main.rs.
+///
+/// Returns `None` when the lookup itself couldn't be completed (missing
+/// symbol, or a null dictionary) — genuinely "unknown," not "not locked."
+/// **This distinction is load-bearing at the call site:** `attempt_auto_unlock`
+/// treats a confirmed `Some(false)` as a lock-cycle boundary and resets the
+/// shared per-lock submission budget there, but must NOT do that on a mere
+/// lookup failure — an intermittently-flaky symbol would otherwise reset the
+/// budget on every failed read, defeating the cap `AUTO_UNLOCK_MAX_SUBMISSIONS`
+/// exists to enforce. Deciding *whether to attempt* an unlock can still fail
+/// toward "skip" on `None` (safe, same as before); it's specifically the
+/// budget-reset side that needed the tri-state.
+///
+/// **If Apple ever removes this** (as happened to the `CGSession` *binary*
+/// on macOS 26 — see docs/known-quirks.md, the `--lock-on-disconnect`
+/// entry), the documented longer-lived alternative is watching the
+/// `com.apple.screenIsLocked` / `com.apple.screenIsUnlocked` distributed
+/// notifications (`NSDistributedNotificationCenter`) instead — an older
+/// mechanism with a longer track record, not a drop-in replacement for this
+/// function's shape.
+pub(super) fn screen_is_locked() -> Option<bool> {
+    unsafe {
+        let rtld_default = -2isize as *mut c_void;
+        let name = CString::new("CGSessionCopyCurrentDictionary").unwrap();
+        let sym = libc::dlsym(rtld_default, name.as_ptr());
+        if sym.is_null() {
+            return None;
+        }
+        let copy_dict: unsafe extern "C" fn() -> CFTypeRef = std::mem::transmute(sym);
+        let dict = copy_dict();
+        if dict.is_null() {
+            return None;
+        }
+        // CGSessionCopyCurrentDictionary follows the Copy naming convention
+        // (+1 owned reference) — release it once we're done reading it.
+        let key = CFString::new("CGSSessionScreenIsLocked");
+        let value = CFDictionaryGetValue(dict, key.as_concrete_TypeRef() as CFTypeRef);
+        let locked = !value.is_null() && CFBooleanGetValue(value) != 0;
+        CFRelease(dict);
+        Some(locked)
+    }
+}
 
 /// `CGSConfigureDisplayEnabled(config, display, enabled)` — undocumented
 /// SkyLight symbol re-exported from CoreGraphics on macOS 26. Called

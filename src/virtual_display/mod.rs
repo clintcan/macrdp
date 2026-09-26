@@ -14,14 +14,14 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
+    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -60,6 +60,16 @@ mod macos {
     /// (see [`DETACH_REENABLE_FAILED`]). Returns true at most once per failure.
     pub fn take_detach_reenable_failed() -> bool {
         DETACH_REENABLE_FAILED.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the local macOS session is currently screen-locked —
+    /// `None` when the underlying private-API lookup itself failed (this
+    /// is NOT the same as "not locked"; see the call sites in main.rs for
+    /// why the distinction matters). Thin re-export of the quarantined
+    /// private-API touch — see `private_api::screen_is_locked` for the
+    /// mechanism and its maintenance/fallback notes.
+    pub fn screen_is_locked() -> Option<bool> {
+        private_api::screen_is_locked()
     }
 
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
@@ -1606,6 +1616,12 @@ mod stub {
     /// No detach path off macOS, so nothing ever leaves a panel stuck.
     pub fn take_detach_reenable_failed() -> bool {
         false
+    }
+
+    /// No screen-lock concept off macOS — definitively not locked, not
+    /// "unknown" (there's nothing to fail to look up).
+    pub fn screen_is_locked() -> Option<bool> {
+        Some(false)
     }
 
     pub struct VirtualDisplay;

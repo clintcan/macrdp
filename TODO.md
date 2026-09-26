@@ -39,7 +39,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
     reminder. **At the bump:** confirm upstream's bound arrives via the pin, and pick his
     `a_client_that_wedges_during_finalize_is_dropped` test back up.
   - **#184** (Ctrl+, → Cmd+,) is **stacked on #183** — it contains #183's commits plus its own `2f61a34`.
-    Review after #183 merges. **#181** (`--lock-on-disconnect`) — not reviewed yet.
+    Review after #183 merges. **#181** (`--lock-on-disconnect` + auto-unlock) — reviewed
+    2026-09-23; the `--shield-primary` lid-closed fix split out to its own PR (#187). Two
+    blocking asks addressed: the shared per-lock submission budget now caps actual Return
+    presses (not calls to `attempt_auto_unlock`) at 2, and `--auto-unlock` is now an opt-in
+    flag (was always-on with an env-only escape hatch). Non-blocking follow-ups also taken:
+    a Caps Lock guard (skips rather than guesses), a startup warning when
+    `sysadminctl -screenLock status` isn't Immediately, EXPERIMENTAL markers in the docs, and
+    a rebase onto v0.9.7.
   - Related: issue **#186** — `run_connection`'s `accept_begin`/TLS/CredSSP are unbounded pre-auth
     awaits, the serving-path half that #182 doesn't cover.
 
