@@ -186,9 +186,67 @@ fn is_remappable_shortcut(vk: u16) -> bool {
     )
 }
 
+/// Pure decision table for the MOUSE half of the Ctrl→Cmd remap: should a
+/// left click's Control be delivered to macOS as Command?
+///
+/// Mirrors the keyboard gate in `key()` minus the per-key
+/// `is_remappable_shortcut` test (a click has no vk). Evaluated ONCE per
+/// gesture — at button-down — and the verdict is latched for the matching drag
+/// and up (see `Inner::left_click_remapped`). Split out pure so the whole table
+/// (remap × ctrl × cmd × alt × excluded) is unit-tested on every target, the
+/// way `map_client_to_display` is; the impure inputs are gathered by
+/// `Inner::click_remap_active`, which checks the cheap flags through this
+/// function first and only then pays for the frontmost-app lookup.
+fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded: bool) -> bool {
+    remap_on && ctrl && !cmd && !alt && !excluded
+}
+
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display};
+    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click};
+
+    /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
+    /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
+    /// is not excluded. Every other combination must leave the click alone.
+    #[test]
+    fn mouse_remap_decision_table() {
+        // (remap_on, ctrl, cmd, alt, excluded) -> expected
+        let only_remapping_row = (true, true, false, false, false);
+        for remap_on in [false, true] {
+            for ctrl in [false, true] {
+                for cmd in [false, true] {
+                    for alt in [false, true] {
+                        for excluded in [false, true] {
+                            let row = (remap_on, ctrl, cmd, alt, excluded);
+                            assert_eq!(
+                                should_remap_click(remap_on, ctrl, cmd, alt, excluded),
+                                row == only_remapping_row,
+                                "unexpected verdict for {row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spot-check the rows that each guard exists for, so a future edit that
+    /// drops one is caught by name rather than by a table diff.
+    #[test]
+    fn mouse_remap_guards_each_hold_independently() {
+        // Flag off → never, even with a perfect Ctrl.
+        assert!(!should_remap_click(false, true, false, false, false));
+        // No Ctrl held → nothing to swap.
+        assert!(!should_remap_click(true, false, false, false, false));
+        // Ctrl+Cmd combo passes through unchanged (matches the keyboard gate).
+        assert!(!should_remap_click(true, true, true, false, false));
+        // Ctrl+Alt combo passes through unchanged (matches the keyboard gate).
+        assert!(!should_remap_click(true, true, false, true, false));
+        // Excluded app (terminal / --no-remap-apps) keeps a REAL Ctrl+click.
+        assert!(!should_remap_click(true, true, false, false, true));
+        // The one remapping case.
+        assert!(should_remap_click(true, true, false, false, false));
+    }
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.5
@@ -331,6 +389,44 @@ static MAP_CTRL_TO_CMD: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 
 pub fn set_map_ctrl_to_cmd(on: bool) {
     MAP_CTRL_TO_CMD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Shared per-SERVED-connection reset flag for held-modifier + button state.
+///
+/// Modifier state lives in `Inner`, which is constructed ONCE for the process,
+/// so a modifier whose key-up never arrived — the classic case being the client
+/// losing focus while Ctrl is held — used to persist across disconnect AND
+/// reconnect, clearing only on a server restart. That was survivable while mouse
+/// events ignored `mods`; now that clicks carry the modifier flags, a stuck Ctrl
+/// turns every left click into a secondary click, so it needs a way out. The
+/// MS-RDPBCGR Synchronize PDU can't provide one — it carries only lock keys
+/// (Caps/Num/Scroll/Kana), never Ctrl/Shift/Alt/Cmd — hence this out-of-band
+/// flag. The same reset also clears button-down tracking, which fixes a
+/// pre-existing hazard: a connection dropped between a left-down and its up
+/// left `left_down` stuck, so every move on the next connection posted as
+/// `LeftMouseDragged`.
+///
+/// **Who raises it matters.** `RdpServerInputHandler` has only
+/// `keyboard`/`mouse`, so the connection edge has to come from the server, and
+/// it is raised (vendored `ironrdp-server` divergence 24) once at the top of
+/// `run_connection` / `serve_negotiated` — the two places that each call
+/// `accept_finalize` exactly once, with reactivations looping *inside* it. Two
+/// tempting seams were rejected: the display `updates()` path (re-runs on every
+/// live resize and blank-recovery reactivation, so it would clear a held
+/// modifier — and, once button state is included, break a drag — with no user
+/// action), and `on_accept` (runs for preemption *candidates* while the live
+/// session is still being served, so a mere connection attempt could clear the
+/// live session's modifiers).
+static MODS_RESET_REQUEST: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// The shared reset flag. Hand a clone to the server via
+/// `RdpServer::set_input_reset_handle`; the input handler drains it on its next
+/// event. Idempotent — every call returns the same `Arc`.
+pub fn modifier_reset_handle() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    MODS_RESET_REQUEST
+        .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
 }
 
 /// Bundle ids whose frontmost focus suppresses the Ctrl→Cmd remap, in ADDITION to
@@ -592,6 +688,35 @@ mod macos {
             *slot = down;
             true
         }
+
+        /// True if any held (non-lock) modifier is currently asserted.
+        fn any_held(&self) -> bool {
+            self.l_shift
+                || self.r_shift
+                || self.l_ctrl
+                || self.r_ctrl
+                || self.l_alt
+                || self.r_alt
+                || self.l_cmd
+                || self.r_cmd
+        }
+
+        /// Drop every held non-lock modifier; returns true if anything changed.
+        /// Caps Lock is deliberately preserved: it is a TOGGLE, not a held key,
+        /// it is the one modifier the Synchronize PDU actually reconciles, and
+        /// clearing it here would fight `synchronize()`.
+        fn clear_non_lock(&mut self) -> bool {
+            let had = self.any_held();
+            self.l_shift = false;
+            self.r_shift = false;
+            self.l_ctrl = false;
+            self.r_ctrl = false;
+            self.l_alt = false;
+            self.r_alt = false;
+            self.l_cmd = false;
+            self.r_cmd = false;
+            had
+        }
     }
 
     pub struct Inner {
@@ -641,6 +766,22 @@ mod macos {
         // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
         // Cmd swap + restores the real (Ctrl) modifier state.
         remapped_keys: HashSet<u16>,
+        // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
+        // button, latched at button-down and reused for the drag and the up.
+        // The verdict must not be recomputed per event: the down itself fires
+        // `update_focus_from_click`, which refreshes the frontmost bundle
+        // off-thread, so Ctrl+clicking INTO an excluded app could otherwise
+        // post a Cmd-flagged down and a Ctrl-flagged up — a mismatched pair,
+        // on the very event that drives the context menu. Latching also keeps
+        // `frontmost_is_excluded()` off the per-motion drag path entirely.
+        left_click_remapped: bool,
+        // Monotonic ms of the previous input event, for the idle-gap modifier
+        // resync in `resync_modifiers_if_stale`. u64::MAX = no event yet.
+        last_event_ms: u64,
+        // The shared per-served-connection reset flag (see `modifier_reset_handle`
+        // at file scope). Cloned once here so draining it per event is a bare
+        // atomic swap, not an `Arc` clone.
+        reset_request: std::sync::Arc<std::sync::atomic::AtomicBool>,
         // Optional non-US keyboard layout. When set, ordinary typing keys are
         // translated to characters against this layout and posted as Unicode
         // strings instead of positional keycodes. `None` → keycode path only.
@@ -724,6 +865,9 @@ mod macos {
                 scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
                 remapped_keys: HashSet::new(),
+                left_click_remapped: false,
+                last_event_ms: u64::MAX,
+                reset_request: super::modifier_reset_handle(),
                 layout,
                 klid_handle,
                 last_klid: 0,
@@ -762,6 +906,7 @@ mod macos {
 
         pub fn keyboard(&mut self, event: KeyboardEvent) {
             mark_input_activity();
+            self.resync_modifiers_if_stale();
             match event {
                 KeyboardEvent::Pressed { code, extended } => self.key(code, extended, true),
                 KeyboardEvent::Released { code, extended } => self.key(code, extended, false),
@@ -788,6 +933,111 @@ mod macos {
                 );
                 self.mods.caps_lock = want_caps;
                 self.post_flags_changed(VK_CAPS_LOCK);
+            }
+        }
+
+        /// Drop stale per-connection input state before processing an event.
+        ///
+        /// Both triggers exist because a modifier key-up that never arrived
+        /// leaves `mods` asserting a key the user is not holding, and once
+        /// clicks carry the modifier flags a stuck Ctrl turns every left click
+        /// into a secondary click. Nothing in the protocol reconciles a held
+        /// modifier (Synchronize carries lock keys only). But the two triggers
+        /// clear DIFFERENT amounts, deliberately:
+        ///
+        ///  * **A new served connection** (`reset_request`, raised by the
+        ///    vendored server once at the top of `run_connection` /
+        ///    `serve_negotiated` — never on a reactivation, never for a
+        ///    preemption candidate) — clears EVERYTHING, unconditionally:
+        ///    modifiers, the click latch, outstanding remapped key-downs, and
+        ///    any button still down — which is RELEASED (a synthetic Up through
+        ///    `button()`), not merely forgotten, since macOS itself still
+        ///    believes it held. Nothing from the previous connection is live,
+        ///    so none of it is worth preserving — and the button release in
+        ///    particular fixes a pre-existing hazard: a drop between a left-down
+        ///    and its up left `left_down` stuck, so every move on the next
+        ///    connection posted as `LeftMouseDragged` (a phantom drag) until the
+        ///    user next clicked. This is also why the clears are NOT gated on
+        ///    "a modifier was held": a connection can end with the modifier
+        ///    already released but a remapped key-up or the left-up still
+        ///    outstanding, and that state must not leak into the next one.
+        ///
+        ///  * **An idle gap** of `mods_resync_idle_ms()` — covers the common
+        ///    case with no disconnect at all (the client loses focus mid-session,
+        ///    the modifier is released where we cannot see it) — clears
+        ///    modifiers ONLY. A click or drag in progress inside a live
+        ///    connection is legitimate state: a drag held still sends no events,
+        ///    so clearing button state here would drop it; and clearing the
+        ///    latch here would undo the down/up consistency fix (Ctrl+down,
+        ///    release Ctrl, hold still past the threshold, release → the up must
+        ///    still post with the Cmd the down carried).
+        ///
+        /// The idle gap is deliberately generous, and the cost asymmetry is the
+        /// point: a false clear costs one keystroke (re-press the modifier), a
+        /// missed one costs every click until the server restarts. Any event — a
+        /// mouse move included — refreshes the timer, so the only false-positive
+        /// shape is a genuine multi-second hold with zero input in between.
+        fn resync_modifiers_if_stale(&mut self) {
+            let now = monotonic_ms();
+            let idle_ms = mods_resync_idle_ms();
+            let idled = self.last_event_ms != u64::MAX
+                && idle_ms > 0
+                && now.saturating_sub(self.last_event_ms) >= idle_ms;
+            self.last_event_ms = now;
+            let reconnected = self
+                .reset_request
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            if !(idled || reconnected) {
+                return;
+            }
+
+            if reconnected {
+                // Connection edge: release any button macOS still believes is
+                // held — we posted the Down, the connection died before the Up.
+                // Go through `button()` so the Up carries the same (latched)
+                // flags the Down did and the click bookkeeping stays paired,
+                // and do it BEFORE clearing modifiers so the pair can't
+                // disagree. This also zeroes `left_down`/`right_down`/
+                // `middle_down`, so the next move posts as MouseMoved, not a
+                // phantom `LeftMouseDragged`.
+                if self.left_down {
+                    self.button(CGMouseButton::Left, false);
+                }
+                if self.right_down {
+                    self.button(CGMouseButton::Right, false);
+                }
+                if self.middle_down {
+                    self.button(CGMouseButton::Center, false);
+                }
+            }
+
+            // Snapshot first so the log shows WHAT was stuck.
+            let stuck = self.mods.cg_flags().bits();
+            let had_mods = self.mods.clear_non_lock();
+
+            if reconnected {
+                // Drop the remaining per-gesture state regardless of whether a
+                // modifier was held (see the doc): an outstanding remapped
+                // key-down or a latch left by a Down whose Up never came.
+                self.remapped_keys.clear();
+                self.left_click_remapped = false;
+            }
+
+            // Only bother macOS when a modifier was actually released: our
+            // earlier FlagsChanged left the session state asserting it, and
+            // macOS derives press-vs-release from the flags diff, so one event
+            // carrying the now-empty set releases all of them.
+            if had_mods {
+                debug!(
+                    reason = if reconnected {
+                        "new connection"
+                    } else {
+                        "idle gap"
+                    },
+                    stuck_flags = format!("0x{stuck:08X}"),
+                    "clearing stale held modifiers"
+                );
+                self.post_flags_changed(VK_LCMD);
             }
         }
 
@@ -1019,6 +1269,53 @@ mod macos {
             }
         }
 
+        /// Swap Control→Command in both the public CGEventFlag bits and the
+        /// device-dependent NX bits, leaving every other modifier intact.
+        /// Shared by the keyboard remap (`post_ctrl_as_cmd`) and the mouse
+        /// remap (`mouse_flags`, when the latched click verdict is set).
+        fn ctrl_to_cmd_flags(&self) -> CGEventFlags {
+            let mut bits = self.mods.cg_flags().bits();
+            bits &= !CGEventFlags::CGEventFlagControl.bits();
+            bits &= !(NX_DEVICE_L_CTRL | NX_DEVICE_R_CTRL);
+            bits |= CGEventFlags::CGEventFlagCommand.bits();
+            bits |= NX_DEVICE_L_CMD;
+            CGEventFlags::from_bits_retain(bits)
+        }
+
+        /// Whether the Ctrl→Cmd swap applies to a left click being pressed
+        /// right now — the mouse analogue of the keyboard remap, so a
+        /// Windows-style Ctrl+click behaves like a macOS Cmd+click (open a link
+        /// in a new tab) instead of a secondary/context click. The decision
+        /// table itself is the pure `should_remap_click`; this gathers its
+        /// inputs. Evaluated at button-down ONLY and latched (see
+        /// `left_click_remapped`), never on the drag or the up.
+        ///
+        /// Two-step on purpose: the cheap flag checks go through the table
+        /// first, and only if they agree do we pay for `frontmost_is_excluded()`
+        /// (two mutexes, a per-candidate `format!`, and — before the first click
+        /// of a session, while `LAST_FOCUS_BUNDLE` is still `None` — a
+        /// synchronous AX round-trip on the input thread).
+        fn click_remap_active(&self) -> bool {
+            let cheap_gate_open = super::should_remap_click(
+                super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed),
+                self.mods.has_ctrl(),
+                self.mods.has_cmd(),
+                self.mods.has_alt(),
+                false, // assume not excluded; the real check is the step below
+            );
+            cheap_gate_open && !frontmost_is_excluded()
+        }
+
+        /// Flags to stamp on a mouse event: the live held-modifier state, with
+        /// Control swapped for Command when `remapped` (the latched verdict).
+        fn mouse_flags(&self, remapped: bool) -> CGEventFlags {
+            if remapped {
+                self.ctrl_to_cmd_flags()
+            } else {
+                self.mods.cg_flags()
+            }
+        }
+
         /// Post a curated `Ctrl+<vk>` shortcut as `Cmd+<vk>` (--map-ctrl-to-cmd).
         /// On **down**: present Cmd-held (not Ctrl) to both modifier views via a
         /// FlagsChanged carrying the swapped flags, then post the key-down with
@@ -1028,14 +1325,7 @@ mod macos {
         /// `self.mods` already reflects it). Shift/Caps in `self.mods` carry
         /// through unchanged, so `Ctrl+Shift+Z` → `Cmd+Shift+Z` (redo) works.
         fn post_ctrl_as_cmd(&self, vk: u16, down: bool) {
-            // Swap Control→Command in both the public CGEventFlag bits and the
-            // device-dependent NX bits, leaving every other modifier intact.
-            let mut bits = self.mods.cg_flags().bits();
-            bits &= !CGEventFlags::CGEventFlagControl.bits();
-            bits &= !(NX_DEVICE_L_CTRL | NX_DEVICE_R_CTRL);
-            bits |= CGEventFlags::CGEventFlagCommand.bits();
-            bits |= NX_DEVICE_L_CMD;
-            let swapped = CGEventFlags::from_bits_retain(bits);
+            let swapped = self.ctrl_to_cmd_flags();
 
             if down {
                 for source in [&self.source, &self.source_hid] {
@@ -1240,6 +1530,7 @@ mod macos {
             letterbox: bool,
         ) {
             mark_input_activity();
+            self.resync_modifiers_if_stale();
             match event {
                 MouseEvent::Move { x, y } => self.move_to(x, y, desktop_w, desktop_h, letterbox),
                 MouseEvent::LeftPressed => self.button(CGMouseButton::Left, true),
@@ -1317,6 +1608,15 @@ mod macos {
             else {
                 return;
             };
+            // Carry the held-modifier state onto the move/drag, just as the
+            // keyboard path does — so a Cmd/Shift/Alt+drag reads correctly
+            // (e.g. Shift-drag to extend a selection). Without this the event
+            // is delivered with empty modifierFlags regardless of what's held.
+            // During a left drag reuse the Ctrl→Cmd verdict LATCHED at
+            // button-down, so the whole gesture posts one consistent modifier
+            // set — and so this path, which fires hundreds of times a second,
+            // never evaluates the frontmost-app check itself.
+            ev.set_flags(self.mouse_flags(self.left_down && self.left_click_remapped));
             ev.post(CGEventTapLocation::HID);
         }
 
@@ -1367,6 +1667,22 @@ mod macos {
                 state_slot.map(|s| s.count).unwrap_or(1)
             };
 
+            // Ctrl→Cmd verdict for this click. Decided ONCE, at left-button-down,
+            // and latched for the matching up (and any drag in between) so the
+            // pair can never disagree — see `left_click_remapped`. LEFT BUTTON
+            // ONLY: the promise is that a Windows-style Ctrl+click opens a link
+            // in a new tab; turning a Ctrl+right-click into a Cmd+right-click was
+            // never intended, so right/middle carry the real held modifiers.
+            let remapped = match (button, down) {
+                (CGMouseButton::Left, true) => {
+                    let verdict = self.click_remap_active();
+                    self.left_click_remapped = verdict;
+                    verdict
+                }
+                (CGMouseButton::Left, false) => std::mem::take(&mut self.left_click_remapped),
+                _ => false,
+            };
+
             let Ok(ev) = CGEvent::new_mouse_event(
                 self.source.clone(),
                 etype,
@@ -1377,6 +1693,17 @@ mod macos {
                 return;
             };
             ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
+            // Attach the currently-held modifier state to the click. macOS does
+            // NOT fold the session's modifier flags into a synthesized mouse
+            // event on its own, so without this a click while Cmd/Shift/Ctrl/Alt
+            // is held arrives with empty modifierFlags — Cmd+click doesn't open a
+            // link in a new tab, Shift+click doesn't range-select, and Ctrl+click
+            // isn't a secondary click. Mirrors the keyboard path (`key()`), which
+            // set_flags for exactly this reason. With --map-ctrl-to-cmd on and
+            // `remapped` latched above, a plain Ctrl is delivered as Cmd so a
+            // Windows-style Ctrl+click opens a link in a new tab (Cmd+click)
+            // rather than firing a secondary/context click.
+            ev.set_flags(self.mouse_flags(remapped));
             ev.post(CGEventTapLocation::HID);
 
             // On a button-down, record which app's window is under the cursor so
@@ -1413,6 +1740,13 @@ mod macos {
             else {
                 return;
             };
+            // Carry the held modifiers so Shift+scroll (horizontal in most apps)
+            // and Cmd+scroll (zoom) work, same as clicks and drags. Deliberately
+            // NO Ctrl→Cmd swap here: the remap's promise is scoped to the
+            // primary button, and Ctrl+scroll is macOS's own screen-zoom
+            // accessibility gesture — silently rewriting it to Cmd+scroll would
+            // hijack a system binding.
+            ev.set_flags(self.mods.cg_flags());
             ev.post(CGEventTapLocation::HID);
         }
     }
@@ -1650,6 +1984,21 @@ mod macos {
         use std::sync::OnceLock;
         static START: OnceLock<Instant> = OnceLock::new();
         START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// Idle gap (ms) after which held modifiers are presumed stale and cleared
+    /// on the next input event — see `Inner::resync_modifiers_if_stale`.
+    /// `MACRDP_MODS_RESYNC_IDLE_MS` overrides; `0` disables the idle trigger
+    /// (the per-connection reset still applies). Read once.
+    fn mods_resync_idle_ms() -> u64 {
+        use std::sync::OnceLock;
+        static V: OnceLock<u64> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("MACRDP_MODS_RESYNC_IDLE_MS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(10_000)
+        })
     }
 
     /// Record that an RDP input event was just forwarded.
@@ -3405,6 +3754,34 @@ mod macos {
             tm.tm_min,
             tm.tm_sec
         )
+    }
+
+    #[cfg(test)]
+    mod modifier_state_tests {
+        use super::*;
+
+        /// The stale-modifier resync must drop every HELD modifier but leave
+        /// Caps Lock alone — it's a toggle reconciled by `synchronize()`, and
+        /// clearing it here would fight that path.
+        #[test]
+        fn clear_non_lock_drops_held_keys_but_preserves_caps_lock() {
+            let mut m = ModifierState::default();
+            assert!(!m.clear_non_lock(), "nothing held → nothing changed");
+
+            m.apply(VK_LCTRL, true);
+            m.apply(VK_RSHIFT, true);
+            m.apply(VK_CAPS_LOCK, true); // toggles ON
+            assert!(m.has_ctrl() && m.has_shift() && m.caps_lock);
+
+            assert!(m.clear_non_lock(), "held keys were cleared");
+            assert!(!m.any_held());
+            assert!(m.caps_lock, "Caps Lock toggle must survive a resync");
+            assert_eq!(
+                m.cg_flags().bits() & CGEventFlags::CGEventFlagControl.bits(),
+                0,
+                "no Control bit left on the wire flags"
+            );
+        }
     }
 }
 

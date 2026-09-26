@@ -1926,3 +1926,33 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (live session + a silent candidate + session end → a later client must
     still be served), verified to fail without the fix — it times out with
     "the loop never accepted it" — and pass with it.
+
+(24) Per-SERVED-connection input-reset signal — `set_input_reset_handle`
+    (NOT upstreamed; added 2026-09-15 for macrdp PR #183).
+    `RdpServer` gains an optional `input_reset_request: Option<Arc<AtomicBool>>`,
+    installed via `set_input_reset_handle` (same shape as
+    `set_display_suppressed_handle`), which the server raises to `true` once at
+    the top of `run_connection` AND `serve_negotiated` — right next to the
+    divergence-13 `auto_reconnect_sent = false`, whose lifecycle is identical.
+    The caller (macrdp's `input.rs`) drains it with `swap(false)` on its next
+    input event to reset per-connection state that would otherwise live for the
+    whole process: held modifiers, the Ctrl→Cmd click latch, outstanding remapped
+    key-downs, and button-down tracking.
+
+    **Why this seam and not the two obvious ones (both tried / considered):**
+    - The display `updates()` path (`RdpServerDisplay::updates` →
+      `build_updates` → `ScreenCaptureUpdates::start`) is where macrdp already
+      resets `display_suppressed` per connection, and was the first cut. But it
+      runs at connect AND after every deactivation-reactivation — i.e. on every
+      live client resize and every blank-recovery reactivation — so a reset
+      there clears a held modifier (and, once button state is included, breaks a
+      drag in progress) with no user action. Reviewed out on #183.
+    - `on_accept` (`ConnectionHandler`) looks like a per-connection hook but runs
+      for **preemption candidates** too (divergence 23), while the live session
+      is still being served — so a mere connection attempt, including an
+      unauthenticated one, could clear the live session's modifiers.
+    `run_connection` / `serve_negotiated` each call `accept_finalize` exactly
+    once and the reactivation loop lives *inside* it, so a signal raised there
+    fires exactly once per connection that is actually served — never for a
+    reactivation, never for a losing candidate. Off by default (`None`), so the
+    upstream-shaped path is byte-identical unless macrdp installs the handle.
