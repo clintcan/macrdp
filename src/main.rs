@@ -3330,6 +3330,15 @@ async fn async_main() -> Result<()> {
     // flag the display never sees.
     server.set_display_suppressed_handle(display_suppressed);
 
+    // Per-SERVED-connection reset for the input handler's held-modifier and
+    // button-down state (vendored divergence 24). The server raises this once
+    // at the top of `run_connection`/`serve_negotiated` — not on a live-resize
+    // or blank-recovery reactivation, and not for a preemption candidate — and
+    // the input handler drains it on its next event. See
+    // `input::modifier_reset_handle` for why the display `updates()` path and
+    // `on_accept` were both the wrong seam.
+    server.set_input_reset_handle(input::modifier_reset_handle());
+
     // The acceptor records the client's announced keyboard-layout id (KLID) in
     // its Client Core Data; the server publishes it here so the input handler
     // can auto-select a matching non-US layout (when --keyboard-layout is unset).

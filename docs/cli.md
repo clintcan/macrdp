@@ -41,11 +41,15 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   must be installed on the Mac. Auto-detect is the
                           #   default (no flag needed). macOS-only.
 --map-ctrl-to-cmd         # Remap Windows editing shortcuts (Ctrl+C/V/X/A/Z/S/F/
-                          #   N/T/W/O/P/R/G, + Shift variants) to their Cmd
+                          #   N/T/W/O/P/R/G/comma, + Shift variants) to their Cmd
                           #   equivalents so Windows muscle memory drives macOS
                           #   copy/paste. Off by default (Q excluded; nav keys
                           #   untouched). Auto-suppressed when a terminal is
-                          #   frontmost so Ctrl+C stays SIGINT. macOS-only.
+                          #   frontmost so Ctrl+C stays SIGINT. Also remaps a
+                          #   LEFT Ctrl+click -> Cmd+click, so a Windows-style
+                          #   Ctrl+click on a link opens it in a new tab instead
+                          #   of a secondary click (right/middle click and
+                          #   scroll keep the real modifiers). macOS-only.
 --no-remap-apps LIST      # Comma-separated bundle ids where --map-ctrl-to-cmd is
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
