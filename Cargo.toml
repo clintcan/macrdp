@@ -70,6 +70,10 @@ nfsserve = "0.11.0"
 [dev-dependencies]
 ironrdp-connector = "0.10"
 ironrdp-tokio = "0.10"
+# `start_paused` for the divergence-24 finalize-timeout regression test, so its
+# 30 s bound costs the suite no wall-clock time. Dev-only: `cargo build` does not
+# pull dev-dependencies, so `test-util` never reaches the shipped binary.
+tokio = { version = "1", features = ["test-util"] }
 # For the UDP multitransport loopback test: decode the listener's SYN+ACK reply.
 ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
 
