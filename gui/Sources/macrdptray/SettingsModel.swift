@@ -107,6 +107,14 @@ final class SettingsModel: ObservableObject {
             if modeActive { draft["PRIMARY_MODE"] = "none" }
             if draft["CAPTURE_PRIMARY"] == "1" { draft["CAPTURE_PRIMARY"] = "0" }
         }
+        // No headless mode => clear the lock/unlock pair. Both only run inside the
+        // headless session watcher, so without a mode the server ignores them
+        // (with a startup warning) and a stale ON would silently re-arm the moment
+        // a mode is picked again. `primaryMode` honors a legacy CAPTURE_PRIMARY=1.
+        if primaryMode == "none" {
+            if draft["LOCK_ON_DISCONNECT"] == "1" { draft["LOCK_ON_DISCONNECT"] = "0" }
+            if draft["AUTO_UNLOCK"] == "1" { draft["AUTO_UNLOCK"] = "0" }
+        }
         // Tunnel off => clear the video-migrate child. Tunnel on + migrate on =>
         // ensure H.264 (the migrate toggle is UI-disabled until the tunnel is on,
         // so this never has to re-enable the tunnel itself).

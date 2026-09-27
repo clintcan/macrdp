@@ -361,6 +361,28 @@ private struct DisplayTab: View {
                     + "window and stays lockable.")
                     .font(.caption).foregroundColor(.secondary)
             }
+            Section("Lock while away (experimental)") {
+                let headless = model.primaryMode != "none"
+                Toggle("Lock the Mac when the last client disconnects",
+                       isOn: model.boolBinding("LOCK_ON_DISCONNECT"))
+                    .disabled(!headless)
+                Toggle("Unlock it automatically when a client reconnects",
+                       isOn: model.boolBinding("AUTO_UNLOCK"))
+                    .disabled(!headless)
+                if !headless {
+                    Text("Needs one of the Detach/Blank modes above.")
+                        .font(.caption).foregroundColor(.secondary)
+                } else if model.bool("LOCK_ON_DISCONNECT") && !model.bool("AUTO_UNLOCK") {
+                    Text("Without automatic unlock you'll need to be at the Mac to unlock it — "
+                        + "a remote-only Mac would be unreachable once it locks.")
+                        .font(.caption).foregroundColor(.orange)
+                }
+                Text("Locking starts the screen saver about 25 s after you leave; it's only a real lock "
+                    + "if “Require password after screen saver begins” is set to Immediately "
+                    + "(Lock Screen settings). Automatic unlock types your account password into the "
+                    + "lock screen — while it's unlocked, anyone at the Mac has your desktop.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
         }
         .formStyle(.grouped)
     }
