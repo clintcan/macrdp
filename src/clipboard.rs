@@ -1208,8 +1208,12 @@ impl CliprdrBackend for MacCliprdrBackend {
                         .chunks_exact(2)
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect();
-                    if matches!(units.last(), Some(0)) {
-                        units.pop();
+                    // CF_UNICODETEXT ends at its first NUL. Windows apps
+                    // (Word) can hand over a buffer with MORE than one
+                    // trailing NUL; popping just one left a NUL in the Mac
+                    // text, which Terminal pastes as a visible `^@`.
+                    if let Some(nul) = units.iter().position(|&u| u == 0) {
+                        units.truncate(nul);
                     }
                     match String::from_utf16(&units) {
                         Ok(s) => self.fetch.got.text = Some(s),
@@ -2031,6 +2035,26 @@ mod tests {
         backend.on_format_data_response(FormatDataResponse::new_error());
         assert_eq!(next_request(&mut rx), ClipboardFormatId::CF_DIB);
         assert!(backend.fetch.got.html.is_none());
+    }
+
+    /// CF_UNICODETEXT ends at its first NUL, however many trail it (seen live
+    /// from Word: an extra NUL pasted into Terminal as `^@`).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn remote_text_stops_at_the_first_nul() {
+        let (mut backend, _rx) = test_backend();
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        backend.fetch.queue.clear(); // keep the reply in `got` (no publish)
+        backend
+            .fetch
+            .queue
+            .push_back(Want::Text(ClipboardFormatId::CF_UNICODETEXT));
+        let data: Vec<u8> = "hi\0\0\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        backend.on_format_data_response(FormatDataResponse::new_data(data));
+        assert_eq!(backend.fetch.got.text.as_deref(), Some("hi"));
     }
 
     /// A retry that succeeds is decoded like a first-time reply, and the
