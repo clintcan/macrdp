@@ -161,6 +161,9 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   lock-on-disconnect note in known-quirks.md. Never fires
                           #   on server shutdown/kill, only on a genuine
                           #   last-client-disconnect. Config: LOCK_ON_DISCONNECT.
+                          #   A client still reconnecting when the timer ends
+                          #   holds the lock until it connects (capped at 30 s,
+                          #   so an unauthenticated peer can only delay it).
                           #   MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
                           #   LOCK_ON_DISCONNECT_DELAY_MS (default 22500 — the extra
                           #   buffer beyond the ~2.5s reactivation grace) tunes the

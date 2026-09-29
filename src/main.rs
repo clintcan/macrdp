@@ -29,6 +29,7 @@ mod h264;
 mod health;
 mod input;
 mod keyboard_layout;
+mod lock_activity;
 mod logging;
 mod multitransport;
 mod rdpdr;
@@ -1312,6 +1313,11 @@ fn screen_lock_delay_is_immediate() -> Option<bool> {
     None
 }
 
+/// Bumped on every disconnect edge that arms a `--lock-on-disconnect` lock, so
+/// a pending lock from an earlier disconnect stands down in favour of the
+/// latest one (which is timed from its own edge).
+static LOCK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Total Return-keypress SUBMISSIONS sent while trying to auto-unlock the
 /// CURRENT lock cycle — reset to 0 the moment the screen is observed
 /// unlocked (a fresh lock cycle starts with a fresh budget) and on a
@@ -1742,10 +1748,11 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     // reconnect (so the client sees them without Ctrl+Alt+G). No-op otherwise.
     restore_windows: bool,
     physical_main_id: u32,
-    // (--lock-on-disconnect) When true, lock the local session on a genuine
+    // (--lock-on-disconnect) When set, lock the local session on a genuine
     // last-client-disconnect (after an extra safety buffer beyond the
-    // REACTIVATION_GRACE poll above). No-op otherwise.
-    lock_on_disconnect: bool,
+    // REACTIVATION_GRACE poll above), holding it while a reconnect is still
+    // handshaking (see lock_activity). None = feature off.
+    lock_on_disconnect: Option<Arc<lock_activity::ConnectionActivity>>,
     // (--auto-unlock) When true, try to unlock the local session on
     // reconnect using the exact same validated credential used for RDP
     // auth. A no-op if the screen isn't locked.
@@ -2011,19 +2018,54 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         // watcher-observed last-client-disconnect, never on server
                         // shutdown/kill. Heuristic, not a guarantee — see
                         // docs/known-quirks.md.
-                        if lock_on_disconnect {
+                        if let Some(activity) = lock_on_disconnect.clone() {
                             let tracker_for_lock = tracker.clone();
+                            // A later disconnect supersedes this one's pending
+                            // lock (it arms its own, timed from ITS edge).
+                            let generation = LOCK_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                            let disconnect_ms = activity.now_ms();
                             std::thread::spawn(move || {
                                 let delay = Duration::from_millis(lock_on_disconnect_delay_ms());
                                 std::thread::sleep(delay);
-                                if tracker_for_lock.count.load(Ordering::SeqCst) > 0 {
-                                    info!(
-                                        label,
-                                        "lock-on-disconnect: session came back during \
-                                         the safety buffer — skipping lock (treating \
-                                         as a delayed reconnect/self-heal)"
-                                    );
-                                    return;
+                                // A client reconnecting late in the buffer only
+                                // counts as live once FULLY connected (~10 s over
+                                // ZeroTier), so hold the lock while a reconnect
+                                // is still handshaking — capped, so a peer that
+                                // merely opens connections can only delay it.
+                                let due_ms = activity.now_ms();
+                                let mut holding = false;
+                                loop {
+                                    if LOCK_GENERATION.load(Ordering::SeqCst) != generation {
+                                        tracing::debug!(
+                                            label,
+                                            "lock-on-disconnect: superseded by a later disconnect"
+                                        );
+                                        return;
+                                    }
+                                    let live = tracker_for_lock.count.load(Ordering::SeqCst) > 0;
+                                    match activity.decide(live, disconnect_ms, due_ms) {
+                                        lock_activity::LockDecision::Skip => {
+                                            info!(
+                                                label,
+                                                "lock-on-disconnect: session came back during \
+                                                 the safety buffer — skipping lock (treating \
+                                                 as a delayed reconnect/self-heal)"
+                                            );
+                                            return;
+                                        }
+                                        lock_activity::LockDecision::Hold => {
+                                            if !holding {
+                                                info!(
+                                                    label,
+                                                    "lock-on-disconnect: a client is reconnecting — \
+                                                     holding the lock until it connects (capped)"
+                                                );
+                                                holding = true;
+                                            }
+                                            std::thread::sleep(Duration::from_millis(250));
+                                        }
+                                        lock_activity::LockDecision::Lock => break,
+                                    }
                                 }
                                 // Reset the auto-unlock submission budget/alert
                                 // latch HERE, not just on an observed unlock —
@@ -2848,6 +2890,11 @@ async fn async_main() -> Result<()> {
     }
 
     let session_tracker = capture::SessionTracker::default();
+    // (--lock-on-disconnect) Connection activity the pending lock consults so
+    // it doesn't fire under a reconnect's handshake. None when the flag is off.
+    let lock_activity = args
+        .lock_on_disconnect
+        .then(|| Arc::new(lock_activity::ConnectionActivity::default()));
     // Auto-unlock is opt-in (--auto-unlock / config AUTO_UNLOCK=1), and
     // additionally skipped entirely under --skip-auth, since in that mode
     // `password` was never validated by PAM and isn't trustworthy to
@@ -2871,7 +2918,7 @@ async fn async_main() -> Result<()> {
             virtual_display::DetachedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
-            args.lock_on_disconnect,
+            lock_activity.clone(),
             Arc::clone(&password),
             auto_unlock,
         );
@@ -2890,7 +2937,7 @@ async fn async_main() -> Result<()> {
             virtual_display::CapturedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
-            args.lock_on_disconnect,
+            lock_activity.clone(),
             Arc::clone(&password),
             auto_unlock,
         );
@@ -2909,7 +2956,7 @@ async fn async_main() -> Result<()> {
             virtual_display::ShieldedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
-            args.lock_on_disconnect,
+            lock_activity.clone(),
             Arc::clone(&password),
             auto_unlock,
         );
@@ -3328,6 +3375,15 @@ async fn async_main() -> Result<()> {
     // (MACRDP_CONN_GUARD=0 disables).
     let conn_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
         auth_guard::AuthGuardHandler::from_env();
+    // With --lock-on-disconnect, wrap it to record reconnect activity (every
+    // hook still forwards unchanged); otherwise the handler is untouched.
+    let conn_handler = match &lock_activity {
+        Some(activity) => Some(lock_activity::ActivityHandler::wrap(
+            conn_handler,
+            Arc::clone(activity),
+        )),
+        None => conn_handler,
+    };
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
