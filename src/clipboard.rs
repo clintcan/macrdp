@@ -103,6 +103,17 @@ enum RemotePlan {
 /// degrading to an `<img>` tag: plain text, then one rich format (HTML
 /// preferred — browsers only offer HTML, and it's usually the smaller), then
 /// one image (DIBV5 preferred over DIB for colour).
+/// A short, escaped prefix of a rejected clipboard payload for the log, so a
+/// client that answers with something unexpected can be diagnosed without a
+/// packet capture. Bounded, and escaped so it can't inject log lines.
+fn payload_preview(data: &[u8]) -> String {
+    data.iter()
+        .take(64)
+        .flat_map(|&b| std::ascii::escape_default(b))
+        .map(char::from)
+        .collect()
+}
+
 fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
     let named = |name: &str| {
         formats
@@ -172,9 +183,29 @@ impl Collected {
 #[derive(Debug, Default)]
 struct RemoteFetch {
     current: Option<Want>,
+    /// Whether `current` is already a retry. A failed representation is
+    /// asked for once more before it's skipped: Windows apps commonly
+    /// announce a copy twice in quick succession, and the second fetch can
+    /// hit the source app still holding its clipboard open — a transient
+    /// error that, unretried, published the copy without its rich format.
+    retried: bool,
     queue: std::collections::VecDeque<Want>,
     got: Collected,
+    /// Set while the reply to a SUPERSEDED request is still due. Browsers
+    /// and Word announce one copy twice in quick succession; restarting the
+    /// fetch at once let the first copy's reply be attributed to the second
+    /// copy's request — text landed in the HTML slot and vice versa, both
+    /// were rejected, and the copy published without its rich format (seen
+    /// live with Firefox). So the new copy's first request waits for that
+    /// reply, which is discarded. Holds when the superseded request went
+    /// out, so a reply that never comes can't stall the clipboard for long.
+    awaiting_stale: Option<std::time::Instant>,
 }
+
+/// How long a superseded request's reply is waited for before it's presumed
+/// lost. Every FormatDataRequest is answered (data or a failure), so this only
+/// bounds a misbehaving client.
+const STALE_REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Convert PNG/TIFF bytes from NSPasteboard into a CF_DIB payload: a
 /// `BITMAPINFOHEADER` (40 bytes) followed by 32bpp BGRA pixels in
@@ -659,6 +690,17 @@ impl MacCliprdrBackend {
         }
     }
 
+    /// If this reply answers a superseded request, drop it and start the
+    /// current copy's fetch. Returns whether the reply was consumed.
+    fn discard_stale_reply(&mut self) -> bool {
+        if self.fetch.awaiting_stale.take().is_none() {
+            return false;
+        }
+        debug!("discarding the reply to a superseded clipboard request");
+        self.request_next();
+        true
+    }
+
     /// Request the next representation of the current remote copy, or — once
     /// the queue is drained — publish everything that arrived.
     fn request_next(&mut self) {
@@ -666,6 +708,7 @@ impl MacCliprdrBackend {
             Some(want) => {
                 debug!(?want, "requesting remote format data");
                 self.fetch.current = Some(want);
+                self.fetch.retried = false;
                 self.push(ClipboardMessage::SendInitiatePaste(want.id()));
             }
             None => self.publish_fetched(),
@@ -967,26 +1010,35 @@ impl CliprdrBackend for MacCliprdrBackend {
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         debug!(
             format_count = available_formats.len(),
-            format_ids = ?available_formats.iter().map(|f| f.id).collect::<Vec<_>>(),
+            formats = ?available_formats
+                .iter()
+                .map(|f| (f.id.value(), f.name.as_ref().map(|n| n.value().to_owned())))
+                .collect::<Vec<_>>(),
             "remote clipboard format list received (connect-time announce or a live copy)"
         );
         // A new remote copy supersedes whatever is still in flight for the
-        // previous one. A reply to that older request may still arrive and be
-        // attributed to the new first request; every decoder validates its
-        // input (even-length UTF-16, markup, an RTF header, a real DIB), so a
-        // mismatched payload is dropped rather than published. Waiting for
-        // that reply instead would risk stalling the clipboard for good if it
-        // never comes.
-        self.fetch = RemoteFetch::default();
+        // previous one. Replies name no format, so if a request is still on
+        // the wire its reply must be waited for and discarded before the new
+        // copy's first request goes out — see RemoteFetch::awaiting_stale.
+        let now = std::time::Instant::now();
+        let awaiting_stale = if self.fetch.current.is_some() {
+            Some(now)
+        } else {
+            self.fetch
+                .awaiting_stale
+                .filter(|since| now.duration_since(*since) < STALE_REPLY_GRACE)
+        };
+        self.fetch = RemoteFetch {
+            awaiting_stale,
+            ..RemoteFetch::default()
+        };
         match plan_remote_fetch(available_formats, self.rich_clipboard) {
             RemotePlan::Files(id) => {
                 debug!(format_id = ?id, "remote advertised files; requesting file list");
-                self.fetch.current = Some(Want::Other(id));
-                self.push(ClipboardMessage::SendInitiatePaste(id));
+                self.fetch.queue.push_back(Want::Other(id));
             }
             RemotePlan::Fetch(wants) => {
                 self.fetch.queue = wants.into();
-                self.request_next();
             }
             RemotePlan::Nothing => {
                 if !available_formats.is_empty() {
@@ -996,10 +1048,18 @@ impl CliprdrBackend for MacCliprdrBackend {
                 }
             }
         }
+        if self.fetch.awaiting_stale.is_some() {
+            debug!("waiting for the superseded request's reply before fetching the new copy");
+        } else {
+            self.request_next();
+        }
     }
 
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
         // The file-list request is answered here, not via on_format_data_response.
+        if self.discard_stale_reply() {
+            return;
+        }
         self.fetch.current = None;
         debug!(
             file_count = files.len(),
@@ -1105,12 +1165,22 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        if self.discard_stale_reply() {
+            return;
+        }
         let want = self.fetch.current.take();
         if let Some(Want::Other(id)) = want {
             warn!(format_id = ?id, "unexpected format in data response");
             return;
         }
         if response.is_error() {
+            if let (Some(w), false) = (want, self.fetch.retried) {
+                debug!(want = ?w, "remote returned error for format data; retrying once");
+                self.fetch.current = Some(w);
+                self.fetch.retried = true;
+                self.push(ClipboardMessage::SendInitiatePaste(w.id()));
+                return;
+            }
             // One representation failing (e.g. an app that advertises HTML
             // but can't render it) mustn't cost the others: carry on.
             warn!(?want, "remote returned error for format data");
@@ -1153,12 +1223,17 @@ impl CliprdrBackend for MacCliprdrBackend {
             },
             Some(Want::Html(_)) => match crate::clipboard_rich::decode_cf_html(data) {
                 Some(html) => self.fetch.got.html = Some(html),
-                None => warn!(len = data.len(), "remote HTML Format payload had no markup"),
+                None => warn!(
+                    len = data.len(),
+                    preview = %payload_preview(data),
+                    "remote HTML Format payload had no markup"
+                ),
             },
             Some(Want::Rtf(_)) => match crate::clipboard_rich::decode_rtf(data) {
                 Some(rtf) => self.fetch.got.rtf = Some(rtf),
                 None => warn!(
                     len = data.len(),
+                    preview = %payload_preview(data),
                     "remote Rich Text Format payload isn't RTF"
                 ),
             },
@@ -1948,13 +2023,43 @@ mod tests {
         assert_eq!(next_request(&mut rx), ClipboardFormatId::new(HTML));
         assert_eq!(backend.fetch.got.text.as_deref(), Some("hi"));
 
-        // The HTML representation fails: the image is still requested.
+        // The HTML representation fails: it's retried once (a transient
+        // error from a source app still holding its clipboard open)...
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert_eq!(next_request(&mut rx), ClipboardFormatId::new(HTML));
+        // ...and when the retry fails too, the image is still requested.
         backend.on_format_data_response(FormatDataResponse::new_error());
         assert_eq!(next_request(&mut rx), ClipboardFormatId::CF_DIB);
         assert!(backend.fetch.got.html.is_none());
     }
 
-    /// A new remote copy supersedes the one still being fetched.
+    /// A retry that succeeds is decoded like a first-time reply, and the
+    /// next representation gets its own retry allowance.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_retried_representation_is_kept() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&[
+            named(RTF, "Rich Text Format"),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+        ]);
+        let _ = rx.try_recv();
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id))) if id == ClipboardFormatId::new(RTF)
+        ));
+        backend.on_format_data_response(FormatDataResponse::new_data(b"{\\rtf1 hi}".to_vec()));
+        assert!(backend.fetch.got.rtf.is_some());
+        assert!(
+            !backend.fetch.retried,
+            "the image starts with a fresh retry"
+        );
+    }
+
+    /// A new remote copy supersedes the one still being fetched — but its
+    /// first request waits for the superseded request's reply, which is
+    /// discarded rather than attributed to the new request.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_new_remote_copy_restarts_the_fetch() {
@@ -1965,6 +2070,14 @@ mod tests {
         ]);
         let _ = rx.try_recv();
         backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is requested while the old reply is still due"
+        );
+        // The superseded text request's reply arrives: dropped, then the new
+        // copy's fetch starts.
+        let text: Vec<u8> = "old\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        backend.on_format_data_response(FormatDataResponse::new_data(text));
         match rx.try_recv() {
             Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id))) => {
                 assert_eq!(id, ClipboardFormatId::CF_DIB);
@@ -1975,7 +2088,55 @@ mod tests {
             backend.fetch.queue.is_empty(),
             "the old HTML request is dropped"
         );
-        assert!(backend.fetch.got.is_empty());
+        assert!(backend.fetch.got.is_empty(), "the stale reply isn't kept");
+    }
+
+    /// The live Firefox failure: one copy announced twice. The first
+    /// announce's text reply must not land in the second fetch's slots.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_double_announced_copy_keeps_its_rich_format() {
+        let (mut backend, mut rx) = test_backend();
+        let formats = vec![
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+            named(HTML, "HTML Format"),
+        ];
+        let utf16 = |t: &str| -> Vec<u8> {
+            t.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        backend.on_remote_copy(&formats);
+        backend.on_remote_copy(&formats);
+        backend.on_format_data_response(FormatDataResponse::new_data(utf16("hi")));
+        backend.on_format_data_response(FormatDataResponse::new_data(utf16("hi")));
+        assert_eq!(backend.fetch.got.text.as_deref(), Some("hi"));
+        assert_eq!(
+            backend.fetch.current,
+            Some(Want::Html(ClipboardFormatId::new(HTML)))
+        );
+        let html = crate::clipboard_rich::encode_cf_html("<b>hi</b>");
+        backend.on_format_data_response(FormatDataResponse::new_data(html));
+        // Published: the fetch state is drained and nothing else is due.
+        assert!(backend.fetch.current.is_none() && backend.fetch.queue.is_empty());
+        let requests = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert_eq!(requests, 3, "text, text, html — one request at a time");
+    }
+
+    /// A superseded reply that never arrives can't stall the clipboard past
+    /// the grace period.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_lost_stale_reply_is_given_up_on() {
+        let (mut backend, mut rx) = test_backend();
+        backend.fetch.awaiting_stale =
+            Some(std::time::Instant::now() - STALE_REPLY_GRACE - std::time::Duration::from_secs(1));
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id))) if id == ClipboardFormatId::CF_DIB
+        ));
     }
 
     /// Regression pin for a bug caught in QA: publishing a remote TEXT/rich
