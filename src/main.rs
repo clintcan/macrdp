@@ -16,6 +16,7 @@ mod avc444;
 mod camera;
 mod capture;
 mod clipboard;
+mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
@@ -512,6 +513,19 @@ struct Args {
     #[cfg(target_os = "macos")]
     #[arg(long = "no-lazy-paste", action = clap::ArgAction::SetTrue)]
     no_lazy_paste: bool,
+
+    /// Copy plain text and images only, without rich text. By default macrdp
+    /// also carries formatted text across the clipboard in both directions —
+    /// the Windows `HTML Format` / `Rich Text Format` clipboard formats mapped
+    /// to the Mac's `public.html` / `public.rtf` — so formatting survives a
+    /// copy from Word, Outlook or a browser into Mail, Notes or Pages, and back.
+    /// A Windows→Mac copy then fetches the formatted version as well as the
+    /// plain text, which is extra traffic on every copy; pass this if that
+    /// matters on a thin link. Images embedded in rich text generally don't
+    /// survive either way (Word's HTML points at local temp files). Config
+    /// key: RICH_CLIPBOARD=0.
+    #[arg(long = "no-rich-clipboard", action = clap::ArgAction::SetTrue)]
+    no_rich_clipboard: bool,
 
     /// Deprecated/no-op: lazy paste is now the default. Accepted so
     /// existing command lines that pass --lazy-paste keep working; use
@@ -2237,6 +2251,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("AUTO_UNLOCK", false) {
         argv.push("--auto-unlock".into());
     }
+    if !on("RICH_CLIPBOARD", true) {
+        argv.push("--no-rich-clipboard".into());
+    }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
@@ -3241,7 +3258,10 @@ async fn async_main() -> Result<()> {
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
-            Box::new(clipboard::MacCliprdr::new(!args.no_lazy_paste))
+            Box::new(clipboard::MacCliprdr::new(
+                !args.no_lazy_paste,
+                !args.no_rich_clipboard,
+            ))
         }
         #[cfg(not(target_os = "macos"))]
         {

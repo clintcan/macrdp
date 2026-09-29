@@ -128,6 +128,11 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           to fall back to the eager path (downloads everything
                           on copy, auto-fires Cmd-V into Finder when done).
                           See [file-copy.md](file-copy.md).
+--no-rich-clipboard       Copy plain text and images only. By default formatted
+                          text also crosses the clipboard in both directions
+                          (Word, Outlook or a browser <-> Mail, Notes, Pages),
+                          at the cost of fetching the formatted version as well
+                          on every Windows copy. Config key: RICH_CLIPBOARD=0.
 --enable-drive-redirection  Let the connecting client redirect its local
                           drive(s) (mstsc: Local Resources → Drives; FreeRDP:
                           /drive:NAME,PATH); the Mac mounts each as a real

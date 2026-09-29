@@ -283,6 +283,12 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;
                           #   --no-lazy-paste reverts to eager download + auto-paste hack.
+--no-rich-clipboard       # Copy plain text + images only. By default rich text
+                          #   (Windows HTML Format / Rich Text Format <-> Mac
+                          #   public.html / public.rtf) crosses the clipboard both
+                          #   ways. A Windows->Mac copy then fetches the formatted
+                          #   version too — extra traffic per copy on a thin link.
+                          #   Config key: RICH_CLIPBOARD=0.
 --enable-udp-multitransport # EXPERIMENTAL, opt-in (default OFF; feature-gated by
                           #   the `multitransport` cargo feature). Offers RDP UDP
                           #   multitransport (MS-RDPEMT over reliable RDPEUDP) and
