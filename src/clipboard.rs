@@ -357,6 +357,16 @@ pub struct MacCliprdr {
     /// our own write and bounce it back to Windows.
     #[cfg(target_os = "macos")]
     self_change_count: crate::file_promise::SelfChangeCount,
+    /// The changeCount of our most recent publish of a remote text / rich /
+    /// image copy. The poller skips it exactly like `self_change_count`, so a
+    /// Windows copy isn't advertised straight back to Windows — but it is a
+    /// SEPARATE marker on purpose: `self_change_count` also drives
+    /// `cleanup_on_disconnect` and `clear_pasteboard_if_stale`, which clear the
+    /// pasteboard while it still holds our write. That's right for stale
+    /// temp-file URLs and wrong for text the user copied, which must outlive
+    /// the session.
+    #[cfg(target_os = "macos")]
+    remote_write_cc: Arc<std::sync::atomic::AtomicI64>,
     /// Coordinates the advertise retry loop with the cliprdr backend's
     /// `on_format_list_response` hook. See [`AdvertiseState`].
     advertise_state: Arc<AdvertiseState>,
@@ -398,6 +408,7 @@ impl MacCliprdr {
             download_router: crate::file_promise::DownloadRouter::default(),
             paste_temp_dir,
             self_change_count,
+            remote_write_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             advertise_state: Arc::new(AdvertiseState::default()),
             active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lazy_paste,
@@ -429,6 +440,8 @@ impl ServerEventSender for MacCliprdr {
         let paths_arc = self.file_paths.clone();
         #[cfg(target_os = "macos")]
         let self_cc = self.self_change_count.clone();
+        #[cfg(target_os = "macos")]
+        let remote_write_cc = self.remote_write_cc.clone();
         let advertise_state = self.advertise_state.clone();
         let active_backends = self.active_backends.clone();
         let rich = self.rich_clipboard;
@@ -460,7 +473,9 @@ impl ServerEventSender for MacCliprdr {
                 // skip — otherwise we'd advertise the just-pasted Windows
                 // files back to Windows as a fresh Mac→Windows copy.
                 #[cfg(target_os = "macos")]
-                if current == self_cc.load(std::sync::atomic::Ordering::Relaxed) {
+                if current == self_cc.load(std::sync::atomic::Ordering::Relaxed)
+                    || current == remote_write_cc.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     debug!(current, "skipping pasteboard tick (self-write)");
                     continue;
                 }
@@ -529,6 +544,8 @@ impl CliprdrBackendFactory for MacCliprdr {
             paste_temp_dir: self.paste_temp_dir.clone(),
             #[cfg(target_os = "macos")]
             self_change_count: self.self_change_count.clone(),
+            #[cfg(target_os = "macos")]
+            remote_write_cc: self.remote_write_cc.clone(),
             advertise_state: self.advertise_state.clone(),
             #[cfg(target_os = "macos")]
             lazy_paste: self.lazy_paste,
@@ -566,6 +583,9 @@ struct MacCliprdrBackend {
     // so the poller can skip its own write. See `MacCliprdr::self_change_count`.
     #[cfg(target_os = "macos")]
     self_change_count: crate::file_promise::SelfChangeCount,
+    // See MacCliprdr::remote_write_cc — why this is NOT self_change_count.
+    #[cfg(target_os = "macos")]
+    remote_write_cc: Arc<std::sync::atomic::AtomicI64>,
     // Lets the `on_format_list_response` hook tell the poller's retry loop
     // that the current advertise wave was accepted, so it stops re-advertising.
     advertise_state: Arc<AdvertiseState>,
@@ -657,6 +677,8 @@ impl MacCliprdrBackend {
     /// it straight back to the remote. Without that mark the echo makes the
     /// client take over its own clipboard again with only what we fetched —
     /// e.g. Word's formatted selection replaced by our plain text/HTML copy.
+    /// The mark goes in `remote_write_cc`, NOT `self_change_count` — see
+    /// MacCliprdr::remote_write_cc for why that distinction is load-bearing.
     fn publish_fetched(&mut self) {
         let got = std::mem::take(&mut self.fetch.got);
         if got.is_empty() {
@@ -669,17 +691,17 @@ impl MacCliprdrBackend {
             image = got.png.as_ref().map(Vec::len),
             "writing remote clipboard to NSPasteboard"
         );
-        let change_count = pb::write_items(
+        #[cfg(target_os = "macos")]
+        let mark = &*self.remote_write_cc;
+        #[cfg(not(target_os = "macos"))]
+        let mark = &std::sync::atomic::AtomicI64::new(-1);
+        pb::write_items(
             got.text.as_deref(),
             got.html.as_deref(),
             got.rtf.as_deref(),
             got.png.as_deref(),
+            mark,
         );
-        #[cfg(target_os = "macos")]
-        self.self_change_count
-            .store(change_count, std::sync::atomic::Ordering::Relaxed);
-        #[cfg(not(target_os = "macos"))]
-        let _ = change_count;
     }
 
     /// Serve a single FileContentsRequest against the path snapshot built
@@ -1474,14 +1496,17 @@ mod pb {
     /// Publish everything fetched from one remote copy as a single pasteboard
     /// item carrying every representation, so the app you paste into picks
     /// the richest type it understands (TextEdit takes RTF/HTML, a plain
-    /// field takes the string, Preview takes the image). Returns the new
-    /// changeCount so the caller can mark it as our own write.
+    /// field takes the string, Preview takes the image). The resulting
+    /// changeCount is stored in `mark` while the pasteboard guard is still
+    /// held, so the poller (which reads changeCount under the same guard) can
+    /// never observe our write before it is marked as ours.
     pub fn write_items(
         text: Option<&str>,
         html: Option<&str>,
         rtf: Option<&[u8]>,
         png: Option<&[u8]>,
-    ) -> i64 {
+        mark: &std::sync::atomic::AtomicI64,
+    ) {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
@@ -1502,7 +1527,10 @@ mod pb {
             if let Some(text) = text {
                 pb.setString_forType(&NSString::from_str(text), NSPasteboardTypeString);
             }
-            pb.changeCount() as i64
+            mark.store(
+                pb.changeCount() as i64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -1570,8 +1598,8 @@ mod pb {
         _: Option<&str>,
         _: Option<&[u8]>,
         _: Option<&[u8]>,
-    ) -> i64 {
-        0
+        _: &std::sync::atomic::AtomicI64,
+    ) {
     }
     pub fn read_files() -> Vec<FileEntry> {
         Vec::new()
@@ -1669,6 +1697,7 @@ mod tests {
             download_router: crate::file_promise::DownloadRouter::default(),
             paste_temp_dir: Arc::new(Mutex::new(None)),
             self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            remote_write_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             advertise_state: Arc::new(AdvertiseState::default()),
             lazy_paste: true,
             initial_advertise_pending: true,
@@ -1947,6 +1976,34 @@ mod tests {
             "the old HTML request is dropped"
         );
         assert!(backend.fetch.got.is_empty());
+    }
+
+    /// Regression pin for a bug caught in QA: publishing a remote TEXT/rich
+    /// copy must mark it in `remote_write_cc` (echo suppression) and must NOT
+    /// touch `self_change_count` — that one drives `cleanup_on_disconnect` and
+    /// `clear_pasteboard_if_stale`, which would otherwise wipe text the user
+    /// copied from Windows when the session ends. (Writes the real
+    /// pasteboard, like the on_ready probes above.)
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn publishing_a_remote_copy_marks_the_echo_marker_not_the_file_marker() {
+        use std::sync::atomic::Ordering;
+        let (mut backend, _rx) = test_backend();
+        backend.fetch.got.text = Some("remote text".into());
+        backend.fetch.got.html = Some("<b>remote</b>".into());
+        backend.publish_fetched();
+        assert_eq!(
+            backend.self_change_count.load(Ordering::Relaxed),
+            -1,
+            "the file-cleanup marker must be left alone"
+        );
+        assert_eq!(
+            backend.remote_write_cc.load(Ordering::Relaxed),
+            pb::change_count(),
+            "our write must be recorded for the poller to skip"
+        );
+        assert_eq!(pb::read_html().as_deref(), Some("<b>remote</b>"));
+        assert!(backend.fetch.got.is_empty(), "published state is consumed");
     }
 
     /// Disposable temp directory; removed on drop. Standalone for the same

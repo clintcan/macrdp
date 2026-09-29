@@ -65,7 +65,11 @@ fn rfind_ci(hay: &str, needle: &str) -> Option<usize> {
 /// that already travelled through a Windows clipboard — are reused rather
 /// than doubled. The result is NUL-terminated; the offsets exclude the NUL.
 pub fn encode_cf_html(html: &str) -> Vec<u8> {
-    let doc = if html.contains(START_MARKER) && html.contains(END_MARKER) {
+    let reusable = matches!(
+        (html.find(START_MARKER), html.rfind(END_MARKER)),
+        (Some(start), Some(end)) if start + START_MARKER.len() <= end
+    );
+    let doc = if reusable {
         html.to_string()
     } else if let (Some(body), Some(body_end)) =
         (find_ci(html, "<body", 0), rfind_ci(html, "</body"))
@@ -236,6 +240,17 @@ mod tests {
         assert_eq!(text.matches("<!--StartFragment-->").count(), 1);
         let [_, _, sf, ef] = offsets(&enc);
         assert_eq!(&enc[sf..ef], b"<u>u</u>");
+    }
+
+    #[test]
+    fn misordered_existing_markers_are_not_trusted() {
+        // End marker before the start marker: reusing them would yield
+        // StartFragment > EndFragment. Treat the input as a plain fragment.
+        let html = "<!--EndFragment-->x<!--StartFragment-->";
+        let enc = encode_cf_html(html);
+        let [_, _, sf, ef] = offsets(&enc);
+        assert!(sf <= ef);
+        assert_eq!(&enc[sf..ef], html.as_bytes());
     }
 
     #[test]
