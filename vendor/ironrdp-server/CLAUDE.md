@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(24)/(25)/(26) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -2036,3 +2036,56 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     fires exactly once per connection that is actually served — never for a
     reactivation, never for a losing candidate. Off by default (`None`), so the
     upstream-shaped path is byte-identical unless macrdp installs the handle.
+(26) `accept_finalize` is BOUNDED — an authenticated client that wedges
+    mid-handshake can no longer hold the live-session slot forever (NOT
+    upstreamed; added 2026-09-02). The companion to (23)'s
+    `CANDIDATE_NEGOTIATION_TIMEOUT` on the other half of the accept path: that
+    one bounds a *candidate* being negotiated alongside a live session, while
+    the connection actually being SERVED still awaited `accept_finalize`
+    unbounded, at all three call sites (`serve_negotiated`, and both arms of
+    `run_connection`).
+
+    **The field bug that forced it (macrdp, diagnosed 2026-09-02).** Windows
+    App for macOS build 68614 intermittently hangs the user at "Configuring
+    remote session". `ironrdp_acceptor=trace` showed the server completing the
+    ENTIRE handshake — X.224, TLS, CredSSP (incl. the HYBRID_EX
+    `EarlyUserAuthResult`), MCS Connect, Erect Domain, Attach User and all
+    seven channel joins — and then blocking on a read, because the client never
+    sends its Client Info PDU. The server's `ConnectResponse` is byte-identical
+    between hung and successful connections, so this is NOT a server protocol
+    fault; `tcpdump` during a live hang captured NOTHING and the socket sat
+    ESTABLISHED with Recv-Q=0 AND Send-Q=0. It is a client-process wedge,
+    cleared only by restarting the client — same class as the mstsc EGFX
+    surface-retention quirk. But the server parked on that read indefinitely
+    and held the session with it: one such connection sat there **45 minutes**.
+
+    Theories tested and REFUTED — do not re-chase: path MTU (`ping -D -s 1472`
+    from the client succeeds); a missing HYBRID_EX `EarlyUserAuthResult` (the
+    trace shows `HYBRID_EX result=Ok(())` on the HUNG connections too);
+    client-type correlation (the iOS client also hangs — 4/4 from one address,
+    3/3 fine from another); network-path correlation (the same LAN IP both
+    hangs and succeeds); and server startup state (the first connection after a
+    restart hung).
+
+    **Placement is load-bearing.** The bound goes on the INNER
+    `ironrdp_acceptor::accept_finalize` call, NOT on `RdpServer::accept_finalize`
+    or its callers: that method is a LOOP whose body also calls
+    `client_accepted`, which runs the entire live session. A timeout hoisted to
+    the loop or a call site would cap session length. Per-pass placement also
+    gives a deactivation–reactivation its own budget instead of sharing one
+    with the initial handshake, and bounds a reactivation that wedges the same
+    way.
+
+    `FINALIZE_TIMEOUT` is 30 s — generous, since a healthy finalize is
+    sub-second and the slowest observed real handshake (cellular, heavy
+    retransmits) spent 12 s in CredSSP alone, well before this point. A false
+    timeout is cheap: the connection drops and the auto-reconnect cookie brings
+    the client straight back.
+
+    Covered by `src/conn_test.rs::a_client_that_wedges_during_finalize_is_dropped`
+    (a client that completes X.224 + TLS then deliberately never sends its
+    Connect Initial must be dropped, not parked on), verified to fail without
+    the fix — the test HANGS, killed at the 150 s mark — and pass with it in
+    0.04 s. It runs under `#[tokio::test(start_paused = true)]` so the 30 s
+    bound costs the suite no wall-clock time; note that paused time makes the
+    test prove "a bound exists", not the specific duration.
