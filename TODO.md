@@ -859,7 +859,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
     **NEXT — live tests:** ARC after a process RESTART (upstream HMAC now denies it), Preempt takeover,
     FreeRDP minimize (upstream now advertises SuppressOutput), `/gfx:progressive` decline, UDP (mstsc
     migrate-egfx, lossy audio, watchdog), RDPDR mstsc write + smart card, USB SelectConfiguration,
-    audio/AAC, NSCodec on Windows App, iOS taps + horizontal-scroll SIGN. Then soak → v0.10.0 → close #182.
+    audio/AAC, NSCodec on Windows App, iOS taps + horizontal-scroll SIGN; also from the audit
+    caveats: a blank-recovery heal still works with the ARC cookie rotating on each reactivation,
+    the UDP offer still reaches mstsc (it's now gated on the MCS message channel), and no URBDRC
+    decode errors (upstream's stricter isoch-shaped completion decode). Then soak → v0.10.0 → close #182.
 - [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
