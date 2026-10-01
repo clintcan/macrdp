@@ -1,9 +1,9 @@
 [package]
-name = "ironrdp-rdpeudp"
+name = "macrdp-rdpeudp"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "MS-RDPEUDP / MS-RDPEUDP2 wire types + reliability state machine for RDP UDP multitransport (macrdp, candidate for upstream)"
+description = "MS-RDPEUDP / MS-RDPEUDP2 wire types + reliability state machine for RDP UDP multitransport (macrdp's own; upstream's ironrdp-rdpeudp is a separate RDPEUDP2 implementation)"
 publish = false
 
 [lib]

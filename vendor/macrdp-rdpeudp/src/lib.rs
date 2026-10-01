@@ -1,4 +1,4 @@
-//! `ironrdp-rdpeudp` — wire types + (later) reliability state machine for RDP
+//! `macrdp-rdpeudp` — wire types + (later) reliability state machine for RDP
 //! UDP multitransport (MS-RDPEUDP / MS-RDPEUDP2).
 //!
 //! This is the **sans-I/O core** of macrdp's UDP multitransport effort (M2 of

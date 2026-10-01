@@ -3,10 +3,10 @@
 //!
 //! Owns a [`tokio::net::UdpSocket`], demultiplexes inbound datagrams by peer
 //! address, and drives a per-peer [`RdpeudpState`] (the sans-I/O reliability
-//! state machine from `ironrdp-rdpeudp`) through the RDPEUDP handshake: a real
+//! state machine from `macrdp-rdpeudp`) through the RDPEUDP handshake: a real
 //! client's SYN is answered with a wire-correct SYN+ACK (matching real Windows;
-//! see `ironrdp-rdpeudp`'s `Datagram::syn_ack`), negotiating the data version
-//! (V3 = RDPEUDP2). The reliability/codec logic lives in `ironrdp-rdpeudp`; this
+//! see `macrdp-rdpeudp`'s `Datagram::syn_ack`), negotiating the data version
+//! (V3 = RDPEUDP2). The reliability/codec logic lives in `macrdp-rdpeudp`; this
 //! file is purely the I/O layer.
 //!
 //! # Scope (M3b)
@@ -39,12 +39,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ironrdp_rdpeudp::datagram::Datagram;
-use ironrdp_rdpeudp::pdu::FecFlags;
-use ironrdp_rdpeudp::state::{Config, DeliveryMode, RdpeudpState, Role};
+use macrdp_rdpeudp::datagram::Datagram;
+use macrdp_rdpeudp::pdu::FecFlags;
+use macrdp_rdpeudp::state::{Config, DeliveryMode, RdpeudpState, Role};
 
-use crate::multitransport::dtls::{DtlsConn, DtlsServerContext};
-use crate::multitransport::{CookieRegistry, TunnelOutbound};
+use crate::mt::dtls::{DtlsConn, DtlsServerContext};
+use crate::mt::{CookieRegistry, TunnelOutbound};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -447,7 +447,7 @@ async fn ship_outbound(
     now_ms: u64,
     mtu: u16,
 ) {
-    use ironrdp_rdpeudp::emt;
+    use macrdp_rdpeudp::emt;
 
     let Some(&peer_addr) = bound_addrs.get(&cookie) else {
         trace!("tunnel data for an unbound cookie; dropping");
@@ -526,7 +526,7 @@ fn handle_emt_tunnel(
     inbound: &mut Option<UnboundedSender<Vec<u8>>>,
     bound_flag: &mut Option<Arc<core::sync::atomic::AtomicBool>>,
 ) -> EmtTunnelOutcome {
-    use ironrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
+    use macrdp_rdpeudp::emt::{self, TunnelCreateRequest, TunnelCreateResponse};
 
     let mut outcome = EmtTunnelOutcome::default();
 

@@ -5,6 +5,6 @@ use libfuzzer_sys::fuzz_target;
 // post-handshake, lower exposure than the two raw decoders), but the codec still
 // parses attacker-influenced bytes and must not panic.
 fuzz_target!(|data: &[u8]| {
-    let _ = ironrdp_rdpeudp::emt::TunnelCreateRequest::decode(data);
-    let _ = ironrdp_core::decode::<ironrdp_rdpeudp::emt::TunnelHeader>(data);
+    let _ = macrdp_rdpeudp::emt::TunnelCreateRequest::decode(data);
+    let _ = ironrdp_core::decode::<macrdp_rdpeudp::emt::TunnelHeader>(data);
 });
