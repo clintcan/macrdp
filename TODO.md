@@ -827,6 +827,30 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic; (b) past `d471bd06`
   → `main.rs` switches `set_honor_client_desktop_size(bool)` to the builder `with_honor_client_desktop_size`
   (and, once #1404 lands, re-route the shipped `--max-client-size` clamp — currently a local acceptor/server divergence extension, 2026-07-09 — through the upstream `Option<DesktopSize>` honor-size API).
+- [ ] **PIN BUMP a5d1c682 → e258f6a0 — DRY RUN DONE 2026-10-01** (branch `chore/pin-bump-e258f6a0`;
+  391 upstream commits; **no crate version changed**, so only the git revs move).
+  - **3-way merge (old base / our fork / new upstream), conflict hunks:** server **83** (`server.rs` 58,
+    `builder.rs` 14, `lib.rs` 4, `Cargo.toml` 4), rdpdr **39** (`esc/mod.rs` 20 = our smart-card side,
+    `efs.rs` 17 = our server-side decode vs upstream's new `src/server.rs`), acceptor **14**
+    (`connection.rs` 11), dvc **3** (`pdu.rs`, Soft-Sync vs upstream #1584). 139 total.
+  - **Build cascade (forks fail before `src/` compiles):** (1) the dvc fork MUST go — upstream's newer
+    `ironrdp-rdpeusb` needs upstream dvc's `DvcClientProcessor`, and the two-sided `[patch]` forces our old
+    fork on everyone; (2) rdpdr fork: `efs.rs:1606` call now takes 5 args; (3) acceptor fork: connector
+    `step()` gained a 4th param (3 sites) + a method gained an arg (4 sites); (4) with all three swapped
+    for upstream, the vendored server has **37 errors** (`server.rs` 18, `rdpdr.rs` 15, `rdpeusb.rs` 3,
+    `multitransport/mod.rs` 1) — mostly our own fork-only items (fingerprint fields, `ScardControlRequest`,
+    Soft-Sync `TUNNELTYPE_UDPFEC{L,R}` → upstream `SoftSyncTunnelType`), plus upstream removals
+    (`DrdynvcServer::get_channel_id_by_name`, `TsUrbResultPayload::Raw`). `src/` not reached yet.
+  - **Structural:** upstream added `server/src/multitransport.rs` (clashes with our
+    `src/multitransport/` dir — rename ours); upstream now has its OWN `ironrdp-rdpeudp` crate (name
+    clash with `vendor/ironrdp-rdpeudp` — rename via `package =` or drop ours); stray committed
+    `vendor/ironrdp-server/Cargo.toml.orig` to delete.
+  - **Triage correction:** acceptor (3) is only half group-1 — the client MT flags are upstream, but our
+    acceptor-side MT *offer* (`MultitransportOffer`, `multitransport_offered`) isn't (upstream offers via
+    #1951) → goes with the UDP work.
+  - **Order:** drop dvc fork (port Soft-Sync use) → rebase acceptor → rebase rdpdr (keep ESC) → rebase
+    server (group 1 drop, group 3 keep, group 2 as-is, rename multitransport dir) → `src/` →
+    tests → live mstsc/FreeRDP → 48–72 h soak incl. a headless mode → v0.10.0.
 - [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
