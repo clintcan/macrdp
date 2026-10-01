@@ -1,18 +1,19 @@
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::any::TypeId;
 use core::fmt;
 
 use ironrdp_core::{Decode as _, DecodeResult, ReadCursor, impl_as_any, invalid_field_err};
-use ironrdp_pdu::{self as pdu, decode_err, encode_err, pdu_other_err};
+use ironrdp_pdu::{self as pdu, PduError, decode_err, encode_err, pdu_other_err};
 use ironrdp_svc::{ChannelFlags, CompressionCondition, SvcMessage, SvcProcessor, SvcServerProcessor};
 use pdu::PduResult;
 use pdu::gcc::ChannelName;
 use tracing::debug;
 
 use crate::pdu::{
-    CapabilitiesRequestPdu, CapsVersion, ClosePdu, CreateRequestPdu, CreationStatus, DrdynvcClientPdu, DrdynvcServerPdu,
+    CapabilitiesRequestPdu, CapsVersion, ClosePdu, CreateRequestPdu, CreationStatus, DrdynvcClientPdu,
+    DrdynvcServerPdu, SoftSyncChannelList, SoftSyncRequestPdu, SoftSyncTunnelType,
 };
 use crate::{CompleteData, DvcProcessor, DynamicChannelMut, DynamicChannelRef, encode_dvc_messages};
 
@@ -27,9 +28,17 @@ enum ChannelState {
     CreationFailed(u32),
 }
 
+enum SoftSyncState {
+    Idle,
+    Active {
+        requested_tunnels: BTreeSet<SoftSyncTunnelType>,
+        response_received: bool,
+    },
+}
+
 struct DynamicChannel {
     state: ChannelState,
-    processor: Box<dyn DvcProcessor>,
+    processor: Box<dyn DvcServerProcessor>,
     complete_data: CompleteData,
     channel_id: u32,
 }
@@ -73,18 +82,30 @@ impl DynamicChannelAllocator {
         }
     }
 
-    fn insert_channel<T>(&mut self, processor: T, state: ChannelState) -> u32
-    where
-        T: DvcServerProcessor + 'static,
-    {
+    fn reserve_channel(&mut self) -> u32 {
         let channel_id = self.next_channel_id;
-        self.dynamic_channels
-            .insert(channel_id, DynamicChannel::new(processor, channel_id, state));
         self.next_channel_id = self
             .next_channel_id
             .checked_add(1)
             .expect("dynamic channels reaches `u32::MAX`");
         channel_id
+    }
+
+    fn insert_channel<T>(&mut self, processor: T, state: ChannelState) -> u32
+    where
+        T: DvcServerProcessor + 'static,
+    {
+        let channel_id = self.reserve_channel();
+        self.insert_channel_with_id(processor, state, channel_id);
+        channel_id
+    }
+
+    fn insert_channel_with_id<T>(&mut self, processor: T, state: ChannelState, channel_id: u32)
+    where
+        T: DvcServerProcessor + 'static,
+    {
+        self.dynamic_channels
+            .insert(channel_id, DynamicChannel::new(processor, channel_id, state));
     }
 
     fn get(&self, channel_id: u32) -> Option<&DynamicChannel> {
@@ -123,6 +144,9 @@ impl DynamicChannel {
 pub struct DrdynvcServer {
     dynamic_channels: DynamicChannelAllocator,
     type_id_to_channel_id: BTreeMap<TypeId, u32>,
+    soft_sync_state: SoftSyncState,
+    outgoing_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
+    incoming_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
 }
 
 impl fmt::Debug for DrdynvcServer {
@@ -147,6 +171,9 @@ impl DrdynvcServer {
         Self {
             dynamic_channels: DynamicChannelAllocator::new(),
             type_id_to_channel_id: BTreeMap::new(),
+            soft_sync_state: SoftSyncState::Idle,
+            outgoing_tunnel_channels: BTreeMap::new(),
+            incoming_tunnel_channels: BTreeMap::new(),
         }
     }
 
@@ -155,17 +182,6 @@ impl DrdynvcServer {
         T: DvcServerProcessor + 'static,
     {
         self.type_id_to_channel_id.get(&TypeId::of::<T>()).copied()
-    }
-
-    /// (macrdp divergence) Find a dynamic channel's id by its announced name (e.g.
-    /// `"Microsoft::Windows::RDS::Graphics"` for EGFX). Used by the multitransport
-    /// path to name the DVC in a Soft-Sync request without needing its concrete
-    /// processor type. Returns the first match (channel names are unique).
-    pub fn get_channel_id_by_name(&self, name: &str) -> Option<u32> {
-        (&self.dynamic_channels)
-            .into_iter()
-            .find(|(_, c)| c.processor.channel_name() == name)
-            .map(|(id, _)| *id)
     }
 
     /// Returns `true` if the DVC channel with the given ID has completed
@@ -197,6 +213,7 @@ impl DrdynvcServer {
             .ok_or_else(|| invalid_field_err!("DRDYNVC", "", "invalid channel id"))
     }
 
+    /// Returns a typed accessor for an active server DVC by channel ID.
     pub fn dvc_by_id<T: DvcServerProcessor>(&self, id: u32) -> Option<DynamicChannelRef<'_, T>> {
         let channel = self.dynamic_channels.get(id)?;
         if channel.state != ChannelState::Opened {
@@ -209,6 +226,7 @@ impl DrdynvcServer {
             .map(|p| DynamicChannelRef::new(id, p))
     }
 
+    /// Returns a mutable typed accessor for an active server DVC by channel ID.
     pub fn dvc_by_id_mut<T: DvcServerProcessor>(&mut self, id: u32) -> Option<DynamicChannelMut<'_, T>> {
         let channel = self.dynamic_channels.get_mut(id)?;
         if channel.state != ChannelState::Opened {
@@ -230,11 +248,39 @@ impl DrdynvcServer {
     where
         T: DvcServerProcessor + 'static,
     {
-        let channel_name = channel.channel_name().into();
+        let channel_id = self.dynamic_channels.reserve_channel();
+        self.create_channel_with_id(channel, channel_id)
+    }
 
-        let channel_id = self.dynamic_channels.insert_channel(channel, ChannelState::Creation);
+    /// Creates a new DVC using a processor built with its assigned channel ID.
+    ///
+    /// The next channel ID is reserved and passed to `build`, allowing the
+    /// processor or one of its dependencies to use the ID during construction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of registered dynamic channels reaches `u32::MAX`.
+    pub fn create_channel_with<T, E, F>(&mut self, build: F) -> Result<SvcMessage, E>
+    where
+        T: DvcServerProcessor + 'static,
+        E: From<PduError>,
+        F: FnOnce(u32) -> Result<T, E>,
+    {
+        let channel_id = self.dynamic_channels.reserve_channel();
+        let channel = build(channel_id)?;
+        self.create_channel_with_id(channel, channel_id).map_err(E::from)
+    }
+
+    fn create_channel_with_id<T>(&mut self, channel: T, channel_id: u32) -> PduResult<SvcMessage>
+    where
+        T: DvcServerProcessor + 'static,
+    {
+        let channel_name = channel.channel_name().into();
         let req = DrdynvcServerPdu::Create(CreateRequestPdu::new(channel_id, channel_name));
-        as_svc_msg_with_flag(req)
+        let svc_msg = as_svc_msg_with_flag(req)?;
+        self.dynamic_channels
+            .insert_channel_with_id(channel, ChannelState::Creation, channel_id);
+        Ok(svc_msg)
     }
 
     fn remove_by_channel_id(&mut self, id: u32) -> Option<DynamicChannel> {
@@ -252,10 +298,206 @@ impl DrdynvcServer {
 
     pub fn close_channel(&mut self, channel_id: u32) -> Option<SvcMessage> {
         self.remove_by_channel_id(channel_id)?;
+        self.outgoing_tunnel_channels.remove(&channel_id);
+        self.incoming_tunnel_channels.remove(&channel_id);
         Some(
             SvcMessage::from(DrdynvcServerPdu::Close(ClosePdu::new(channel_id)))
                 .with_flags(ChannelFlags::SHOW_PROTOCOL),
         )
+    }
+
+    /// Creates a Soft-Sync request that moves the supplied channels to reliable UDP.
+    ///
+    /// This API emits exactly one `ReliableUdp` channel list and maps every supplied
+    /// channel to that list. A future multi-tunnel request API must establish an
+    /// explicit response-routing mapping before it is exposed.
+    ///
+    /// A connection gets one request: The state never returns to idle, so a
+    /// later call returns an error. The request declares the TCP path flushed for
+    /// the supplied channels (SOFT_SYNC_TCP_FLUSHED, [MS-RDPEDYC] 2.2.5.1), so the
+    /// server sends their data over the tunnel from then on ([MS-RDPEDYC]
+    /// 3.3.5.3.1), whatever the client's response lists.
+    pub fn request_reliable_udp(&mut self, channel_ids: Vec<u32>) -> PduResult<SvcMessage> {
+        if channel_ids.is_empty() {
+            return Err(pdu_other_err!("soft-sync requires at least one dynamic channel"));
+        }
+        if !matches!(self.soft_sync_state, SoftSyncState::Idle) {
+            return Err(pdu_other_err!("soft-sync has already been requested"));
+        }
+
+        let mut selected_channels = BTreeMap::new();
+        for channel_id in &channel_ids {
+            if !self.is_channel_opened(*channel_id) {
+                return Err(pdu_other_err!(
+                    "Soft-Sync requested for a dynamic channel that is not open"
+                ));
+            }
+            if selected_channels
+                .insert(*channel_id, SoftSyncTunnelType::RELIABLE_UDP)
+                .is_some()
+            {
+                return Err(pdu_other_err!("soft-sync channel list contains a duplicate channel ID"));
+            }
+        }
+
+        let request = SoftSyncRequestPdu::new(alloc::vec![SoftSyncChannelList::new(
+            SoftSyncTunnelType::RELIABLE_UDP,
+            channel_ids,
+        )]);
+        let message = as_svc_msg_with_flag(DrdynvcServerPdu::SoftSyncRequest(request))?;
+        self.outgoing_tunnel_channels = selected_channels;
+        self.soft_sync_state = SoftSyncState::Active {
+            requested_tunnels: BTreeSet::from([SoftSyncTunnelType::RELIABLE_UDP]),
+            response_received: false,
+        };
+        Ok(message)
+    }
+
+    // (macrdp divergence) See vendor/ironrdp-dvc/CLAUDE.md.
+    /// Creates a Soft-Sync request that moves the supplied channels onto `tunnel_type`,
+    /// leaving per-channel routing to the caller.
+    ///
+    /// Like [`Self::request_reliable_udp`], a connection gets one request, and the
+    /// client's response is validated against it (only `tunnel_type` may be selected).
+    /// Two differences:
+    ///
+    /// - `tunnel_type` may be [`SoftSyncTunnelType::LOSSY_UDP`], and `channel_ids` may be
+    ///   empty: the request then carries no channel list (only SOFT_SYNC_TCP_FLUSHED is
+    ///   set), confirming the tunnel without moving any channel.
+    /// - The channels are **not** registered for tunneling: [`Self::tunnel_for_outgoing_channel`]
+    ///   stays `None` for them, and [`SvcProcessor::process`] keeps accepting their data
+    ///   over TCP. The caller routes their data itself, which lets it move a channel back to
+    ///   TCP when the tunnel fails, something the Soft-Sync protocol has no message for.
+    pub fn request_soft_sync(
+        &mut self,
+        tunnel_type: SoftSyncTunnelType,
+        channel_ids: Vec<u32>,
+    ) -> PduResult<SvcMessage> {
+        if !matches!(self.soft_sync_state, SoftSyncState::Idle) {
+            return Err(pdu_other_err!("soft-sync has already been requested"));
+        }
+
+        let mut seen = BTreeSet::new();
+        for channel_id in &channel_ids {
+            if !self.is_channel_opened(*channel_id) {
+                return Err(pdu_other_err!(
+                    "Soft-Sync requested for a dynamic channel that is not open"
+                ));
+            }
+            if !seen.insert(*channel_id) {
+                return Err(pdu_other_err!("soft-sync channel list contains a duplicate channel ID"));
+            }
+        }
+
+        let channel_lists = if channel_ids.is_empty() {
+            Vec::new()
+        } else {
+            alloc::vec![SoftSyncChannelList::new(tunnel_type, channel_ids)]
+        };
+        let message = as_svc_msg_with_flag(DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(
+            channel_lists,
+        )))?;
+        self.soft_sync_state = SoftSyncState::Active {
+            requested_tunnels: BTreeSet::from([tunnel_type]),
+            response_received: false,
+        };
+        Ok(message)
+    }
+
+    /// Returns whether server-to-client data for `channel_id` must be sent through a tunnel.
+    pub fn tunnel_for_outgoing_channel(&self, channel_id: u32) -> Option<SoftSyncTunnelType> {
+        self.outgoing_tunnel_channels.get(&channel_id).copied()
+    }
+
+    /// Returns whether a Soft-Sync request was sent and its response has not
+    /// arrived yet, the window in which the server must not read tunnel data
+    /// (MS-RDPEDYC 3.3.5.3.2).
+    pub const fn soft_sync_awaiting_response(&self) -> bool {
+        matches!(
+            self.soft_sync_state,
+            SoftSyncState::Active {
+                response_received: false,
+                ..
+            }
+        )
+    }
+
+    /// Returns whether the client has acknowledged the Soft-Sync request over TCP.
+    pub const fn soft_sync_response_received(&self) -> bool {
+        matches!(
+            self.soft_sync_state,
+            SoftSyncState::Active {
+                response_received: true,
+                ..
+            }
+        )
+    }
+
+    /// Processes raw DRDYNVC data received through an established multitransport tunnel.
+    pub fn process_tunnel(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        let pdu = decode_dvc_message(payload).map_err(|e| decode_err!(e))?;
+        let DrdynvcClientPdu::Data(data) = pdu else {
+            return Err(pdu_other_err!("only DVC data is permitted on a multitransport tunnel"));
+        };
+        if !self.incoming_tunnel_channels.contains_key(&data.channel_id()) {
+            return Err(pdu_other_err!(
+                "received tunneled data for a channel not selected by Soft-Sync"
+            ));
+        }
+        self.process_data(data)
+    }
+
+    fn process_data(&mut self, data: crate::pdu::DrdynvcDataPdu) -> PduResult<Vec<SvcMessage>> {
+        let channel_id = data.channel_id();
+        let c = self.channel_by_id(channel_id).map_err(|e| decode_err!(e))?;
+        if c.state != ChannelState::Opened {
+            debug!(?channel_id, ?c.state, "Invalid channel state");
+            return Err(pdu_other_err!("invalid channel state"));
+        }
+        let mut resp = Vec::new();
+        if let Some(complete) = c.complete_data.process_data(data).map_err(|e| decode_err!(e))? {
+            let msg = c.processor.process(channel_id, &complete)?;
+            resp.extend(encode_dvc_messages(channel_id, msg, ChannelFlags::SHOW_PROTOCOL).map_err(|e| encode_err!(e))?);
+        }
+        Ok(resp)
+    }
+
+    fn process_soft_sync_response(&mut self, response: crate::pdu::SoftSyncResponsePdu) -> PduResult<()> {
+        let SoftSyncState::Active {
+            requested_tunnels,
+            response_received,
+        } = &mut self.soft_sync_state
+        else {
+            return Err(pdu_other_err!("received unexpected Soft-Sync response"));
+        };
+        if *response_received {
+            return Err(pdu_other_err!("received duplicate Soft-Sync response"));
+        }
+        for tunnel_type in response.tunnels_to_switch() {
+            if !requested_tunnels.contains(tunnel_type) {
+                return Err(pdu_other_err!("soft-sync response selected an unrequested tunnel"));
+            }
+        }
+        let accepted_channels: BTreeMap<u32, SoftSyncTunnelType> = self
+            .outgoing_tunnel_channels
+            .iter()
+            .filter(|(_, tunnel_type)| response.tunnels_to_switch().contains(tunnel_type))
+            .map(|(channel_id, tunnel_type)| (*channel_id, *tunnel_type))
+            .collect();
+        // The response names the tunnels the client will write on
+        // (MS-RDPEDYC 2.2.5.2), so it sets only what the server reads from a
+        // tunnel. The server's own sending was fixed by the request: after
+        // sending it, the server MUST keep using the tunnel it named for
+        // those channels (3.3.5.3.1), and the request told the client that no
+        // more of their data comes over TCP.
+        debug!(
+            tunnels = ?response.tunnels_to_switch(),
+            channels = ?accepted_channels.keys().collect::<Vec<_>>(),
+            "Soft-Sync response received"
+        );
+        self.incoming_tunnel_channels = accepted_channels;
+        *response_received = true;
+        Ok(())
     }
 }
 
@@ -307,7 +549,13 @@ impl SvcProcessor for DrdynvcServer {
                     return Err(pdu_other_err!("invalid channel state"));
                 }
                 if create_resp.creation_status() != CreationStatus::OK {
-                    c.state = ChannelState::CreationFailed(create_resp.creation_status().into());
+                    let name = c.processor.channel_name();
+                    let status = create_resp.creation_status();
+                    // A client answers the Create Request with a failure status when it has
+                    // no listener for the channel, so this is how an optional channel is
+                    // declined on every connect, not a fault.
+                    debug!(channel_id = ?id, %name, ?status, "DVC channel creation declined by client");
+                    c.state = ChannelState::CreationFailed(status.into());
                     return Ok(resp);
                 }
                 c.state = ChannelState::Opened;
@@ -320,27 +568,14 @@ impl SvcProcessor for DrdynvcServer {
                 self.remove_by_channel_id(channel_id);
             }
             DrdynvcClientPdu::Data(data) => {
-                let channel_id = data.channel_id();
-                let c = self.channel_by_id(channel_id).map_err(|e| decode_err!(e))?;
-                if c.state != ChannelState::Opened {
-                    debug!(?channel_id, ?c.state, "Invalid channel state");
-                    return Err(pdu_other_err!("invalid channel state"));
+                if self.incoming_tunnel_channels.contains_key(&data.channel_id()) {
+                    return Err(pdu_other_err!("received TCP data for a channel selected by Soft-Sync"));
                 }
-                if let Some(complete) = c.complete_data.process_data(data).map_err(|e| decode_err!(e))? {
-                    let msg = c.processor.process(channel_id, &complete)?;
-                    resp.extend(
-                        encode_dvc_messages(channel_id, msg, ChannelFlags::SHOW_PROTOCOL)
-                            .map_err(|e| encode_err!(e))?,
-                    );
-                }
+                resp.extend(self.process_data(data)?);
             }
-            // (macrdp divergence) The client's Soft-Sync Response. Upstream had no
-            // arm for it and the catch-all in DrdynvcClientPdu::decode errored,
-            // tearing down the connection. We just acknowledge it — the client has
-            // switched the listed tunnels; routing DVC data onto the UDP tunnel is
-            // the multitransport layer's job (macrdp), not the drdynvc server's.
-            DrdynvcClientPdu::SoftSyncResponse(resp_pdu) => {
-                debug!("Got DVC Soft-Sync Response PDU: {resp_pdu:?}");
+            DrdynvcClientPdu::SoftSyncResponse(response) => {
+                debug!("Got DVC Soft-Sync Response PDU: {response:?}");
+                self.process_soft_sync_response(response)?;
             }
         }
 
@@ -356,4 +591,228 @@ fn decode_dvc_message(user_data: &[u8]) -> DecodeResult<DrdynvcClientPdu> {
 
 fn as_svc_msg_with_flag(pdu: DrdynvcServerPdu) -> PduResult<SvcMessage> {
     Ok(SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDvc;
+
+    impl_as_any!(TestDvc);
+
+    impl DvcProcessor for TestDvc {
+        fn channel_name(&self) -> &str {
+            "test"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl DvcServerProcessor for TestDvc {}
+
+    #[test]
+    fn soft_sync_rejects_tunnel_data_until_the_client_responds() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        server.request_reliable_udp(alloc::vec![channel_id]).unwrap();
+        assert_eq!(
+            server.tunnel_for_outgoing_channel(channel_id),
+            Some(SoftSyncTunnelType::RELIABLE_UDP)
+        );
+
+        let tunnel_data = ironrdp_core::encode_vec(&DrdynvcClientPdu::Data(crate::pdu::DrdynvcDataPdu::Data(
+            crate::pdu::DataPdu::new(channel_id, Vec::new()),
+        )))
+        .unwrap();
+        assert!(server.process_tunnel(&tunnel_data).is_err());
+
+        server
+            .process_soft_sync_response(crate::pdu::SoftSyncResponsePdu::new(alloc::vec![
+                SoftSyncTunnelType::RELIABLE_UDP,
+            ]))
+            .unwrap();
+
+        assert!(server.soft_sync_response_received());
+        assert!(server.process_tunnel(&tunnel_data).is_ok());
+
+        server.close_channel(channel_id).unwrap();
+        assert!(server.request_reliable_udp(alloc::vec![channel_id]).is_err());
+    }
+
+    #[test]
+    fn soft_sync_response_does_not_change_the_outgoing_tunnel() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        server.request_reliable_udp(alloc::vec![channel_id]).unwrap();
+        assert_eq!(
+            server.tunnel_for_outgoing_channel(channel_id),
+            Some(SoftSyncTunnelType::RELIABLE_UDP)
+        );
+
+        // An empty list means the client keeps writing over TCP. It does not
+        // take back the server's own switch, which the request announced.
+        server
+            .process_soft_sync_response(crate::pdu::SoftSyncResponsePdu::new(alloc::vec![]))
+            .unwrap();
+
+        assert!(server.soft_sync_response_received());
+        assert_eq!(
+            server.tunnel_for_outgoing_channel(channel_id),
+            Some(SoftSyncTunnelType::RELIABLE_UDP),
+            "the server keeps sending on the tunnel its request named"
+        );
+        let tunnel_data = ironrdp_core::encode_vec(&DrdynvcClientPdu::Data(crate::pdu::DrdynvcDataPdu::Data(
+            crate::pdu::DataPdu::new(channel_id, Vec::new()),
+        )))
+        .unwrap();
+        assert!(
+            server.process_tunnel(&tunnel_data).is_err(),
+            "the client did not switch its own writing, so tunnel data for the channel is unexpected"
+        );
+    }
+
+    #[test]
+    fn soft_sync_accepts_a_response_after_the_selected_channel_closes() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        server.request_reliable_udp(alloc::vec![channel_id]).unwrap();
+        server.close_channel(channel_id).unwrap();
+
+        server
+            .process_soft_sync_response(crate::pdu::SoftSyncResponsePdu::new(alloc::vec![
+                SoftSyncTunnelType::RELIABLE_UDP,
+            ]))
+            .unwrap();
+
+        assert!(server.soft_sync_response_received());
+        assert!(server.request_reliable_udp(alloc::vec![channel_id]).is_err());
+    }
+
+    // (macrdp divergence) Tests for `request_soft_sync`.
+
+    fn soft_sync_response(tunnels: Vec<SoftSyncTunnelType>) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::SoftSyncResponse(
+            crate::pdu::SoftSyncResponsePdu::new(tunnels),
+        ))
+        .unwrap()
+    }
+
+    fn data_for(channel_id: u32) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcClientPdu::Data(crate::pdu::DrdynvcDataPdu::Data(
+            crate::pdu::DataPdu::new(channel_id, Vec::new()),
+        )))
+        .unwrap()
+    }
+
+    fn expected_request(channel_lists: Vec<SoftSyncChannelList>) -> Vec<u8> {
+        ironrdp_core::encode_vec(&DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(
+            channel_lists,
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn request_soft_sync_validates_the_response_but_leaves_routing_to_the_caller() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        let request = server
+            .request_soft_sync(SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel_id])
+            .unwrap();
+        assert_eq!(
+            request.encode_unframed_pdu().unwrap(),
+            expected_request(alloc::vec![SoftSyncChannelList::new(
+                SoftSyncTunnelType::LOSSY_UDP,
+                alloc::vec![channel_id],
+            )])
+        );
+        assert_eq!(server.tunnel_for_outgoing_channel(channel_id), None);
+
+        server
+            .process(&soft_sync_response(alloc::vec![SoftSyncTunnelType::LOSSY_UDP]))
+            .unwrap();
+        assert!(server.soft_sync_response_received());
+
+        // The caller owns routing, so the channel's data is still accepted over TCP —
+        // what lets a caller move a channel back to TCP when its tunnel fails.
+        assert!(server.process(&data_for(channel_id)).is_ok());
+    }
+
+    #[test]
+    fn request_soft_sync_without_channels_sends_no_channel_list() {
+        let mut server = DrdynvcServer::new();
+
+        let request = server
+            .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, Vec::new())
+            .unwrap();
+        assert_eq!(request.encode_unframed_pdu().unwrap(), expected_request(Vec::new()));
+
+        server.process(&soft_sync_response(Vec::new())).unwrap();
+        assert!(server.soft_sync_response_received());
+    }
+
+    #[test]
+    fn request_soft_sync_rejects_a_response_selecting_an_unrequested_tunnel() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        server
+            .request_soft_sync(SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel_id])
+            .unwrap();
+        assert!(
+            server
+                .process(&soft_sync_response(alloc::vec![SoftSyncTunnelType::RELIABLE_UDP]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn request_soft_sync_allows_one_request_per_connection() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+
+        server
+            .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![channel_id])
+            .unwrap();
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::LOSSY_UDP, alloc::vec![channel_id])
+                .is_err()
+        );
+        assert!(server.request_reliable_udp(alloc::vec![channel_id]).is_err());
+    }
+
+    #[test]
+    fn request_soft_sync_rejects_unopened_and_duplicate_channels() {
+        let mut server = DrdynvcServer::new();
+        let opened = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+        let pending = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Creation);
+
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![pending])
+                .is_err()
+        );
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![opened, opened])
+                .is_err()
+        );
+        // A rejected request leaves the one-request allowance unused.
+        assert!(
+            server
+                .request_soft_sync(SoftSyncTunnelType::RELIABLE_UDP, alloc::vec![opened])
+                .is_ok()
+        );
+    }
 }
