@@ -1304,19 +1304,50 @@ pub(crate) fn pasteboard_guard() -> std::sync::MutexGuard<'static, ()> {
     PB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The pasteboard every clipboard path reads and writes: the system's general
+/// pasteboard. Callers hold [`pasteboard_guard`] while using it.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn pasteboard() -> objc2::rc::Retained<objc2_app_kit::NSPasteboard> {
+    unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() }
+}
+
+/// Under test, each test thread gets its own uniquely named pasteboard instead.
+/// The general one is shared by every process on the Mac, so tests that wrote
+/// it and then asserted on it failed whenever anything else copied at the same
+/// moment: a parallel test, another test process, Universal Clipboard, or the
+/// user. libtest runs each test on its own thread, and the tests that reach the
+/// pasteboard stay on that thread (`#[tokio::test]`'s default runtime is
+/// single-threaded, so even the spawned deferred advertise does). The board is
+/// released when the thread exits so runs don't leave named pasteboards behind.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) fn pasteboard() -> objc2::rc::Retained<objc2_app_kit::NSPasteboard> {
+    struct Private(objc2::rc::Retained<objc2_app_kit::NSPasteboard>);
+    impl Drop for Private {
+        fn drop(&mut self) {
+            // Not generated in objc2-app-kit 0.2; the AppKit method is.
+            let () = unsafe { objc2::msg_send![&self.0, releaseGlobally] };
+        }
+    }
+    thread_local! {
+        static PRIVATE: Private =
+            Private(unsafe { objc2_app_kit::NSPasteboard::pasteboardWithUniqueName() });
+    }
+    PRIVATE.with(|pb| pb.0.clone())
+}
+
 #[cfg(target_os = "macos")]
 mod pb {
     use objc2::rc::autoreleasepool;
     use objc2_app_kit::{
-        NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeHTML, NSPasteboardTypePNG,
-        NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+        NSPasteboardTypeFileURL, NSPasteboardTypeHTML, NSPasteboardTypePNG, NSPasteboardTypeRTF,
+        NSPasteboardTypeString, NSPasteboardTypeTIFF,
     };
     use objc2_foundation::{NSData, NSString, NSURL};
 
     pub fn change_count() -> i64 {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             pb.changeCount() as i64
         }
     }
@@ -1345,7 +1376,7 @@ mod pb {
     pub fn read_html() -> Option<String> {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             pb.dataForType(NSPasteboardTypeHTML)
                 .map(|d| String::from_utf8_lossy(&nsdata_to_vec(&d)).into_owned())
         })
@@ -1355,7 +1386,7 @@ mod pb {
     pub fn read_rtf() -> Option<Vec<u8>> {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             pb.dataForType(NSPasteboardTypeRTF)
                 .map(|d| nsdata_to_vec(&d))
         })
@@ -1392,7 +1423,7 @@ mod pb {
     pub fn read_files() -> Vec<FileEntry> {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             let Some(items) = pb.pasteboardItems() else {
                 return Vec::new();
             };
@@ -1522,7 +1553,7 @@ mod pb {
     fn has_type(target: &objc2_app_kit::NSPasteboardType) -> bool {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             let Some(types) = pb.types() else {
                 return false;
             };
@@ -1539,7 +1570,7 @@ mod pb {
     pub fn read_string() -> Option<String> {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             pb.stringForType(NSPasteboardTypeString)
                 .map(|s| s.to_string())
         })
@@ -1550,7 +1581,7 @@ mod pb {
     pub fn write_string(s: &str) {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             pb.clearContents();
             let ns = NSString::from_str(s);
             pb.setString_forType(&ns, NSPasteboardTypeString);
@@ -1563,7 +1594,7 @@ mod pb {
     pub fn read_image_bytes() -> Option<(ImageEncoding, Vec<u8>)> {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
                 return Some((ImageEncoding::Png, nsdata_to_vec(&d)));
             }
@@ -1590,7 +1621,7 @@ mod pb {
     ) {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = super::pasteboard();
             pb.clearContents();
             // Richest first: the order is the owner's stated preference.
             if let Some(rtf) = rtf {

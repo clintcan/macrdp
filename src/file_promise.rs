@@ -35,7 +35,6 @@ use ironrdp_cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsR
 use ironrdp_server::ServerEvent;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_app_kit::NSPasteboard;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -408,7 +407,7 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
     // guard so no other writer can bump it between our write and the capture.
     let _pb_guard = crate::clipboard::pasteboard_guard();
     let new_change_count = unsafe {
-        let pb = NSPasteboard::generalPasteboard();
+        let pb = crate::clipboard::pasteboard();
         pb.clearContents();
         pb.writeObjects(&array);
         pb.changeCount() as i64

@@ -59,7 +59,6 @@ use block2::Block;
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
-use objc2_app_kit::NSPasteboard;
 use objc2_foundation::{
     NSArray, NSFileCoordinator, NSFilePresenter, NSOperationQueue, NSString, NSURL,
 };
@@ -507,13 +506,13 @@ pub fn clear_pasteboard_if_stale(self_change_count: &SelfChangeCount) {
     // it's atomic (no other writer can bump changeCount between them) and race-
     // free against the advertise poller (NSPasteboard is not thread-safe).
     let _pb_guard = crate::clipboard::pasteboard_guard();
-    let current_cc = unsafe { NSPasteboard::generalPasteboard().changeCount() } as i64;
+    let current_cc = unsafe { crate::clipboard::pasteboard().changeCount() } as i64;
     if current_cc != our_cc {
         // Something else owns the clipboard now — leave it alone.
         return;
     }
     unsafe {
-        let pb = NSPasteboard::generalPasteboard();
+        let pb = crate::clipboard::pasteboard();
         pb.clearContents();
         let new_cc = pb.changeCount() as i64;
         // Record as a self-write so the change-count poller doesn't see
@@ -558,13 +557,13 @@ pub fn cleanup_on_disconnect(
     // Atomic check-then-clear under the shared pasteboard guard (NSPasteboard is
     // not thread-safe; this Drop path races the advertise poller during churn).
     let _pb_guard = crate::clipboard::pasteboard_guard();
-    let current_cc = unsafe { NSPasteboard::generalPasteboard().changeCount() } as i64;
+    let current_cc = unsafe { crate::clipboard::pasteboard().changeCount() } as i64;
     if current_cc == our_cc {
         unsafe {
             // clearContents bumps changeCount; record it as a self-write
             // so the change-count poller doesn't read the now-empty
             // pasteboard and bounce it back to Windows as a fresh copy.
-            let pb = NSPasteboard::generalPasteboard();
+            let pb = crate::clipboard::pasteboard();
             pb.clearContents();
             let new_cc = pb.changeCount() as i64;
             self_change_count.store(new_cc, Ordering::Relaxed);
@@ -624,7 +623,7 @@ fn publish_to_pasteboard(urls: &[SendRetained<NSURL>], self_change_count: &SelfC
     // keep the changeCount capture inside the guard so it's our write's count.
     let _pb_guard = crate::clipboard::pasteboard_guard();
     let new_change_count = unsafe {
-        let pb = NSPasteboard::generalPasteboard();
+        let pb = crate::clipboard::pasteboard();
         pb.clearContents();
         pb.writeObjects(&array);
         pb.changeCount() as i64
