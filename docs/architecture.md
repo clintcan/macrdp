@@ -176,9 +176,9 @@ src/multitransport.rs  macrdp-side RDP UDP multitransport provider
                   default OFF). Thin: a MacMultitransport that tells the
                   vendored server to offer reliable UDP (UdpFecR). The transport
                   itself (RDPEUDP state machine + RDPEUDP2/EMT codecs) is the
-                  sans-I/O vendor/ironrdp-rdpeudp crate; the UDP listener + rustls
+                  sans-I/O vendor/macrdp-rdpeudp crate; the UDP listener + rustls
                   TLS + MS-RDPEMT tunnel + DYNVC Soft-Sync EGFX migration live in
-                  vendored ironrdp-server (src/multitransport/, divergence (12))
+                  vendored ironrdp-server (src/mt/, divergence (12))
                   + vendored ironrdp-dvc (Soft-Sync codec). main.rs binds the
                   listener on the TCP address/port and wires the cookie registry +
                   the server↔listener tunnel handoff. EGFX-over-UDP rendering is
@@ -346,15 +346,17 @@ vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.5.0 (added 2026-06-16,
                           PDU-layer fork went away. If you're seeing this in a stale
                           checkout, the dir isn't missing — it stopped existing.)
 
-vendor/ironrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
+vendor/macrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
                           multitransport (--enable-udp-multitransport, feature
                           `multitransport`, default OFF). No sockets/tokio: PDU
                           codecs for RDPEUDP v1 (pdu.rs, big-endian) + RDPEUDP2
                           (eudp2.rs) + the MS-RDPEMT tunnel PDUs (emt.rs), and the
                           reliable transport state machine (state.rs: handshake +
                           in-order dedup delivery + cumulative-ACK + RTO retransmit)
-                          driven by the listener. Candidate for upstream. See
-                          vendor/ironrdp-rdpeudp/CLAUDE.md.
+                          driven by the listener. Renamed from ironrdp-rdpeudp at
+                          the e258f6a0 bump (upstream now ships its own crate of
+                          that name, unused here). See
+                          vendor/macrdp-rdpeudp/CLAUDE.md.
 
 vendor/ironrdp-dvc/       Local fork of ironrdp-dvc 0.5.0 (added 2026-06-26, 4th
                           fork). Adds the server-direction MS-RDPEDYC **Soft-Sync**
