@@ -112,10 +112,10 @@ ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
 # encode/decode halves the client-oriented upstream crate lacks. See
 # vendor/ironrdp-rdpdr/CLAUDE.md.
 ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
-# ironrdp-dvc is vendored (same upstream rev) for server-side MS-RDPEDYC Soft-Sync
-# support — moving dynamic virtual channels (EGFX) onto the UDP multitransport
-# tunnel. Upstream is client-oriented and errors on the server-inbound
-# SoftSyncResponse. See vendor/ironrdp-dvc/CLAUDE.md.
+# ironrdp-dvc is vendored (same upstream rev) for one addition,
+# `DrdynvcServer::request_soft_sync`: Soft-Sync onto the lossy tunnel or with no
+# channels, with macrdp owning per-channel routing (upstream's request_reliable_udp
+# is reliable-only and blocks the TCP fallback). See vendor/ironrdp-dvc/CLAUDE.md.
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 # ironrdp-rdpeusb: FORK RETIRED at the a5d1c682 pin bump — all four vendored
 # divergences merged upstream (div1 #1418 SupportedUsbVer newtype + USB_32, div2
