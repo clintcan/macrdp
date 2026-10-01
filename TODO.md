@@ -430,7 +430,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   encoder is pointless. The 1+1 redundancy stand-in (above) is the only loss-resilience
   lever reachable for a modern client. Would only reopen with legacy-Windows-8.x test
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
-  RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
+  RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/macrdp-rdpeudp/CLAUDE.md`.
 
 - [ ] **Generic USB redirection (MS-RDPEUSB) — FreeRDP: DRIVE MOUNTS ✅✅ (Phase 3.2 bulk). mstsc: ENUMERATES + CONFIGURES + negotiates FORMAT ✅ (2026-07-07); only gap = client doesn't deliver bulk frames (mstsc-side). Remaining: camera-redirection channel, device-class streaming (isoch/interrupt), retract/multi-device.**
   **mstsc now enumerates, configures, and negotiates format end-to-end** (verified camera `09da:2692`
@@ -851,6 +851,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
   - **Order:** drop dvc fork (port Soft-Sync use) → rebase acceptor → rebase rdpdr (keep ESC) → rebase
     server (group 1 drop, group 3 keep, group 2 as-is, rename multitransport dir) → `src/` →
     tests → live mstsc/FreeRDP → 48–72 h soak incl. a headless mode → v0.10.0.
+  - **▶ PROGRESS 2026-10-01: code steps DONE** (commits `accaf99`..`134d2e5`): dvc fork shrunk to one
+    addition, acceptor/rdpdr/server re-vendored as upstream-verbatim + our files + marked hooks
+    (`vendor/ironrdp-server/CLAUDE.md`; old log frozen in `DIVERGENCE-HISTORY.md`), `vendor/ironrdp-rdpeudp`
+    → `vendor/macrdp-rdpeudp`, `src/` on the new API (`ConnectionHooks`, builder chain incl.
+    `ConnectionPolicy::Preempt`). 266 tests pass; fmt/clippy/deny clean on macOS; Linux = CI.
+    **NEXT — live tests:** ARC after a process RESTART (upstream HMAC now denies it), Preempt takeover,
+    FreeRDP minimize (upstream now advertises SuppressOutput), `/gfx:progressive` decline, UDP (mstsc
+    migrate-egfx, lossy audio, watchdog), RDPDR mstsc write + smart card, USB SelectConfiguration,
+    audio/AAC, NSCodec on Windows App, iOS taps + horizontal-scroll SIGN. Then soak → v0.10.0 → close #182.
 - [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
