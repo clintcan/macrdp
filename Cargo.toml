@@ -122,29 +122,29 @@ ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 # #1513 usb_device match, div3 #1420 UsbConfigDesc.trailing, div4 #1321 completion
 # guards). Upstream is publish=false (git-workspace crate), so it stays a git-pin
 # rather than a crates.io version. vendor/ironrdp-rdpeusb/ was DELETED at the bump.
-ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
 # ironrdp-str isn't depended on directly by macrdp, but the git
 # ironrdp-rdpeusb names it as a crates.io dep (it's a git-workspace crate, never
 # published); pin it to the same git rev so it resolves + unifies with the copy
 # the other ironrdp crates pull transitively. (Same shape as ironrdp-error above.)
-ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
 # ironrdp-error isn't depended on directly by macrdp, but the vendored
 # ironrdp-rdpdr names it as a crates.io dep; pin it to the same git rev as the
 # rest so it unifies with the copy the other ironrdp crates pull transitively.
-ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
 
 # The git-pinned ironrdp crates above (egfx, displaycontrol, echo, …) depend on
 # ironrdp-dvc as a path dep WITHIN the git workspace, so the [patch.crates-io]
