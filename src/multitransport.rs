@@ -293,8 +293,8 @@ mod tests {
     // rather than byte-compare the whole packet.
     #[tokio::test]
     async fn listener_answers_real_client_syn_over_loopback() {
-        use ironrdp_rdpeudp::datagram::Datagram;
-        use ironrdp_rdpeudp::pdu::{FecFlags, UdpVersion};
+        use macrdp_rdpeudp::datagram::Datagram;
+        use macrdp_rdpeudp::pdu::{FecFlags, UdpVersion};
         use ironrdp_server::{ListenerConfig, UdpMultitransportListener};
         use std::time::Duration;
         use tokio::net::UdpSocket;

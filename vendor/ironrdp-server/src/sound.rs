@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::ServerEventSender;
 
-/// One captured audio chunk en route to the client: encoded audio bytes
+/// (macrdp divergence 2/8) One captured audio chunk en route to the client: encoded audio bytes
 /// in the negotiated format (16-bit stereo interleaved PCM at 44.1 kHz,
 /// or a single AAC-LC access unit) plus the source-side timestamp in ms,
 /// plus the chunk's playback duration in ms. Carried on a dedicated

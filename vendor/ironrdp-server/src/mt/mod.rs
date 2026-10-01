@@ -25,13 +25,12 @@ pub mod audio_dvc;
 pub mod dtls;
 pub mod listener;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use ironrdp_acceptor::MultitransportOffer;
 use ironrdp_core::encode_vec;
 use ironrdp_pdu::mcs::SendDataIndication;
 use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
@@ -103,7 +102,7 @@ pub fn encode_initiate_request(
 /// yet consumed/torn down. The per-connection offer path
 /// ([`RdpServer`](crate::RdpServer)) registers the cookie it puts in its
 /// Initiate Multitransport Request; the process-global UDP
-/// [`listener`](crate::multitransport::listener) checks an inbound tunnel
+/// [`listener`](crate::mt::listener) checks an inbound tunnel
 /// `RDP_TUNNEL_CREATEREQUEST`'s echoed cookie against it before accepting the
 /// tunnel — **binding the UDP flow to a real, current TCP session** so a forged
 /// or replayed cookie can't open a tunnel. Cookies are one-time: the listener
@@ -215,35 +214,6 @@ impl CookieRegistry {
     }
 }
 
-/// Build a fresh [`MultitransportOffer`] for one connection: a process-wide
-/// monotonic `request_id` plus a **cryptographically-random** 16-byte security
-/// cookie. The acceptor sends it as the Server Initiate Multitransport Request
-/// after licensing (before Demand Active); the client echoes `request_id` +
-/// `cookie` back inside the UDP tunnel's `RDP_TUNNEL_CREATEREQUEST`, where the
-/// listener matches it against the [`CookieRegistry`] to bind the flow. The
-/// cookie is CSPRNG-generated (not derivable from `request_id`) so it can't be
-/// forged by an attacker who can see the predictable request id.
-pub(crate) fn new_offer(protocol: RequestedProtocol) -> MultitransportOffer {
-    static MT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
-    let request_id = MT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let mut cookie = [0u8; 16];
-    if let Err(e) = getrandom::getrandom(&mut cookie) {
-        // The system RNG failing is catastrophic and near-impossible; fall back
-        // to a non-secret derived value so we don't panic the whole server. The
-        // tunnel binding still works (registry match); only unpredictability is
-        // lost in this degenerate case.
-        tracing::error!(error = %e, "system RNG failed for multitransport cookie; using a weak fallback");
-        for (i, b) in cookie.iter_mut().enumerate() {
-            *b = (request_id.wrapping_mul(2_654_435_761).wrapping_add(i as u32) & 0xff) as u8;
-        }
-    }
-    MultitransportOffer {
-        request_id,
-        protocol,
-        cookie,
-    }
-}
-
 /// (M5c) One unit of server-originated data to ship over a bound UDP tunnel: the
 /// `cookie` selects which peer (the listener maps cookie → peer address on bind),
 /// and `data` is the **HigherLayerData** for an `RDP_TUNNEL_DATA` PDU (one SVC
@@ -275,7 +245,7 @@ impl TunnelSender {
 
 /// (M5c) Create the server→listener handoff channel. Hand the [`TunnelSender`] to
 /// the [`RdpServer`](crate::RdpServer) (via `set_multitransport_tunnel_sender`) and
-/// the receiver to [`UdpMultitransportListener::bind`](crate::multitransport::listener::UdpMultitransportListener::bind).
+/// the receiver to [`UdpMultitransportListener::bind`](crate::mt::listener::UdpMultitransportListener::bind).
 pub fn tunnel_channel() -> (TunnelSender, tokio::sync::mpsc::UnboundedReceiver<TunnelOutbound>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (TunnelSender(tx), rx)
