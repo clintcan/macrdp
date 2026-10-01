@@ -33,7 +33,7 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rcgen = "0.13"  # self-signed cert for first-run / dev
 rustls-pemfile = "2"  # read persisted cert.pem / key.pem on subsequent runs
-x509-cert = { version = "0.2", default-features = false }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }  # std: Time::to_system_time (cert-expiry warning)
 der = "0.7"
 
 # RDP protocol — ironrdp is split into many sub-crates; add only what you use.
