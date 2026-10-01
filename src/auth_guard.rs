@@ -665,7 +665,7 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         &mut self,
         peer: std::net::SocketAddr,
         duration: Duration,
-        error: Option<&anyhow::Error>,
+        error: Option<&ironrdp_server::ServerError>,
     ) -> ironrdp_server::PostConnectionAction {
         let outcome = classify_outcome(error.is_some(), duration, self.core.failfast_window());
         self.core.record_outcome(Instant::now(), peer.ip(), outcome);

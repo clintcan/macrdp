@@ -18,14 +18,15 @@
 //! fired, so an unauthenticated peer opening connections can delay the lock
 //! by at most that much — never prevent it.
 //!
-//! Only installed with `--lock-on-disconnect`; the default connection path is
-//! unchanged (no wrapper, no timestamps).
+//! Only installed with `--lock-on-disconnect` (as one of the server's
+//! [`ConnectionHooks`](crate::conn_hooks::ConnectionHooks), after the auth guard);
+//! the default connection path records nothing.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ironrdp_server::{ConnectionHandler, PostConnectionAction};
+use ironrdp_server::ConnectionHandler;
 
 /// Upper bound on how long the lock may be held past its normal firing time.
 pub const MAX_HOLD: Duration = Duration::from_secs(30);
@@ -129,64 +130,21 @@ pub fn decide(
     }
 }
 
-/// Wraps the server's connection handler (or none) to record activity for
-/// [`ConnectionActivity`], forwarding every hook unchanged.
-pub struct ActivityHandler {
-    inner: Option<Box<dyn ConnectionHandler>>,
-    activity: std::sync::Arc<ConnectionActivity>,
-}
+/// Records connection activity for [`ConnectionActivity`]. Runs after the auth
+/// guard in [`ConnectionHooks`](crate::conn_hooks::ConnectionHooks), which stops at
+/// the first rejection, so a connection the guard refused (rate limit / lockout)
+/// never counts.
+pub struct ActivityHook(pub std::sync::Arc<ConnectionActivity>);
 
-impl ActivityHandler {
-    pub fn wrap(
-        inner: Option<Box<dyn ConnectionHandler>>,
-        activity: std::sync::Arc<ConnectionActivity>,
-    ) -> Box<dyn ConnectionHandler> {
-        Box::new(Self { inner, activity })
-    }
-}
-
-impl ConnectionHandler for ActivityHandler {
-    fn on_accept(&mut self, peer: SocketAddr) -> bool {
-        let accepted = self.inner.as_mut().is_none_or(|h| h.on_accept(peer));
-        // Only connections the inner handler let through count: one the auth
-        // guard rejected (rate limit / lockout) is dropped at once.
-        if accepted {
-            ConnectionActivity::mark(&self.activity.last_accept_ms, self.activity.now_ms());
-        }
-        accepted
+impl ConnectionHandler for ActivityHook {
+    fn on_accept(&mut self, _peer: SocketAddr) -> bool {
+        ConnectionActivity::mark(&self.0.last_accept_ms, self.0.now_ms());
+        true
     }
 
-    fn on_disconnected(
-        &mut self,
-        peer: SocketAddr,
-        duration: Duration,
-        error: Option<&anyhow::Error>,
-    ) -> PostConnectionAction {
-        self.inner
-            .as_mut()
-            .map_or(PostConnectionAction::Continue, |h| {
-                h.on_disconnected(peer, duration, error)
-            })
-    }
-
-    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+    fn on_authenticated(&mut self, success: bool, _reason: Option<&str>) {
         if success {
-            ConnectionActivity::mark(&self.activity.last_auth_ms, self.activity.now_ms());
-        }
-        if let Some(h) = self.inner.as_mut() {
-            h.on_authenticated(success, reason);
-        }
-    }
-
-    fn on_client_fingerprint(
-        &mut self,
-        client_name: &str,
-        rdp_version: u32,
-        client_build: u32,
-        platform: &str,
-    ) {
-        if let Some(h) = self.inner.as_mut() {
-            h.on_client_fingerprint(client_name, rdp_version, client_build, platform);
+            ConnectionActivity::mark(&self.0.last_auth_ms, self.0.now_ms());
         }
     }
 }
@@ -194,6 +152,7 @@ impl ConnectionHandler for ActivityHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_server::PostConnectionAction;
     use std::sync::Arc;
 
     const S: fn(u64) -> Duration = Duration::from_secs;
@@ -272,19 +231,25 @@ mod tests {
         }
     }
 
+    /// Composed after the guard, the hook records only what the guard allows.
     #[test]
-    fn the_wrapper_records_only_what_the_inner_handler_allows() {
+    fn only_connections_the_guard_allows_are_recorded() {
+        use crate::conn_hooks::ConnectionHooks;
+
         let peer = SocketAddr::from(([203, 0, 113, 5], 51000));
         let activity = Arc::new(ConnectionActivity::default());
 
-        let mut rejecting = ActivityHandler::wrap(Some(Box::new(Rejecting)), activity.clone());
-        assert!(!rejecting.on_accept(peer), "the inner verdict is preserved");
-        rejecting.on_authenticated(false, Some("bad password"));
+        let mut guarded = ConnectionHooks::new(vec![
+            Box::new(Rejecting),
+            Box::new(ActivityHook(activity.clone())),
+        ]);
+        assert!(!guarded.on_accept(peer), "the guard's verdict is preserved");
+        guarded.on_authenticated(false, Some("bad password"));
         assert_eq!(activity.last_accept_ms.load(Ordering::SeqCst), 0);
         assert_eq!(activity.last_auth_ms.load(Ordering::SeqCst), 0);
 
-        let mut open = ActivityHandler::wrap(None, activity.clone());
-        assert!(open.on_accept(peer), "no inner handler accepts all");
+        let mut open = ConnectionHooks::new(vec![Box::new(ActivityHook(activity.clone()))]);
+        assert!(open.on_accept(peer));
         open.on_authenticated(true, None);
         assert_ne!(activity.last_accept_ms.load(Ordering::SeqCst), 0);
         assert_ne!(activity.last_auth_ms.load(Ordering::SeqCst), 0);

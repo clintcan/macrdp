@@ -813,8 +813,8 @@ impl MacCliprdrBackend {
 ///
 /// File copies and non-file copies take different code paths inside
 /// ironrdp-cliprdr: a regular format list goes via `SendInitiateCopy`, but
-/// file lists must go via `initiate_file_copy` (exposed here through the
-/// vendored `ServerEvent::ClipboardFileCopy` variant) so that the cliprdr
+/// file lists must go via `initiate_file_copy` (reached through
+/// `ClipboardMessage::SendInitiateFileCopy`) so that the cliprdr
 /// server populates its `local_file_list` and accepts subsequent
 /// FileContentsRequests instead of short-circuiting them with
 /// CB_RESPONSE_FAIL.
@@ -845,7 +845,10 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
                 file_count = files.len(),
                 "advertising file copy to client (recursive)"
             );
-            return send(sender, ServerEvent::ClipboardFileCopy(files));
+            return send(
+                sender,
+                ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(files)),
+            );
         }
         // Files claimed but read empty (race) — fall through to format list.
     }
@@ -1120,7 +1123,7 @@ impl CliprdrBackend for MacCliprdrBackend {
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         // FileGroupDescriptorW is handled internally by upstream cliprdr
         // once we go through `initiate_file_copy` (the
-        // ServerEvent::ClipboardFileCopy path) — it answers the FormatData
+        // `SendInitiateFileCopy` path) — it answers the FormatData
         // request from its stored `local_file_list` without ever reaching
         // us. So we only deal with CF_UNICODETEXT and CF_DIB here.
         let response = match request.format {
