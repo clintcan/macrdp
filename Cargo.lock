@@ -4524,6 +4524,7 @@ dependencies = [
  "const-oid 0.9.6",
  "der 0.7.10",
  "spki 0.7.3",
+ "tls_codec",
 ]
 
 [[package]]

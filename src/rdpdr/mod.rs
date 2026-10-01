@@ -66,7 +66,7 @@ use std::collections::HashMap;
 use ironrdp_rdpdr::pdu::efs::DeviceType;
 use ironrdp_rdpdr::pdu::efs::NtStatus;
 use ironrdp_server::{
-    AnnouncedDevice, RdpdrBackendFactory, RdpdrHandle, RdpdrServerFactory, RdpdrServerHandler,
+    AnnouncedDevice, RdpdrBackendFactory, RdpdrDriveServerFactory, RdpdrHandle, RdpdrServerHandler,
     ServerEvent, ServerEventSender,
 };
 use nfsserve::nfs::nfsstat3;
@@ -120,7 +120,7 @@ impl RdpdrBackendFactory for MacRdpdr {
     }
 }
 
-impl RdpdrServerFactory for MacRdpdr {}
+impl RdpdrDriveServerFactory for MacRdpdr {}
 
 /// Backend for the RDPDR server processor. Logs announced devices and, on
 /// macOS, mounts each redirected filesystem as its own real NFS volume

@@ -696,7 +696,7 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         &mut self,
         peer: std::net::SocketAddr,
         duration: Duration,
-        error: Option<&anyhow::Error>,
+        error: Option<&ironrdp_server::ServerError>,
     ) -> ironrdp_server::PostConnectionAction {
         let authenticated = self.authenticated.remove(&peer);
         let outcome = classify_outcome(
