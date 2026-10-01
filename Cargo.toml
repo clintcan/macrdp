@@ -54,7 +54,7 @@ ironrdp-cliprdr = "0.7"
 ironrdp-core = "0.2"
 ironrdp-rdpsnd = "0.9"
 # RDPDR drive redirection (gated at runtime by --enable-drive-redirection).
-# Vendored locally for the server-direction encode/decode halves — see
+# Vendored locally for the server-direction smart-card halves — see
 # vendor/ironrdp-rdpdr/CLAUDE.md.
 ironrdp-rdpdr = "0.7"
 # EGFX / H.264 video pipeline (gated at runtime by --enable-h264).
@@ -104,12 +104,14 @@ screencapturekit = { version = "2.1", features = ["async"] }
 # git pin list below.
 [patch.crates-io]
 ironrdp-server = { path = "vendor/ironrdp-server" }
-# ironrdp-acceptor is vendored (same upstream rev as the git pins below) for
-# the honor-client-desktop-size divergence — serve the resolution the client
-# requests. See vendor/ironrdp-acceptor/CLAUDE.md.
+# ironrdp-acceptor is vendored (same upstream rev as the git pins below) for two
+# additions: the client fingerprint on AcceptorResult, and choosing which UDP
+# transport the multitransport request asks for (lossy audio). See
+# vendor/ironrdp-acceptor/CLAUDE.md.
 ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
-# ironrdp-rdpdr is vendored (same upstream rev) for the server-direction RDPDR
-# encode/decode halves the client-oriented upstream crate lacks. See
+# ironrdp-rdpdr is vendored (same upstream rev) for what macrdp's own RDPDR
+# server processor needs that upstream lacks: the smart-card (MS-RDPESC) server
+# direction and a public request envelope. Two new files on upstream verbatim. See
 # vendor/ironrdp-rdpdr/CLAUDE.md.
 ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
 # ironrdp-dvc is vendored (same upstream rev) for one addition,

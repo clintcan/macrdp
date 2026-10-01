@@ -1622,6 +1622,7 @@ dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
  "ironrdp-svc",
+ "rand 0.9.4",
  "tracing",
 ]
 
@@ -1786,6 +1787,7 @@ name = "ironrdp-rdpdr"
 version = "0.7.0"
 dependencies = [
  "bitflags 2.11.1",
+ "getrandom 0.3.4",
  "ironrdp-core",
  "ironrdp-error",
  "ironrdp-pdu",
