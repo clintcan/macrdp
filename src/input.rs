@@ -202,9 +202,94 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
     remap_on && ctrl && !cmd && !alt && !excluded
 }
 
+/// What `resync_modifiers_if_stale` must do for one trigger. Split out pure —
+/// like `should_remap_click` — so the decision table is unit-tested on every
+/// target; the method itself only gathers the inputs and performs the effects.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct ResyncPlan {
+    /// Buttons to release with a synthetic Up (left, right, middle). Only on a
+    /// connection edge: an idle gap must never drop a drag in progress.
+    release_buttons: [bool; 3],
+    /// Drop `remapped_keys` and the click latch. Connection edge only —
+    /// clearing the latch on an idle gap would undo the down/up consistency fix.
+    clear_gesture_state: bool,
+    /// Post the `FlagsChanged` that releases held modifiers. Gated on a
+    /// modifier actually being held, so a clean reconnect doesn't bother macOS.
+    post_flags_changed: bool,
+}
+
+/// `reconnected`: a new served connection began. `buttons_down`: left, right,
+/// middle as currently tracked. `mods_held`: any non-lock modifier is held.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn resync_plan(reconnected: bool, buttons_down: [bool; 3], mods_held: bool) -> ResyncPlan {
+    ResyncPlan {
+        release_buttons: if reconnected {
+            buttons_down
+        } else {
+            [false; 3]
+        },
+        clear_gesture_state: reconnected,
+        post_flags_changed: mods_held,
+    }
+}
+
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click};
+    use super::{
+        is_remappable_shortcut, map_client_to_display, resync_plan, should_remap_click, ResyncPlan,
+    };
+
+    /// Connection edge: every tracked button is released, the gesture state is
+    /// cleared, and `FlagsChanged` is posted only if a modifier was held.
+    #[test]
+    fn resync_plan_connection_edge_releases_buttons_and_clears_state() {
+        // Mid-drag disconnect: left held, no modifier left.
+        assert_eq!(
+            resync_plan(true, [true, false, false], false),
+            ResyncPlan {
+                release_buttons: [true, false, false],
+                clear_gesture_state: true,
+                post_flags_changed: false,
+            },
+            "latch/remapped_keys are cleared even though no modifier was held"
+        );
+        // Every button + a held modifier.
+        assert_eq!(
+            resync_plan(true, [true, true, true], true),
+            ResyncPlan {
+                release_buttons: [true, true, true],
+                clear_gesture_state: true,
+                post_flags_changed: true,
+            }
+        );
+        // Clean reconnect: nothing to release, nothing to post — but state
+        // is still cleared.
+        assert_eq!(
+            resync_plan(true, [false; 3], false),
+            ResyncPlan {
+                release_buttons: [false; 3],
+                clear_gesture_state: true,
+                post_flags_changed: false,
+            }
+        );
+    }
+
+    /// Idle gap: modifiers only. A drag/click in progress inside a live
+    /// connection is legitimate state, and the latch must survive.
+    #[test]
+    fn resync_plan_idle_gap_touches_modifiers_only() {
+        assert_eq!(
+            resync_plan(false, [true, true, true], true),
+            ResyncPlan {
+                release_buttons: [false; 3],
+                clear_gesture_state: false,
+                post_flags_changed: true,
+            },
+            "buttons and latch survive an idle gap"
+        );
+        assert!(!resync_plan(false, [false; 3], false).post_flags_changed);
+    }
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
     /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
@@ -992,31 +1077,36 @@ mod macos {
                 return;
             }
 
-            if reconnected {
-                // Connection edge: release any button macOS still believes is
-                // held — we posted the Down, the connection died before the Up.
-                // Go through `button()` so the Up carries the same (latched)
-                // flags the Down did and the click bookkeeping stays paired,
-                // and do it BEFORE clearing modifiers so the pair can't
-                // disagree. This also zeroes `left_down`/`right_down`/
-                // `middle_down`, so the next move posts as MouseMoved, not a
-                // phantom `LeftMouseDragged`.
-                if self.left_down {
-                    self.button(CGMouseButton::Left, false);
-                }
-                if self.right_down {
-                    self.button(CGMouseButton::Right, false);
-                }
-                if self.middle_down {
-                    self.button(CGMouseButton::Center, false);
-                }
+            let plan = super::resync_plan(
+                reconnected,
+                [self.left_down, self.right_down, self.middle_down],
+                self.mods.any_held(),
+            );
+
+            // Connection edge: release any button macOS still believes is
+            // held — we posted the Down, the connection died before the Up.
+            // Go through `button()` so the Up carries the same (latched)
+            // flags the Down did and the click bookkeeping stays paired,
+            // and do it BEFORE clearing modifiers so the pair can't
+            // disagree. This also zeroes `left_down`/`right_down`/
+            // `middle_down`, so the next move posts as MouseMoved, not a
+            // phantom `LeftMouseDragged`.
+            let [rel_left, rel_right, rel_middle] = plan.release_buttons;
+            if rel_left {
+                self.button(CGMouseButton::Left, false);
+            }
+            if rel_right {
+                self.button(CGMouseButton::Right, false);
+            }
+            if rel_middle {
+                self.button(CGMouseButton::Center, false);
             }
 
             // Snapshot first so the log shows WHAT was stuck.
             let stuck = self.mods.cg_flags().bits();
-            let had_mods = self.mods.clear_non_lock();
+            self.mods.clear_non_lock();
 
-            if reconnected {
+            if plan.clear_gesture_state {
                 // Drop the remaining per-gesture state regardless of whether a
                 // modifier was held (see the doc): an outstanding remapped
                 // key-down or a latch left by a Down whose Up never came.
@@ -1028,7 +1118,7 @@ mod macos {
             // earlier FlagsChanged left the session state asserting it, and
             // macOS derives press-vs-release from the flags diff, so one event
             // carrying the now-empty set releases all of them.
-            if had_mods {
+            if plan.post_flags_changed {
                 debug!(
                     reason = if reconnected {
                         "new connection"
