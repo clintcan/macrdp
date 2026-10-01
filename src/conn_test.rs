@@ -16,9 +16,9 @@
 //! `MacInputHandler`), so the test is fully cross-platform — it runs on Linux CI
 //! AND locally on macOS without touching the screen-capture backend.
 //!
-//! What it asserts: with `set_honor_client_desktop_size(true)`, a client that
+//! What it asserts: with `with_honor_client_desktop_size(Some(..))`, a client that
 //! requests 1920×1080 gets a session negotiated at 1920×1080 even though the
-//! server's display starts at 1024×768 — i.e. the vendored acceptor's
+//! server's display starts at 1024×768 — i.e. the acceptor's
 //! client-resolution auto-adopt works across a real handshake. With it off, the
 //! client gets the server's own size. (Pure-fn coverage of the adopt decision
 //! lives in `capture.rs::adopt_client_size`; this proves the wire path.)
