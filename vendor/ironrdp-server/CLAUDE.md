@@ -80,6 +80,9 @@ Notes on the port:
   The two audio DVCs now have distinct types (`AudioReliableDvc`, `AudioLossyDvc`),
   because the DRDYNVC server's by-type lookup keys on the Rust type. Our field
   `egfx_on_udp` lives in `mt` state; upstream has its own field of that name.
+  **Behaviour change:** the rebased acceptor only offers multitransport when the client
+  negotiated the MCS message channel (the old fork fell back to the I/O channel). mstsc
+  sends it; a client that doesn't now silently gets no UDP offer.
 - **(15)** A preemption winner's RTT is now sampled as a candidate (carried on
   `NegotiatedConnection.link_rtt_ms`); before, it inherited the previous connection's.
 - **(16)** Upstream made a completion's raw `TS_URB_RESULT` bytes private, so
@@ -87,6 +90,10 @@ Notes on the port:
   only after upstream's decode has validated the layout. Byte-tested against
   upstream's encoder, with two mutations caught, 2026-10-01 (scratch crate). Drop it
   once upstream exposes the bytes or a typed result.
+  **Stricter decode:** upstream now decodes every `URB_COMPLETION` result as isoch
+  (`into_isoch()`), so a *non-isoch* completion carrying a non-empty result payload fails
+  the whole PDU, where the old fork accepted it. Normal for bulk/control; watch the USB
+  live test for decode errors.
 - **(18)** Fires for preemption candidates too (`NegotiationContext` carries the
   handler); #2065's shared handler makes that borrow-safe.
 
@@ -105,6 +112,10 @@ Notes on the port:
   change:** upstream verifies a returning cookie (HMAC), rotates it on every
   reactivation and hourly, and invalidates it on eviction. A client reconnecting after
   a macrdp *process* restart is now denied: live-test before release.
+  The cookie is also re-sent and rotated on every Deactivation–Reactivation pass (each
+  live resize and each blank-recovery heal). That is safe because the acceptor `take()`s
+  the received cookie, so a reactivation never re-verifies, but it's more wire traffic
+  than before.
 - **(21) mouse position before button** → `MouseEvent::Button { x, y, button, pressed }`
   (upstream #1769, fixing our report #1466). Breaking: the old positionless variants are gone.
 - **(22)/(23) preemption** → builder `with_connection_policy(ConnectionPolicy::Preempt)`.
