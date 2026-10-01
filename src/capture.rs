@@ -321,9 +321,9 @@ pub struct CaptureDisplay {
     /// mirror-primary path when no explicit `--width`/`--height`/`--hidpi`
     /// was given; `--no-client-resolution` opts out.
     ///
-    /// The actual size negotiation happens in the vendored
-    /// `ironrdp-acceptor` (`honor_client_desktop_size`, wired via
-    /// `RdpServer::set_honor_client_desktop_size`): the client's true
+    /// The actual size negotiation happens in `ironrdp-acceptor`
+    /// (`set_honor_client_desktop_size`, wired via the server builder's
+    /// `with_honor_client_desktop_size`): the client's true
     /// request is only visible in its GCC Client Core Data, and the
     /// acceptor commits a size in Demand Active before any server code
     /// runs. This flag's job is the receiving end — adopt the negotiated
