@@ -92,6 +92,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
+- [ ] **Windows App (macOS) intermittently doesn't announce client copies to the server — pre-existing,
+  NOT a pin-bump regression.** Found 2026-10-02 while live-testing the bump: after a copy on the MacBook,
+  clicking into the Windows App session sometimes sends no CLIPRDR FormatList at all, so the mini never
+  gets the text (the server logs nothing; the connect-time FormatList does arrive). A/B on the same
+  route: bump build 2/5 sessions delivered, **v0.9.6 1/2 — same failure on the old build**. mini→client
+  direction was fine throughout. Not yet known whether it's purely client-side or something macrdp's
+  handshake could influence (e.g. the connect-time FormatList/ack ordering). Test gotcha: in Terminal,
+  Cmd+V from Windows App arrives as Ctrl+V (`^V`; the Ctrl→Cmd remap is off in terminals) — paste via
+  Edit → Paste, and reset the mini's pasteboard to a marker first, or a stale paste looks like success.
+
 - [ ] **Microphone / audio-input redirection (MS-RDPEAI, the `AUDIO_INPUT` DVC) — present the CLIENT's mic as a macOS input device.**
   Scoped 2026-07-27, prompted by the A4Tech FHD webcam (`09da:2692`) having a built-in mic:
   none of the three existing channels can carry it — **USB redirection** can't (USB audio streams over
@@ -863,6 +873,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
     caveats: a blank-recovery heal still works with the ARC cookie rotating on each reactivation,
     the UDP offer still reaches mstsc (it's now gated on the MCS message channel), and no URBDRC
     decode errors (upstream's stricter isoch-shaped completion decode). Then soak → v0.10.0 → close #182.
+  - **▶ LIVE on the Mac mini 2026-10-01/02** (draft PR #194, entitled build, Windows App + sdl-freerdp from
+    the MacBook). **PASS:** no-AVC `/gfx` client declined + stays up on legacy; FreeRDP minimize now sends
+    SuppressOutput (suppress→resume, IDR on restore); FreeRDP in-process auto-reconnect (2 network drops
+    overnight); Preempt takeover (Windows App evicted FreeRDP with ERRINFO, no ping-pong); Windows App
+    reconnect after a process restart (normal NLA logon, no cookie rejection — a client that PRESENTS a
+    stale cookie is still untested). **Found + fixed on main:** flaky pasteboard tests (#195), blank
+    recovery firing after a slow login (#196, live-verified: 6.7 s login, no reactivation). **Not a
+    regression:** client→mini clipboard intermittently missing on BOTH builds (see Deferred). **Still
+    to do:** drive read/write (SSH can't touch the NFS mount — run `~/t.sh` inside the session), mstsc
+    UDP/RDPDR/smart card, USB, audio/AAC, NSCodec, iOS. Mini helpers: `~/swap.sh bump|v096`, backups
+    `~/macrdp.app.v0.9.6.prebump.bak` + `config.env.prebump.bak` + plist `.prebump.bak`.
 - [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
