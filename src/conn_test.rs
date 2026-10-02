@@ -16,9 +16,9 @@
 //! `MacInputHandler`), so the test is fully cross-platform — it runs on Linux CI
 //! AND locally on macOS without touching the screen-capture backend.
 //!
-//! What it asserts: with `set_honor_client_desktop_size(true)`, a client that
+//! What it asserts: with `with_honor_client_desktop_size(Some(..))`, a client that
 //! requests 1920×1080 gets a session negotiated at 1920×1080 even though the
-//! server's display starts at 1024×768 — i.e. the vendored acceptor's
+//! server's display starts at 1024×768 — i.e. the acceptor's
 //! client-resolution auto-adopt works across a real handshake. With it off, the
 //! client gets the server's own size. (Pure-fn coverage of the adopt decision
 //! lives in `capture.rs::adopt_client_size`; this proves the wire path.)
@@ -31,8 +31,9 @@ use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{ClientConnector, Config, ConnectorResult, Credentials, DesktopSize};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
 use ironrdp_server::{
-    ConnectionHandler, DesktopSize as ServerDesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent,
-    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
+    ConnectionHandler, ConnectionPolicy, DesktopSize as ServerDesktopSize, DisplayUpdate,
+    KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
+    RdpServerInputHandler,
 };
 use ironrdp_tokio::TokioFramed;
 use tokio_rustls::{rustls, TlsConnector};
@@ -51,7 +52,7 @@ impl RdpServerInputHandler for TestInput {
 struct TestUpdates;
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for TestUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
         std::future::pending::<()>().await;
         Ok(None)
     }
@@ -65,7 +66,7 @@ impl RdpServerDisplay for TestDisplay {
     async fn size(&mut self) -> ServerDesktopSize {
         self.size
     }
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(TestUpdates))
     }
 }
@@ -218,7 +219,7 @@ fn client_config(width: u16, height: u16) -> Config {
         // Added to connector Config in the a5d1c682 pin bump; Lan is the canonical
         // default (client config / testsuite / web all use it).
         connection_type: ConnectionType::Lan,
-        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
@@ -244,6 +245,14 @@ fn client_config(width: u16, height: u16) -> Config {
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        // Added to connector Config by the e258f6a0 pin bump; values as upstream's
+        // own e2e tests use, except no RAIL (this client doesn't use it).
+        monitor_layout: None,
+        enable_standard_rdp_security: false,
+        enable_audio_capture: false,
+        support_dyn_vc_gfx_protocol: false,
+        remote_application_mode: false,
+        rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty(),
     }
 }
 
@@ -308,19 +317,25 @@ fn build_test_server_full(
     } else {
         None
     };
-    let mut server = RdpServer::builder()
+    RdpServer::builder()
         .with_addr((Ipv4Addr::LOCALHOST, port))
         .with_tls(server_tls_acceptor())
         .with_input_handler(TestInput)
         .with_display_handler(display)
         .with_sound_factory(sound)
         .with_bitmap_codecs(codecs)
-        .build();
-    server.set_honor_client_desktop_size(honor);
-    server.set_honor_client_desktop_size_max(
-        max.map(|(width, height)| ServerDesktopSize { width, height }),
-    );
-    server
+        .with_honor_client_desktop_size(honor_client_size(honor, max))
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build()
+}
+
+/// The honored-size setting as `main.rs` builds it: the operator ceiling, or
+/// MS-RDPBCGR's own 8192 maximum, when auto-adopt is on.
+fn honor_client_size(honor: bool, max: Option<(u16, u16)>) -> Option<ServerDesktopSize> {
+    honor.then(|| {
+        let (width, height) = max.unwrap_or((8192, 8192));
+        ServerDesktopSize { width, height }
+    })
 }
 
 /// Drive a real IronRDP client through the full connect handshake (X.224 nego →
@@ -784,8 +799,9 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
                 .with_connection_handler(Some(Box::new(RejectAfterFirst {
                     accepted_once: false,
                 })))
+                .with_honor_client_desktop_size(honor_client_size(true, None))
+                .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
-            server.set_honor_client_desktop_size(true);
 
             let server_task = tokio::task::spawn_local(async move {
                 let _ = server.run().await;
@@ -886,8 +902,9 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
                 .with_connection_handler(Some(Box::new(CountingAccepts {
                     count: Arc::clone(&accept_count),
                 })))
+                .with_honor_client_desktop_size(honor_client_size(true, None))
+                .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
-            server.set_honor_client_desktop_size(true);
 
             let server_task = tokio::task::spawn_local(async move {
                 let _ = server.run().await;

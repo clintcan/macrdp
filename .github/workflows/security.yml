@@ -111,12 +111,12 @@ jobs:
       - name: cargo-deny — root tree
         run: cargo deny check advisories bans sources
 
-      # vendor/ironrdp-rdpeudp is a STANDALONE crate (its own Cargo.lock, not a
+      # vendor/macrdp-rdpeudp is a STANDALONE crate (its own Cargo.lock, not a
       # workspace member — see ci.yml). Scan it separately against the same
       # deny.toml so an advisory that only appears in its independent lock is
       # still caught.
-      - name: cargo-deny — vendored ironrdp-rdpeudp
+      - name: cargo-deny — standalone macrdp-rdpeudp
         run: >
           cargo deny
-          --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml
+          --manifest-path vendor/macrdp-rdpeudp/Cargo.toml
           check --config deny.toml advisories bans sources

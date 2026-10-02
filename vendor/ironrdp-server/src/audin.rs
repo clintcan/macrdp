@@ -30,7 +30,7 @@
 //! issue) so a malformed PDU never tears down the whole RDP session for an opt-in
 //! feature.
 
-use ironrdp_core::{impl_as_any, Decode, Encode, EncodeResult, ReadCursor, WriteCursor};
+use ironrdp_core::{Decode, Encode, EncodeResult, ReadCursor, WriteCursor, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
@@ -73,6 +73,10 @@ struct AudinMsg {
 }
 
 impl AudinMsg {
+    #[expect(
+        clippy::new_ret_no_self,
+        reason = "builds the boxed DVC message the processor returns"
+    )]
     fn new(msg_id: u8, body: Vec<u8>) -> DvcMessage {
         Box::new(Self { msg_id, body })
     }
@@ -153,7 +157,7 @@ pub fn choose_capture_format(client_formats: &[AudioFormat]) -> Option<(u32, &Au
 /// AUDIO_FORMAT[]` (MS-RDPEAI 2.2.2.2). `cbSizeFormatsPacket` is the total byte
 /// size of the encoded `SoundFormats` array.
 fn formats_body(formats: &[AudioFormat]) -> Vec<u8> {
-    let encoded: Vec<u8> = formats.iter().flat_map(|f| encode_to_vec(f)).collect();
+    let encoded: Vec<u8> = formats.iter().flat_map(encode_to_vec).collect();
     let mut body = Vec::with_capacity(8 + encoded.len());
     body.extend_from_slice(&(formats.len() as u32).to_le_bytes());
     body.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
@@ -260,10 +264,7 @@ impl DvcProcessor for AudinServer {
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
         // The server speaks first: advertise our protocol version.
         info!("MS-RDPEAI AUDIO_INPUT channel opened — sending Version");
-        Ok(vec![AudinMsg::new(
-            msg_id::VERSION,
-            OUR_VERSION.to_le_bytes().to_vec(),
-        )])
+        Ok(vec![AudinMsg::new(msg_id::VERSION, OUR_VERSION.to_le_bytes().to_vec())])
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
@@ -328,13 +329,13 @@ impl DvcProcessor for AudinServer {
             msg_id::DATA => {
                 self.data_bytes += body.len() as u64;
                 self.data_packets += 1;
-                if self.negotiated_format.is_some() {
-                    if let Some(sink) = self.sink.as_mut() {
-                        sink.on_data(body);
-                    }
+                if self.negotiated_format.is_some()
+                    && let Some(sink) = self.sink.as_mut()
+                {
+                    sink.on_data(body);
                 }
                 // Log the first packet, then throttle to ~every 200 packets (~2 s).
-                if self.data_packets == 1 || self.data_packets % 200 == 0 {
+                if self.data_packets == 1 || self.data_packets.is_multiple_of(200) {
                     info!(
                         packets = self.data_packets,
                         total_bytes = self.data_bytes,
@@ -363,7 +364,10 @@ impl DvcProcessor for AudinServer {
                         self.negotiated_format = Some(format);
                     }
                     None => {
-                        warn!(index, "MS-RDPEAI Format Change to an unsupported format — dropping the mic audio");
+                        warn!(
+                            index,
+                            "MS-RDPEAI Format Change to an unsupported format — dropping the mic audio"
+                        );
                         self.negotiated_format = None;
                     }
                 }

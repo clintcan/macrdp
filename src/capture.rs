@@ -12,8 +12,14 @@ use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
-    RdpServerDisplayUpdates,
+    RdpServerDisplayUpdates, ServerError, ServerErrorExt as _, ServerResult,
 };
+
+/// The server's display traits use its own error type; capture code uses anyhow.
+/// Keeps the whole context chain in the message (the server logs it with `{:#}`).
+fn display_error(error: anyhow::Error) -> ServerError {
+    ServerError::reason("display capture", format!("{error:#}"))
+}
 use tokio::sync::Notify;
 
 use std::sync::atomic::AtomicU64;
@@ -296,7 +302,7 @@ impl Drop for CountedUpdates {
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for CountedUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         self.inner.next_update().await
     }
 }
@@ -315,9 +321,9 @@ pub struct CaptureDisplay {
     /// mirror-primary path when no explicit `--width`/`--height`/`--hidpi`
     /// was given; `--no-client-resolution` opts out.
     ///
-    /// The actual size negotiation happens in the vendored
-    /// `ironrdp-acceptor` (`honor_client_desktop_size`, wired via
-    /// `RdpServer::set_honor_client_desktop_size`): the client's true
+    /// The actual size negotiation happens in `ironrdp-acceptor`
+    /// (`set_honor_client_desktop_size`, wired via the server builder's
+    /// `with_honor_client_desktop_size`): the client's true
     /// request is only visible in its GCC Client Core Data, and the
     /// acceptor commits a size in Demand Active before any server code
     /// runs. This flag's job is the receiving end — adopt the negotiated
@@ -614,12 +620,14 @@ impl RdpServerDisplay for CaptureDisplay {
         self.pending_resize.request(adopted.width, adopted.height);
     }
 
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
         let (width, height) = self.sync_virtual_display();
-        self.build_updates(width, height).await
+        self.build_updates(width, height)
+            .await
+            .map_err(display_error)
     }
 }
 
@@ -1302,9 +1310,9 @@ mod macos {
         }
     }
 
-    #[async_trait::async_trait]
-    impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
-        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    impl ScreenCaptureUpdates {
+        /// The capture loop. Kept on anyhow; the trait impl below converts at the boundary.
+        async fn capture_next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
                 // EXPERIMENTAL blank-recovery: if the H.264 blank detector armed
                 // a bare core reactivation (BlankAction::Reactivate), emit a
@@ -1691,6 +1699,13 @@ mod macos {
             }
         }
     }
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
+        async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
+            self.capture_next_update().await.map_err(display_error)
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1750,7 +1765,7 @@ mod stub {
 
     #[async_trait::async_trait]
     impl RdpServerDisplayUpdates for StubUpdates {
-        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
             if let Some(u) = self.queue.pop_front() {
                 return Ok(Some(u));
             }

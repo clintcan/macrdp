@@ -15,7 +15,7 @@
 
 [graph]
 # Scan with every feature enabled (multitransport, egfx, …) so feature-gated
-# deps like ironrdp-rdpeudp are in the graph. Leave `targets` unset so
+# deps like macrdp-rdpeudp are in the graph. Leave `targets` unset so
 # macOS-only deps are scanned too — a vuln in a macOS-gated crate must still
 # surface even though CI runs on Linux.
 all-features = true
@@ -64,7 +64,7 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 # The only git remote macrdp intentionally pulls from is the pinned IronRDP fork
-# (both the root tree and the standalone vendor/ironrdp-rdpeudp crate resolve
+# (both the root tree and the standalone vendor/macrdp-rdpeudp crate resolve
 # ironrdp-* from here via [patch.crates-io]).
 allow-git = [
   "https://github.com/Devolutions/IronRDP.git",

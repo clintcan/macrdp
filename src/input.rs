@@ -4,7 +4,7 @@
 //! in desktop-pixel space. We translate to macOS virtual keycodes and post via
 //! `CGEventPost(kCGHIDEventTap)`. Non-macOS targets get a logging stub.
 
-use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 #[cfg(not(target_os = "macos"))]
 use tracing::trace;
 
@@ -78,7 +78,11 @@ impl RdpServerInputHandler for MacInputHandler {
         if let Some(sig) = &self.click_signal {
             if matches!(
                 event,
-                MouseEvent::LeftPressed | MouseEvent::RightPressed | MouseEvent::MiddlePressed
+                MouseEvent::Button {
+                    button: MouseButton::Left | MouseButton::Right | MouseButton::Middle,
+                    pressed: true,
+                    ..
+                }
             ) {
                 sig.record_click();
             }
@@ -479,7 +483,7 @@ mod macos {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
     use ironrdp_pdu::input::fast_path::SynchronizeFlags;
-    use ironrdp_server::{KeyboardEvent, MouseEvent};
+    use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent};
     use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
     use tracing::{debug, trace, warn};
 
@@ -1534,21 +1538,43 @@ mod macos {
             self.resync_modifiers_if_stale();
             match event {
                 MouseEvent::Move { x, y } => self.move_to(x, y, desktop_w, desktop_h, letterbox),
-                MouseEvent::LeftPressed => self.button(CGMouseButton::Left, true),
-                MouseEvent::LeftReleased => self.button(CGMouseButton::Left, false),
-                MouseEvent::RightPressed => self.button(CGMouseButton::Right, true),
-                MouseEvent::RightReleased => self.button(CGMouseButton::Right, false),
-                MouseEvent::MiddlePressed => self.button(CGMouseButton::Center, true),
-                MouseEvent::MiddleReleased => self.button(CGMouseButton::Center, false),
-                MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
-                MouseEvent::Scroll { x, y } => self.scroll(y, x),
-                MouseEvent::Button4Pressed
-                | MouseEvent::Button4Released
-                | MouseEvent::Button5Pressed
-                | MouseEvent::Button5Released => {
-                    trace!(?event, "extra mouse buttons not implemented");
+                // A button event carries the pointer position: apply it first, or a
+                // client that sends a tap as a lone button PDU (the iOS Windows App
+                // in touch mode) clicks wherever the cursor last was.
+                MouseEvent::Button {
+                    x,
+                    y,
+                    button,
+                    pressed,
+                } => {
+                    self.move_to(x, y, desktop_w, desktop_h, letterbox);
+                    self.mouse_button(button, pressed);
                 }
+                MouseEvent::ButtonRel {
+                    x,
+                    y,
+                    button,
+                    pressed,
+                } => {
+                    self.move_rel(x, y);
+                    self.mouse_button(button, pressed);
+                }
+                MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
+                // RDP's horizontal wheel is positive to the right; macOS's
+                // horizontal scroll delta is positive to the left.
+                MouseEvent::HorizontalScroll { value } => self.scroll(0, -i32::from(value)),
+                MouseEvent::Scroll { x, y } => self.scroll(y, x),
                 MouseEvent::RelMove { x, y } => self.move_rel(x, y),
+                _ => trace!(?event, "mouse event not implemented"),
+            }
+        }
+
+        fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
+            match button {
+                MouseButton::Left => self.button(CGMouseButton::Left, pressed),
+                MouseButton::Right => self.button(CGMouseButton::Right, pressed),
+                MouseButton::Middle => self.button(CGMouseButton::Center, pressed),
+                _ => trace!(?button, pressed, "extra mouse buttons not implemented"),
             }
         }
 

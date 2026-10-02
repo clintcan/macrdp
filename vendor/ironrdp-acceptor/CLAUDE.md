@@ -1,193 +1,92 @@
 # vendor/ironrdp-acceptor — divergence log
 
-Local fork of ironrdp-acceptor 0.10.0, **re-vendored 2026-08-05 from upstream
-Devolutions/IronRDP@a5d1c682** (the pin-bump rev). Originally copied 2026-06-12
-from @879ffed. connection.rs was refreshed verbatim from a5d1c682 and the surviving
-divergences re-applied on top (142 pure additions + 2 intended modifications:
-`let mut written`, and `create_gcc_blocks`'s `multi_transport_channel` populate);
-lib.rs keeps only the `MultitransportOffer` re-export; finalization.rs keeps only the
-channel-skip (upstream unchanged there); channel_connection/credssp/util are byte-
-identical to a5d1c682. Has a standalone `[patch]` (core/pdu/svc/connector/async →
-a5d1c682) for isolated build, ignored in the macrdp workspace. Keep the rev in sync.
+Local fork of ironrdp-acceptor 0.10.0, **re-vendored 2026-10-01 from upstream
+Devolutions/IronRDP@e258f6a0** (the pin-bump rev). `src/` is upstream verbatim except
+`connection.rs`, which carries the two divergences below (every insertion is marked
+`(macrdp divergence N)`). Earlier vendorings: @a5d1c682 (2026-08-05), @879ffed
+(2026-06-12). Has a standalone `[patch.crates-io]` (core/pdu/svc/connector/async →
+e258f6a0) for isolated builds, ignored in the macrdp workspace (the root `[patch]`
+wins). Keep that rev in sync. `rustfmt.toml` mirrors the IronRDP workspace config
+(added 2026-10-01 — without it rustfmt reformats upstream's 120-column code).
 
-**▶▶▶ STATE AT THE a5d1c682 PIN BUMP (2026-08-05): divergences (1), (2), and the
-READ-side of (3) all RETIRED — upstream now provides them.** a5d1c682 carries:
-`honor_client_desktop_size: Option<DesktopSize>` (unified honor + #1404 max;
-setter `set_honor_client_desktop_size(Option<DesktopSize>)` — so div (1) incl. the
-operator ceiling is upstream, #1373+#1404), `keyboard_layout: u32` (div (2), #1397),
-`multitransport_flags` on `Acceptor`+`AcceptorResult` (div (3) read-side, #1453),
-**AND the MCS message-channel allocation + `SC_MCS_MSGCHANNEL` grant + join**
-(`message_channel_id`, allocated when the client sends `CS_MESSAGE_CHANNEL`), plus an
-**unconditional `EXTENDED_CLIENT_DATA_SUPPORTED`** advertise. So macrdp's
-`advertise_extended_client_data` field ALSO retired (upstream always advertises), as
-did macrdp's own message-channel allocation. **What REMAINS vendored: the M3c OFFER
-half of (3)** (`multitransport_offer`/`multitransport_offered` + `set_multitransport_offer`,
-the `MultitransportOffer` type, the `SC_MULTITRANSPORT` advertise in `create_gcc_blocks`
-now gated on `multitransport_offer.is_some()`, the Server-Initiate-Multitransport emit
-in `LicensingExchange` riding upstream's `message_channel_id` and gated on upstream's
-`multitransport_flags`, and the `CapabilitiesWaitConfirm` + finalization.rs channel-skip)
-**+ divergence (4) fingerprint**. The historical divergence notes below are kept for
-context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size forward)
-+ main.rs must adopt the `set_honor_client_desktop_size(Option<DesktopSize>)` signature
-(bool→Option) — a downstream server/src change.
+**Known, pre-existing, not ours:** `cargo clippy -- -D warnings` on this crate alone
+flags a `collapsible_if` in upstream's credentials check (`connection.rs`, the
+`if let Some(expected) = &self.creds` block). It's a newer-clippy lint (our 1.95 vs
+upstream's 1.94); verified identical on pure upstream source. macrdp's own clippy run
+doesn't lint path dependencies. Don't "fix" upstream code here.
 
-(1) Honor the client's requested desktop size from Client Core Data
-    (UPSTREAMED as #1373, MERGED 2026-07-02 — DROP ON PIN BUMP; still vendored
-    only because macrdp's pin `879ffed` predates the merge): `Acceptor` gains
-    a `honor_client_desktop_size: bool`
-    (default false, setter `set_honor_client_desktop_size`, carried across
-    `new_deactivation_reactivation`). When set, the
-    `BasicSettingsWaitInitial` state reads `gcc_blocks.core.desktop_width/
-    desktop_height` — the resolution the client actually asked for (mstsc
-    full-screen monitor size, FreeRDP `/size:WxH`) — and, if sane
-    (200..=8192 per MS-RDPBCGR), replaces `self.desktop_size` AND patches
-    the Bitmap capset in `server_capabilities` (same mutation
-    `new_deactivation_reactivation` does) BEFORE the Demand Active is sent.
-    The session is thereby negotiated at the client's resolution from the
-    start with no deactivation-reactivation resize.
+## Testing
 
-    Why the acceptor and not the server: the client's own requested size is
-    ONLY visible in GCC Client Core Data, which upstream parses in
-    `BasicSettingsWaitInitial` and discards (only `early_capability_flags`
-    is kept). The Confirm Active bitmap capset — what
-    `RdpServerDisplay::request_initial_size` receives — is no help:
-    conformant clients (verified in FreeRDP's `rdp_apply_bitmap_capability_set`,
-    and mstsc behaves the same) overwrite their desktop size with the
-    server's Demand Active values and echo those back. And by the time the
-    server sees ANY of this, the acceptor has already committed a size in
-    Demand Active inside `accept_finalize`.
+The lib is `test = false`, and the useful harness lives upstream in
+`ironrdp-testsuite-core/tests/server/acceptor.rs`. To test a change, copy
+`connection.rs` into the IronRDP clone (`~/Documents/Projects/Misc/IronRDP`) at the
+pinned rev and run `cargo test -p ironrdp-testsuite-core server::acceptor`. The
+2026-10-01 rebase did exactly that on the local branch
+`scratch/macrdp-acceptor-divergences` (not pushed): four `macrdp_*` tests below, plus
+upstream's 13 acceptor tests and the whole suite (1731) passing against this fork.
+Both divergences were mutation-checked.
 
-    Consumed by `vendor/ironrdp-server` divergence (9): `RdpServer::
-    set_honor_client_desktop_size` forwards the flag to each connection's
-    acceptor; macrdp wires it from the default-on client-resolution
-    auto-adopt (`--no-client-resolution` opts out). The server's display
-    handler still learns the adopted size through the normal
-    `request_initial_size` call, because the client's Confirm Active echo
-    now equals the adopted size.
+## Divergences
 
-    Upstream status: MERGED as #1373 (2026-07-02) with the builder shape
-    (`RdpServerBuilder::with_honor_client_desktop_size` + a helper refactor).
-    On the next pin bump past it, delete this divergence and adopt the upstream
-    API (main.rs switches the `set_honor_client_desktop_size` setter to the
-    builder method). Verified redundant vs upstream/master 2026-07-08. (Follow-up
-    #1404 — clamp the honored size to an operator max — is still OPEN.)
+(4) **Client-fingerprint identity fields** (NOT upstreamed; added 2026-07-18).
+    `Acceptor` captures `client_name: String`, `client_version: u32` (raw
+    `RdpVersion.0`) and `client_build: u32` from the GCC Client Core Data in
+    `BasicSettingsWaitInitial`, next to upstream's own `keyboard_layout` /
+    `keyboard_type` / `ime_file_name` captures, carries them across
+    deactivation–reactivation, and surfaces them as `pub` fields on `AcceptorResult`.
+    Consumed by the vendored server's divergence (20) client-fingerprint log. Same
+    additive shape as #1397 (keyboard layout) — cleanly upstreamable. Heuristics: mstsc
+    sends the real Windows build + its hostname; FreeRDP hardcodes build 2600.
+    Informational only — a client can claim anything.
+    Test: `macrdp_result_carries_the_client_fingerprint` (drives to `Connected`, reads
+    `get_result()`). Mutation: dropping the build capture fails it.
 
-    **Extension (2026-07-09): operator ceiling for the honored size**
-    (`honor_client_desktop_size_max: Option<DesktopSize>`, setter
-    `set_honor_client_desktop_size_max`, carried across
-    `new_deactivation_reactivation`). Mirrors upstream PR #1404's semantics
-    locally as defense-in-depth: an in-band client request is clamped
-    per-dimension to the operator maximum before adoption (an 8192×8192
-    request is ~256 MB of BGRA per frame), while an out-of-band (garbage)
-    request stays refused outright by the existing 200..=8192 band check on
-    the RAW request — the clamp bounds legit requests, it doesn't launder
-    garbage. `None` (the default) is byte-identical to the pre-extension
-    behavior. Wired from macrdp's `--max-client-size WxH` via the vendored
-    server (divergence (9) extension); end-to-end tested in macrdp's
-    `src/conn_test.rs` (`client_resolution_clamped_to_operator_max` +
-    `operator_max_does_not_touch_in_bounds_request`, a real IronRDP client
-    over duplex). On the pin bump past #1404, delete this and pass the max
-    through the upstream `Option<DesktopSize>` honor-size API instead.
+(5) **`Acceptor::set_multitransport_requested_protocol(RequestedProtocol)`** (NOT
+    upstreamed; added 2026-10-01). Upstream's offer (#1951) only ever requests reliable
+    UDP: `MultitransportBootstrapping` gates on `TRANSPORT_TYPE_UDP_FECR` and hard-codes
+    `RequestedProtocol::UdpFecR` ("this acceptor never requests [lossy]"). macrdp's
+    `--enable-lossy-audio` needs a lossy (`UdpFecL`) request. The setter (default
+    `UdpFecR`, so upstream behaviour is unchanged when it isn't called) makes both gates
+    — our advertised offer and the client's flags — and the request use the chosen
+    protocol's transport flag. The gate's locals were renamed `offer_transport` /
+    `client_supports_transport` (upstream's `offer_udp_fecr` / `client_supports_udp_fecr`
+    would be wrong for lossy) and the "Not offering UDP multitransport" debug log gained
+    `requested_protocol`. Tests: `macrdp_lossy_multitransport_request_when_requested_and_reciprocated`,
+    `macrdp_lossy_request_needs_the_client_to_support_lossy`,
+    `macrdp_lossy_request_needs_the_offer_to_include_lossy`. Mutation: hard-coding the
+    request back to `UdpFecR` fails the first. Upstream candidate: a natural extension
+    of #1951.
 
-(2) Expose the client's keyboard-layout id from Client Core Data (UPSTREAMED
-    as #1397, MERGED 2026-07-01 — DROP ON PIN BUMP; added 2026-06-16): `Acceptor` gains a private
-    `client_keyboard_layout: u32` (captured in `BasicSettingsWaitInitial`
-    from `gcc_blocks.core.keyboard_layout`, alongside the size read in (1),
-    but UNCONDITIONALLY — it's free and harmless), carried across
-    `new_deactivation_reactivation`, and surfaced as a new
-    `pub keyboard_layout: u32` field on `AcceptorResult` (0 = not sent).
-    Consumed by `vendor/ironrdp-server` divergence (10), which publishes it
-    to a shared cell macrdp's input handler reads to auto-select a non-US
-    keyboard layout (`src/keyboard_layout.rs`). Purely additive (a new struct
-    field + a new private field). Upstreamed as #1397 (MERGED 2026-07-01, same
-    `AcceptorResult` field shape); drop on the next pin bump past it. Verified
-    redundant vs upstream/master 2026-07-08. See the keyboard-layout quirk note
-    in docs/known-quirks.md.
+## Retired
 
-(3) Expose the client's multitransport (MS-RDPEMT) support flags from its GCC
-    MultiTransportChannelData block. **The READ-side (surfacing the flags on
-    `AcceptorResult`) is MERGED as #1453 (2026-07-30, by mamoreau-devolutions) — a
-    line-for-line twin of the merged #1397/#1373 GCC-surfacing; drop it from this
-    fork on the pin bump past its merge. The M3c advertise/emit/offer half below stays
-    vendored (macrdp UDP-offer policy), so #1453 does NOT de-vendor the
-    acceptor.** Added 2026-06-25 for UDP
-    multitransport M1: `Acceptor` gains a private
-    `client_multitransport: gcc::MultiTransportFlags` (captured in
-    `BasicSettingsWaitInitial` alongside (1)/(2), UNCONDITIONALLY — free and
-    harmless; empty if the client sent no block), carried across
-    `new_deactivation_reactivation`, and surfaced as a new
-    `pub multitransport_flags: gcc::MultiTransportFlags` field on
-    `AcceptorResult`. Upstream parses the block into
-    `ClientGccBlocks.multi_transport_channel` and then discards it (only
-    early-capability flags, core size, and keyboard layout are kept). Consumed
-    by `vendor/ironrdp-server` divergence (12), which decides whether to send a
-    Server Initiate Multitransport Request. Purely additive (same shape as (2)),
-    so trivially upstreamable — offer alongside (1)/(2). See the
-    docs/rdp-udp-multitransport-feasibility.md plan.
+(1) Honor the client's requested desktop size — upstream #1373 + #1404
+    (`set_honor_client_desktop_size(Option<DesktopSize>)`), retired at a5d1c682.
+    *Why it has to live in the acceptor at all* (the client's size is only in the GCC
+    Client Core Data, before Demand Active) is recorded in `docs/known-quirks.md`.
+(2) Expose the client's keyboard-layout id — upstream #1397, retired at a5d1c682.
+(3) UDP multitransport — read side (client flags) upstream #1453, retired at a5d1c682;
+    **offer side retired 2026-10-01** in favour of upstream's own offer (#1951). What
+    went: our `MultitransportOffer` type and `set_multitransport_offer(Option<MultitransportOffer>)`,
+    `AcceptorResult::multitransport_offered`, our `SC_MULTITRANSPORT` advertise, the
+    request emitted in `LicensingExchange`, and the `finalization.rs` skip of
+    non-io-channel PDUs. Upstream equivalents: `set_multitransport_offer(Option<MultiTransportFlags>)`
+    advertises; `MultitransportBootstrapping` (right after licensing, the same window)
+    sends the request; `multitransport_request()` exposes what was sent;
+    `set_multitransport_security_rng()` supplies the cookie and request ID; and
+    `is_late_multitransport_response` tolerates the client's reply during
+    capabilities confirmation and finalization (stricter than our skip: only a payload
+    that decodes as the reply to the sent request is consumed — which covers the
+    E_ABORT case our skip existed for). One behaviour difference: with no MCS message
+    channel, upstream doesn't offer; ours fell back to the I/O channel. Upstream's is
+    the spec-correct one (2.2.15.1: the request travels on the message channel).
 
-    M3c (2026-06-25): the acceptor now also *advertises* and *emits* the
-    multitransport offer, not just surfaces the client's flags. Four additions,
-    all gated on the offer being set (so the default build is unchanged):
-    - **`advertise_extended_client_data: bool`** (setter
-      `set_advertise_extended_client_data`): when set, the X.224 Negotiation
-      Response carries `EXTENDED_CLIENT_DATA_SUPPORTED`. Load-bearing —
-      WITHOUT it mstsc omits ALL optional GCC client blocks (CS_MULTITRANSPORT,
-      CS_MCS_MSGCHANNEL, CS_MONITOR), so the server never sees UDP support.
-    - **`multitransport_offer: Option<MultitransportOffer>`** (setter
-      `set_multitransport_offer`; `MultitransportOffer { request_id, protocol,
-      cookie }` is a new pub type, re-exported from `lib.rs`). When set, the
-      server's GCC Connect Response echoes **SC_MULTITRANSPORT**
-      (`MultiTransportChannelData`) AND grants an **SC_MCS_MSGCHANNEL**
-      (`ServerMessageChannelData`) with an allocated MCS message channel id
-      (= io_channel + channel_count + 1, e.g. 1008). The message channel is a
-      hard requirement: clients route the bootstrap/autodetect PDUs by
-      `messageChannelId` and ignore an Initiate Request on the I/O channel
-      (FreeRDP logs `expected messageChannelId=1008, got 1003`).
-    - **Emit the Server Initiate Multitransport Request in `LicensingExchange`**
-      — after the licensing PDU, BEFORE Demand Active, on the message channel.
-      This is the ONLY window clients honor it (FreeRDP's
-      MULTITRANSPORT_BOOTSTRAPPING_REQUEST state, between LICENSING and
-      DEMAND_ACTIVE; mstsc the same). Sent post-finalization (the original M1
-      shape, on the I/O channel from the server crate) the client is ACTIVE and
-      misreads it as a share-control PDU and tears the session down. The issued
-      offer is recorded on `multitransport_offered: Option<MultitransportOffer>`
-      (new `AcceptorResult` field) so the server can build its MigrationState.
-    - **Finalization channel-skip** (`finalization.rs` + `CapabilitiesWaitConfirm`
-      in `connection.rs`): once a message channel exists, the client interleaves
-      PDUs on it — notably its **Client Initiate Multitransport Response**
-      (E_ABORT when it can't bring up UDP, or simply when it falls back) —
-      with the io-channel finalization PDUs. Both decode sites blindly decoded
-      the next `SendDataRequest`'s payload as a `ShareControlHeader`, so a
-      message-channel PDU killed the session with `invalid pdu_type` during
-      `accept_finalize`. Fix: skip any `SendDataRequest` whose `channel_id` !=
-      the io channel and stay in the same state. (Strictly more correct than the
-      old behaviour even ignoring multitransport: `WaitSynchronize`/
-      `WaitControlCooperate` previously swallowed a decode error AND advanced,
-      which would desync.) Verified live: FreeRDP + mstsc both reach ACTIVE and
-      render; mstsc additionally completes the RDPEUDP SYN→SYN+ACK handshake on
-      the wire (see server divergence (12) M3c). **Cookie finding:** mstsc
-      negotiates RDPEUDP **V2**, where the 16-byte security cookie is NOT in the
-      SYN (the SYN `cookieHash` is V3/RDPEUDP2 only) — it rides the MS-RDPEMT
-      `RDP_TUNNEL_CREATEREQUEST`, so strict cookie binding is an M4 concern.
+## Porting notes for the server rebase (vendored ironrdp-server)
 
-    P2.0 spike (2026-06-26): the `SC_MULTITRANSPORT` advertise at
-    `BasicSettingsSendResponse` now emits the flag MATCHING the offer's protocol
-    (`UDP_FECL` when `self.multitransport_offer.protocol == UdpFecL`, else
-    `UDP_FECR`) instead of hardcoding `UDP_FECR` — the advertised type and the
-    Initiate Request must agree. Default offer is still reliable; lossy is the
-    env-gated spike (`MACRDP_UDP_OFFER_FECL=1`). Verified GREEN on real mstsc: it
-    advertises `UDP_FECR|UDP_FECL|UDP_PREFERRED|SOFT_SYNC`, accepts the `UdpFecL`
-    Initiate Request, opens a `SYN_LOSSY` flow, and starts a **DTLS 1.2**
-    handshake. See docs/rdp-udp-multitransport-feasibility.md → "P2.0 Result".
-
-(4) Client-fingerprint identity fields from GCC Client Core Data (NOT upstreamed;
-    added 2026-07-18): `Acceptor` gains private `client_name: String` /
-    `client_version: u32` (raw `RdpVersion.0`) / `client_build: u32`, captured in
-    `BasicSettingsWaitInitial` alongside the KLID (divergence (2)) and surfaced as
-    `pub` fields on `AcceptorResult` (name cloned, not taken, so a
-    deactivation–reactivation's result still carries it). Consumed by the vendored
-    server's divergence (20) client-fingerprint log. Same additive GCC-surfacing
-    shape as (2) KLID/#1397 and the #1453 multitransport flags → cleanly
-    upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
-    22621) + its hostname; FreeRDP hardcodes build 2600. Informational
-    fingerprinting only — a client can claim anything.
+- Offer: `acceptor.set_multitransport_offer(Some(flag | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP))`
+  where `flag` is `TRANSPORT_TYPE_UDP_FECR` or `_FECL`, plus
+  `set_multitransport_requested_protocol(..)` for the lossy case.
+- Cookie: implement `MultitransportSecurityRng` so `fill_security_cookie` registers the
+  cookie in the multitransport `CookieRegistry` as it is generated — the UDP listener
+  then knows it before the client's first datagram (no race), replacing `new_offer()`.
+- Replace `result.multitransport_offered` with `acceptor.multitransport_request()` (or
+  the `accept_finalize_with_multitransport` handler).

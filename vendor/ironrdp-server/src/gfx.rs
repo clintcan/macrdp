@@ -48,7 +48,7 @@ pub trait GfxServerFactory: ServerEventSender + Send {
 /// enabling shared access from both the DVC layer and the display handler.
 pub struct GfxDvcBridge {
     inner: GfxServerHandle,
-    /// Optional "decline the graphics pipeline" flag, set by the application's
+    /// (macrdp divergence 14) Optional "decline the graphics pipeline" flag, set by the application's
     /// `GraphicsPipelineHandler` (synchronously during `process` — the inner
     /// server invokes the handler before returning). When true, `process`
     /// discards the inner server's output instead of shipping it — most
@@ -138,5 +138,41 @@ impl core::fmt::Display for EgfxServerMessage {
                 write!(f, "SendMessages(count={})", messages.len())
             }
         }
+    }
+}
+
+/// The dynamic channel id EGFX is registered under: the bridge when the
+/// factory handed out a frame handle, otherwise the server itself.
+pub(crate) fn egfx_channel_id(drdynvc: &ironrdp_dvc::DrdynvcServer) -> Option<u32> {
+    drdynvc
+        .get_channel_id_by_type::<GfxDvcBridge>()
+        .or_else(|| drdynvc.get_channel_id_by_type::<GraphicsPipelineServer>())
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_dvc::DrdynvcServer;
+    use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitySet};
+
+    use super::*;
+
+    struct Handler;
+
+    impl GraphicsPipelineHandler for Handler {
+        fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+
+        fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+    }
+
+    #[test]
+    fn egfx_is_found_whichever_way_it_was_registered() {
+        let server = Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(Handler))));
+        let bridged = DrdynvcServer::new().with_dynamic_channel(GfxDvcBridge::new(server));
+        assert!(egfx_channel_id(&bridged).is_some());
+
+        let direct = DrdynvcServer::new().with_dynamic_channel(GraphicsPipelineServer::new(Box::new(Handler)));
+        assert!(egfx_channel_id(&direct).is_some());
+
+        assert!(egfx_channel_id(&DrdynvcServer::new()).is_none());
     }
 }

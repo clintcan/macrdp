@@ -232,7 +232,7 @@ impl Session {
         if self.context.is_none() {
             debug!("smart card: establishing context");
             let ctx = self.handle.scard_establish_context(self.device_id).await?;
-            debug!(context = ctx.value, "smart card: established context");
+            debug!(context = ?ctx.as_bytes(), "smart card: established context");
             self.context = Some(ctx);
         }
         let context = self.context.expect("context just set");
@@ -283,7 +283,7 @@ impl Session {
     async fn power_on(&mut self) -> Result<Vec<u8>> {
         let (context, reader) = self.ensure_session().await?;
         if self.card.is_none() {
-            let (mut card, protocol) = self
+            let (card, protocol) = self
                 .handle
                 .scard_connect(
                     self.device_id,
@@ -298,7 +298,8 @@ impl Session {
             // But a REDIR_SCARDHANDLE in a *request* (Transmit/Status/Disconnect)
             // must carry the real context, or the client-side redirector faults on
             // the missing context and tears down the whole channel. Fill it in.
-            card.context = context;
+            let card = ScardCardHandle::from_opaque(context, card.as_bytes())
+                .map_err(|e| anyhow!("smart card handle: {e}"))?;
             debug!(protocol = ?protocol, "smart card: connected to card");
             self.card = Some((card, protocol));
         }
