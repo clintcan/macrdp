@@ -880,9 +880,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
     reconnect after a process restart (normal NLA logon, no cookie rejection — a client that PRESENTS a
     stale cookie is still untested). **Found + fixed on main:** flaky pasteboard tests (#195), blank
     recovery firing after a slow login (#196, live-verified: 6.7 s login, no reactivation). **Not a
-    regression:** client→mini clipboard intermittently missing on BOTH builds (see Deferred). **Still
-    to do:** drive read/write (SSH can't touch the NFS mount — run `~/t.sh` inside the session), mstsc
-    UDP/RDPDR/smart card, USB, audio/AAC, NSCodec, iOS. Mini helpers: `~/swap.sh bump|v096`, backups
+    regression:** client→mini clipboard intermittently missing on BOTH builds (see Deferred). **Also PASS
+    (10-02):** FreeRDP drive read + write (byte-exact both ways, mkdir/rename/delete; run inside the
+    session via `~/t.sh` — SSH can't touch the NFS mount); audio (Windows App, PCM, clear; FreeRDP
+    negotiated AAC); NSCodec (Windows App with H.264 off: sharp picture, ~1.5 Mbit/s — upstream logs no
+    codec choice, so that's inference + the `conn_test` canary). **Still to do:** mstsc UDP/RDPDR/smart
+    card, USB, iOS. Mini helpers: `~/swap.sh bump|v096`, backups
     `~/macrdp.app.v0.9.6.prebump.bak` + `config.env.prebump.bak` + plist `.prebump.bak`.
 - [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
