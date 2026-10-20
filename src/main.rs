@@ -27,6 +27,7 @@ mod file_promise;
 mod file_promise_lazy;
 #[cfg(target_os = "macos")]
 mod h264;
+mod h264_sps;
 mod health;
 mod input;
 mod keyboard_layout;
