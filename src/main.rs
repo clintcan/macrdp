@@ -986,13 +986,24 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
 
-    let mut file = fs::File::open(path)
+    // O_NONBLOCK: opening a FIFO without a writer would otherwise block
+    // startup with no log line; it is refused below as not a regular file.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
         .with_context(|| format!("opening password file {}", path.display()))?;
     // Check the opened file, not the path, so a swap between check and read
     // cannot pass a different file.
     let meta = file
         .metadata()
         .with_context(|| format!("reading metadata of password file {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(anyhow!(
+            "password file {} is not a regular file",
+            path.display()
+        ));
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     check_password_file_access(meta.mode(), meta.uid(), euid)
@@ -4109,6 +4120,24 @@ mod config_tests {
         fs::remove_file(&p).ok();
         assert!(e.contains("chmod 600"), "{e}");
         assert!(!e.contains("s3cret"));
+    }
+
+    #[test]
+    fn password_file_must_be_a_regular_file() {
+        // A FIFO without a writer must not block startup.
+        let p = std::env::temp_dir().join(format!("macrdp-pwfifo-{}", std::process::id()));
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("not a regular file"), "{e}");
+        // A directory neither.
+        let e = format!(
+            "{:#}",
+            read_password_file(&std::env::temp_dir()).unwrap_err()
+        );
+        assert!(e.contains("not a regular file"), "{e}");
     }
 
     #[test]
