@@ -62,6 +62,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
 | (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
 | (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection | `run_connection_inner`, around `negotiate_and_authenticate` | — |
+| (33) | RemoteFX goes out in a Stream Surface Bits command instead of Set Surface Bits; Windows 10 mstsc shows a black session for Set | `encoder/mod.rs` `RemoteFxHandler::handle`, `surface_command` | — |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -106,6 +107,16 @@ Notes on the port:
   accept-to-auth) and a cellular CredSSP took 12.5 s. Upstream master has the same
   gap. Test: `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused
   clock; fails without the bound, and with a 30 s one). Upstream candidate.
+
+- **(33)** Added 2026-10-21 (clintcan/macrdp#226). Numbered (33) because main used
+  (29) to (32) while this branch was open. MS-RDPRFX 3.1.8.3.1: "The sequence of
+  encode messages is encapsulated inside an Extended Bitmap Data structure ..., which
+  is encapsulated in a Stream Surface Bits Surface Command". Windows 10 mstsc
+  (10.0.19041.4717) picks the RemoteFX codec (id 3) and shows a **black** session for
+  Set Surface Bits (no error, input still flows); the same bytes in Stream Surface Bits
+  render and move (A/B on the wire). Every other codec keeps `set_surface`. Upstream
+  master still sends Set Surface Bits. Test: `encoder::surface_command_tests`.
+  Upstream candidate.
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
