@@ -56,9 +56,15 @@ impl NumLock {
     /// the extended flag, so Pause looks like Ctrl+Num Lock, which Windows
     /// also reads as Pause. Pause is not posted (macOS has no Pause key) and
     /// does not toggle Num Lock.
+    ///
+    /// A held key repeats its key-down (typematic) until the key-up: only the
+    /// first press toggles, as on Windows; a repeat is posted as a repeat.
     pub(super) fn key(&mut self, pressed: bool) -> bool {
         if !pressed {
             return std::mem::take(&mut self.key_down);
+        }
+        if self.key_down {
+            return true;
         }
         if self.left_ctrl {
             return false;
@@ -105,6 +111,23 @@ mod tests {
         assert!(n.key(false));
         assert!(!n.is_on());
         assert!(n.key(true));
+        assert!(n.is_on());
+    }
+
+    /// A held Num Lock: the client repeats the key-down (typematic) until the
+    /// key-up. Only the first press toggles, as on Windows.
+    #[test]
+    fn num_lock_auto_repeat_toggles_once() {
+        let mut n = NumLock::default();
+        assert!(n.key(true));
+        assert!(!n.is_on());
+        for _ in 0..5 {
+            assert!(n.key(true), "a repeat is posted (the key is down)");
+            assert!(!n.is_on(), "a repeat does not toggle");
+        }
+        assert!(n.key(false));
+        assert!(!n.is_on());
+        assert!(n.key(true), "a new press toggles again");
         assert!(n.is_on());
     }
 
