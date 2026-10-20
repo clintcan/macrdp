@@ -2061,17 +2061,28 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     scan meaningful. Only `Cargo.toml` changes, no code. Drop it once upstream
     requires zstd-safe >= 8.2.
 
-(29) RemoteFX rides a Stream Surface Bits command, not Set Surface Bits
-    (NOT upstreamed; added 2026-10-21). `RemoteFxHandler::handle` now emits
-    `CMDTYPE_STREAM_SURFACE_BITS` (0x0006) through the new
-    `surface_command(.., SurfaceCommandKind::Stream)`; every other codec
-    (NSCodec, QOI/QOIZ, raw) keeps `set_surface` = `CMDTYPE_SET_SURFACE_BITS`.
+(29) RemoteFX (codec GUID REMOTEFX) rides a Stream Surface Bits command; the
+    ImageRemoteFX codec (GUID IMAGE_REMOTEFX) keeps Set Surface Bits
+    (NOT upstreamed; added 2026-10-21, narrowed to RemoteFX the same day).
+    `UpdateEncoderCodecs::set_remotefx` records `SurfaceCommandKind::Stream`,
+    the new `set_image_remotefx` (server.rs, ImageRemoteFx branch) records
+    `SurfaceCommandKind::Set`, and `RemoteFxHandler::handle` sends the kind it
+    was built with through `surface_command(..)`. Every other codec (NSCodec,
+    QOI/QOIZ, raw) keeps `set_surface` = `CMDTYPE_SET_SURFACE_BITS`.
     MS-RDPRFX 3.1.8.3.1: "The sequence of encode messages is encapsulated inside
     an Extended Bitmap Data structure ..., which is encapsulated in a Stream
-    Surface Bits Surface Command". Windows 10 mstsc (10.0.19041.4717) picks the
-    RemoteFX codec (id 3) and shows a **black** session for Set Surface Bits
-    (no error, input still flows); the same bytes in Stream Surface Bits render
-    and move. Verified A/B on the wire 2026-10-21. The ImageRemoteFX codec
-    id (5) happened to render with Set Surface Bits, so this is specific to the
-    RemoteFX codec path. Upstream master (66bfd60e, 2026-10-20) still sends Set
-    Surface Bits — upstream candidate. Tests: `encoder::surface_command_tests`.
+    Surface Bits Surface Command". Windows 10 mstsc (10.0.19041.4717), A/B on
+    the wire 2026-10-21:
+    - RemoteFX, id 3 (what mstsc picks when both are offered — it lists id 5
+      first, id 3 last, and the last confirmed codec wins): Set Surface Bits =
+      **black** session (no error, input still flows); Stream Surface Bits =
+      renders and moves.
+    - ImageRemoteFX, id 5 (server offering only ImageRemoteFX): Set Surface
+      Bits = renders and moves (385 commands in 12 s); Stream Surface Bits =
+      mstsc "An internal error has occurred" after 4 commands (3 of 3 runs).
+    FreeRDP 3.30 `/rfx` offers only RemoteFX (id 3), so it cannot exercise id 5.
+    Upstream master (66bfd60e, 2026-10-20) still sends Set Surface Bits for
+    both — upstream candidate for the RemoteFX case. Tests:
+    `encoder::surface_command_tests` (run by CI: `cargo test --manifest-path
+    vendor/ironrdp-server/Cargo.toml --lib`, test-linux job; the root
+    `cargo test` does not reach this crate).
