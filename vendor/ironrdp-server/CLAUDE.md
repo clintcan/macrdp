@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(29) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -2060,3 +2060,18 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (`CCtx`), so none of the three is reachable here; the bump is to keep the
     scan meaningful. Only `Cargo.toml` changes, no code. Drop it once upstream
     requires zstd-safe >= 8.2.
+
+(29) RemoteFX rides a Stream Surface Bits command, not Set Surface Bits
+    (NOT upstreamed; added 2026-10-21). `RemoteFxHandler::handle` now emits
+    `CMDTYPE_STREAM_SURFACE_BITS` (0x0006) through the new
+    `surface_command(.., SurfaceCommandKind::Stream)`; every other codec
+    (NSCodec, QOI/QOIZ, raw) keeps `set_surface` = `CMDTYPE_SET_SURFACE_BITS`.
+    MS-RDPRFX 3.1.8.3.1: "The sequence of encode messages is encapsulated inside
+    an Extended Bitmap Data structure ..., which is encapsulated in a Stream
+    Surface Bits Surface Command". Windows 10 mstsc (10.0.19041.4717) picks the
+    RemoteFX codec (id 3) and shows a **black** session for Set Surface Bits
+    (no error, input still flows); the same bytes in Stream Surface Bits render
+    and move. Verified A/B on the wire 2026-10-21. The ImageRemoteFX codec
+    id (5) happened to render with Set Surface Bits, so this is specific to the
+    RemoteFX codec path. Upstream master (66bfd60e, 2026-10-20) still sends Set
+    Surface Bits — upstream candidate. Tests: `encoder::surface_command_tests`.

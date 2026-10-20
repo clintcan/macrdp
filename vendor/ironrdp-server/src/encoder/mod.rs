@@ -577,7 +577,10 @@ impl BitmapUpdateHandler for RemoteFxHandler {
             }
         };
 
-        set_surface(bitmap, self.codec_id, &buffer[..len])
+        // MS-RDPRFX 3.1.8.3.1: a RemoteFX stream rides a Stream Surface Bits
+        // command. Windows 10 mstsc shows nothing (black) when the same data
+        // comes in a Set Surface Bits command.
+        surface_command(bitmap, self.codec_id, &buffer[..len], SurfaceCommandKind::Stream)
     }
 }
 
@@ -727,6 +730,24 @@ fn qoi_encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>> {
 }
 
 fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<UpdateFragmenter> {
+    surface_command(bitmap, codec_id, data, SurfaceCommandKind::Set)
+}
+
+/// Which surface command carries the bitmap data (MS-RDPBCGR 2.2.9.2.1 and 2.2.9.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceCommandKind {
+    /// CMDTYPE_SET_SURFACE_BITS
+    Set,
+    /// CMDTYPE_STREAM_SURFACE_BITS
+    Stream,
+}
+
+fn surface_command(
+    bitmap: &BitmapUpdate,
+    codec_id: u8,
+    data: &[u8],
+    kind: SurfaceCommandKind,
+) -> Result<UpdateFragmenter> {
     let destination = ExclusiveRectangle {
         left: bitmap.x,
         top: bitmap.y,
@@ -745,6 +766,54 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
         destination,
         extended_bitmap_data,
     };
-    let cmd = SurfaceCommand::SetSurfaceBits(pdu);
+    let cmd = match kind {
+        SurfaceCommandKind::Set => SurfaceCommand::SetSurfaceBits(pdu),
+        SurfaceCommandKind::Stream => SurfaceCommand::StreamSurfaceBits(pdu),
+    };
     Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
+}
+
+#[cfg(test)]
+mod surface_command_tests {
+    use core::num::{NonZeroU16, NonZeroUsize};
+
+    use bytes::Bytes;
+    use ironrdp_graphics::image_processing::PixelFormat;
+
+    use super::*;
+
+    const CMDTYPE_SET_SURFACE_BITS: u16 = 0x0001;
+    const CMDTYPE_STREAM_SURFACE_BITS: u16 = 0x0006;
+
+    fn bitmap() -> BitmapUpdate {
+        BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(64).unwrap(),
+            height: NonZeroU16::new(64).unwrap(),
+            format: PixelFormat::BgrX32,
+            data: Bytes::from(vec![0x80u8; 64 * 64 * 4]),
+            stride: NonZeroUsize::new(64 * 4).unwrap(),
+        }
+    }
+
+    fn cmd_type(f: &UpdateFragmenter) -> u16 {
+        u16::from_le_bytes([f.data[0], f.data[1]])
+    }
+
+    #[test]
+    fn remotefx_uses_stream_surface_bits() {
+        let size = DesktopSize { width: 64, height: 64 };
+        let mut h = RemoteFxHandler::new(EntropyBits::Rlgr3, 3, size);
+        let f = h.handle(&bitmap()).unwrap();
+        assert_eq!(cmd_type(&f), CMDTYPE_STREAM_SURFACE_BITS);
+        // The codec id sits after cmdType(2) + destRect(8) + bpp, flags, reserved.
+        assert_eq!(f.data[2 + 8 + 3], 3);
+    }
+
+    #[test]
+    fn other_codecs_keep_set_surface_bits() {
+        let f = set_surface(&bitmap(), 0, &[0u8; 16]).unwrap();
+        assert_eq!(cmd_type(&f), CMDTYPE_SET_SURFACE_BITS);
+    }
 }
