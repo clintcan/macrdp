@@ -9,7 +9,11 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 ```
 --bind 0.0.0.0:3390       Listen address (3390 by default; 3389 needs root)
 --username NAME           Defaults to $USER
---password PASS           Skip the interactive prompt
+--password PASS           Skip the interactive prompt (visible in `ps`)
+--password-file PATH      Read the password from a file (mode 600, owned by
+                          you; otherwise refused). Not visible in `ps`.
+                          One trailing newline is stripped. Config key
+                          PASSWORD_FILE (set USE_KEYCHAIN=0 with it)
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
 -v, --verbose             Show all the noisy logs the default filter hides
