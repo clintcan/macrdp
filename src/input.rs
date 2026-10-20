@@ -1669,8 +1669,12 @@ mod macos {
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
+            self.num_lock.note_scancode(scancode, extended, down);
             if scancode == SCANCODE_NUM_LOCK && !extended && !self.num_lock.key(down) {
-                trace!(down, "Num Lock key-up not posted (no posted press)");
+                trace!(
+                    down,
+                    "scancode 0x45 not posted (Pause, or a release without a posted press)"
+                );
                 return;
             }
             // With Num Lock off the keypad keys move the cursor, as on
