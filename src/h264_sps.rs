@@ -13,9 +13,14 @@
 //!
 //! The rewrite copies every SPS syntax element bit for bit and only changes
 //! the VUI tail. An SPS that already has `bitstream_restriction_flag = 1`, or
-//! one this parser cannot read, is left unchanged.
+//! one this parser cannot read, is left unchanged (the latter with one
+//! warning per process).
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tracing::warn;
 
 /// Values written for the added `bitstream_restriction` fields other than
 /// the two that matter. They are the values H.264 E.2.1 infers when the
@@ -24,11 +29,72 @@ const MAX_BYTES_PER_PIC_DENOM: u32 = 2;
 const MAX_BITS_PER_MB_DENOM: u32 = 1;
 const LOG2_MAX_MV_LENGTH: u32 = 16;
 
+/// One-shot guard for the "SPS not rewritten" warning in [`fix_parameter_set`].
+static UNPARSABLE_SPS_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Result of [`rewrite`].
+#[derive(Debug, PartialEq, Eq)]
+enum Rewrite {
+    /// The SPS with `bitstream_restriction` added.
+    Done(Vec<u8>),
+    /// Not an SPS, or an SPS that already has `bitstream_restriction`.
+    NotNeeded,
+    /// An SPS this parser cannot read.
+    Unparsable,
+}
+
+/// Add `bitstream_restriction` to one parameter set from the encoder if it
+/// is an SPS without it, and return the NAL unit to send. An SPS that cannot be parsed is
+/// sent unchanged, with one warning per process: Windows 10 mstsc may then
+/// show a black session, and the log must say why.
+pub fn fix_parameter_set(nal: &[u8]) -> Vec<u8> {
+    match rewrite(nal) {
+        Rewrite::Done(out) => out,
+        Rewrite::NotNeeded => nal.to_vec(),
+        Rewrite::Unparsable => {
+            if !UNPARSABLE_SPS_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    len = nal.len(),
+                    head = %hex_head(nal),
+                    "H.264 SPS could not be parsed, so bitstream_restriction was not added; \
+                     sending it unchanged (Windows 10 mstsc may show a black session)"
+                );
+            }
+            nal.to_vec()
+        }
+    }
+}
+
+/// The first bytes of `nal` as hex, for the log.
+fn hex_head(nal: &[u8]) -> String {
+    nal.iter().take(24).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Return the SPS NAL unit (header byte included, no start code) with
 /// `bitstream_restriction` added, or `None` if `nal` needs no change or is
 /// not an SPS this function can rewrite.
-pub fn add_bitstream_restriction(nal: &[u8]) -> Option<Vec<u8>> {
-    if nal.len() < 4 || nal[0] & 0x1f != 7 {
+#[cfg(test)]
+fn add_bitstream_restriction(nal: &[u8]) -> Option<Vec<u8>> {
+    match rewrite(nal) {
+        Rewrite::Done(out) => Some(out),
+        Rewrite::NotNeeded | Rewrite::Unparsable => None,
+    }
+}
+
+fn rewrite(nal: &[u8]) -> Rewrite {
+    if nal.first().is_none_or(|h| h & 0x1f != 7) {
+        return Rewrite::NotNeeded;
+    }
+    match try_rewrite(nal) {
+        Some(Some(out)) => Rewrite::Done(out),
+        Some(None) => Rewrite::NotNeeded,
+        None => Rewrite::Unparsable,
+    }
+}
+
+/// `None`: cannot parse. `Some(None)`: already has bitstream_restriction.
+fn try_rewrite(nal: &[u8]) -> Option<Option<Vec<u8>>> {
+    if nal.len() < 4 {
         return None;
     }
     let rbsp = unescape(&nal[1..]);
@@ -40,7 +106,7 @@ pub fn add_bitstream_restriction(nal: &[u8]) -> Option<Vec<u8>> {
     w.u(1, 1);
     if vui_present == 1 {
         if !copy_vui_until_restriction(&mut r, &mut w)? {
-            return None; // already has bitstream_restriction
+            return Some(None); // already has bitstream_restriction
         }
     } else {
         // Minimal VUI: every optional part absent (aspect ratio, overscan,
@@ -62,7 +128,7 @@ pub fn add_bitstream_restriction(nal: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(nal.len() + 8);
     out.push(nal[0]);
     out.extend_from_slice(&escape(&w.finish_rbsp()));
-    Some(out)
+    Some(Some(out))
 }
 
 /// Copy seq_parameter_set_data() up to (not including)
@@ -363,12 +429,23 @@ mod tests {
         let rbsp2 = unescape(&nal[1..]);
         let mut r2 = BitReader::new(&rbsp2);
         r2.u(24).unwrap();
-        r2.ue().unwrap();
-        r2.ue().unwrap();
-        let poc = r2.ue().unwrap();
-        assert_eq!(poc, 0, "test SPSs use pic_order_cnt_type 0");
-        r2.ue().unwrap();
-        r2.ue().unwrap();
+        r2.ue().unwrap(); // seq_parameter_set_id
+        if profile == 100 {
+            assert_eq!(r2.ue(), Some(1), "test SPSs are 4:2:0");
+            r2.ue().unwrap();
+            r2.ue().unwrap();
+            r2.u(1).unwrap();
+            assert_eq!(r2.u(1), Some(0), "test SPSs carry no scaling matrix");
+        }
+        r2.ue().unwrap(); // log2_max_frame_num_minus4
+        match r2.ue().unwrap() {
+            0 => {
+                r2.ue().unwrap();
+            }
+            2 => {}
+            poc => panic!("test SPSs use pic_order_cnt_type 0 or 2, not {poc}"),
+        }
+        r2.ue().unwrap(); // max_num_ref_frames
         r2.u(1).unwrap();
         let width_mbs = r2.ue().unwrap() + 1;
         let height_mbs = r2.ue().unwrap() + 1;
@@ -397,7 +474,17 @@ mod tests {
                 r.u(32).unwrap();
                 r.u(1).unwrap();
             }
-            assert_eq!(r.u(2).unwrap(), 0, "test SPSs carry no HRD");
+            let nal_hrd = r.u(1).unwrap();
+            if nal_hrd == 1 {
+                skip_hrd(&mut r);
+            }
+            let vcl_hrd = r.u(1).unwrap();
+            if vcl_hrd == 1 {
+                skip_hrd(&mut r);
+            }
+            if nal_hrd == 1 || vcl_hrd == 1 {
+                r.u(1).unwrap(); // low_delay_hrd_flag
+            }
             r.u(1).unwrap(); // pic_struct_present_flag
             if r.u(1).unwrap() == 1 {
                 r.u(1).unwrap();
@@ -407,8 +494,12 @@ mod tests {
                 restriction = Some((r.ue().unwrap(), r.ue().unwrap()));
             }
         }
-        // rbsp_trailing_bits must follow.
+        // rbsp_trailing_bits must follow, then only zero bits to the end.
         assert_eq!(r.u(1).unwrap(), 1, "rbsp stop bit");
+        while let Some(b) = r.bit() {
+            assert_eq!(b, 0, "data after rbsp_trailing_bits");
+        }
+        assert!(r.pos.div_ceil(8) == rbsp.len(), "trailing bytes");
         Fields {
             profile,
             level,
@@ -418,6 +509,230 @@ mod tests {
             colour,
             restriction,
         }
+    }
+
+    /// HRD parameters (E.1.2), read with this test's own reader.
+    fn skip_hrd(r: &mut BitReader<'_>) {
+        let cpb_cnt = r.ue().unwrap() + 1;
+        r.u(8).unwrap(); // bit_rate_scale, cpb_size_scale
+        for _ in 0..cpb_cnt {
+            r.ue().unwrap();
+            r.ue().unwrap();
+            r.u(1).unwrap();
+        }
+        r.u(20).unwrap();
+    }
+
+    /// x264 (libx264 via PyAV), High profile, NAL HRD (VBR), sar 7:5
+    /// (aspect_ratio_idc 255), timing info, and its own
+    /// bitstream_restriction. The payload has emulation-prevention bytes.
+    const X264_HIGH_VBR_SAR: &[u8] = &[
+        0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xbb, 0xff, 0x00, 0x07, 0x00, 0x01,
+        0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0xc6, 0x48, 0x00, 0x0f, 0x42,
+        0x40, 0x01, 0xe8, 0x4a, 0x4c, 0x30, 0x07, 0x8c, 0x18, 0xcb,
+    ];
+
+    /// x264, High profile, NAL HRD (CBR), B-frames (max_num_reorder_frames 1
+    /// in its own bitstream_restriction).
+    const X264_HIGH_CBR: &[u8] = &[
+        0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xba, 0x10, 0x00, 0x00, 0x03, 0x00,
+        0x10, 0x00, 0x00, 0x03, 0x03, 0xc6, 0x26, 0x00, 0x0f, 0x42, 0x40, 0x01, 0xe8, 0x4e, 0x4c,
+        0x30, 0x07, 0x8c, 0x18, 0xcb,
+    ];
+
+    /// The same SPS with bitstream_restriction_flag = 0 and the fields
+    /// removed (built with the copy functions under test).
+    fn strip_restriction(nal: &[u8]) -> Vec<u8> {
+        let rbsp = unescape(&nal[1..]);
+        let mut r = BitReader::new(&rbsp);
+        let mut w = BitWriter::default();
+        copy_sps_until_vui(&mut r, &mut w).unwrap();
+        assert_eq!(r.copy_u(&mut w, 1), Some(1), "VUI present");
+        assert_eq!(copy_vui_until_restriction(&mut r, &mut w), Some(false));
+        w.u(1, 0);
+        let mut out = vec![nal[0]];
+        out.extend_from_slice(&escape(&w.finish_rbsp()));
+        out
+    }
+
+    #[test]
+    fn x264_sps_with_hrd_reads_to_the_end() {
+        // An independent encoder's SPS with HRD and 00 00 03 escapes: the
+        // copy functions must stop exactly at bitstream_restriction_flag, so
+        // that the test's reader then lands exactly on the stop bit.
+        for sps in [X264_HIGH_VBR_SAR, X264_HIGH_CBR] {
+            let f = parse(sps);
+            assert_eq!(f.profile, 100);
+            assert_eq!((f.width_mbs, f.height_mbs), (80, 45));
+            assert!(f.restriction.is_some());
+            assert_eq!(add_bitstream_restriction(sps), None, "already has it");
+        }
+    }
+
+    #[test]
+    fn x264_sps_without_restriction_gets_it_back() {
+        for sps in [X264_HIGH_VBR_SAR, X264_HIGH_CBR] {
+            let before = parse(sps);
+            let stripped = strip_restriction(sps);
+            assert_eq!(parse(&stripped).restriction, None);
+            let out = add_bitstream_restriction(&stripped).expect("rewritten");
+            let after = parse(&out);
+            assert_eq!(
+                after.restriction,
+                Some((0, before.max_num_ref_frames.max(1)))
+            );
+            assert_eq!(
+                Fields {
+                    restriction: None,
+                    ..after
+                },
+                Fields {
+                    restriction: None,
+                    ..before
+                }
+            );
+            // Bits before the restriction are unchanged: re-stripping gives
+            // the same bytes.
+            assert_eq!(strip_restriction(&out), stripped);
+        }
+    }
+
+    /// A hand-built High-profile SPS (H.264 7.3.2.1.1 / E.1.1) with the
+    /// syntax no encoder sample here has: SPS scaling lists (explicit 4x4
+    /// and 8x8 lists, a "use default" list, a list that ends early with
+    /// nextScale 0), pic_order_cnt_type 1, field coding, cropping, VUI with
+    /// aspect_ratio_idc 255, colour, chroma location, timing, NAL HRD with
+    /// two CPBs and VCL HRD. With `restriction`, the VUI ends with the
+    /// fields `add_bitstream_restriction` writes.
+    fn hand_built_sps(restriction: bool) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        w.u(8, 100); // profile_idc
+        w.u(8, 0); // constraint flags
+        w.u(8, 40); // level_idc
+        w.ue(0); // seq_parameter_set_id
+        w.ue(1); // chroma_format_idc 4:2:0
+        w.ue(0); // bit_depth_luma_minus8
+        w.ue(0); // bit_depth_chroma_minus8
+        w.u(1, 0); // qpprime_y_zero_transform_bypass_flag
+        w.u(1, 1); // seq_scaling_matrix_present_flag
+        w.u(1, 1); // list 0 (4x4): 16 explicit deltas, all scales nonzero
+        for d in [8, -1, 2, -3, 4, 0, 1, 1, -2, 3, 5, -6, 7, 1, 1, 1] {
+            w.ue(se_code(d));
+        }
+        // List 1 (4x4): delta -8 makes nextScale 0 at j = 0, "use default".
+        w.u(1, 1);
+        w.ue(se_code(-8));
+        // List 2: absent.
+        w.u(1, 0);
+        // List 3 (4x4): nextScale becomes 0 at j = 4; no more deltas.
+        w.u(1, 1);
+        for d in [2, 3, -1, 4, -16] {
+            w.ue(se_code(d));
+        }
+        // Lists 4, 5: absent.
+        w.u(1, 0);
+        w.u(1, 0);
+        // List 6 (8x8): 64 explicit deltas.
+        w.u(1, 1);
+        for i in 0..64 {
+            w.ue(se_code(if i % 2 == 0 { 1 } else { -1 }));
+        }
+        // List 7: absent.
+        w.u(1, 0);
+        w.ue(4); // log2_max_frame_num_minus4
+        w.ue(1); // pic_order_cnt_type
+        w.u(1, 0); // delta_pic_order_always_zero_flag
+        w.ue(se_code(-2)); // offset_for_non_ref_pic
+        w.ue(se_code(1)); // offset_for_top_to_bottom_field
+        w.ue(2); // num_ref_frames_in_pic_order_cnt_cycle
+        w.ue(se_code(3));
+        w.ue(se_code(-4));
+        w.ue(4); // max_num_ref_frames
+        w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+        w.ue(119); // pic_width_in_mbs_minus1
+        w.ue(33); // pic_height_in_map_units_minus1
+        w.u(1, 0); // frame_mbs_only_flag
+        w.u(1, 1); // mb_adaptive_frame_field_flag
+        w.u(1, 1); // direct_8x8_inference_flag
+        w.u(1, 1); // frame_cropping_flag
+        for v in [0, 0, 0, 4] {
+            w.ue(v);
+        }
+        w.u(1, 1); // vui_parameters_present_flag
+        w.u(1, 1); // aspect_ratio_info_present_flag
+        w.u(8, 255); // Extended_SAR
+        w.u(16, 7);
+        w.u(16, 5);
+        w.u(1, 1); // overscan_info_present_flag
+        w.u(1, 0);
+        w.u(1, 1); // video_signal_type_present_flag
+        w.u(3, 5);
+        w.u(1, 0);
+        w.u(1, 1); // colour_description_present_flag
+        w.u(24, 0x01_01_01);
+        w.u(1, 1); // chroma_loc_info_present_flag
+        w.ue(1);
+        w.ue(2);
+        w.u(1, 1); // timing_info_present_flag
+        w.u(32, 1001);
+        w.u(32, 60_000);
+        w.u(1, 1);
+        // NAL HRD: two CPB specifications.
+        w.u(1, 1);
+        w.ue(1); // cpb_cnt_minus1
+        w.u(4, 2);
+        w.u(4, 3);
+        for (rate, size, cbr) in [(999, 1999, 0), (4999, 9999, 1)] {
+            w.ue(rate);
+            w.ue(size);
+            w.u(1, cbr);
+        }
+        w.u(5, 23); // initial_cpb_removal_delay_length_minus1
+        w.u(5, 23); // cpb_removal_delay_length_minus1
+        w.u(5, 23); // dpb_output_delay_length_minus1
+        w.u(5, 24); // time_offset_length
+        w.u(1, 1); // VCL HRD: one CPB
+        w.ue(0);
+        w.u(4, 1);
+        w.u(4, 1);
+        w.ue(500);
+        w.ue(700);
+        w.u(1, 0);
+        w.u(20, 0xabcde);
+        w.u(1, 0); // low_delay_hrd_flag
+        w.u(1, 1); // pic_struct_present_flag
+        if restriction {
+            w.u(1, 1);
+            w.u(1, 1);
+            w.ue(MAX_BYTES_PER_PIC_DENOM);
+            w.ue(MAX_BITS_PER_MB_DENOM);
+            w.ue(LOG2_MAX_MV_LENGTH);
+            w.ue(LOG2_MAX_MV_LENGTH);
+            w.ue(0);
+            w.ue(4); // max_dec_frame_buffering = max_num_ref_frames
+        } else {
+            w.u(1, 0);
+        }
+        let mut out = vec![0x67];
+        out.extend_from_slice(&escape(&w.finish_rbsp()));
+        out
+    }
+
+    /// se(v) to the codeNum that ue(v) writes (H.264 9.1.1).
+    fn se_code(v: i32) -> u32 {
+        if v > 0 {
+            (2 * v - 1) as u32
+        } else {
+            (-2 * v) as u32
+        }
+    }
+
+    #[test]
+    fn hand_built_sps_with_scaling_lists_and_hrd() {
+        let input = hand_built_sps(false);
+        let out = add_bitstream_restriction(&input).expect("rewritten");
+        assert_eq!(out, hand_built_sps(true), "same bits plus the restriction");
+        assert_eq!(add_bitstream_restriction(&out), None);
     }
 
     #[test]
@@ -470,6 +785,23 @@ mod tests {
             add_bitstream_restriction(&[0x27, 0x42, 0x00, 0x1f, 0x00, 0x00]),
             None
         );
+    }
+
+    #[test]
+    fn unparsable_sps_is_sent_unchanged() {
+        // Truncated SPS (the VUI is cut off) and an SPS shorter than the
+        // fixed header: both cannot be parsed.
+        for bad in [&VT_SPS[..8], &[0x27, 0x42][..]] {
+            assert_eq!(rewrite(bad), Rewrite::Unparsable);
+            assert_eq!(fix_parameter_set(bad), bad);
+        }
+        assert!(UNPARSABLE_SPS_WARNED.load(Ordering::Relaxed));
+        // Not an SPS, or an SPS that needs nothing: no warning case.
+        assert_eq!(rewrite(&[0x28, 0xce, 0x3c, 0x80]), Rewrite::NotNeeded);
+        assert_eq!(rewrite(&[]), Rewrite::NotNeeded);
+        let fixed = fix_parameter_set(VT_SPS);
+        assert_eq!(Some(fixed.clone()), add_bitstream_restriction(VT_SPS));
+        assert_eq!(rewrite(&fixed), Rewrite::NotNeeded);
     }
 
     #[test]
