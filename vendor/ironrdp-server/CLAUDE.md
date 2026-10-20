@@ -63,6 +63,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
 | (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection. **Upstream as #2432 (`e482e340`); drops at the next pin bump** | `run_connection_inner`, around `negotiate_and_authenticate` | — |
 | (33) | The client's desktop and device scale factors on `ConnectionInfo`, **harvested early** from upstream #2107 (merged 2026-10-30, after this pin) | `ConnectionInfo` fields + `new()`, the `on_connection_info` call in `client_accepted`; pairs with acceptor divergence (6) | `ConnectionInfo::{desktop,device}_scale_factor` |
+| (34) | RemoteFX goes out in a Stream Surface Bits command instead of Set Surface Bits; Windows 10 mstsc shows a black session for Set | `encoder/mod.rs` `RemoteFxHandler::handle`, `surface_command` | — |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -120,6 +121,16 @@ Notes on the port:
   announced later in a monitor layout. Copied from upstream's diff, not its file. Test:
   `conn_hooks::tests::the_desktop_scale_factor_reaches_the_shared_cell`. **Drop it at
   the next pin bump** (any rev at or after `335d6712`).
+
+- **(34)** Added 2026-10-21 (clintcan/macrdp#226). Numbered (34) because main used
+  (29) to (33) while this branch was open. MS-RDPRFX 3.1.8.3.1: "The sequence of
+  encode messages is encapsulated inside an Extended Bitmap Data structure ..., which
+  is encapsulated in a Stream Surface Bits Surface Command". Windows 10 mstsc
+  (10.0.19041.4717) picks the RemoteFX codec (id 3) and shows a **black** session for
+  Set Surface Bits (no error, input still flows); the same bytes in Stream Surface Bits
+  render and move (A/B on the wire). Every other codec keeps `set_surface`. Upstream
+  master still sends Set Surface Bits. Test: `encoder::surface_command_tests`.
+  Upstream candidate.
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
