@@ -74,6 +74,17 @@ jobs:
           cargo fmt --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml -- --check
           cargo test --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml
 
+      # vendor/ironrdp-server is a [patch.crates-io] path crate, not a workspace
+      # member, and its manifest sets `[lib] test = false`, so the root
+      # `cargo test` never runs its unit tests (the divergence tests, e.g. the
+      # surface command per codec of divergence (29)). `--lib` runs them; the
+      # crate resolves its IronRDP siblings via its own [patch.crates-io].
+      # Platform-independent, so Linux is enough.
+      - name: Test ironrdp-server (vendored crate, unit tests)
+        env:
+          RUSTFLAGS: ''
+        run: cargo test --manifest-path vendor/ironrdp-server/Cargo.toml --lib
+
   test-macos:
     name: test (macos)
     runs-on: macos-14   # Apple Silicon
