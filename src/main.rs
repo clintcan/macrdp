@@ -249,6 +249,14 @@ struct Args {
     #[arg(long)]
     keychain: bool,
 
+    /// Read the password from this file instead of prompting (one trailing
+    /// newline is stripped). Keeps the password out of `ps` and shell history
+    /// for headless / launchd runs where the Keychain is not an option. The
+    /// file should be mode 0600; a warning is logged if group or others can
+    /// read it.
+    #[arg(long, conflicts_with_all = ["password", "keychain"])]
+    password_file: Option<PathBuf>,
+
     /// Directory holding cert.pem / key.pem. Generated on first run and
     /// reused thereafter so clients see a stable fingerprint across restarts.
     /// Defaults to ~/Library/Application Support/macrdp.
@@ -963,6 +971,34 @@ fn spawn_hud_helper() -> Option<std::process::Child> {
             None
         }
     }
+}
+
+/// Read the password from `--password-file`. One trailing `\n` (or `\r\n`)
+/// is stripped; an empty password is an error. Warns when the file is
+/// readable by group or others.
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.permissions().mode() & 0o077 != 0 {
+            warn!(
+                path = %path.display(),
+                "password file is readable by group or others; chmod 600 it"
+            );
+        }
+    }
+    let mut s = Zeroizing::new(
+        fs::read_to_string(path)
+            .with_context(|| format!("reading password file {}", path.display()))?,
+    );
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    if s.is_empty() {
+        return Err(anyhow!("password file {} is empty", path.display()));
+    }
+    Ok(s)
 }
 
 /// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
@@ -2297,7 +2333,13 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(username);
     }
 
-    if on("USE_KEYCHAIN", true) {
+    // PASSWORD_FILE replaces the Keychain, so USE_KEYCHAIN then defaults off.
+    let password_file = cfg.get("PASSWORD_FILE").filter(|p| !p.is_empty());
+    if let Some(p) = password_file {
+        argv.push("--password-file".into());
+        argv.push(p.clone());
+    }
+    if on("USE_KEYCHAIN", password_file.is_none()) {
         argv.push("--keychain".into());
     }
     if on("ENABLE_H264", false) {
@@ -2895,6 +2937,8 @@ async fn async_main() -> Result<()> {
         .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
     let password: Zeroizing<String> = if args.keychain {
         read_password_from_keychain(&username)?
+    } else if let Some(path) = args.password_file.as_deref() {
+        read_password_file(path)?
     } else if let Some(p) = args.password.take() {
         warn!(
             "--password is visible to any local user via `ps` and may be saved in \
@@ -3935,6 +3979,57 @@ mod config_tests {
         let p = write_temp("br4", "BITRATE=\n");
         assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
         fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn password_file_config_bridge() {
+        // PASSWORD_FILE maps to --password-file and turns the Keychain default off.
+        let p = write_temp("pwf1", "PASSWORD_FILE=/tmp/x/pw\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert_eq!(a.password_file.as_deref(), Some(Path::new("/tmp/x/pw")));
+        assert!(!a.keychain);
+
+        // Both set explicitly is a conflict, not a silent pick.
+        let p = write_temp("pwf2", "PASSWORD_FILE=/tmp/x/pw\nUSE_KEYCHAIN=1\n");
+        assert!(args_from_config(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        // Empty PASSWORD_FILE is ignored → Keychain default as before.
+        let p = write_temp("pwf3", "PASSWORD_FILE=\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert!(a.password_file.is_none());
+        assert!(a.keychain);
+    }
+
+    #[test]
+    fn password_file_reads_and_strips_one_newline() {
+        let p = write_temp("pwf4", "s3cret\r\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "s3cret");
+        fs::remove_file(&p).ok();
+
+        let p = write_temp("pwf5", "two\n\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "two\n");
+        fs::remove_file(&p).ok();
+
+        let p = write_temp("pwf6", "\n");
+        assert!(read_password_file(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        assert!(read_password_file(Path::new("/nonexistent/macrdp-pw")).is_err());
+    }
+
+    #[test]
+    fn password_file_conflicts_with_password_flag() {
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--password", "x"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--keychain"]).is_err()
+        );
+        assert!(Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw"]).is_ok());
     }
 
     #[test]
