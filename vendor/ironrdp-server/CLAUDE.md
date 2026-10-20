@@ -62,7 +62,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
 | (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
 | (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection | `run_connection_inner`, around `negotiate_and_authenticate` | — |
-| (33) | RemoteFX goes out in a Stream Surface Bits command instead of Set Surface Bits; Windows 10 mstsc shows a black session for Set | `encoder/mod.rs` `RemoteFxHandler::handle`, `surface_command` | — |
+| (33) | RemoteFX (codec GUID REMOTEFX) goes out in a Stream Surface Bits command; ImageRemoteFX (GUID IMAGE_REMOTEFX) and every other codec keep Set Surface Bits. Windows 10 mstsc shows a black session for RemoteFX in Set | `encoder/mod.rs` `UpdateEncoderCodecs::set_remotefx` / `set_image_remotefx`, `RemoteFxHandler::handle`, `surface_command`; `server.rs` ImageRemoteFx arm | — |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -111,12 +111,21 @@ Notes on the port:
 - **(33)** Added 2026-10-21 (clintcan/macrdp#226). Numbered (33) because main used
   (29) to (32) while this branch was open. MS-RDPRFX 3.1.8.3.1: "The sequence of
   encode messages is encapsulated inside an Extended Bitmap Data structure ..., which
-  is encapsulated in a Stream Surface Bits Surface Command". Windows 10 mstsc
-  (10.0.19041.4717) picks the RemoteFX codec (id 3) and shows a **black** session for
-  Set Surface Bits (no error, input still flows); the same bytes in Stream Surface Bits
-  render and move (A/B on the wire). Every other codec keeps `set_surface`. Upstream
-  master still sends Set Surface Bits. Test: `encoder::surface_command_tests`.
-  Upstream candidate.
+  is encapsulated in a Stream Surface Bits Surface Command". `set_remotefx` records
+  `SurfaceCommandKind::Stream`, `set_image_remotefx` records `Set`, and
+  `RemoteFxHandler::handle` sends the kind it was built with. Windows 10 mstsc
+  (10.0.19041.4717), A/B on the wire 2026-10-21:
+  - RemoteFX, id 3 (what mstsc gets when both are offered: it lists id 5 first and
+    id 3 last, and the last confirmed codec wins): Set Surface Bits = **black**
+    session (no error, input still flows); Stream Surface Bits = renders and moves.
+  - ImageRemoteFX, id 5 (server offering only ImageRemoteFX): Set Surface Bits =
+    renders and moves (385 commands in 12 s); Stream Surface Bits = mstsc "An
+    internal error has occurred" after 4 commands (3 of 3 runs).
+
+  FreeRDP 3.30 `/rfx` offers only RemoteFX (id 3), so it cannot exercise id 5.
+  Upstream master still sends Set Surface Bits for both. Tests:
+  `encoder::surface_command_tests` (run by CI: `cargo test --manifest-path
+  vendor/ironrdp-server/Cargo.toml --lib`). Upstream candidate for the RemoteFX case.
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
