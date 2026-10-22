@@ -334,7 +334,9 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           Config keys: STATS_ENDPOINT, STATS_PORT.
 ```
 
-`RUST_LOG=debug` for verbose logging.
+`RUST_LOG=debug` for verbose logging. Under `RUST_LOG`, `rustls=error` is added unless the value
+names `rustls` (mstsc sends the server IP as SNI, and rustls warns about it on each connect). An
+invalid `RUST_LOG` is not used: macrdp logs a warning at start and uses the default filter.
 
 ### Auth hardening (environment variables, on by default)
 

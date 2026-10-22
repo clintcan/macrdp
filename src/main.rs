@@ -3032,23 +3032,13 @@ async fn async_main() -> Result<()> {
         std::process::exit(usb_redirect::run_spike());
     }
 
-    // RUST_LOG (if set) always wins. Otherwise: --verbose turns on debug
-    // everywhere; without it we apply a targeted filter that quiets known
-    // noisy modules:
-    //   - rustls SNI warnings (clients legally put IPs there)
-    //   - the ironrdp_server::encoder "took N ms" timer (fires above 10ms)
-    //   - ironrdp_server::server WARN ("Unexpected share data pdu"); ERRORs
-    //     are still shown — that's where the cert-acceptance "Broken pipe"
-    //     comes from, which we can't suppress without losing real errors.
-    let filter = if let Ok(env) = tracing_subscriber::EnvFilter::try_from_default_env() {
-        env
-    } else if args.verbose {
-        tracing_subscriber::EnvFilter::new("debug")
-    } else {
-        tracing_subscriber::EnvFilter::new(
-            "info,rustls=error,ironrdp_server::encoder=error,ironrdp_server::server=error",
-        )
-    };
+    // RUST_LOG (if set and valid) always wins; see `logging::build_filter`.
+    let mut log_notices = Vec::new();
+    let filter = logging::build_filter(
+        std::env::var("RUST_LOG").ok().as_deref(),
+        args.verbose,
+        &mut log_notices,
+    );
     // Resolve the JSON audit-stream sink (SIEM/SOC): an explicit --audit-file /
     // AUDIT_FILE wins; otherwise MACRDP_AUDIT_JSON=1 enables it at the default
     // `<log-dir-or-~/Library/Logs>/macrdp-audit.log`. Off (None) by default, so the
@@ -3073,6 +3063,9 @@ async fn async_main() -> Result<()> {
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
     info!(version = version::version(), "macrdp starting");
+    for w in &log_notices {
+        warn!("{w}");
+    }
 
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste

@@ -33,6 +33,73 @@ const BASE: &str = "macrdp.log";
 const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_FILES: usize = 5;
 
+/// The filter used without `RUST_LOG`: debug everywhere with `--verbose`,
+/// else info with known noisy third-party targets quieted:
+///   - rustls SNI warnings (clients legally put IPs there)
+///   - the ironrdp_server::encoder "took N ms" timer (fires above 10ms)
+///   - ironrdp_server::server WARN ("Unexpected share data pdu"); ERRORs
+///     are still shown — that's where the cert-acceptance "Broken pipe"
+///     comes from, which we can't suppress without losing real errors.
+const DEFAULT_FILTER: &str =
+    "info,rustls=error,ironrdp_server::encoder=error,ironrdp_server::server=error";
+
+/// Third-party targets that log client mistakes as warnings on each
+/// connection; lowered also under `RUST_LOG` unless it names the target.
+/// rustls: "Illegal SNI extension: ignoring IP address presented as hostname"
+/// (mstsc sends the server IP as SNI).
+const QUIET_TARGETS: &[(&str, &str)] = &[("rustls", "error")];
+
+/// The directives of a `RUST_LOG` value plus a default for each quiet target
+/// it does not name. With a global `off`, nothing is added (`off` stays off).
+///
+/// The split on ',' also splits a span field list (`[span{a=1,b=2}]`); the
+/// pieces only fail to match a quiet target, so at most a default is added.
+///
+/// Ported from macrdp-v1 3ad34dd / 84a4069 (`filter_directives`), relicensed
+/// by the author.
+pub fn filter_directives(user: &str) -> String {
+    let mut out = user.trim().to_owned();
+    let global_off = user
+        .split(',')
+        .any(|d| d.trim().eq_ignore_ascii_case("off"));
+    if global_off {
+        return out;
+    }
+    for (target, level) in QUIET_TARGETS {
+        let named = user.split(',').any(|d| {
+            let t = d.trim().split(['=', '[']).next().unwrap_or("");
+            t == *target || t.starts_with(&format!("{target}::"))
+        });
+        if !named {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(&format!("{target}={level}"));
+        }
+    }
+    out
+}
+
+/// The log filter: `RUST_LOG` when set and not empty (with the quiet targets
+/// of [`filter_directives`]), else [`DEFAULT_FILTER`] (`debug` with
+/// `verbose`). An invalid `RUST_LOG` is not used: a line goes to `notices`
+/// (logged once the logger is up) and the default filter is used.
+pub fn build_filter(rust_log: Option<&str>, verbose: bool, notices: &mut Vec<String>) -> EnvFilter {
+    let default = || EnvFilter::new(if verbose { "debug" } else { DEFAULT_FILTER });
+    let Some(user) = rust_log.filter(|v| !v.trim().is_empty()) else {
+        return default();
+    };
+    match EnvFilter::try_new(filter_directives(user)) {
+        Ok(f) => f,
+        Err(e) => {
+            notices.push(format!(
+                "invalid RUST_LOG {user:?} ({e}): not used, logging with the default filter"
+            ));
+            default()
+        }
+    }
+}
+
 /// Initialize the global tracing subscriber.
 ///
 /// `filter` is the already-resolved [`EnvFilter`]. `log_dir_override` is the
@@ -395,6 +462,44 @@ impl<'a> MakeWriter<'a> for RotatingWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_log_gets_the_quiet_targets_unless_it_names_them() {
+        assert_eq!(filter_directives("debug"), "debug,rustls=error");
+        assert_eq!(
+            filter_directives("info,macrdp::h264=trace"),
+            "info,macrdp::h264=trace,rustls=error"
+        );
+        assert_eq!(filter_directives("info,rustls=debug"), "info,rustls=debug");
+        assert_eq!(
+            filter_directives("info,rustls::server=warn"),
+            "info,rustls::server=warn"
+        );
+        assert_eq!(filter_directives("off"), "off");
+        assert_eq!(filter_directives(""), "rustls=error");
+    }
+
+    #[test]
+    fn an_invalid_rust_log_is_reported_and_not_used() {
+        let mut notices = Vec::new();
+        let f = build_filter(Some("info,macrdp=nonsense"), false, &mut notices);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("invalid RUST_LOG"), "{notices:?}");
+        assert_eq!(f.to_string(), EnvFilter::new(DEFAULT_FILTER).to_string());
+        let mut notices = Vec::new();
+        let f = build_filter(Some("info"), false, &mut notices);
+        assert!(notices.is_empty());
+        assert_eq!(
+            f.to_string(),
+            EnvFilter::new("info,rustls=error").to_string()
+        );
+        // Unset or empty: the default (debug with --verbose), no notice.
+        for v in [None, Some(""), Some("  ")] {
+            let f = build_filter(v, true, &mut notices);
+            assert_eq!(f.to_string(), EnvFilter::new("debug").to_string());
+        }
+        assert!(notices.is_empty());
+    }
 
     fn unique_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
