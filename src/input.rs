@@ -234,11 +234,41 @@ fn resync_plan(reconnected: bool, buttons_down: [bool; 3], mods_held: bool) -> R
     }
 }
 
+/// Wheel units per posted scroll line; see `Inner::scroll`.
+const SCROLL_UNITS_PER_LINE: i32 = 60;
+
+/// Adds a wheel delta to the running total and returns the lines to post (at
+/// most 5 per event) and the new total. Whatever the cap cuts off is dropped,
+/// and a reversal starts from zero.
+fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
+    let accum = if delta != 0 && accum != 0 && (accum < 0) != (delta < 0) {
+        delta
+    } else {
+        accum + delta
+    };
+    let lines = accum / SCROLL_UNITS_PER_LINE;
+    (lines.clamp(-5, 5), accum - lines * SCROLL_UNITS_PER_LINE)
+}
+
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        is_remappable_shortcut, map_client_to_display, resync_plan, should_remap_click, ResyncPlan,
+        is_remappable_shortcut, map_client_to_display, resync_plan, scroll_lines,
+        should_remap_click, ResyncPlan,
     };
+
+    #[test]
+    fn scroll_drops_what_the_cap_cuts_off() {
+        assert_eq!(scroll_lines(0, -1236), (-5, -36));
+        assert_eq!(scroll_lines(0, 30), (0, 30));
+        assert_eq!(scroll_lines(30, 30), (1, 0));
+    }
+
+    #[test]
+    fn scroll_reversal_ignores_the_previous_direction() {
+        let (_, accum) = scroll_lines(0, -1236);
+        assert_eq!(scroll_lines(accum, 120), (2, 0));
+    }
 
     /// Connection edge: every tracked button is released, the gesture state is
     /// cleared, and `FlagsChanged` is posted only if a modifier was held.
@@ -1833,18 +1863,15 @@ mod macos {
             // RDP wheel rotation units are 120 per "tick", but this client
             // slices a single gesture into many small legacy MOUSE PDU
             // events (observed raw magnitude ~2-40 per event, not one
-            // 120-per-notch value). A flat `delta / SCALE` per event
+            // 120-per-notch value). A flat per-event division
             // truncates almost every one of those to zero — scroll never
             // moves at all. Accumulate the raw delta across calls instead,
             // and only emit whole lines once the running total crosses
-            // SCALE, carrying the remainder forward so no motion is lost.
-            const SCALE: i32 = 60;
-            self.scroll_v_accum += vertical;
-            self.scroll_h_accum += horizontal;
-            let v = (self.scroll_v_accum / SCALE).clamp(-5, 5);
-            let h = (self.scroll_h_accum / SCALE).clamp(-5, 5);
-            self.scroll_v_accum -= v * SCALE;
-            self.scroll_h_accum -= h * SCALE;
+            // SCROLL_UNITS_PER_LINE (see `scroll_lines`).
+            let (v, v_accum) = super::scroll_lines(self.scroll_v_accum, vertical);
+            let (h, h_accum) = super::scroll_lines(self.scroll_h_accum, horizontal);
+            self.scroll_v_accum = v_accum;
+            self.scroll_h_accum = h_accum;
             if v == 0 && h == 0 {
                 return;
             }
