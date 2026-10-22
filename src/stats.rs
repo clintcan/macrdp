@@ -27,14 +27,11 @@ use std::sync::{Arc, OnceLock};
 /// The live snapshot. Every field is an atomic so the encode path can update it
 /// lock-free; the listener reads it under no lock either. Values are best-effort
 /// and eventually-consistent — a slightly stale read between updates is fine for
-/// a status display. "Connected" is deliberately NOT authoritative here (there
-/// is no reliable EGFX teardown hook — see the h264 reconnect-blank note); the
-/// controller determines connected/disconnected from `lsof` and uses these
-/// numbers only while it independently sees a live client.
+/// a status display. "Connected" is set at EGFX setup and cleared, with the
+/// other per-session values, by [`SessionStats::session_ended`] when the
+/// served connection ends.
 #[derive(Default)]
 pub struct SessionStats {
-    /// Best-effort: set true at connection setup. Not cleared reliably (no
-    /// teardown hook) — the controller gates on its own `lsof` check instead.
     pub connected: AtomicBool,
     pub width: AtomicU32,
     pub height: AtomicU32,
@@ -56,6 +53,24 @@ pub struct SessionStats {
 }
 
 impl SessionStats {
+    /// Zeroes the per-session values; `aac` is process config.
+    pub fn session_ended(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+        for v in [
+            &self.width,
+            &self.height,
+            &self.bitrate_bps,
+            &self.ceiling_bps,
+            &self.rtt_ms,
+            &self.queue_delay_ms,
+            &self.fps,
+        ] {
+            v.store(0, Ordering::Relaxed);
+        }
+        self.frames_sent.store(0, Ordering::Relaxed);
+        self.adaptive.store(false, Ordering::Relaxed);
+    }
+
     fn to_json(&self) -> String {
         format!(
             concat!(
@@ -157,6 +172,25 @@ mod tests {
         assert!(j.contains("\"width\":1920"));
         assert!(j.contains("\"bitrate_bps\":4000000"));
         assert!(j.contains("\"fps\":60"));
+    }
+
+    #[test]
+    fn session_end_reports_disconnected_and_zeros() {
+        let s = SessionStats::default();
+        s.connected.store(true, Ordering::Relaxed);
+        s.width.store(3024, Ordering::Relaxed);
+        s.bitrate_bps.store(5_000_000, Ordering::Relaxed);
+        s.frames_sent.store(900, Ordering::Relaxed);
+        s.adaptive.store(true, Ordering::Relaxed);
+        s.aac.store(true, Ordering::Relaxed);
+        s.session_ended();
+        let j = s.to_json();
+        assert!(j.contains("\"connected\":false"));
+        assert!(j.contains("\"width\":0"));
+        assert!(j.contains("\"bitrate_bps\":0"));
+        assert!(j.contains("\"frames_sent\":0"));
+        assert!(j.contains("\"adaptive\":false"));
+        assert!(j.contains("\"aac\":true"), "aac is process config");
     }
 
     #[test]
