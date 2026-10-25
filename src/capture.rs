@@ -433,6 +433,25 @@ pub struct CaptureDisplay {
         Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
 }
 
+/// Which of ScreenCaptureKit's displays to mirror when no virtual display is
+/// set: the main display, which is the one input maps the mouse onto
+/// (`CGDisplay::main()`), falling back to the first. SCK doesn't list the main
+/// display first on every multi-monitor Mac, and mirroring another one put the
+/// picture on one monitor and the mouse on a different one (#205). Pure, so
+/// it's unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mirror_display_index(display_ids: &[u32], main_id: u32) -> Option<usize> {
+    if display_ids.is_empty() {
+        return None;
+    }
+    Some(
+        display_ids
+            .iter()
+            .position(|&id| id == main_id)
+            .unwrap_or(0),
+    )
+}
+
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
 ///
 /// Returns `None` on non-macOS targets so the caller can fall back to a stub
@@ -449,7 +468,11 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
             anyhow!("AsyncSCShareableContent::get failed (Screen Recording permission?): {e:?}")
         })?;
         let displays = content.displays();
-        let display = displays.first().context("no displays available")?;
+        let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
+        let main_id = core_graphics::display::CGDisplay::main().id;
+        let display = mirror_display_index(&ids, main_id)
+            .map(|i| &displays[i])
+            .context("no displays available")?;
         let w = u16::try_from(display.width()).context("display width > u16")?;
         let h = u16::try_from(display.height()).context("display height > u16")?;
         Ok(Some((w, h)))
@@ -1095,7 +1118,22 @@ mod macos {
                                 .join(", ")
                         )
                     })?,
-                None => displays.first().context("no displays available")?,
+                None => {
+                    // Mirror mode: follow the main display, as input does.
+                    let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
+                    let main_id = core_graphics::display::CGDisplay::main().id;
+                    let index = super::mirror_display_index(&ids, main_id)
+                        .context("no displays available")?;
+                    if ids.len() > 1 {
+                        tracing::info!(
+                            mirrored = ids[index],
+                            main = main_id,
+                            sck_displays = ?ids,
+                            "multiple displays: mirroring the main display"
+                        );
+                    }
+                    &displays[index]
+                }
             };
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
@@ -1780,6 +1818,20 @@ mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #205: mirror the main display even when SCK lists another first.
+    #[test]
+    fn mirror_display_prefers_the_main_display() {
+        // Main display listed second: pick it, not the first.
+        assert_eq!(mirror_display_index(&[3, 1, 7], 1), Some(1));
+        // Main listed first, or the only display: unchanged from before.
+        assert_eq!(mirror_display_index(&[1, 3], 1), Some(0));
+        assert_eq!(mirror_display_index(&[1], 1), Some(0));
+        // Main not in SCK's list at all: fall back to the first, as before.
+        assert_eq!(mirror_display_index(&[3, 7], 1), Some(0));
+        // No displays: nothing to mirror.
+        assert_eq!(mirror_display_index(&[], 1), None);
+    }
 
     #[test]
     fn shared_desktop_size_roundtrips() {
