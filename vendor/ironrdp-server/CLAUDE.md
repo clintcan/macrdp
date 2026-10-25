@@ -56,8 +56,15 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (20) | Client-fingerprint log + `on_client_fingerprint` | top of `client_accepted` | trait method |
 | (24) | Per-served-connection input-reset flag | `raise_input_reset` in `run_connection_inner` and `serve_negotiated` | `set_input_reset_handle` |
 | (25) | Our MS-RDPEAI microphone | `audin.rs` | `with_audin_factory` |
+| (27) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
 
 Notes on the port:
+- **(27)** A byte-for-byte backport of upstream #2108 (by @antonmos): `RGBAPointer` and
+  `LargePointer` used to go out with an empty AND mask, which MS-RDPBCGR 2.2.9.1.1.4.4
+  requires and Windows App drops (macOS: stuck on the default arrow; suspected for the
+  iOS no-cursor report, clintcan/macrdp#211). Upstream's unit tests live in
+  `pointer_mask.rs` but this lib is `test = false`, so they were run once in a scratch
+  crate (2026-10-26). **Drop it at the next pin bump** (any rev at or after `fb25b47c`).
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
