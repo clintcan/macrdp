@@ -2940,6 +2940,21 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
     })
 }
 
+/// One log entry for a capability set that didn't parse: its version, the first
+/// four data bytes read as the flags word (every EGFX capset starts with one), and
+/// why it didn't parse. Never prints more than the flags word, so a long or
+/// garbage body can't flood the log.
+fn describe_unparsed_capset(version: u32, data: &[u8], reason: &str) -> String {
+    let flags = match data.first_chunk::<4>() {
+        Some(word) => format!("{:#010x}", u32::from_le_bytes(*word)),
+        None => "none".to_owned(),
+    };
+    format!(
+        "version={version:#010x} flags={flags} len={} ({reason})",
+        data.len()
+    )
+}
+
 /// Per-connection EGFX state callbacks from upstream `GraphicsPipelineServer`.
 /// MUST NOT lock `server_handle` from these — the server mutex is already held.
 struct GfxHandler {
@@ -2970,11 +2985,27 @@ impl GraphicsPipelineHandler for GfxHandler {
             .filter_map(|raw| raw.parsed().ok().flatten())
             .collect();
         let supports_avc = caps_indicate_avc(&typed);
+        // The sets that didn't parse, with their raw version and flags, so a
+        // client whose AVC support hides in a set this build can't read shows
+        // up in the log (#211).
+        let unparsed: Vec<String> = pdu
+            .0
+            .iter()
+            .filter_map(|raw| {
+                let reason = match raw.parsed() {
+                    Ok(Some(_)) => return None,
+                    Ok(None) => "unknown version".to_owned(),
+                    Err(e) => format!("decode error: {e}"),
+                };
+                Some(describe_unparsed_capset(raw.version.0, &raw.data, &reason))
+            })
+            .collect();
         info!(
             count = pdu.0.len(),
             parsed_count = typed.len(),
             supports_avc,
             caps = ?typed,
+            unparsed = ?unparsed,
             "EGFX: client advertised capabilities"
         );
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
@@ -3245,6 +3276,38 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #211: the iOS client sends two capsets this build can't parse. The log
+    /// line must say which versions they are, and the flags, without dumping
+    /// the body.
+    #[test]
+    fn unparsed_capsets_log_version_and_flags_only() {
+        use ironrdp_egfx::pdu::{CapabilityVersion, RawCapabilitySet};
+
+        // An undocumented "Azure" version FreeRDP knows about: unknown here.
+        let azure =
+            RawCapabilitySet::new(CapabilityVersion(0x000B_0101), vec![0x20, 0x00, 0x00, 0x00]);
+        assert!(matches!(azure.parsed(), Ok(None)));
+        assert_eq!(
+            describe_unparsed_capset(azure.version.0, &azure.data, "unknown version"),
+            "version=0x000b0101 flags=0x00000020 len=4 (unknown version)"
+        );
+
+        // A known version with a body too short to hold its flags word.
+        let short = RawCapabilitySet::new(CapabilityVersion::V10_7, vec![0x01]);
+        let e = short.parsed().unwrap_err();
+        assert_eq!(
+            describe_unparsed_capset(short.version.0, &short.data, &format!("decode error: {e}")),
+            format!("version=0x000a0701 flags=none len=1 (decode error: {e})")
+        );
+
+        // A long body still logs only the flags word.
+        let long = describe_unparsed_capset(0x000B_0300, &[0xAA; 4096], "unknown version");
+        assert_eq!(
+            long,
+            "version=0x000b0300 flags=0xaaaaaaaa len=4096 (unknown version)"
+        );
+    }
 
     fn recovery_params() -> RecoveryParams {
         RecoveryParams {
