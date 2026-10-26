@@ -2051,3 +2051,12 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     2026-10-26). Upstream leaves Nagle on, so the short tail segment of each
     frame waits for the ACK of the previous one, which the client may delay;
     set at both accept sites (the idle listener and the preemption race).
+
+(28) `zstd-safe` 8.2 instead of upstream's 7.2 (NOT upstreamed; added
+    2026-10-27). zstd-safe 7.x has RUSTSEC-2026-0398 (`Seekable::decompress`)
+    and RUSTSEC-2026-0403 (streaming decompression of a legacy frame), and the
+    zstd-sys it pulls has RUSTSEC-2026-0410 (WebAssembly allocator), which
+    turned the daily cargo-deny scan red. The QOIZ encoder only compresses
+    (`CCtx`), so none of the three is reachable here; the bump is to keep the
+    scan meaningful. Only `Cargo.toml` changes, no code. Drop it once upstream
+    requires zstd-safe >= 8.2.
