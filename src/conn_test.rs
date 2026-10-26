@@ -1175,24 +1175,27 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
     }
 
     /// Sends full-screen frames forever, so a client that stops reading
-    /// leaves the server's socket write blocked.
-    struct FloodUpdates;
+    /// leaves the server's socket write blocked. Each frame differs from the
+    /// last, because the bitmap encoder skips an unchanged frame.
+    struct FloodUpdates(usize);
     #[async_trait::async_trait]
     impl RdpServerDisplayUpdates for FloodUpdates {
-        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
             tokio::task::yield_now().await;
-            let (width, height) = (256_u16, 256_u16);
-            let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4)
-                .map(|i| (i * 7919 % 251) as u8)
+            const SIDE: std::num::NonZeroU16 = std::num::NonZeroU16::new(256).unwrap();
+            const STRIDE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(256 * 4).unwrap();
+            let data: Vec<u8> = (0..STRIDE.get() * usize::from(SIDE.get()))
+                .map(|i| ((i * 7919 + self.0) % 251) as u8)
                 .collect();
+            self.0 += 1;
             Ok(Some(DisplayUpdate::Bitmap(ironrdp_server::BitmapUpdate {
                 x: 0,
                 y: 0,
-                width: width.try_into()?,
-                height: height.try_into()?,
+                width: SIDE,
+                height: SIDE,
                 format: ironrdp_server::PixelFormat::BgrA32,
                 data: data.into(),
-                stride: (usize::from(width) * 4).try_into()?,
+                stride: STRIDE,
             })))
         }
     }
@@ -1206,8 +1209,10 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
                 height: 256,
             }
         }
-        async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-            Ok(Box::new(FloodUpdates))
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            Ok(Box::new(FloodUpdates(0)))
         }
     }
 
