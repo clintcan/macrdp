@@ -905,6 +905,8 @@ struct MacrdpServerState {
     input_reset_request: Option<Arc<AtomicBool>>,
     /// (15) Kernel TCP RTT sampled at accept, in ms (0 = unknown).
     link_rtt_ms: Option<Arc<AtomicU32>>,
+    /// (26) X224 frames read but not dispatched when a reactivation ended `client_loop`.
+    read_ahead: Vec<Vec<u8>>,
     /// (12) macrdp's UDP multitransport.
     #[cfg(feature = "multitransport")]
     mt: mt_session::MtState,
@@ -3030,7 +3032,7 @@ impl RdpServer {
         match action {
             Action::FastPath => {
                 let input = decode(&bytes).map_err(ServerError::decode)?;
-                self.handle_fastpath(input).await;
+                Self::handle_fastpath(&self.handler, input).await;
             }
 
             Action::X224 => {
@@ -4114,12 +4116,31 @@ impl RdpServer {
         let udp_transport_for_pdus = Rc::clone(&udp_transport);
         let write_counter = writer.write_counter();
         let ev_receiver = Arc::clone(&self.ev_receiver);
+        let input_handler = Arc::clone(&self.handler);
         let s = Rc::new(Mutex::new(self));
 
-        let this = Rc::clone(&s);
-        let dispatch_pdu = async move {
+        // (macrdp divergence 26) Read without the `Self` lock, which `dispatch_events` holds across its writes.
+        let (x224_tx, mut x224_rx) = mpsc::channel(64);
+        let read_pdus = async move {
             loop {
                 let (action, bytes) = reader.read_pdu().await.map_err(|e| ServerError::io("read pdu", e))?;
+                match action {
+                    Action::FastPath => {
+                        let input = decode(&bytes).map_err(ServerError::decode)?;
+                        Self::handle_fastpath(&input_handler, input).await;
+                    }
+                    Action::X224 => x224_tx
+                        .send(bytes)
+                        .await
+                        .map_err(|_| ServerError::channel("X224 PDU queue closed"))?,
+                }
+            }
+        };
+
+        let this = Rc::clone(&s);
+        let x224_queue = &mut x224_rx;
+        let dispatch_pdu = async move {
+            while let Some(bytes) = x224_queue.recv().await {
                 // D8: per-PDU lock-acquisition + dispatch timing. The `this`
                 // mutex is shared with dispatch_events; when an outbound
                 // event batch is in flight, this lock wait is the latency
@@ -4135,7 +4156,7 @@ impl RdpServer {
                 let current_udp_transport = udp_transport_for_pdus.borrow().clone();
                 let result = this
                     .dispatch_pdu(
-                        action,
+                        Action::X224,
                         bytes,
                         &mut writer,
                         io_channel_id,
@@ -4166,9 +4187,10 @@ impl RdpServer {
 
                 match result {
                     RunState::Continue => continue,
-                    state => break Ok(state),
+                    state => return Ok(state),
                 }
             }
+            Ok(RunState::Disconnect)
         };
 
         let dispatch_display = async move {
@@ -4478,6 +4500,7 @@ impl RdpServer {
         };
 
         let state = tokio::select!(
+            state = read_pdus => state,
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
@@ -4487,6 +4510,15 @@ impl RdpServer {
             state = dispatch_audio => state,
             state = dispatch_mt_tunnel => state,
         );
+
+        // (macrdp divergence 26) Frames left in the queue would otherwise have stayed in the socket for the
+        // reactivation's backlog.
+        if let Ok(RunState::DeactivationReactivation { .. }) = state {
+            let mut this = s.lock().await;
+            while let Ok(bytes) = x224_rx.try_recv() {
+                this.macrdp.read_ahead.push(bytes.to_vec());
+            }
+        }
 
         debug!("End of client loop: {state:?}");
         state
@@ -4590,7 +4622,13 @@ impl RdpServer {
             });
         }
 
-        if !result.input_events.is_empty() {
+        // (macrdp divergence 26) Replay what `client_loop` read ahead, but only into the same connection.
+        let mut backlog = core::mem::take(&mut self.macrdp.read_ahead);
+        if !result.reactivation {
+            backlog.clear();
+        }
+        backlog.extend(result.input_events);
+        if !backlog.is_empty() {
             debug!("Handling input event backlog from acceptor sequence");
             // Set on a reactivation pass, where EGFX may already be on the tunnel.
             let current_udp_transport = udp_transport.borrow().clone();
@@ -4599,7 +4637,7 @@ impl RdpServer {
                 result.io_channel_id,
                 result.user_channel_id,
                 result.message_channel_id,
-                result.input_events,
+                backlog,
                 current_udp_transport.as_ref(),
             )
             .await?;
@@ -4813,7 +4851,7 @@ impl RdpServer {
             match Action::from_fp_output_header(frame[0]) {
                 Ok(Action::FastPath) => {
                     let input = decode(&frame).map_err(ServerError::decode)?;
-                    self.handle_fastpath(input).await;
+                    Self::handle_fastpath(&self.handler, input).await;
                 }
 
                 Ok(Action::X224) => {
@@ -4838,9 +4876,9 @@ impl RdpServer {
         Ok(())
     }
 
-    async fn handle_fastpath(&mut self, input: FastPathInput) {
+    async fn handle_fastpath(handler: &Mutex<Box<dyn RdpServerInputHandler>>, input: FastPathInput) {
         for event in input.input_events().iter().copied() {
-            let mut handler = self.handler.lock().await;
+            let mut handler = handler.lock().await;
             match event {
                 FastPathInputEvent::KeyboardEvent(flags, key) => {
                     handler.keyboard((key, flags).into());
