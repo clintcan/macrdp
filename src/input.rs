@@ -244,7 +244,7 @@ fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
     let accum = if delta != 0 && accum != 0 && (accum < 0) != (delta < 0) {
         delta
     } else {
-        accum + delta
+        accum.saturating_add(delta)
     };
     let lines = accum / SCROLL_UNITS_PER_LINE;
     (lines.clamp(-5, 5), accum - lines * SCROLL_UNITS_PER_LINE)
@@ -262,6 +262,11 @@ mod coord_tests {
         assert_eq!(scroll_lines(0, -1236), (-5, -36));
         assert_eq!(scroll_lines(0, 30), (0, 30));
         assert_eq!(scroll_lines(30, 30), (1, 0));
+    }
+
+    #[test]
+    fn scroll_saturates_instead_of_overflowing() {
+        assert_eq!(scroll_lines(59, i32::MAX), (5, i32::MAX % 60));
     }
 
     #[test]
