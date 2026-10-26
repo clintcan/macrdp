@@ -1316,7 +1316,8 @@ mod macos {
             let swapped = self.ctrl_to_cmd_flags();
 
             if down {
-                if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true) {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true)
+                {
                     ev.set_flags(swapped);
                     ev.set_type(CGEventType::FlagsChanged);
                     ev.post(CGEventTapLocation::HID);
