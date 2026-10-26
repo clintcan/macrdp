@@ -76,6 +76,21 @@ mod macos {
         fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
     }
 
+    /// Serializes every TIS call. HIToolbox ABORTS the process (SIGABRT, no
+    /// panic message) when two threads call TIS concurrently from a non-UI
+    /// process: "you must not call TIS/TSM API from multiple threads
+    /// concurrently". Found via crash reports from parallel CI tests, but the
+    /// server is exposed too: `resolve` runs on the input path while
+    /// `current` runs on the auto-unlock thread. `UCKeyTranslate` isn't TIS
+    /// (it reads the layout bytes we already retained), so `translate`
+    /// doesn't take this.
+    static TIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tis_lock() -> std::sync::MutexGuard<'static, ()> {
+        // The guarded state is `()`, so a poisoned lock carries nothing stale.
+        TIS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     const KEY_ACTION_DOWN: u16 = 0;
     // Carbon modifier bits, in the `(eventModifiers >> 8) & 0xFF` form that
     // UCKeyTranslate's `modifierKeyState` expects: shiftKey>>8 = 0x02,
@@ -105,6 +120,7 @@ mod macos {
         /// (and warns) if nothing matched, so callers fall back to the Mac's
         /// active input source.
         pub fn resolve(spec: &str) -> Option<KeyboardLayout> {
+            let _tis = tis_lock();
             let kbd_type = u32::from(unsafe { LMGetKbdType() });
             let spec = spec.trim();
 
@@ -150,6 +166,7 @@ mod macos {
         /// produce the right characters *on this Mac*, so the active layout is
         /// the only correct reference.
         pub fn current() -> Option<KeyboardLayout> {
+            let _tis = tis_lock();
             let kbd_type = u32::from(unsafe { LMGetKbdType() });
             unsafe {
                 let source = TISCopyCurrentKeyboardLayoutInputSource();
@@ -485,6 +502,30 @@ mod macos {
                 Some("1")
             );
             assert_eq!(us.translate(0x12, true, false, false).as_deref(), Some("!"));
+        }
+
+        #[test]
+        fn concurrent_layout_lookups_do_not_abort() {
+            // Without TIS_LOCK, HIToolbox aborts the whole test binary when
+            // two threads call TIS at once. Release the threads together so
+            // their TIS calls overlap, mixing both entry points.
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|i| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if i % 2 == 0 {
+                            KeyboardLayout::resolve("us").is_some()
+                        } else {
+                            KeyboardLayout::current().is_some()
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("layout lookup thread panicked");
+            }
         }
 
         #[test]
