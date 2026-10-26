@@ -978,7 +978,8 @@ const MAX_PASSWORD_FILE_BYTES: usize = 4096;
 
 /// Read the password from `--password-file`. The file must belong to the
 /// user that runs macrdp and must give no access to group or others (mode
-/// 0600 or 0400), as ssh requires for private keys; otherwise it is refused.
+/// 0600 or 0400), as ssh requires for private keys, and on macOS must have no
+/// access control list; otherwise it is refused.
 /// One trailing `\n` (or `\r\n`) is stripped; an empty password is an error.
 /// The bytes are read into one buffer of a fixed size that is never
 /// reallocated, so no unzeroized copy of the password is left on the heap.
@@ -1008,6 +1009,16 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     let euid = unsafe { libc::geteuid() };
     check_password_file_access(meta.mode(), meta.uid(), euid)
         .with_context(|| format!("password file {}", path.display()))?;
+    // A macOS ACL can grant access that the mode bits do not show, for
+    // example one inherited from the parent folder.
+    #[cfg(target_os = "macos")]
+    if has_extended_acl(&file).with_context(|| format!("password file {}", path.display()))? {
+        return Err(anyhow!(
+            "password file {} has an access control list; remove it with `chmod -N {}`",
+            path.display(),
+            path.display()
+        ));
+    }
 
     let mut buf = Zeroizing::new(vec![0u8; MAX_PASSWORD_FILE_BYTES + 1]);
     let mut len = 0;
@@ -1048,6 +1059,34 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         return Err(anyhow!("password file {} is empty", path.display()));
     }
     Ok(s)
+}
+
+/// Whether the open file has an extended access control list (any entry).
+#[cfg(target_os = "macos")]
+fn has_extended_acl(file: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // <sys/acl.h>; the libc crate does not declare these.
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: the fd stays open while `file` is borrowed; a non-null result is
+    // freed once below.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let err = std::io::Error::last_os_error();
+        // ENOENT: no ACL. ENOTSUP: the file system has no ACLs.
+        return match err.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTSUP) => Ok(false),
+            _ => Err(err).context("reading its access control list"),
+        };
+    }
+    // SAFETY: `acl` came from acl_get_fd_np and is not used after this.
+    unsafe { acl_free(acl) };
+    Ok(true)
 }
 
 /// The access rule for `--password-file`: owned by `euid` and no permission
@@ -4120,6 +4159,34 @@ mod config_tests {
         fs::remove_file(&p).ok();
         assert!(e.contains("chmod 600"), "{e}");
         assert!(!e.contains("s3cret"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn password_file_refuses_an_acl() {
+        let p = write_pw("pwf-acl", "s3cret\n");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        // Without the ACL the same file is accepted.
+        let status = std::process::Command::new("chmod")
+            .arg("-N")
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ok = read_password_file(&p);
+        fs::remove_file(&p).ok();
+        assert!(
+            e.contains("access control list") && e.contains("chmod -N"),
+            "{e}"
+        );
+        assert!(!e.contains("s3cret"));
+        assert_eq!(ok.unwrap().as_str(), "s3cret");
     }
 
     #[test]
