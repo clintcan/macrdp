@@ -56,10 +56,17 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (20) | Client-fingerprint log + `on_client_fingerprint` | top of `client_accepted` | trait method |
 | (24) | Per-served-connection input-reset flag | `raise_input_reset` in `run_connection_inner` and `serve_negotiated` | `set_input_reset_handle` |
 | (25) | Our MS-RDPEAI microphone | `audin.rs` | `with_audin_factory` |
-| (27) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
+| (26) | Client input read off the `Self` lock: fast-path input straight to the handler, X224 through a bounded queue; queued X224 replayed across a reactivation | `client_loop`'s `read_pdus` arm; `MacrdpServerState::read_ahead`, drained into the backlog in `client_accepted` | — |
+| (28) | `zstd-safe` 8.2 instead of upstream's 7.2 (RustSec advisories in 7.x; QOIZ only compresses, so unreachable) | `Cargo.toml` only | — |
+| (29) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
 
 Notes on the port:
-- **(27)** A byte-for-byte backport of upstream #2108 (by @antonmos): `RGBAPointer` and
+- **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
+  logging stays in `dispatch_pdu`, which still takes the lock. The replay path has no
+  test: removing the `read_ahead.push` leaves every test passing.
+- **(28)** Drop it once upstream requires zstd-safe >= 8.2.
+- **(29)** Numbered (29) because main used (27) and (28) while this branch was open.
+  A byte-for-byte backport of upstream #2108 (by @antonmos): `RGBAPointer` and
   `LargePointer` used to go out with an empty AND mask, which MS-RDPBCGR 2.2.9.1.1.4.4
   requires and Windows App drops (macOS: stuck on the default arrow; suspected for the
   iOS no-cursor report, clintcan/macrdp#211). Upstream's unit tests live in
@@ -132,11 +139,16 @@ Notes on the port:
 - **`ServerEvent::ClipboardFileCopy`** (was undocumented) →
   `ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(files))`, whose arm
   is identical, including not ending the session on failure.
+- **(27) `TCP_NODELAY`** (main, #222) → nothing to call: e258f6a0 sets it at both
+  accept sites that serve a connection (the idle listener and the preemption race).
+  The `Reject` policy's accept drops the socket unserved.
 - Earlier: (1) PR #1276, (7) QOI at a5d1c682, (17) wheel decode at a5d1c682.
 
 ## Known leftovers
 
 - `cargo clippy` flags two `collapsible_if`s in upstream's own code (`autodetect.rs`,
   `run()`'s `on_disconnected` call) under our newer toolchain. Left as upstream wrote them.
+  With `--all-features` it also flags `urbdrc::PendingIo` as more private than
+  `UrbdrcDeviceServerMessage::IoReq::tx`, also upstream's.
 - Upstream's in-file `#[cfg(test)]` module never compiles here (`test = false`); its
   one `NegotiationContext` literal was kept in step with our added field anyway.
