@@ -1172,6 +1172,9 @@ mod macos {
                     "clearing stale held modifiers"
                 );
                 self.post_flags_changed(VK_LCMD);
+                // The modifier that held an open Cmd+Tab or Option+Tab switcher is gone, so close it.
+                CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                commit_cycle_session();
             }
         }
 
