@@ -265,11 +265,17 @@ impl SessionTracker {
     fn enter(&self) {
         let prev = self.count.fetch_add(1, Ordering::SeqCst);
         tracing::info!(prev, now = prev + 1, "SessionTracker::enter");
+        if prev == 0 {
+            crate::display_awake::session_started();
+        }
         self.notify.notify_one();
     }
     fn leave(&self) {
         let prev = self.count.fetch_sub(1, Ordering::SeqCst);
         tracing::info!(prev, now = prev.saturating_sub(1), "SessionTracker::leave");
+        if prev == 1 {
+            crate::display_awake::session_ended();
+        }
         self.notify.notify_one();
     }
 }
@@ -693,6 +699,12 @@ impl RdpServerDisplay for CaptureDisplay {
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
+        // The wait polls with thread::sleep; keep it off the server task that also carries input and audio.
+        tokio::task::spawn_blocking(|| {
+            crate::virtual_display::wake_displays_and_wait(Duration::from_secs(2))
+        })
+        .await
+        .ok();
         let (width, height) = self.sync_virtual_display();
         self.build_updates(width, height)
             .await
