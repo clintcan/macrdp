@@ -345,6 +345,14 @@ struct ConnectionContext {
     /// `on_qoe_metrics` (which only sees the context, not the owning `Gfx`) can
     /// set the [`QoeEvidence::presented_clean`] latch. Not RTT-scaled.
     min_render_reports: u64,
+    /// True once EGFX went ready with AVC on this connection. A later
+    /// `on_close` clears `is_ready` but not this, so the legacy hold (see
+    /// [`hold_legacy_for_egfx`]) applies only before the first ready.
+    egfx_ever_ready: bool,
+    /// One-shot guards for the "holding back" and "legacy hold expired" log
+    /// lines.
+    legacy_hold_logged: bool,
+    legacy_hold_expired_logged: bool,
 }
 
 impl ConnectionContext {
@@ -457,6 +465,29 @@ fn should_demigrate_to_tcp(
         && !acks_suspended
         && since_ship <= active_window
         && since_ack >= wedge_timeout
+}
+
+/// Whether capture must hold back a legacy bitmap update because this
+/// connection is still negotiating EGFX. Pure, unit-tested.
+///
+/// Windows 10 mstsc 10.0.19041.4717 (2026-10-27): when one legacy bitmap
+/// update reaches the client between capture start and EGFX ready, the
+/// session often stays frozen on that legacy picture after EGFX starts:
+/// every AVC420 frame is acknowledged, none is shown, and every QoE report
+/// has `timeDiffEDR == 0`, so the blank detector reactivates it. Fresh
+/// connects with moving content: 7 of 8 frozen with the legacy update sent,
+/// 0 of 8 with it held.
+///
+/// Hold while EGFX has not yet been ready on this connection, the client
+/// has not declined it (no AVC), and the hold has lasted less than `limit`:
+/// a client that never opens EGFX gets legacy updates after `limit`.
+fn hold_legacy_for_egfx(
+    ever_ready: bool,
+    declined: bool,
+    held_for: Duration,
+    limit: Duration,
+) -> bool {
+    !ever_ready && !declined && held_for < limit
 }
 
 /// Tunables for the blank-presentation detector + recovery (the mstsc
@@ -919,11 +950,16 @@ fn should_blank_recover(
     // out a client that sends no QoE, e.g. FreeRDP, from ever firing on the
     // wall-clock branch). That last fast path is withheld once the session is
     // established: with `blank_min_reports` as low as 1, a single stray zero
-    // from a healthy long-running session would otherwise satisfy it.
+    // from a healthy long-running session would otherwise satisfy it. It is
+    // also for the first attempt only: after a reactivation, Windows 10 mstsc
+    // presents with zero and nonzero reports mixed, and one zero report then
+    // dropped the healed session. A heal that did not take is still caught by
+    // the count path or the heal-confirmation deadline.
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
         || post_attempt_unconfirmed
-        || (since_connect >= p.blank_max_wait
+        || (attempts == 0
+            && since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
             && !established);
     blank_evidence
@@ -1307,6 +1343,10 @@ pub struct Gfx {
     /// experimentation) — see [`BlankAction`].
     blank_recovery_enabled: bool,
     blank_params: BlankRecoveryParams,
+    /// How long capture holds back legacy bitmap updates on a new connection
+    /// while EGFX is not ready yet (see [`hold_legacy_for_egfx`]).
+    /// `MACRDP_EGFX_LEGACY_HOLD_MS`, default 3000; 0 disables the hold.
+    legacy_hold: Duration,
     /// Consecutive connections (process lifetime) that ended in a blank-recovery
     /// DROP with no connection presenting in between — the reconnect-storm guard
     /// counter (see [`blank_drop_capped`]). Incremented when a drop is armed;
@@ -1511,6 +1551,10 @@ impl Gfx {
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
+        let legacy_hold = Duration::from_millis(u64::from(env_u32_zero_ok(
+            "MACRDP_EGFX_LEGACY_HOLD_MS",
+            3000,
+        )));
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -1571,6 +1615,7 @@ impl Gfx {
             adaptive_min_fps_interval,
             blank_recovery_enabled,
             blank_params,
+            legacy_hold,
             consecutive_blank_drops: Arc::new(AtomicU32::new(0)),
             link_rtt_ms,
             adaptive_seed_rtt_ms,
@@ -1617,6 +1662,49 @@ impl Gfx {
              proactively de-migrating to TCP (one-way for this session) so the restore \
              IDR lands over TCP instead of a stale tunnel"
         );
+    }
+
+    /// Called by capture when [`Self::submit_bgra`] returned `Ok(false)`:
+    /// true means "do not send this frame as a legacy bitmap update" because
+    /// the connection is still negotiating EGFX (see [`hold_legacy_for_egfx`]).
+    /// Capture keeps the frame and submits it again when EGFX is ready, or
+    /// sends it as legacy when this returns false later.
+    ///
+    /// `capture_started` is when this connection's capture stream started:
+    /// the hold is measured from it, not from state on the shared ctx, which a
+    /// takeover candidate can replace while the live session still captures.
+    pub fn hold_legacy(&self, capture_started: Instant) -> bool {
+        if self.legacy_hold.is_zero() {
+            return false;
+        }
+        let mut guard = self.ctx.lock().unwrap();
+        let Some(ctx) = guard.as_mut() else {
+            return false;
+        };
+        if ctx.is_ready {
+            // EGFX became ready after `submit_bgra` returned `Ok(false)` for
+            // this frame: do not send a legacy picture now; capture submits
+            // its held frame to EGFX on the next loop.
+            return true;
+        }
+        let held_for = capture_started.elapsed();
+        let declined = ctx.egfx_declined.load(Ordering::Relaxed);
+        let hold = hold_legacy_for_egfx(ctx.egfx_ever_ready, declined, held_for, self.legacy_hold);
+        if hold && !ctx.legacy_hold_logged {
+            ctx.legacy_hold_logged = true;
+            debug!(
+                limit_ms = self.legacy_hold.as_millis() as u64,
+                "EGFX not ready yet — holding back legacy bitmap updates"
+            );
+        }
+        if !hold && !ctx.egfx_ever_ready && !ctx.legacy_hold_expired_logged {
+            ctx.legacy_hold_expired_logged = true;
+            info!(
+                held_ms = held_for.as_millis() as u64,
+                declined, "EGFX did not become ready — sending legacy bitmap updates"
+            );
+        }
+        hold
     }
 
     /// Feed one full-frame BGRA buffer. Never blocks on the encoder.
@@ -2905,6 +2993,9 @@ impl GfxServerFactory for Gfx {
             link_rtt_ms,
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
+            egfx_ever_ready: false,
+            legacy_hold_logged: false,
+            legacy_hold_expired_logged: false,
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -2996,6 +3087,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                     ctx.start_clocks(Instant::now());
                 }
                 ctx.is_ready = true;
+                ctx.egfx_ever_ready = true;
                 ctx.need_keyframe = true;
                 info!(?negotiated, "EGFX channel ready (H.264 active)");
             } else {
@@ -4578,6 +4670,70 @@ mod tests {
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
             &p
         ));
+    }
+
+    #[test]
+    fn blank_wall_clock_fast_path_is_for_the_first_attempt_only() {
+        // After a reactivation, a presenting Windows 10 mstsc mixes zero and
+        // nonzero reports: one zero report (zero_streak 1) after a nonzero
+        // run must not drop the healed session on the wall-clock path.
+        let p = BlankRecoveryParams {
+            // Production defaults for the wall-clock path.
+            blank_max_wait: ms(4000),
+            blank_min_reports: 1,
+            ..blank_params()
+        };
+        let healed = QoeEvidence {
+            zero_streak: 1,
+            nonzero_streak: 0,
+            max_nonzero_streak: 8,
+            reports_since_reset: 21,
+            zeros_since_reset: 4,
+            nonzero_max_since_reset: 8,
+            presented_clean: false,
+        };
+        let check = |attempts| {
+            should_blank_recover(
+                healed,
+                true,       // acks flowing
+                false,      // not suspended
+                ms(60_000), // well past blank_max_wait
+                ms(0),
+                ms(60_000), // well past retry_interval
+                attempts,
+                true, // acked since the attempt
+                &p,
+            )
+        };
+        assert!(check(0), "before any attempt the fast path still fires");
+        assert!(!check(1), "after an attempt one zero report is not enough");
+        // A reactivation that did not heal (all zero since) still escalates
+        // through the count path.
+        assert!(should_blank_recover(
+            qoe(p.min_qoe_reports, 0, 0),
+            true,
+            false,
+            ms(60_000),
+            ms(0),
+            ms(60_000),
+            1,
+            true,
+            &p
+        ));
+    }
+
+    #[test]
+    fn legacy_hold_lasts_until_egfx_is_ready_or_the_limit() {
+        let limit = ms(3000);
+        // Negotiating, within the limit: hold.
+        assert!(hold_legacy_for_egfx(false, false, ms(0), limit));
+        assert!(hold_legacy_for_egfx(false, false, ms(2999), limit));
+        // Limit reached without EGFX: send legacy.
+        assert!(!hold_legacy_for_egfx(false, false, ms(3000), limit));
+        // EGFX was ready once (a later on_close does not restart the hold).
+        assert!(!hold_legacy_for_egfx(true, false, ms(0), limit));
+        // The client declined EGFX (no AVC): legacy at once.
+        assert!(!hold_legacy_for_egfx(false, true, ms(0), limit));
     }
 
     #[test]
