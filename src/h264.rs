@@ -950,11 +950,16 @@ fn should_blank_recover(
     // out a client that sends no QoE, e.g. FreeRDP, from ever firing on the
     // wall-clock branch). That last fast path is withheld once the session is
     // established: with `blank_min_reports` as low as 1, a single stray zero
-    // from a healthy long-running session would otherwise satisfy it.
+    // from a healthy long-running session would otherwise satisfy it. It is
+    // also for the first attempt only: after a reactivation, Windows 10 mstsc
+    // presents with zero and nonzero reports mixed, and one zero report then
+    // dropped the healed session. A heal that did not take is still caught by
+    // the count path or the heal-confirmation deadline.
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
         || post_attempt_unconfirmed
-        || (since_connect >= p.blank_max_wait
+        || (attempts == 0
+            && since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
             && !established);
     blank_evidence
@@ -4663,6 +4668,56 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_wall_clock_fast_path_is_for_the_first_attempt_only() {
+        // After a reactivation, a presenting Windows 10 mstsc mixes zero and
+        // nonzero reports: one zero report (zero_streak 1) after a nonzero
+        // run must not drop the healed session on the wall-clock path.
+        let p = BlankRecoveryParams {
+            // Production defaults for the wall-clock path.
+            blank_max_wait: ms(4000),
+            blank_min_reports: 1,
+            ..blank_params()
+        };
+        let healed = QoeEvidence {
+            zero_streak: 1,
+            nonzero_streak: 0,
+            max_nonzero_streak: 8,
+            reports_since_reset: 21,
+            zeros_since_reset: 4,
+            nonzero_max_since_reset: 8,
+            presented_clean: false,
+        };
+        let check = |attempts| {
+            should_blank_recover(
+                healed,
+                true,       // acks flowing
+                false,      // not suspended
+                ms(60_000), // well past blank_max_wait
+                ms(0),
+                ms(60_000), // well past retry_interval
+                attempts,
+                true, // acked since the attempt
+                &p,
+            )
+        };
+        assert!(check(0), "before any attempt the fast path still fires");
+        assert!(!check(1), "after an attempt one zero report is not enough");
+        // A reactivation that did not heal (all zero since) still escalates
+        // through the count path.
+        assert!(should_blank_recover(
+            qoe(p.min_qoe_reports, 0, 0),
+            true,
+            false,
+            ms(60_000),
+            ms(0),
+            ms(60_000),
+            1,
+            true,
             &p
         ));
     }
