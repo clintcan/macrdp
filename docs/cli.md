@@ -580,6 +580,7 @@ MACRDP_BLANK_RECOVERY_RETRY_MS=4000    # spacing between attempts
 MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # forced to >=2 when REACTIVATE=1 so the fallback drop can fire
 MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = uncapped; only the drop fallback counts)
 MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie (only the drop fallback needs it)
+MACRDP_EGFX_LEGACY_HOLD_MS=3000        # hold legacy bitmap updates on a new connection until EGFX is ready, at most this long (0 = off); Windows 10 mstsc freezes on a legacy picture sent just before EGFX
 ```
 
 Testing against the server:
