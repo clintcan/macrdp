@@ -1259,7 +1259,8 @@ mod macos {
         egfx_pending_frame: bool,
         /// When this capture started; bounds how long a frame is held for
         /// `egfx_pending_frame` (a client that never opens the graphics
-        /// channel would otherwise have every legacy frame retained).
+        /// channel would otherwise have every legacy frame retained), and the
+        /// legacy hold of `Gfx::hold_legacy` is measured from it.
         started_at: Instant,
         /// Capturing NV12 for the encoder (`--capture-nv12`). Frames that still
         /// ship as legacy bitmaps (before EGFX is ready, or a client without
@@ -1301,6 +1302,12 @@ mod macos {
         /// "client is fully wired up" signal that's stricter than just
         /// "connected" but cheap to maintain.
         first_egfx_frame_sent: bool,
+        /// `last_frame` holds a frame captured while EGFX was still being
+        /// negotiated (legacy hold) and not yet sent anywhere. SCK sends
+        /// nothing more on a static screen, so the loop submits this frame to
+        /// EGFX once it is ready, or sends it as a legacy update when the hold
+        /// ends without EGFX.
+        held_frame: bool,
         /// When capturing a virtual display, the RDP session drives the cursor
         /// into that display's slot of the global coordinate space (to the
         /// right of / beyond the physical panels). On disconnect the cursor is
@@ -1387,6 +1394,73 @@ mod macos {
     }
 
     impl ScreenCaptureUpdates {
+        /// The SCK stream sent no frame for one interval while a frame is held
+        /// for the EGFX negotiation (`held_frame`): submit it to EGFX if EGFX
+        /// is ready now, keep holding it while the hold lasts, or send it as a
+        /// full legacy picture once the hold ends without EGFX.
+        fn send_held_frame(&mut self) {
+            let (Some(gfx), Some(pb)) = (self.gfx.as_ref(), self.last_frame.as_ref()) else {
+                self.held_frame = false;
+                return;
+            };
+            // `submit_to_gfx` hands the buffer over as NV12 or locks it as BGRA,
+            // matching the capture format (`--capture-nv12`).
+            match submit_to_gfx(gfx, pb, self.nv12, true) {
+                Ok(true) => {
+                    self.held_frame = false;
+                    self.seeded = true;
+                    self.first_egfx_frame_sent = true;
+                    self.flush_remaining = self.flush_frames;
+                    tracing::debug!("EGFX ready — submitted the frame held during the negotiation");
+                }
+                Ok(false) if gfx.hold_legacy(self.started_at) => {}
+                Ok(false) => {
+                    // Hold over without EGFX: send the held frame as a full
+                    // legacy picture (converted back to BGRA in NV12 mode).
+                    self.held_frame = false;
+                    let guard = match pb.lock(CVPixelBufferLockFlags::READ_ONLY) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            tracing::warn!(error = ?e, "held frame: CVPixelBuffer::lock failed");
+                            return;
+                        }
+                    };
+                    let (Ok(w), Ok(h)) =
+                        (u16::try_from(guard.width()), u16::try_from(guard.height()))
+                    else {
+                        return;
+                    };
+                    let (src, stride): (&[u8], usize) = if self.nv12 {
+                        if let Err(e) = nv12_to_bgra(&guard, &mut self.nv12_bgra) {
+                            tracing::warn!(error = ?e, "held frame: NV12 to BGRA failed");
+                            return;
+                        }
+                        (&self.nv12_bgra, usize::from(w) * 4)
+                    } else {
+                        (guard.as_slice(), guard.bytes_per_row())
+                    };
+                    for (sx, sy, sw, sh) in split_strips(0, 0, w, h) {
+                        if let Some(update) = rect_update(src, stride, sx, sy, sw, sh) {
+                            self.pending.push_back(update);
+                        }
+                    }
+                    self.seeded = true;
+                    // EGFX may still come up after the hold: keep the frame
+                    // (already in `last_frame`) for `promote_frame_to_egfx`.
+                    if gfx.pipeline_pending()
+                        && self.started_at.elapsed() < EGFX_PENDING_FRAME_WINDOW
+                    {
+                        self.egfx_pending_frame = true;
+                    }
+                    tracing::debug!("legacy hold over — sent the held frame as legacy");
+                }
+                Err(e) => {
+                    self.held_frame = false;
+                    tracing::warn!(error = ?e, "EGFX held-frame submit failed");
+                }
+            }
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub async fn start(
             width: u16,
@@ -1634,6 +1708,7 @@ mod macos {
                 was_suppressed: false,
                 suppressed_since: None,
                 first_egfx_frame_sent: false,
+                held_frame: false,
                 warp_cursor_home,
                 pending_resize,
                 desktop_size,
@@ -2070,10 +2145,20 @@ mod macos {
                 // screen (the resize arrows at a window edge, which change no
                 // pixels because the captured frame excludes the cursor) gets
                 // polled and sent instead of waiting for the next redraw.
-                let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
+                // A frame held during the EGFX negotiation also waits at most
+                // one frame interval, so it goes out once EGFX is ready even
+                // when the screen is static.
+                let sample = if self.flush_remaining > 0
+                    || self.pending_resize.has_pending()
+                    || self.held_frame
+                {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(sample) => sample,
                         Err(_) => {
+                            if self.held_frame {
+                                self.send_held_frame();
+                                continue;
+                            }
                             if self.flush_remaining > 0 {
                                 self.flush_remaining -= 1;
                                 if let Some(gfx) = self.gfx.as_ref() {
@@ -2225,6 +2310,7 @@ mod macos {
                         big_change || resume_keyframe,
                     ) {
                         Ok(true) => {
+                            self.held_frame = false;
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress
                             // gate (see `first_egfx_frame_sent` in the struct).
@@ -2242,6 +2328,16 @@ mod macos {
                             self.flush_remaining = self.flush_frames;
                             continue;
                         }
+                        // EGFX still negotiating on this connection: do not send
+                        // the frame as a legacy update (Windows 10 mstsc can stay
+                        // frozen on a legacy picture sent just before EGFX starts;
+                        // see `hold_legacy_for_egfx`). Keep it: on a static screen
+                        // no other frame may come (see `held_frame`).
+                        Ok(false) if gfx.hold_legacy(self.started_at) => {
+                            self.last_frame = Some(pixel_buffer.clone());
+                            self.held_frame = true;
+                            continue;
+                        }
                         Ok(false) => {
                             // Not ready yet: this frame goes out as legacy
                             // bitmaps, but retain it to re-send over H.264
@@ -2257,6 +2353,9 @@ mod macos {
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
                 }
+
+                // This frame goes out as legacy, so a held one is obsolete.
+                self.held_frame = false;
 
                 // Legacy bitmap path: needs the pixels as BGRA on the CPU.
                 let guard = pixel_buffer
