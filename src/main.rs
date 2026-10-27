@@ -2082,7 +2082,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         was_zero = true;
                         continue;
                     }
-                    match install(vd_id) {
+                    match install(virtual_display::current_id(vd_id)) {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
                             info!(
@@ -2098,6 +2098,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             // "follow me". Off-thread; the install's reposition has
                             // already settled, so the vd's live bounds are correct.
                             if restore_windows {
+                                let vd_id = virtual_display::current_id(vd_id);
                                 std::thread::spawn(move || {
                                     let moved = restore_gather_windows(vd_id);
                                     if moved > 0 {
