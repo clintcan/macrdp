@@ -209,6 +209,75 @@ pub(crate) fn record_id_change(old: u32, new: u32) {
     tracing::warn!(old, new, "virtual display re-registered under a new id");
 }
 
+/// Wakes a sleeping display the way a local keypress does, without unlocking.
+#[cfg(target_os = "macos")]
+pub fn wake_display() {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOPMAssertionDeclareUserActivity(
+            name: CFStringRef,
+            user_type: u32,
+            assertion_id: *mut u32,
+        ) -> i32;
+    }
+    // Reusing the id refreshes one assertion instead of piling up new ones.
+    static ASSERTION: AtomicU32 = AtomicU32::new(0);
+    let name = CFString::new("macrdp client connected");
+    let mut id = ASSERTION.load(Ordering::Relaxed);
+    // 0 is kIOPMUserActiveLocal.
+    let r = unsafe { IOPMAssertionDeclareUserActivity(name.as_concrete_TypeRef(), 0, &mut id) };
+    if r == 0 {
+        ASSERTION.store(id, Ordering::Relaxed);
+    } else {
+        tracing::warn!(ioreturn = r, "IOPMAssertionDeclareUserActivity failed");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn wake_display() {}
+
+/// Whether any online display is asleep. Online, not active: while the
+/// displays sleep none of them is active (measured on the mini, macOS 26.5:
+/// the active list was empty, both displays online and asleep).
+#[cfg(target_os = "macos")]
+pub fn any_display_asleep() -> bool {
+    extern "C" {
+        fn CGDisplayIsAsleep(display: u32) -> u32;
+    }
+    macos::online_displays()
+        .map(|ids| {
+            ids.into_iter()
+                .any(|id| unsafe { CGDisplayIsAsleep(id) } != 0)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn any_display_asleep() -> bool {
+    false
+}
+
+/// Wakes the displays and waits up to `timeout` for them to come up.
+/// Does nothing while every display is awake, so the Mac's idle timers aren't reset.
+pub fn wake_displays_and_wait(timeout: std::time::Duration) {
+    if !any_display_asleep() {
+        return;
+    }
+    wake_display();
+    let deadline = std::time::Instant::now() + timeout;
+    while any_display_asleep() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    tracing::info!(
+        still_asleep = any_display_asleep(),
+        "woke the displays for a client"
+    );
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::time::Duration;
@@ -369,7 +438,7 @@ mod macos {
     // online-but-currently-disabled displays — which is exactly the set we
     // need to look at when recovering from a prior install/drop that left a
     // physical display stuck disabled.
-    fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
+    pub(super) fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
         extern "C" {
             fn CGGetOnlineDisplayList(
                 max_displays: u32,
@@ -1159,6 +1228,12 @@ mod macos {
                 detached_count = self.detached.len(),
                 "DetachedPrimary::drop running — re-enabling physical displays"
             );
+            // A reconfiguration while the displays sleep fails with CGError
+            // 1014. Start waking them without waiting: this runs on the
+            // session watcher, and the re-enable below retries with a backoff.
+            if super::any_display_asleep() {
+                super::wake_display();
+            }
             let any = CGDisplay::new(super::current_id(self.virtual_id));
 
             // Two transactions: re-enable in tx 1, reposition in tx 2.
@@ -1208,6 +1283,7 @@ mod macos {
                     Err(e) => {
                         tracing::warn!(attempt, "enable-tx complete failed (CGError {e})");
                         if attempt < MAX_ENABLE_ATTEMPTS {
+                            super::wake_display();
                             std::thread::sleep(ENABLE_RETRY_BACKOFF);
                         }
                     }
