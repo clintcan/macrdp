@@ -15,11 +15,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
     presentation lag. Its new CI step is fine; the missing `--locked` is a follow-up (see the pin-bump
     item). Its divergence (29) collides with the AND-mask backport on the bump branch, and (30) is now
     the cookie fallback → renumber the AND mask to (31) and hand-port the encoder change at the next rebase.
-  - **#218** (@SferaDev, stats `frames_sent` + `connected:false` on disconnect) — approved 10-29. **When rebasing
-    #194 over it:** its `SessionHooks` wrapper (`src/connection_hooks.rs`) forwards only the four hooks `main`
-    has. The bump's trait adds `on_connection_info`, which has a do-nothing default, so the wrapper would
-    silently swallow it and break keyboard-layout auto-detect (`conn_hooks.rs::KeyboardLayoutHook`) with no
-    build error. Forward it, add a test, and fold the wrapper into `conn_hooks.rs`.
+  - **#218** (@SferaDev, stats `frames_sent` + `connected:false` on disconnect) — merged 10-29 (`fde48a7`).
+    Ported onto the bump at the 10-29 rebase as `conn_hooks::StatsHook` in the hook list, added only with
+    `--stats-endpoint` (its `SessionHooks` wrapper would have swallowed `on_connection_info` and broken
+    keyboard-layout auto-detect with no build error).
   - **#230** (@rophy, fixes #229: Win10 mstsc starts frozen, then the blank detector drops it) — not reviewed.
   - **#197 / #198** (@antonmos) — changes requested (AX hit-test timeout; slow-reply misattribution).
   - **Not reviewed:** @antonmos #200 #201 #204; @SferaDev #206 #217–#221 #223 #231–#234 (#233 touches

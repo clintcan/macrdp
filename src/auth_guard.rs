@@ -792,14 +792,14 @@ mod tests {
 
     #[test]
     fn handler_counts_a_fast_failure_after_auth_as_server_error() {
-        use ironrdp_server::ConnectionHandler;
+        use ironrdp_server::{ConnectionHandler, ServerError, ServerErrorExt};
         let mut handler = AuthGuardHandler {
             core: AuthGuardCore::with_config(test_cfg()),
             last_peer: None,
             authenticated: Default::default(),
         };
         let peer = std::net::SocketAddr::from((Ipv4Addr::new(203, 0, 113, 22), 51000));
-        let err = anyhow::anyhow!("client loop failure");
+        let err = ServerError::reason("client loop", "failure");
         for k in 0..30u16 {
             let peer = std::net::SocketAddr::new(peer.ip(), 51000 + k);
             assert!(handler.on_accept(peer), "attempt {k} rejected");
