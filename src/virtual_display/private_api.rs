@@ -169,9 +169,16 @@ impl Handle {
     /// calling it again on the live instance switches the active mode (the
     /// WindowServer relays out windows like a physical monitor changing
     /// resolution). The new mode must fit the descriptor's max dimensions
-    /// (8192×8192, set in `create`).
-    pub(super) fn apply_mode(&self, width: u32, height: u32, refresh_hz: u32) -> Result<()> {
-        apply_single_mode(self.raw, width, height, refresh_hz)
+    /// (8192×8192, set in `create`). With `hidpi`, `width`×`height` is the
+    /// point size and macOS backs it with a 2x framebuffer.
+    pub(super) fn apply_mode(
+        &self,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+        hidpi: bool,
+    ) -> Result<()> {
+        apply_single_mode(self.raw, width, height, refresh_hz, hidpi)
     }
 }
 
@@ -184,6 +191,7 @@ fn apply_single_mode(
     width: u32,
     height: u32,
     refresh_hz: u32,
+    hidpi: bool,
 ) -> Result<()> {
     let settings_class = class_required("CGVirtualDisplaySettings")?;
     let mode_class = class_required("CGVirtualDisplayMode")?;
@@ -207,7 +215,9 @@ fn apply_single_mode(
         if settings.is_null() {
             return Err(anyhow!("[CGVirtualDisplaySettings init] returned nil"));
         }
-        let _: () = msg_send![settings, setHiDPI: 0u32];
+        // HiDPI only takes effect when the mode is declared at the point
+        // size; declared at the backing pixel size, macOS offers no 2x mode.
+        let _: () = msg_send![settings, setHiDPI: u32::from(hidpi)];
         let _: () = msg_send![settings, setModes: modes];
 
         let ok: bool = msg_send![display, applySettings: settings];
@@ -239,7 +249,13 @@ impl Drop for Handle {
 /// are intentionally leaked — they're tiny, only allocated once per
 /// process, and avoiding manual `release` calls keeps the code
 /// obviously free of double-free hazards.
-pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Result<Handle> {
+pub(super) fn create(
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    name: &str,
+    hidpi: bool,
+) -> Result<Handle> {
     let desc_class = class_required("CGVirtualDisplayDescriptor")?;
     let display_class = class_required("CGVirtualDisplay")?;
 
@@ -288,7 +304,7 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         //      the applySettings: call is what actually registers the display
         //      with the WindowServer so it appears in Displays. Shared with
         //      the live-resize path (`Handle::apply_mode`).
-        if let Err(e) = apply_single_mode(display, width, height, refresh_hz) {
+        if let Err(e) = apply_single_mode(display, width, height, refresh_hz, hidpi) {
             let _: () = msg_send![display, release];
             return Err(e);
         }

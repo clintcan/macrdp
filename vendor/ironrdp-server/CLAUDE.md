@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(29) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -2060,3 +2060,13 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (`CCtx`), so none of the three is reachable here; the bump is to keep the
     scan meaningful. Only `Cargo.toml` changes, no code. Drop it once upstream
     requires zstd-safe >= 8.2.
+
+(29) `RdpServerDisplay::set_client_desktop_scale_factor` (NOT upstreamed; added
+    2026-10-20). A defaulted no-op trait method the server calls once per served
+    connection in `client_accepted`, before the Confirm Active capset reaches
+    `request_initial_size`, with the acceptor's divergence (5) scale factor.
+    Skipped on reactivations: they repeat the connect-time Core Data, and a live
+    MS-RDPEDISP monitor layout carries its own scale that may have superseded it
+    (moving a Windows App window from a Retina panel to a standard monitor).
+    macrdp uses it to pick a HiDPI virtual display for Retina clients. Off unless
+    the display implements it, so the upstream-shaped path is unchanged.

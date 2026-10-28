@@ -3513,6 +3513,15 @@ impl RdpServer {
             }
         }
 
+        // (vendored, divergence (29)) A reactivation repeats the connect-time
+        // Core Data, which a live monitor layout may have superseded since.
+        if !result.reactivation {
+            self.display
+                .lock()
+                .await
+                .set_client_desktop_scale_factor(result.desktop_scale_factor);
+        }
+
         let mut backlog = core::mem::take(&mut self.read_ahead);
         if !result.reactivation {
             backlog.clear();

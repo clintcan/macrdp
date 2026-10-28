@@ -191,3 +191,12 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
     22621) + its hostname; FreeRDP hardcodes build 2600. Informational
     fingerprinting only — a client can claim anything.
+
+(5) Desktop scale factor from GCC Client Core Data (NOT upstreamed; added
+    2026-10-20): `Acceptor` gains private `desktop_scale_factor: Option<u32>`,
+    captured in `BasicSettingsWaitInitial` from `optional_data` next to the
+    fingerprint fields (divergence (4)), carried across a
+    deactivation–reactivation and surfaced as a `pub` field on `AcceptorResult`.
+    Consumed by the vendored server's divergence (29). Windows App for Mac sends
+    200 from a Retina panel and 100 from a standard one. Same additive
+    GCC-surfacing shape as (2) and (4), so cleanly upstreamable.

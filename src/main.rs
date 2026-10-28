@@ -41,6 +41,7 @@ mod shield;
 mod stats;
 mod switcher_hud;
 mod usb_redirect;
+mod vd_mode_state;
 mod videotoolbox;
 mod virtual_display;
 
@@ -1145,6 +1146,51 @@ fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
         return Err(anyhow!("keychain entry for macrdp is empty"));
     }
     Ok(s)
+}
+
+/// Creates the virtual display in the last session's mode when one is
+/// remembered, else at `width`×`height` 1x.
+fn create_virtual_display(
+    args: &Args,
+    width: u32,
+    height: u32,
+) -> Result<virtual_display::VirtualDisplay> {
+    // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
+    // metadata here (capture cadence is governed by --fps); pass a
+    // safe value so CGVirtualDisplay doesn't reject the mode.
+    let hz = 60;
+    // A pinned size never re-modes, so a remembered mode would override it.
+    let remember = !args.no_client_resolution
+        && vd_mode_state::enabled(std::env::var("MACRDP_REMEMBER_VD_MODE").ok().as_deref());
+    let path = match default_cert_dir() {
+        Ok(dir) if remember => Some(vd_mode_state::path_in(&dir)),
+        _ => None,
+    };
+    let stored = path.as_deref().and_then(vd_mode_state::load);
+    if let Some(path) = path {
+        vd_mode_state::init(path, stored);
+    }
+    if let Some(mode) = stored {
+        match virtual_display::VirtualDisplay::new_scaled(mode.width, mode.height, mode.scale, hz) {
+            Ok(vd) => {
+                info!(
+                    width = mode.width,
+                    height = mode.height,
+                    scale = mode.scale,
+                    "virtual display created in the last session's mode \
+                     (MACRDP_REMEMBER_VD_MODE=0 disables)"
+                );
+                return Ok(vd);
+            }
+            Err(e) => warn!(
+                error = %format!("{e:#}"),
+                ?mode,
+                "creating the virtual display in the remembered mode failed; \
+                 using --width/--height"
+            ),
+        }
+    }
+    virtual_display::VirtualDisplay::new(width, height, hz).context("attaching virtual display")
 }
 
 fn default_cert_dir() -> Result<PathBuf> {
@@ -2598,6 +2644,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
     // plist's EnvironmentVariables. Unset keys keep the on-by-default defaults.
     for (cfg_key, env_var) in [
         ("CONN_GUARD", "MACRDP_CONN_GUARD"),
+        ("REMEMBER_VD_MODE", "MACRDP_REMEMBER_VD_MODE"),
         ("AUDIT_LOG", "MACRDP_AUDIT_LOG"),
         ("GUARD_RL_MAX", "MACRDP_GUARD_RL_MAX"),
         ("GUARD_RL_WINDOW_SECS", "MACRDP_GUARD_RL_WINDOW_SECS"),
@@ -3030,11 +3077,7 @@ async fn async_main() -> Result<()> {
             let h = args
                 .height
                 .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-            // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
-            // metadata here (capture cadence is governed by --fps); pass a
-            // safe value so CGVirtualDisplay doesn't reject the mode.
-            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-                .context("attaching virtual display")?;
+            let vd = create_virtual_display(&args, u32::from(w), u32::from(h))?;
             info!(
                 display_id = vd.display_id(),
                 origin = ?vd.origin_pts(),
@@ -3224,13 +3267,9 @@ async fn async_main() -> Result<()> {
     //   - primary panel with override: use the override + main geometry.
     let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
         let vd = vd.lock().expect("virtual display mutex poisoned");
-        // Both required earlier, so the unwraps can't fire.
-        let w = args
-            .width
-            .expect("checked above when --virtual-display set");
-        let h = args
-            .height
-            .expect("checked above when --virtual-display set");
+        // The remembered mode can differ from --width/--height.
+        let (w, h) = vd.size_px();
+        let (w, h) = (w as u16, h as u16);
         // Re-query CGDisplayBounds rather than trusting the cached
         // values from VirtualDisplay creation: if --make-primary
         // moved the display to (0, 0), the cached size is fine but
@@ -3486,6 +3525,7 @@ async fn async_main() -> Result<()> {
         // Shared so a live client resize can re-mode the display; None on
         // the mirror-primary path (no virtual display to re-mode).
         virtual_display: virtual_display.clone(),
+        client_scale_percent: 100,
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {

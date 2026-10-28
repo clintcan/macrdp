@@ -109,6 +109,8 @@ mod macos {
         display_id: u32,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
+        /// Backing pixels per point: 1, or 2 for a HiDPI mode.
+        scale: u32,
     }
 
     impl VirtualDisplay {
@@ -122,8 +124,20 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            let handle = private_api::create(width, height, refresh_hz, "macrdp")
-                .context("creating virtual display")?;
+            Self::new_scaled(width, height, 1, refresh_hz)
+        }
+
+        /// Created straight in a `scale` mode, with `width`×`height` the framebuffer size as in
+        /// [`Self::resize`].
+        pub fn new_scaled(width: u32, height: u32, scale: u32, refresh_hz: u32) -> Result<Self> {
+            let handle = private_api::create(
+                width / scale,
+                height / scale,
+                refresh_hz,
+                "macrdp",
+                scale == 2,
+            )
+            .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)
             // and the point-space size. macOS auto-arranges new displays
@@ -145,6 +159,7 @@ mod macos {
                 display_id: id,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
+                scale,
             })
         }
 
@@ -160,6 +175,18 @@ mod macos {
             self.size_pts
         }
 
+        pub fn scale(&self) -> u32 {
+            self.scale
+        }
+
+        /// The framebuffer size, which is what the RDP session is served at.
+        pub fn size_px(&self) -> (u32, u32) {
+            (
+                self.size_pts.0 as u32 * self.scale,
+                self.size_pts.1 as u32 * self.scale,
+            )
+        }
+
         /// Live-resize the display to a new mode (client-driven session
         /// resize). Re-applies settings with a single mode at the new size
         /// — the WindowServer treats it like a physical monitor changing
@@ -168,12 +195,13 @@ mod macos {
         /// async on the WindowServer side; creation has the same
         /// zero-size-rect race, handled there by erroring). The display id
         /// is stable across the resize; the global-space origin can shift,
-        /// so both cached values are refreshed. Virtual displays are
-        /// always 1:1 points-to-pixels (no HiDPI backing — see the
-        /// known-quirks note), so the expected bounds equal the mode size.
-        pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        /// so both cached values are refreshed. `width`×`height` is the
+        /// framebuffer size; at `scale` 2 the mode is declared at half that
+        /// in points with HiDPI on, so the expected bounds are the point size.
+        pub fn resize(&mut self, width: u32, height: u32, scale: u32) -> Result<()> {
+            let (width, height) = (width / scale, height / scale);
             self._handle
-                .apply_mode(width, height, 60)
+                .apply_mode(width, height, 60, scale == 2)
                 .context("re-applying virtual display mode")?;
 
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -182,6 +210,7 @@ mod macos {
                 if bounds.size.width as u32 == width && bounds.size.height as u32 == height {
                     self.origin_pts = (bounds.origin.x, bounds.origin.y);
                     self.size_pts = (bounds.size.width, bounds.size.height);
+                    self.scale = scale;
                     return Ok(());
                 }
                 if std::time::Instant::now() >= deadline {
@@ -1633,6 +1662,14 @@ mod stub {
                  different target"
             ))
         }
+        pub fn new_scaled(
+            _width: u32,
+            _height: u32,
+            _scale: u32,
+            _refresh_hz: u32,
+        ) -> Result<Self> {
+            Self::new(0, 0, 0)
+        }
         pub fn display_id(&self) -> u32 {
             0
         }
@@ -1642,7 +1679,13 @@ mod stub {
         pub fn size_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
         }
-        pub fn resize(&mut self, _width: u32, _height: u32) -> Result<()> {
+        pub fn scale(&self) -> u32 {
+            1
+        }
+        pub fn size_px(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        pub fn resize(&mut self, _width: u32, _height: u32, _scale: u32) -> Result<()> {
             Err(anyhow!("virtual display is macOS-only"))
         }
         pub fn reanchor_as_main(&mut self) -> Result<bool> {

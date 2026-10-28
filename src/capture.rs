@@ -407,6 +407,10 @@ pub struct CaptureDisplay {
     /// pinned off there, and `updates()` re-modes the display to match
     /// `desktop_size` before each capture stream is built.
     pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    /// The client's desktop scale factor in percent, from its Core Data at
+    /// connect and then from each live monitor layout. Picks the virtual
+    /// display's scale in `sync_virtual_display`.
+    pub client_scale_percent: u32,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -529,6 +533,19 @@ fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize
     }
 }
 
+/// Backing pixels per point for a virtual display serving a `width`×`height`
+/// session: 2 for a Retina client (200% or more), as long as the session
+/// halves into a mode inside the protocol-legal band, otherwise 1.
+fn virtual_display_scale(width: u16, height: u16, client_scale_percent: u32) -> u32 {
+    let halves =
+        width.is_multiple_of(2) && height.is_multiple_of(2) && width >= 400 && height >= 400;
+    if client_scale_percent >= 200 && halves {
+        2
+    } else {
+        1
+    }
+}
+
 #[async_trait::async_trait]
 impl RdpServerDisplay for CaptureDisplay {
     async fn size(&mut self) -> DesktopSize {
@@ -580,6 +597,10 @@ impl RdpServerDisplay for CaptureDisplay {
         DesktopSize { width, height }
     }
 
+    fn set_client_desktop_scale_factor(&mut self, desktop_scale_factor: Option<u32>) {
+        self.client_scale_percent = desktop_scale_factor.unwrap_or(100);
+    }
+
     /// Handle a client-driven live resize (MS-RDPEDISP monitor layout — the
     /// client resized its window). The connect-time auto-adopt path only
     /// negotiates a size once, in `request_initial_size`; this is the
@@ -624,7 +645,8 @@ impl RdpServerDisplay for CaptureDisplay {
         };
 
         let (w, h) = monitor.dimensions();
-        let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
+        self.client_scale_percent = monitor.desktop_scale_factor().unwrap_or(100);
+        let (Ok(mut width), Ok(mut height)) = (u16::try_from(w), u16::try_from(h)) else {
             tracing::warn!(
                 w,
                 h,
@@ -676,17 +698,20 @@ impl CaptureDisplay {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
-        let (cur_w, cur_h) = vd.size_pts();
-        if (cur_w as u16, cur_h as u16) == (width, height) {
+        let scale = virtual_display_scale(width, height, self.client_scale_percent);
+        let (cur_w, cur_h) = vd.size_px();
+        if (cur_w as u16, cur_h as u16) == (width, height) && vd.scale() == scale {
             return (width, height);
         }
-        match vd.resize(u32::from(width), u32::from(height)) {
+        match vd.resize(u32::from(width), u32::from(height), scale) {
             Ok(()) => {
+                crate::vd_mode_state::remember(u32::from(width), u32::from(height), scale);
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
                     width,
                     height,
+                    scale,
                     display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
                 );
@@ -1918,6 +1943,16 @@ mod tests {
             next_y += h;
         }
         assert_eq!(next_y, 1080, "strips cover the whole height");
+    }
+
+    #[test]
+    fn virtual_display_scale_doubles_only_for_retina_clients() {
+        assert_eq!(virtual_display_scale(3024, 1898, 200), 2);
+        assert_eq!(virtual_display_scale(3440, 1440, 100), 1);
+        assert_eq!(virtual_display_scale(2880, 1800, 150), 1);
+        // The mode is declared at half the session size, in whole points.
+        assert_eq!(virtual_display_scale(3025, 1898, 200), 1);
+        assert_eq!(virtual_display_scale(398, 600, 200), 1);
     }
 
     #[test]

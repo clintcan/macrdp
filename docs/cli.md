@@ -78,6 +78,15 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   display size, or the --width/--height vd size)
                           #   and live client-driven resize is disabled too —
                           #   it rides the same auto-adopt gate.
+MACRDP_REMEMBER_VD_MODE=1 # --virtual-display: each mode the primary virtual
+                          #   display is re-moded to (pixel size and 1x/2x
+                          #   scale) is saved to ~/Library/Application
+                          #   Support/macrdp/vd-mode, and the next start creates
+                          #   the display in it instead of --width/--height 1x,
+                          #   so the first connect after a restart skips the
+                          #   re-mode. A missing or invalid file falls back to
+                          #   --width/--height. 0/off disables; ignored with
+                          #   --no-client-resolution. Config key: REMEMBER_VD_MODE.
 --stretch                 # On the auto-size path, fill the client frame instead
                           #   of the default aspect-preserving letterbox/pillarbox.
                           #   No effect with --width/--height or matching aspect.
