@@ -56,7 +56,7 @@ brew trust clintcan/tap    # current Homebrew asks you to trust third-party taps
 brew install --cask macrdp
 ```
 
-Then open **macrdpController** from /Applications: it stores your Mac password in the Keychain and starts the server at login. After `brew upgrade`, restart the server with `launchctl kickstart -k gui/$UID/com.clintcan.macrdp`. It's a cask rather than a formula on purpose: only the signed app carries the entitlement USB redirection needs, and it keeps your permission grants across upgrades.
+Then open **macrdpController** from /Applications. It's a menu-bar app, so no window opens and nothing appears in the Dock: look for a small display icon in the menu bar (dimmed while the server isn't running), click it and choose **Start (first run sets up)**. That asks for your Mac password, stores it in the Keychain, and sets the server to start at login; then turn on Screen Recording and Accessibility for macrdp in System Settings › Privacy & Security (the controller offers to open it). If you can't see the icon, it may be hidden behind the notch or by the Menu Bar settings in System Settings. After `brew upgrade`, restart the server with `launchctl kickstart -k gui/$UID/com.clintcan.macrdp`. It's a cask rather than a formula on purpose: only the signed app carries the entitlement USB redirection needs, and it keeps your permission grants across upgrades.
 
 **From source:**
 
