@@ -1,133 +1,122 @@
 # vendor/ironrdp-rdpdr — divergence log
 
-Local fork of ironrdp-rdpdr 0.7.0, copied 2026-06-16 from upstream
-Devolutions/IronRDP@879ffed and **re-synced 2026-08-05 to the a5d1c682 pin bump**
-(upstream had ZERO source churn between the two revs — only Cargo.toml/CHANGELOG —
-so the fork's source was already current; just the dep versions bumped). Pulled in
-via `[patch.crates-io]` in the root `Cargo.toml`; has a standalone
-`[patch.crates-io]` (core/error/pdu/svc → a5d1c682) for isolated build, ignored in
-the macrdp workspace. Keep this vendor dir until divergence (1) is upstreamed AND
-released.
+Local fork of ironrdp-rdpdr 0.7.0, **re-vendored 2026-10-01 from upstream
+Devolutions/IronRDP@e258f6a0** (the pin-bump rev). Earlier vendorings: @a5d1c682
+(2026-08-05), @879ffed (2026-06-16). Pulled in via `[patch.crates-io]` in the root
+`Cargo.toml`; has a standalone `[patch.crates-io]` (core/error/pdu/svc → e258f6a0) for
+isolated builds, ignored in the macrdp workspace (the root `[patch]` wins). Keep that rev in
+sync.
 
-Upstream `ironrdp-rdpdr` is **client-oriented**: `Rdpdr` is a
-`SvcClientProcessor`, and the PDU `Encode`/`Decode` impls in `pdu::efs` only
-cover the direction a *client* needs (encode client→server, decode
-server→client). macrdp is the **server**, so it needs the opposite halves on a
-few PDUs. The wire structs, field layouts, and constants are all upstream and
-reused as-is; we only add the missing server-direction halves.
+## Shape: upstream verbatim + two new files
 
-(1) Server-direction decode halves + accessors (NOT upstreamed):
-    - `ClientNameRequest::decode` — server reads PAKID_CORE_CLIENT_NAME.
-    - `ClientDeviceListAnnounce::decode` — server reads
-      PAKID_CORE_DEVICELIST_ANNOUNCE (loops `DeviceAnnounceHeader::decode`).
-    - `DeviceAnnounceHeader::decode` + `PreferredDosName::decode`, plus public
-      accessors `device_id()` and `preferred_dos_name()`, and `device_type()`
-      widened from `pub(crate)` to `pub`, so the server can read the announced
-      device id / type / label.
-    These pair with the **server-side `RdpdrServer` processor** that lives in
-    `vendor/ironrdp-server/src/rdpdr.rs` (divergence (11) there) — kept out of
-    this crate so the macrdp-facing factory/backend traits sit next to the other
-    server channel factories. Outbound (server→client) reuses the existing
-    `RdpdrPdu`/`*::encode` impls unchanged: `VersionAndIdPdu`, `CoreCapability`,
-    `ServerDeviceAnnounceResponse` all have public fields and working `encode`,
-    so the server constructs them directly.
+`src/` is upstream e258f6a0 **verbatim** except four code lines across three files, all
+marked `(macrdp divergence N)`:
 
-    Phase 1b added the device-I/O halves: `encode` for `DeviceCreateRequest` /
-    `DeviceReadRequest` / `DeviceCloseRequest` (write the `DeviceIoRequest`
-    header + body), `decode` for `DeviceCreateResponse` / `DeviceReadResponse` /
-    `DeviceCloseResponse`, and an `impl Encode + SvcEncode for
-    ServerDriveIoRequest` (in `pdu/mod.rs`) that prepends the
-    `PAKID_CORE_DEVICE_IOREQUEST` SharedHeader so the server can emit a request
-    as an `SvcMessage`. Phase 1b-ii (list_dir) added `encode` for
-    `ServerDriveQueryDirectoryRequest` and `decode` for `FileDirectoryInformation`
-    (the directory-entry class the server requests); the query-directory response
-    is decoded inline in the server's `RdpdrHandle::list_dir` (DeviceIoResponse +
-    Length + one entry per response, looped until NO_MORE_FILES).
+- `pdu/efs.rs`: `DeviceAnnounceHeader::device_type()` widened `pub(crate)` → `pub`.
+- `pdu/mod.rs`: `mod server_direction;` + `pub use self::server_direction::ScardControlRequest;`
+- `pdu/esc/mod.rs`: `mod server_direction;`
 
-    Phase 2 (writes) added the server-direction halves for the write path:
-    `encode` for `DeviceWriteRequest` and `ServerDriveSetInformationRequest`,
-    `decode` for `DeviceWriteResponse`, `encode` for the set-information buffers
-    `FileEndOfFileInformation` / `FileDispositionInformation` /
-    `FileRenameInformation` / `FileAllocationInformation` (upstream had only
-    their `decode`), the matching `FileInformationClass::encode` arms + a
-    `FileInformationClass::level()` helper (maps a buffer to its
-    `FileInformationClassLevel`), and the `DeviceWriteRequest` /
-    `ServerDriveSetInformationRequest` arms in `ServerDriveIoRequest`'s
-    `Encode`/`size` dispatch (`pdu/mod.rs`). `DeviceCreateRequest::encode`
-    (Phase 1b) already carries the create-disposition, so create/mkdir reuse it.
+Everything else lives in two new files: `pdu/server_direction.rs` and
+`pdu/esc/server_direction.rs`. As child modules they can implement traits on, and add
+methods to, their parent's types and read private fields, so no upstream line needs to
+change. **Keep it that way:** the next rebase is "copy upstream `src/`, re-apply four lines,
+fix what no longer compiles in our two files".
 
-    Upstreamable as a `SvcServerProcessor` peer to the client `Rdpdr` (offer the
-    decode halves + the server processor together). De-vendor once a published
-    ironrdp-rdpdr carries a server-side path.
+Cost of this shape: under IronRDP's own workspace lints, `clippy::multiple_inherent_impl`
+fires for every type that gains a second `impl` block here. It doesn't apply to our
+standalone build. If any of this is upstreamed, it folds into upstream's existing `impl`
+blocks.
 
-(2) Server-direction MS-RDPESC (smart-card) halves in `pdu/esc/` (NOT
-    upstreamed) — the smart-card analogue of (1), for the
-    `--enable-smartcard-redirection` path. Upstream `pdu::esc` is client-oriented
-    (decode `*Call`, encode `*Return`); macrdp is the server, so it needs the
-    mirror halves. Added, all in `pdu/esc/`:
-    - `rpce::HeaderlessEncode` for the `*Call` set the server sends:
-      `EstablishContextCall`, `ContextCall` (release/cancel/is-valid),
-      `ListReadersCall`, `GetStatusChangeCall`, `ConnectCall`,
-      `HCardAndDispositionCall` (begin/end-transaction, disconnect), `StatusCall`,
-      `TransmitCall`.
-    - `rpce::HeaderlessDecode` + a `decode()` for the matching `*Return` set:
-      `LongReturn`, `EstablishContextReturn`, `ListReadersReturn`,
-      `GetStatusChangeReturn`, `ConnectReturn`, `StatusReturn`, `TransmitReturn`.
-    - Supporting NDR encoders the encode side needs: `ndr::Encode` for
-      `ConnectCommon` and `ReaderState`, plus `ndr::write_string_to_cursor` /
-      `ndr::string_size` (the conformant+varying string *writer* mirroring
-      `read_string_from_cursor` — MaximumCount/Offset/ActualCount + NUL-terminated
-      string + 4-byte tail pad; the pad is position-based on write but, since
-      every MS-RDPESC string field starts 4-byte aligned, equals
-      `region.next_multiple_of(4)` for sizing).
-    - `TryFrom<u32>` for `ReturnCode` and `CardState`, and `From<Scope> for u32`
-      (the reverse conversions upstream only had one direction of).
-    Byte-exactness is proven offline by `server_direction_tests` (18 round-trips:
-    `*Call` = our encode -> upstream decode; `*Return` = upstream encode -> our
-    decode). The server uses the **W (Unicode)** IOCTL variants, so reader/string
-    fields marshal as UTF-16.
+## Why a fork at all
 
-    The IOCTL envelope is also here now: `ScardCall::encode`/`size` (dispatch the
-    chosen variant's RPCE `Pdu`) and **`ScardControlRequest`** in `pdu/mod.rs` — a
-    server-direction DR_CONTROL_REQ (`IRP_MJ_DEVICE_CONTROL`) that prepends the
-    `PAKID_CORE_DEVICE_IOREQUEST` `SharedHeader` + `DeviceIoRequest`, then
-    Output/Input buffer lengths + `IoControlCode` + 20 reserved bytes + the
-    marshaled call, and impls `Encode + SvcEncode` so it ships as an `SvcMessage`
-    (peer to `ServerDriveIoRequest`). `From<ScardIoCtlCode> for u32` added.
-    `scard_control_request_tests` proves the full envelope round-trips through the
-    decode chain (`SharedHeader` -> `DeviceIoRequest` ->
-    `DeviceControlRequest<ScardIoCtlCode>` -> `ScardCall`).
+macrdp's RDPDR server processor is its own (`vendor/ironrdp-server/src/rdpdr.rs`,
+divergence (11) there), and it needs to build requests and parse replies in the server's
+direction. Upstream has since made the EFS (drive) PDU layer two-way (#1779) and added its
+own `RdpdrServer` (#1783/#1784); its ESC (smart card) layer is still client-only. Moving
+macrdp onto upstream's `RdpdrServer` is a later, separate change (group 2 of the pin-bump
+triage). Until then this crate supplies what our processor uses.
 
-    Live-Windows conformance fixes (2026-06-18, found verifying against mstsc +
-    a TPM virtual smart card — the offline round-trips couldn't catch these
-    because they encode/decode symmetrically; real 64-bit Windows exercises NDR
-    edges our own encoder never produced):
-    - **Variable-length context/handle.** `ScardContext`/`ScardHandle` `value`
-      changed from `u32` to `u64` + a `length: u8` (was hardcoded 4). Real 64-bit
-      Windows `SCARDCONTEXT`/`SCARDHANDLE` are pointer-sized (8 bytes); the old
-      decode rejected them with "unsupported value length". `read_cb` caps at 8.
-    - **NULL-referent handling on every `[unique]` pointer's value section.** A
-      NULL referent means NO deferred conformant array — reading a `MaximumCount`
-      unconditionally consumes the next field's bytes. Fixed in: `StatusReturn`
-      (Windows returns NULL `mszReaderNames` — ATR-only Status), `SCardIORequest`
-      (empty `pbExtraBytes` → NULL referent, no deferred), `TransmitReturn` (NULL
-      `pbRecvBuffer` when the card returns no data), and **`ScardContext`** (the
-      embedded Context of a returned handle is empty: `cbContext=0` + NULL
-      referent + no value). The `ScardContext` one was the killer: it made the
-      connect handle decode with `cbHandle=0`, so Transmit sent an empty handle.
-    Regression tests added for each (hand-built Windows-shaped bytes +
-    8-byte-handle round-trips); 27 tests total. **VERIFIED end-to-end on mstsc**:
-    full APDU transceive (GIDS SELECT → FCI + `90 00`) round-trips through the
-    redirected reader.
+## Divergences
 
-    Server-side path (the "STILL TODO" below) is DONE — see
-    `vendor/ironrdp-server/src/rdpdr.rs` divergence (11) smart-card phase: the
-    `RdpdrHandle::scard_*` methods + completion router.
+(1) **Drive (EFS) server direction** — nearly all retired at e258f6a0 (see below). What's left:
+    - `device_type()` made `pub` (the server reads the announced device type).
+    - `pdu/server_direction.rs`: `impl Encode + SvcEncode for ServerDriveIoRequest` —
+      `PAKID_CORE_DEVICE_IOREQUEST` header + the request's own (upstream) `encode`. Upstream's
+      equivalent (`DriveRequestBody` in `server.rs`) is private. Covers every variant except
+      `DeviceControlRequest`, which carries no input buffer (upstream's server excludes it
+      too). The `match` is exhaustive on purpose: a new upstream variant is a compile error,
+      not a silent gap.
 
-Cargo notes: the de-worked `Cargo.toml` inlines the workspace-inherited fields
-(edition 2024, rust-version, license, …) and drops the `path = "../ironrdp-*"`
-deps, resolving them through the root `[patch.crates-io]` git pins — same shape
-as `vendor/ironrdp-acceptor`. Its `ironrdp-error = "0.1"` dep is why the root
-adds an `ironrdp-error` git pin to `[patch.crates-io]`: without it, this crate
-would pull `ironrdp-error` from crates.io and split it from the copy the other
-ironrdp crates use transitively.
+(2) **Smart card (ESC) server direction** — `pdu/esc/server_direction.rs`, for
+    `--enable-smartcard-redirection`. Upstream decodes each `*Call` and encodes each
+    `*Return`; macrdp needs the mirror halves:
+    - `rpce::HeaderlessEncode` for the calls the server sends: `EstablishContextCall`,
+      `ContextCall`, `ListReadersCall`, `GetStatusChangeCall`, `ConnectCall`,
+      `HCardAndDispositionCall`, `StatusCall`, `TransmitCall`; plus `ScardCall::encode`/`size`.
+    - `decode` + `rpce::HeaderlessDecode` for the replies: `LongReturn`,
+      `EstablishContextReturn`, `ListReadersReturn`, `GetStatusChangeReturn`,
+      `ConnectReturn`, `StatusReturn`, `TransmitReturn`. Accessors `return_code()` on
+      `LongReturn` and `return_code()`/`context()` on `EstablishContextReturn` (upstream's
+      fields are private).
+    - `ndr::Encode` for `ConnectCommon` and `ReaderState`; a private NDR string writer
+      (`write_ndr_string`/`ndr_string_size`, the mirror of `ndr::read_string_from_cursor`).
+    - `TryFrom<u32>` for `ReturnCode` and `CardState`; `From<Scope> for u32`.
+    - `ScardControlRequest` (in `pdu/server_direction.rs`): a `DR_CONTROL_REQ` carrying a
+      `ScardCall`. Now built from upstream's `DeviceControlRequest::encode` (new at
+      e258f6a0) plus the call; same bytes as before.
+
+    **Live-Windows rules these halves must keep** (found against mstsc + a TPM virtual smart
+    card, 2026-06-18; full APDU transceive verified end to end):
+    - A NULL `[unique]` referent means no deferred conformant array. The decoders check the
+      referent before reading `MaximumCount` for `mszReaderNames` (`StatusReturn`, Windows
+      often sends an ATR-only status), `pbRecvBuffer` (`TransmitReturn`, no card data), and
+      now `msz` in `ListReadersReturn` (a length-only probe).
+    - **`TransmitCall` writes a NULL `pbExtraBytes` referent when there are no extra PCI
+      bytes** (`encode_io_request_ptr`). This deliberately does NOT use upstream's
+      `ndr::Encode for SCardIORequest`, which writes a non-NULL referent for the same
+      input; real Windows rejects that `Transmit_Call` with `STATUS_UNSUCCESSFUL`. Don't
+      "simplify" it back to `send_pci.encode_ptr`.
+    - Pointer-sized (8-byte) contexts/handles and the connect handle's empty embedded
+      context are now upstream's own behaviour (`ScardContext`/`ScardHandle`, #1654); our
+      old `u64 value + length` fix was retired in favour of it.
+
+## Retired at e258f6a0 (upstream now has it)
+
+- All drive decode halves: `ClientNameRequest::decode`, `ClientDeviceListAnnounce::decode`,
+  `DeviceAnnounceHeader`/`PreferredDosName` decode + `device_id()`/`preferred_dos_name()`,
+  and the `Device{Create,Read,Close,Write}Response` decoders (upstream #1779; they now take
+  the `DeviceIoResponse` first).
+- All drive encode halves: `Device{Create,Read,Close,Write}Request`,
+  `ServerDriveQueryDirectoryRequest`, `ServerDriveSetInformationRequest`, the
+  set-information buffers, and `FileDirectoryInformation` decode. `FileInformationClass::level()`
+  went too: upstream's `ServerDriveSetInformationRequest::encode` maps the class itself.
+- Smart card: variable-length `ScardContext`/`ScardHandle` and their NULL handling
+  (upstream #1654), and `From<ScardIoCtlCode> for u32`.
+
+## Testing
+
+The lib is `test = false`; run the tests on a scratch copy with `test = true`
+(`cargo test --lib`). 52 pass: upstream's 38 plus 14 of ours (`pdu::server_direction::tests`,
+`pdu::esc::server_direction::tests`; the round trips are table-driven, so one test covers
+many PDUs). Ours round-trip every request through upstream's own
+decode chain and every reply from upstream's own encoder, and add hand-built byte layouts
+real Windows sends (empty handle context, NULL reader names, NULL receive buffer).
+**Mutation-checked 2026-10-01:** each of these, introduced alone, fails a test — non-NULL
+`pbExtraBytes` referent, unconditional `msz`/reader-names/receive-buffer read, a typo in
+the `ReturnCode` table, dropping the NDR string padding, skipping the connect handle's
+value.
+
+## Porting notes for the server rebase (vendored ironrdp-server)
+
+Measured against `vendor/ironrdp-server/src/rdpdr.rs`: 10 of its compile errors come from
+this crate, all mechanical.
+- `Device{Create,Read,Write}Response::decode(src)` → decode the `DeviceIoResponse` first,
+  then `::decode(io_response, src)`.
+- The inline query-directory parse used `FileDirectoryInformation::decode` (now private) →
+  use upstream's `ClientDriveQueryDirectoryResponse::decode_for_class(FILE_DIRECTORY_INFORMATION, …)`.
+- `ret.return_code` / `ret.context` → `ret.return_code()` / `ret.context()` for `LongReturn`
+  and `EstablishContextReturn`.
+- `ListReadersReturn::readers` and `TransmitReturn::recv_buffer` are now `Option` (NULL
+  referent ⇒ `None`).
+- `src/rdpdr/smartcard.rs` logs `ctx.value` → `ctx.value()` (or `as_bytes()`).
+- Later (group 2): adopt upstream's `RdpdrServer` and drop this fork's drive half.

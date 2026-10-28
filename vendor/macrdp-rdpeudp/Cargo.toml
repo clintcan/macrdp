@@ -1,9 +1,9 @@
 [package]
-name = "ironrdp-rdpeudp"
+name = "macrdp-rdpeudp"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "MS-RDPEUDP / MS-RDPEUDP2 wire types + reliability state machine for RDP UDP multitransport (macrdp, candidate for upstream)"
+description = "MS-RDPEUDP / MS-RDPEUDP2 wire types + reliability state machine for RDP UDP multitransport (macrdp's own; upstream's ironrdp-rdpeudp is a separate RDPEUDP2 implementation)"
 publish = false
 
 [lib]
@@ -29,4 +29,4 @@ bitflags = "2"
 # Honored only when this crate is built as the top-level (standalone tests).
 # Ignored when it's a path dependency of macrdp (the root's [patch] wins). Keep
 # the rev in sync with the root Cargo.toml.
-ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }

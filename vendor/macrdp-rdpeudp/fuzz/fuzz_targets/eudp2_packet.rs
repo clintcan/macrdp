@@ -5,6 +5,6 @@ use libfuzzer_sys::fuzz_target;
 // the full packet parser and the bare header decode. Must never panic on
 // malformed input.
 fuzz_target!(|data: &[u8]| {
-    let _ = ironrdp_rdpeudp::eudp2::Eudp2Packet::parse(data);
-    let _ = ironrdp_rdpeudp::eudp2::Eudp2Header::decode(data);
+    let _ = macrdp_rdpeudp::eudp2::Eudp2Packet::parse(data);
+    let _ = macrdp_rdpeudp::eudp2::Eudp2Header::decode(data);
 });

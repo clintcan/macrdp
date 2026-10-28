@@ -1,23 +1,25 @@
 use core::fmt::{self, Display};
 
 use ironrdp_core::{
-    Decode, DecodeError, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_size,
-    invalid_field_err, unsupported_value_err,
+    Decode, DecodeError, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_size, invalid_field_err,
+    unsupported_value_err,
 };
-use ironrdp_pdu::write_padding;
 use ironrdp_svc::SvcEncode;
 
 use self::efs::{
-    ClientDeviceListAnnounce, ClientDeviceListRemove, ClientDriveQueryDirectoryResponse,
-    ClientDriveQueryInformationResponse, ClientDriveQueryVolumeInformationResponse, ClientDriveSetInformationResponse,
-    ClientNameRequest, CoreCapability, CoreCapabilityKind, DeviceCloseResponse, DeviceControlResponse,
-    DeviceCreateResponse, DeviceIoRequest, DeviceReadResponse, DeviceWriteResponse, MajorFunction, MinorFunction,
-    ServerDeviceAnnounceResponse, ServerDriveIoRequest, VersionAndIdPdu, VersionAndIdPduKind,
+    ClientDeviceListAnnounce, ClientDeviceListRemove, ClientDriveLockControlResponse,
+    ClientDriveNotifyChangeDirectoryResponse, ClientDriveQueryDirectoryResponse, ClientDriveQueryInformationResponse,
+    ClientDriveQuerySecurityResponse, ClientDriveQueryVolumeInformationResponse, ClientDriveSetInformationResponse,
+    ClientDriveSetSecurityResponse, ClientNameRequest, CoreCapability, CoreCapabilityKind, DeviceCloseResponse,
+    DeviceControlResponse, DeviceCreateResponse, DeviceFlushBuffersResponse, DeviceIoRequest, DeviceIoResponse,
+    DeviceReadResponse, DeviceWriteResponse, FileInformationClassLevel, FileSystemInformationClassLevel, MajorFunction,
+    MinorFunction, ServerDeviceAnnounceResponse, VersionAndIdPdu, VersionAndIdPduKind,
 };
-use self::esc::{ScardCall, ScardIoCtlCode};
 
 pub mod efs;
 pub mod esc;
+mod server_direction; // (macrdp divergence 1 + 2) server-to-client request encoders
+pub use self::server_direction::ScardControlRequest;
 
 /// All available RDPDR PDUs.
 pub enum RdpdrPdu {
@@ -31,12 +33,17 @@ pub enum RdpdrPdu {
     DeviceControlResponse(DeviceControlResponse),
     DeviceCreateResponse(DeviceCreateResponse),
     ClientDriveQueryInformationResponse(ClientDriveQueryInformationResponse),
+    ClientDriveQuerySecurityResponse(ClientDriveQuerySecurityResponse),
     DeviceCloseResponse(DeviceCloseResponse),
     ClientDriveQueryDirectoryResponse(ClientDriveQueryDirectoryResponse),
     ClientDriveQueryVolumeInformationResponse(ClientDriveQueryVolumeInformationResponse),
     DeviceReadResponse(DeviceReadResponse),
     DeviceWriteResponse(DeviceWriteResponse),
+    DeviceFlushBuffersResponse(DeviceFlushBuffersResponse),
     ClientDriveSetInformationResponse(ClientDriveSetInformationResponse),
+    ClientDriveSetSecurityResponse(ClientDriveSetSecurityResponse),
+    ClientDriveNotifyChangeDirectoryResponse(ClientDriveNotifyChangeDirectoryResponse),
+    ClientDriveLockControlResponse(ClientDriveLockControlResponse),
     UserLoggedon,
     EmptyResponse,
 }
@@ -92,12 +99,17 @@ impl RdpdrPdu {
             RdpdrPdu::DeviceControlResponse(_)
             | RdpdrPdu::DeviceCreateResponse(_)
             | RdpdrPdu::ClientDriveQueryInformationResponse(_)
+            | RdpdrPdu::ClientDriveQuerySecurityResponse(_)
             | RdpdrPdu::DeviceCloseResponse(_)
             | RdpdrPdu::ClientDriveQueryDirectoryResponse(_)
             | RdpdrPdu::ClientDriveQueryVolumeInformationResponse(_)
             | RdpdrPdu::DeviceReadResponse(_)
             | RdpdrPdu::DeviceWriteResponse(_)
+            | RdpdrPdu::DeviceFlushBuffersResponse(_)
             | RdpdrPdu::ClientDriveSetInformationResponse(_)
+            | RdpdrPdu::ClientDriveSetSecurityResponse(_)
+            | RdpdrPdu::ClientDriveNotifyChangeDirectoryResponse(_)
+            | RdpdrPdu::ClientDriveLockControlResponse(_)
             | RdpdrPdu::EmptyResponse => SharedHeader {
                 component: Component::RdpdrCtypCore,
                 packet_id: PacketId::CoreDeviceIoCompletion,
@@ -119,10 +131,135 @@ impl RdpdrPdu {
             )),
             PacketId::CoreDeviceIoRequest => Ok(RdpdrPdu::DeviceIoRequest(DeviceIoRequest::decode(src)?)),
             PacketId::CoreUserLoggedon => Ok(RdpdrPdu::UserLoggedon),
+            PacketId::CoreClientName => Ok(RdpdrPdu::ClientNameRequest(ClientNameRequest::decode(src)?)),
+            PacketId::CoreClientCapability => Ok(RdpdrPdu::CoreCapability(CoreCapability::decode(header, src)?)),
+            PacketId::CoreDevicelistAnnounce => Ok(RdpdrPdu::ClientDeviceListAnnounce(
+                ClientDeviceListAnnounce::decode(src)?,
+            )),
+            PacketId::CoreDevicelistRemove => {
+                Ok(RdpdrPdu::ClientDeviceListRemove(ClientDeviceListRemove::decode(src)?))
+            }
             packet_id => Err(unsupported_value_err!(
                 "RdpdrPdu::decode_body",
                 "PacketId",
-                format!("{packet_id} ({:#06X})", u16::from(packet_id))
+                format!("{packet_id} ({:#06X})", u16::from(packet_id)), in: src)),
+        }
+    }
+
+    /// Decodes a `PacketId::CoreDeviceIoCompletion` body once the caller already knows which
+    /// [`MajorFunction`] (and, for `DirectoryControl`, [`MinorFunction`]) the completion answers.
+    ///
+    /// This PacketId is shared by every completion response type (`RdpdrPdu::decode_body`
+    /// cannot route it: see [`Self::header`], where all of them map to the same `PacketId`), so
+    /// the wire alone cannot disambiguate which one a given completion is. That disambiguation
+    /// requires knowing the `MajorFunction` of the request being completed, which only a
+    /// caller tracking its own outstanding requests (by `CompletionId`) has. `info_class` and
+    /// `volume_info_class` are needed for the same reason, and only for the three completions
+    /// (`QueryInformation`, `DirectoryControl` + `IRP_MN_QUERY_DIRECTORY`, `QueryVolumeInformation`)
+    /// whose body layout depends on which class the original request asked for.
+    pub fn decode_io_completion(
+        major_function: MajorFunction,
+        minor_function: MinorFunction,
+        info_class: Option<FileInformationClassLevel>,
+        volume_info_class: Option<FileSystemInformationClassLevel>,
+        device_io_response: DeviceIoResponse,
+        src: &mut ReadCursor<'_>,
+    ) -> DecodeResult<Self> {
+        match major_function {
+            MajorFunction::Create => Ok(RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse::decode(
+                device_io_response,
+                src,
+            )?)),
+            MajorFunction::Close => Ok(RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse::decode(
+                device_io_response,
+                src,
+            )?)),
+            MajorFunction::Read => Ok(RdpdrPdu::DeviceReadResponse(DeviceReadResponse::decode(
+                device_io_response,
+                src,
+            )?)),
+            MajorFunction::Write => Ok(RdpdrPdu::DeviceWriteResponse(DeviceWriteResponse::decode(
+                device_io_response,
+                src,
+            )?)),
+            MajorFunction::FlushBuffers => Ok(RdpdrPdu::DeviceFlushBuffersResponse(
+                DeviceFlushBuffersResponse::decode(device_io_response),
+            )),
+            MajorFunction::DeviceControl => Ok(RdpdrPdu::DeviceControlResponse(DeviceControlResponse::decode(
+                device_io_response,
+                src,
+            )?)),
+            MajorFunction::QueryInformation => {
+                let info_class = info_class.ok_or_else(|| {
+                    invalid_field_err!(
+                        "RdpdrPdu::decode_io_completion",
+                        "info_class",
+                        "required for QueryInformation"
+                    )
+                })?;
+                Ok(RdpdrPdu::ClientDriveQueryInformationResponse(
+                    ClientDriveQueryInformationResponse::decode_for_class(info_class, device_io_response, src)?,
+                ))
+            }
+            MajorFunction::SetInformation => Ok(RdpdrPdu::ClientDriveSetInformationResponse(
+                ClientDriveSetInformationResponse::decode(device_io_response, src)?,
+            )),
+            MajorFunction::QueryVolumeInformation => {
+                let volume_info_class = volume_info_class.ok_or_else(|| {
+                    invalid_field_err!(
+                        "RdpdrPdu::decode_io_completion",
+                        "volume_info_class",
+                        "required for QueryVolumeInformation"
+                    )
+                })?;
+                Ok(RdpdrPdu::ClientDriveQueryVolumeInformationResponse(
+                    ClientDriveQueryVolumeInformationResponse::decode_for_class(
+                        volume_info_class,
+                        device_io_response,
+                        src,
+                    )?,
+                ))
+            }
+            MajorFunction::DirectoryControl => match minor_function {
+                MinorFunction::IRP_MN_QUERY_DIRECTORY => {
+                    let info_class = info_class.ok_or_else(|| {
+                        invalid_field_err!(
+                            "RdpdrPdu::decode_io_completion",
+                            "info_class",
+                            "required for DirectoryControl/IRP_MN_QUERY_DIRECTORY"
+                        )
+                    })?;
+                    Ok(RdpdrPdu::ClientDriveQueryDirectoryResponse(
+                        ClientDriveQueryDirectoryResponse::decode_for_class(info_class, device_io_response, src)?,
+                    ))
+                }
+                MinorFunction::IRP_MN_NOTIFY_CHANGE_DIRECTORY => {
+                    Ok(RdpdrPdu::ClientDriveNotifyChangeDirectoryResponse(
+                        ClientDriveNotifyChangeDirectoryResponse::decode(device_io_response, src)?,
+                    ))
+                }
+                _ => Err(invalid_field_err!(
+                    "RdpdrPdu::decode_io_completion",
+                    "MinorFunction",
+                    "invalid value"
+                )),
+            },
+            MajorFunction::LockControl => Ok(RdpdrPdu::ClientDriveLockControlResponse(
+                ClientDriveLockControlResponse::decode(device_io_response, src)?,
+            )),
+            MajorFunction::QuerySecurity => Ok(RdpdrPdu::ClientDriveQuerySecurityResponse(
+                ClientDriveQuerySecurityResponse::decode(device_io_response, src)?,
+            )),
+            MajorFunction::SetSecurity => Ok(RdpdrPdu::ClientDriveSetSecurityResponse(
+                ClientDriveSetSecurityResponse::decode(device_io_response, src)?,
+            )),
+            // Matches ServerDriveIoRequest::decode's own treatment of this MajorFunction on the
+            // request side (crates/ironrdp-rdpdr/src/pdu/efs.rs): unsupported end to end, not
+            // specific to the completion side.
+            MajorFunction::SetVolumeInformation => Err(unsupported_value_err!(
+                "RdpdrPdu::decode_io_completion",
+                "MajorFunction",
+                "SetVolumeInformation".to_owned()
             )),
         }
     }
@@ -150,12 +287,17 @@ impl Encode for RdpdrPdu {
             RdpdrPdu::DeviceControlResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::DeviceCreateResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::ClientDriveQueryInformationResponse(pdu) => pdu.encode(dst),
+            RdpdrPdu::ClientDriveQuerySecurityResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::DeviceCloseResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::ClientDriveQueryDirectoryResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::ClientDriveQueryVolumeInformationResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::DeviceReadResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::DeviceWriteResponse(pdu) => pdu.encode(dst),
+            RdpdrPdu::DeviceFlushBuffersResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::ClientDriveSetInformationResponse(pdu) => pdu.encode(dst),
+            RdpdrPdu::ClientDriveSetSecurityResponse(pdu) => pdu.encode(dst),
+            RdpdrPdu::ClientDriveNotifyChangeDirectoryResponse(pdu) => pdu.encode(dst),
+            RdpdrPdu::ClientDriveLockControlResponse(pdu) => pdu.encode(dst),
             RdpdrPdu::UserLoggedon => Ok(()),
             RdpdrPdu::EmptyResponse => {
                 // https://github.com/FreeRDP/FreeRDP/blob/dfa231c0a55b005af775b833f92f6bcd30363d77/channels/drive/client/drive_main.c#L601
@@ -177,12 +319,17 @@ impl Encode for RdpdrPdu {
             RdpdrPdu::DeviceControlResponse(pdu) => pdu.name(),
             RdpdrPdu::DeviceCreateResponse(pdu) => pdu.name(),
             RdpdrPdu::ClientDriveQueryInformationResponse(pdu) => pdu.name(),
+            RdpdrPdu::ClientDriveQuerySecurityResponse(pdu) => pdu.name(),
             RdpdrPdu::DeviceCloseResponse(pdu) => pdu.name(),
             RdpdrPdu::ClientDriveQueryDirectoryResponse(pdu) => pdu.name(),
             RdpdrPdu::ClientDriveQueryVolumeInformationResponse(pdu) => pdu.name(),
             RdpdrPdu::DeviceReadResponse(pdu) => pdu.name(),
             RdpdrPdu::DeviceWriteResponse(pdu) => pdu.name(),
+            RdpdrPdu::DeviceFlushBuffersResponse(pdu) => pdu.name(),
             RdpdrPdu::ClientDriveSetInformationResponse(pdu) => pdu.name(),
+            RdpdrPdu::ClientDriveSetSecurityResponse(pdu) => pdu.name(),
+            RdpdrPdu::ClientDriveNotifyChangeDirectoryResponse(pdu) => pdu.name(),
+            RdpdrPdu::ClientDriveLockControlResponse(pdu) => pdu.name(),
             RdpdrPdu::UserLoggedon => "UserLoggedon",
             RdpdrPdu::EmptyResponse => "EmptyResponse",
         }
@@ -201,12 +348,17 @@ impl Encode for RdpdrPdu {
                 RdpdrPdu::DeviceControlResponse(pdu) => pdu.size(),
                 RdpdrPdu::DeviceCreateResponse(pdu) => pdu.size(),
                 RdpdrPdu::ClientDriveQueryInformationResponse(pdu) => pdu.size(),
+                RdpdrPdu::ClientDriveQuerySecurityResponse(pdu) => pdu.size(),
                 RdpdrPdu::DeviceCloseResponse(pdu) => pdu.size(),
                 RdpdrPdu::ClientDriveQueryDirectoryResponse(pdu) => pdu.size(),
                 RdpdrPdu::ClientDriveQueryVolumeInformationResponse(pdu) => pdu.size(),
                 RdpdrPdu::DeviceReadResponse(pdu) => pdu.size(),
                 RdpdrPdu::DeviceWriteResponse(pdu) => pdu.size(),
+                RdpdrPdu::DeviceFlushBuffersResponse(pdu) => pdu.size(),
                 RdpdrPdu::ClientDriveSetInformationResponse(pdu) => pdu.size(),
+                RdpdrPdu::ClientDriveSetSecurityResponse(pdu) => pdu.size(),
+                RdpdrPdu::ClientDriveNotifyChangeDirectoryResponse(pdu) => pdu.size(),
+                RdpdrPdu::ClientDriveLockControlResponse(pdu) => pdu.size(),
                 RdpdrPdu::UserLoggedon => 0,
                 RdpdrPdu::EmptyResponse => size_of::<u32>(),
             }
@@ -214,129 +366,6 @@ impl Encode for RdpdrPdu {
 }
 
 impl SvcEncode for RdpdrPdu {}
-
-/// (vendored) Server-direction encoding for drive I/O requests
-/// (PAKID_CORE_DEVICE_IOREQUEST). Upstream `ServerDriveIoRequest` is decode-only
-/// (the client parses these); this lets the *server* emit them. Only the
-/// request kinds the macrdp server issues are encodable; the rest error.
-impl Encode for ServerDriveIoRequest {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        SharedHeader {
-            component: Component::RdpdrCtypCore,
-            packet_id: PacketId::CoreDeviceIoRequest,
-        }
-        .encode(dst)?;
-        match self {
-            ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.encode(dst),
-            ServerDriveIoRequest::DeviceReadRequest(req) => req.encode(dst),
-            ServerDriveIoRequest::DeviceWriteRequest(req) => req.encode(dst),
-            ServerDriveIoRequest::DeviceCloseRequest(req) => req.encode(dst),
-            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(req) => req.encode(dst),
-            ServerDriveIoRequest::ServerDriveSetInformationRequest(req) => req.encode(dst),
-            other => Err(unsupported_value_err!(
-                "ServerDriveIoRequest::encode",
-                "ServerDriveIoRequest",
-                format!("{other:?}")
-            )),
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        "DR_DRIVE_CORE_DEVICE_IOREQUEST"
-    }
-
-    fn size(&self) -> usize {
-        SharedHeader::SIZE
-            + match self {
-                ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.size(),
-                ServerDriveIoRequest::DeviceReadRequest(req) => req.size(),
-                ServerDriveIoRequest::DeviceWriteRequest(req) => req.size(),
-                ServerDriveIoRequest::DeviceCloseRequest(req) => req.size(),
-                ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(req) => req.size(),
-                ServerDriveIoRequest::ServerDriveSetInformationRequest(req) => req.size(),
-                _ => 0,
-            }
-    }
-}
-
-impl SvcEncode for ServerDriveIoRequest {}
-
-/// (vendored, server-direction) A Device Control Request (DR_CONTROL_REQ,
-/// `IRP_MJ_DEVICE_CONTROL`) carrying an MS-RDPESC [`ScardCall`] as its RPCE input
-/// buffer. Upstream's `DeviceControlRequest` is decode-only (the client parses
-/// these); this lets the macrdp **server** emit a smart-card IOCTL. Emitted as an
-/// [`SvcEncode`] message — it prepends the `PAKID_CORE_DEVICE_IOREQUEST`
-/// [`SharedHeader`], then the `DeviceIoRequest`, the
-/// Output/Input buffer lengths + `IoControlCode` + 20 reserved bytes, then the
-/// marshaled call. The smart-card device has no file handle, so `FileId` is 0.
-#[derive(Debug)]
-pub struct ScardControlRequest {
-    pub device_id: u32,
-    pub completion_id: u32,
-    pub io_control_code: ScardIoCtlCode,
-    pub call: ScardCall,
-    /// `OutputBufferLength` — the maximum response size the client should allocate.
-    pub output_buffer_length: u32,
-}
-
-impl ScardControlRequest {
-    /// OutputBufferLength + InputBufferLength + IoControlCode + 20 reserved bytes.
-    const CONTROL_FIXED_PART_SIZE: usize = size_of::<u32>() * 3 + 20;
-
-    pub fn new(
-        device_id: u32,
-        completion_id: u32,
-        io_control_code: ScardIoCtlCode,
-        call: ScardCall,
-        output_buffer_length: u32,
-    ) -> Self {
-        Self {
-            device_id,
-            completion_id,
-            io_control_code,
-            call,
-            output_buffer_length,
-        }
-    }
-
-    fn device_io_request(&self) -> DeviceIoRequest {
-        DeviceIoRequest {
-            device_id: self.device_id,
-            file_id: 0,
-            completion_id: self.completion_id,
-            major_function: MajorFunction::DeviceControl,
-            minor_function: MinorFunction::from(0),
-        }
-    }
-}
-
-impl Encode for ScardControlRequest {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(ctx: "DR_CONTROL_REQ(Scard)", in: dst, size: self.size());
-        SharedHeader {
-            component: Component::RdpdrCtypCore,
-            packet_id: PacketId::CoreDeviceIoRequest,
-        }
-        .encode(dst)?;
-        self.device_io_request().encode(dst)?;
-        let input_buffer_length: u32 = cast_length!("ScardControlRequest", "input_buffer_length", self.call.size())?;
-        dst.write_u32(self.output_buffer_length);
-        dst.write_u32(input_buffer_length);
-        dst.write_u32(self.io_control_code.into());
-        write_padding!(dst, 20);
-        self.call.encode(dst)
-    }
-
-    fn name(&self) -> &'static str {
-        "DR_CONTROL_REQ(Scard)"
-    }
-
-    fn size(&self) -> usize {
-        SharedHeader::SIZE + self.device_io_request().size() + Self::CONTROL_FIXED_PART_SIZE + self.call.size()
-    }
-}
-
-impl SvcEncode for ScardControlRequest {}
 
 impl fmt::Debug for RdpdrPdu {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -371,6 +400,9 @@ impl fmt::Debug for RdpdrPdu {
             Self::ClientDriveQueryInformationResponse(it) => {
                 write!(f, "RdpdrPdu({it:?})")
             }
+            Self::ClientDriveQuerySecurityResponse(it) => {
+                write!(f, "RdpdrPdu({it:?})")
+            }
             Self::DeviceCloseResponse(it) => {
                 write!(f, "RdpdrPdu({it:?})")
             }
@@ -386,7 +418,19 @@ impl fmt::Debug for RdpdrPdu {
             Self::DeviceWriteResponse(it) => {
                 write!(f, "RdpdrPdu({it:?})")
             }
+            Self::DeviceFlushBuffersResponse(it) => {
+                write!(f, "RdpdrPdu({it:?})")
+            }
             Self::ClientDriveSetInformationResponse(it) => {
+                write!(f, "RdpdrPdu({it:?})")
+            }
+            Self::ClientDriveSetSecurityResponse(it) => {
+                write!(f, "RdpdrPdu({it:?})")
+            }
+            Self::ClientDriveNotifyChangeDirectoryResponse(it) => {
+                write!(f, "RdpdrPdu({it:?})")
+            }
+            Self::ClientDriveLockControlResponse(it) => {
                 write!(f, "RdpdrPdu({it:?})")
             }
             Self::UserLoggedon => {
@@ -414,6 +458,12 @@ impl From<DeviceCreateResponse> for RdpdrPdu {
 impl From<ClientDriveQueryInformationResponse> for RdpdrPdu {
     fn from(value: ClientDriveQueryInformationResponse) -> Self {
         Self::ClientDriveQueryInformationResponse(value)
+    }
+}
+
+impl From<ClientDriveQuerySecurityResponse> for RdpdrPdu {
+    fn from(value: ClientDriveQuerySecurityResponse) -> Self {
+        Self::ClientDriveQuerySecurityResponse(value)
     }
 }
 
@@ -447,9 +497,33 @@ impl From<DeviceWriteResponse> for RdpdrPdu {
     }
 }
 
+impl From<DeviceFlushBuffersResponse> for RdpdrPdu {
+    fn from(value: DeviceFlushBuffersResponse) -> Self {
+        Self::DeviceFlushBuffersResponse(value)
+    }
+}
+
 impl From<ClientDriveSetInformationResponse> for RdpdrPdu {
     fn from(value: ClientDriveSetInformationResponse) -> Self {
         Self::ClientDriveSetInformationResponse(value)
+    }
+}
+
+impl From<ClientDriveSetSecurityResponse> for RdpdrPdu {
+    fn from(value: ClientDriveSetSecurityResponse) -> Self {
+        Self::ClientDriveSetSecurityResponse(value)
+    }
+}
+
+impl From<ClientDriveNotifyChangeDirectoryResponse> for RdpdrPdu {
+    fn from(value: ClientDriveNotifyChangeDirectoryResponse) -> Self {
+        Self::ClientDriveNotifyChangeDirectoryResponse(value)
+    }
+}
+
+impl From<ClientDriveLockControlResponse> for RdpdrPdu {
+    fn from(value: ClientDriveLockControlResponse) -> Self {
+        Self::ClientDriveLockControlResponse(value)
     }
 }
 
@@ -593,52 +667,5 @@ impl From<PacketId> for u16 {
     )]
     fn from(packet_id: PacketId) -> Self {
         packet_id as u16
-    }
-}
-
-#[cfg(test)]
-mod scard_control_request_tests {
-    //! Encode a server-direction DR_CONTROL_REQ and parse it back through the
-    //! same chain the client/server decode path uses, proving the IOCTL envelope
-    //! + RPCE body marshal correctly end-to-end.
-    use ironrdp_core::{ReadCursor, encode_vec};
-
-    use super::efs::DeviceControlRequest;
-    use super::esc::{ConnectCall, ConnectCommon, EstablishContextCall, ScardContext, Scope};
-    use super::*;
-
-    fn roundtrip(io_control_code: ScardIoCtlCode, call: ScardCall) -> ScardCall {
-        let req = ScardControlRequest::new(0x07, 0x42, io_control_code, call, 2048);
-        let bytes = encode_vec(&req).unwrap();
-        let mut src = ReadCursor::new(&bytes);
-
-        let header = SharedHeader::decode(&mut src).unwrap();
-        assert_eq!(header.packet_id, PacketId::CoreDeviceIoRequest);
-        let dev_io = DeviceIoRequest::decode(&mut src).unwrap();
-        assert_eq!(dev_io.major_function, MajorFunction::DeviceControl);
-        assert_eq!(dev_io.device_id, 0x07);
-        assert_eq!(dev_io.completion_id, 0x42);
-        let ctrl = DeviceControlRequest::<ScardIoCtlCode>::decode(dev_io, &mut src).unwrap();
-        assert_eq!(ctrl.io_control_code, io_control_code);
-        ScardCall::decode(ctrl.io_control_code, &mut src).unwrap()
-    }
-
-    #[test]
-    fn establish_context_control_request_roundtrip() {
-        let call = ScardCall::EstablishContextCall(EstablishContextCall { scope: Scope::System });
-        assert_eq!(roundtrip(ScardIoCtlCode::EstablishContext, call.clone()), call);
-    }
-
-    #[test]
-    fn connect_control_request_roundtrip() {
-        let call = ScardCall::ConnectCall(ConnectCall {
-            reader: "macrdp".to_string(),
-            common: ConnectCommon {
-                context: ScardContext::new(0x0102_0304),
-                share_mode: 2,
-                preferred_protocols: super::esc::CardProtocol::SCARD_PROTOCOL_T1,
-            },
-        });
-        assert_eq!(roundtrip(ScardIoCtlCode::ConnectW, call.clone()), call);
     }
 }

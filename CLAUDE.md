@@ -26,7 +26,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
 (VPN/ZeroTier). **Latest release: v0.9.11** (input fixes from @antonmos: held modifiers on
 mouse events, Ctrl+click→Cmd+click and Ctrl+,→Cmd+, under `--map-ctrl-to-cmd`, per-connection
-input reset — #183/#184, vendored divergence (24)). Next: the IronRDP pin bump on its own branch.
+input reset — #183/#184, vendored divergence (24)). Next: v0.10.0 = the IronRDP pin bump to e258f6a0 (branch
+`chore/pin-bump-e258f6a0`, draft PR #194: code done and CI green; live tests, then a soak).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

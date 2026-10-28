@@ -1143,7 +1143,7 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   Env-gated (`MACRDP_UDP_OFFER_FECL=1`) + default-off; the reliable path is
   byte-unchanged.
 
-- **P2.2 — lossy RDPEUDP state machine.** Extend `vendor/ironrdp-rdpeudp` with a lossy
+- **P2.2 — lossy RDPEUDP state machine.** Extend `vendor/macrdp-rdpeudp` with a lossy
   mode alongside the existing reliable one: source packets sent **without retransmit**,
   loss-tolerant delivery (deliver-on-arrival, no in-order HOL block — *this is the whole
   point*), and the lossy ACK semantics. Most PDU codecs already exist from Phase 1; this

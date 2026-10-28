@@ -3,16 +3,16 @@ name = "ironrdp-acceptor"
 version = "0.10.0"
 readme = "README.md"
 description = "State machines to drive an RDP connection acceptance sequence"
-# Vendored copy of upstream master ironrdp-acceptor (copied 2026-06-12 from
-# Devolutions/IronRDP@879ffed). Workspace-inherited fields are inlined below
-# because we're not inside the IronRDP cargo workspace. See CLAUDE.md in this
-# directory for the divergence log.
+# Vendored copy of upstream ironrdp-acceptor at Devolutions/IronRDP@e258f6a0 (same
+# rev as the git pins in the root Cargo.toml). Workspace-inherited fields are
+# inlined below because we're not inside the IronRDP cargo workspace. See
+# CLAUDE.md in this directory for the divergence log.
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Devolutions/IronRDP"
 repository = "https://github.com/Devolutions/IronRDP"
-authors = ["Devolutions Inc. <infos@devolutions.net>"]
+authors = ["Devolutions Inc. <infos@devolutions.net>", "Teleport <goteleport.com>"]
 keywords = ["rdp", "remote-desktop", "network", "client", "protocol"]
 categories = ["network-programming"]
 
@@ -29,14 +29,15 @@ ironrdp-pdu = "0.9" # public
 ironrdp-svc = "0.8" # public
 ironrdp-connector = "0.10" # public
 ironrdp-async = "0.10" # public
+rand = "0.9"
 tracing = { version = "0.1", features = ["log"] }
 
 # Honored ONLY when this crate is built standalone (isolated validation); ignored
 # when it's a path dependency of macrdp (the root Cargo.toml's [patch] wins). Keep
 # the rev in sync with the root Cargo.toml when bumping the IronRDP pin.
 [patch.crates-io]
-ironrdp-core      = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-pdu       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-svc       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-async     = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-core      = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-pdu       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-svc       = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-async     = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }

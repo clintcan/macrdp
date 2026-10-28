@@ -182,20 +182,35 @@ mod tests {
         assert_eq!(req.security_cookie, cookie);
     }
 
-    // M5b-2: the server-side MS-RDPEDYC Soft-Sync codec lives in the vendored
-    // (test = false) ironrdp-dvc crate, so its byte-exact round-trips are asserted
-    // here through the public DrdynvcServerPdu / DrdynvcClientPdu Encode/Decode
-    // traits — exactly the path the server uses to emit the Soft-Sync Request and
-    // decode the client's Soft-Sync Response. (Soft-Sync rides drdynvc on the MAIN
-    // TCP connection; only channel DATA after the switch rides the UDP tunnel.)
+    // The Soft-Sync wire format, pinned. These expected bytes are the ones real
+    // mstsc accepted live with macrdp's own codec (M5b/M5c/P2.4b); since the
+    // e258f6a0 pin bump the codec is upstream's (#1584), so these prove the bytes
+    // didn't change. `soft_sync_request` builds the PDU exactly as the vendored
+    // ironrdp-dvc's `DrdynvcServer::request_soft_sync` does: no channels means no
+    // list. (Soft-Sync rides drdynvc on the main TCP connection; only channel DATA
+    // after the switch rides the UDP tunnel.)
+    fn soft_sync_request(
+        tunnel: ironrdp_dvc::pdu::SoftSyncTunnelType,
+        channel_ids: Vec<u32>,
+    ) -> Vec<u8> {
+        use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncChannelList, SoftSyncRequestPdu};
+        let lists = if channel_ids.is_empty() {
+            Vec::new()
+        } else {
+            vec![SoftSyncChannelList::new(tunnel, channel_ids)]
+        };
+        ironrdp_core::encode_vec(&DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(
+            lists,
+        )))
+        .unwrap()
+    }
+
     #[test]
     fn soft_sync_request_encodes_to_exact_wire_bytes() {
-        use ironrdp_core::encode_vec;
-        use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncRequestPdu};
-
-        let pdu =
-            DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::switch_to_udpfecr(vec![0x0007]));
-        let bytes = encode_vec(&pdu).unwrap();
+        let bytes = soft_sync_request(
+            ironrdp_dvc::pdu::SoftSyncTunnelType::RELIABLE_UDP,
+            vec![0x0007],
+        );
 
         #[rustfmt::skip]
         let expected: [u8; 20] = [
@@ -215,12 +230,10 @@ mod tests {
     // shape as the reliable request, only TunnelType differs (FECL=0x03 vs FECR=0x01).
     #[test]
     fn soft_sync_request_udpfecl_encodes_to_exact_wire_bytes() {
-        use ironrdp_core::encode_vec;
-        use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncRequestPdu};
-
-        let pdu =
-            DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::switch_to_udpfecl(vec![0x0009]));
-        let bytes = encode_vec(&pdu).unwrap();
+        let bytes = soft_sync_request(
+            ironrdp_dvc::pdu::SoftSyncTunnelType::LOSSY_UDP,
+            vec![0x0009],
+        );
 
         #[rustfmt::skip]
         let expected: [u8; 20] = [
@@ -240,11 +253,7 @@ mod tests {
     // no list is emitted, NumberOfTunnels = 0, CHANNEL_LIST_PRESENT unset.
     #[test]
     fn soft_sync_request_empty_list_encodes_flush_only() {
-        use ironrdp_core::encode_vec;
-        use ironrdp_dvc::pdu::{DrdynvcServerPdu, SoftSyncRequestPdu};
-
-        let pdu = DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::switch_to_udpfecr(vec![]));
-        let bytes = encode_vec(&pdu).unwrap();
+        let bytes = soft_sync_request(ironrdp_dvc::pdu::SoftSyncTunnelType::RELIABLE_UDP, vec![]);
 
         #[rustfmt::skip]
         let expected: [u8; 10] = [
@@ -260,7 +269,7 @@ mod tests {
     #[test]
     fn soft_sync_response_decodes_from_wire_and_round_trips() {
         use ironrdp_core::{decode, encode_vec};
-        use ironrdp_dvc::pdu::{DrdynvcClientPdu, TUNNELTYPE_UDPFECR};
+        use ironrdp_dvc::pdu::{DrdynvcClientPdu, SoftSyncTunnelType};
 
         #[rustfmt::skip]
         let wire: [u8; 10] = [
@@ -275,7 +284,7 @@ mod tests {
             DrdynvcClientPdu::SoftSyncResponse(r) => r,
             other => panic!("expected SoftSyncResponse, got {other:?}"),
         };
-        assert_eq!(resp.tunnels, vec![TUNNELTYPE_UDPFECR]);
+        assert_eq!(resp.tunnels_to_switch(), [SoftSyncTunnelType::RELIABLE_UDP]);
 
         // Re-encoding the decoded PDU reproduces the exact input bytes.
         let reencoded = encode_vec(&DrdynvcClientPdu::SoftSyncResponse(resp)).unwrap();
@@ -293,9 +302,9 @@ mod tests {
     // rather than byte-compare the whole packet.
     #[tokio::test]
     async fn listener_answers_real_client_syn_over_loopback() {
-        use ironrdp_rdpeudp::datagram::Datagram;
-        use ironrdp_rdpeudp::pdu::{FecFlags, UdpVersion};
         use ironrdp_server::{ListenerConfig, UdpMultitransportListener};
+        use macrdp_rdpeudp::datagram::Datagram;
+        use macrdp_rdpeudp::pdu::{FecFlags, UdpVersion};
         use std::time::Duration;
         use tokio::net::UdpSocket;
 
