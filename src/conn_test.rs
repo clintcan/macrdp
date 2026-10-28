@@ -33,7 +33,7 @@ use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCo
 use ironrdp_server::{
     ConnectionHandler, ConnectionPolicy, DesktopSize as ServerDesktopSize, DisplayUpdate,
     KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
-    RdpServerInputHandler,
+    RdpServerInputHandler, ServerAutoReconnect,
 };
 use ironrdp_tokio::TokioFramed;
 use tokio_rustls::{rustls, TlsConnector};
@@ -364,11 +364,28 @@ async fn connect_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    connect_client_with_cookie(client_io, client_w, client_h, None).await
+}
+
+/// [`connect_client`], presenting `cookie` in the Client Info PDU the way a client
+/// auto-reconnecting after a dropped connection does.
+async fn connect_client_with_cookie<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+    cookie: Option<ServerAutoReconnect>,
+) -> anyhow::Result<((u16, u16), TokioFramed<tokio_rustls::client::TlsStream<S>>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
     let mut connector = ClientConnector::new(
         client_config(client_w, client_h),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
     );
+    if let Some(cookie) = cookie {
+        connector = connector.with_auto_reconnect_cookie(cookie);
+    }
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
     let initial = framed.into_inner_no_leftover();
@@ -554,6 +571,47 @@ async fn no_shared_codec_falls_back_and_connects() -> anyhow::Result<()> {
         "no-shared-codec connect should still complete (raw fallback)"
     );
     Ok(())
+}
+
+/// A client returning with an auto-reconnect cookie the server can't verify (one
+/// issued before a server restart) still gets in, through a normal logon. That is
+/// MS-RDPBCGR 3.3.5.3.11 and vendored divergence (30). Upstream denied it, and
+/// FreeRDP then retried the same cookie about three times a second, which tripped
+/// the auth lockout for its address (found live, 2026-10-28).
+#[tokio::test]
+async fn a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon() -> anyhow::Result<()> {
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // A live session (see `KeepAliveSound`), so a served connection stays up and the
+    // only way `run_connection` ends early is the cookie check denying it. The client
+    // can't tell on its own: it counts as connected before the server checks the cookie.
+    let mut server =
+        build_test_server_full(3389, 1280, 800, false, None, crate::bitmap_codecs(), true);
+    server.set_auto_reconnect_cookie(Some(ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x11; 16],
+    }));
+    let stale = ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x22; 16],
+    };
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move { server.run_connection(server_io).await });
+            let (size, _framed) = connect_client_with_cookie(client_io, 1280, 800, Some(stale)).await?;
+            assert_eq!(size, (1280, 800));
+
+            // Still serving a second later; a denied connection ends at once with an error.
+            match tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await {
+                Err(_elapsed) => Ok(()),
+                Ok(ended) => Err(anyhow::anyhow!(
+                    "the server ended the connection instead of falling back to a normal logon: {ended:?}"
+                )),
+            }
+        })
+        .await
 }
 
 /// Layer-4 reconnect lifecycle soak: one long-lived server serves many

@@ -59,6 +59,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (26) | Client input read off the `Self` lock: fast-path input straight to the handler, X224 through a bounded queue; queued X224 replayed across a reactivation | `client_loop`'s `read_pdus` arm; `MacrdpServerState::read_ahead`, drained into the backlog in `client_accepted` | — |
 | (28) | `zstd-safe` 8.2 instead of upstream's 7.2 (RustSec advisories in 7.x; QOIZ only compresses, so unreachable) | `Cargo.toml` only | — |
 | (29) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
+| (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -72,6 +73,17 @@ Notes on the port:
   iOS no-cursor report, clintcan/macrdp#211). Upstream's unit tests live in
   `pointer_mask.rs` but this lib is `test = false`, so they were run once in a scratch
   crate (2026-10-26). **Drop it at the next pin bump** (any rev at or after `fb25b47c`).
+- **(30)** Added 2026-10-28 after a live FreeRDP test: restarting macrdp with a client
+  connected made it auto-reconnect with the old process's cookie, which never verifies.
+  Upstream denied it, FreeRDP retried with the same cookie about three times a second,
+  and every try ended in under a second, so `auth_guard` counted each as a failed login
+  and locked out the client's address (30 s, then 59 s). Each try also evicted the live
+  session first, because preemption runs before this check. MS-RDPBCGR 3.3.5.3.11: "If
+  logon with the cookie fails, the credentials supplied in the Client Info PDU SHOULD
+  be used". The fallback grants nothing: CredSSP or the acceptor's credential check has
+  already authenticated the client, and the credential validator still runs. Test:
+  `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`. Upstream
+  candidate.
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
@@ -125,7 +137,8 @@ Notes on the port:
 - **(13) auto-reconnect cookie** → builder `with_auto_reconnect_cookie`. **Behaviour
   change:** upstream verifies a returning cookie (HMAC), rotates it on every
   reactivation and hourly, and invalidates it on eviction. A client reconnecting after
-  a macrdp *process* restart is now denied: live-test before release.
+  a macrdp *process* restart was denied, which looped the client into an auth lockout;
+  divergence (30) turns that denial into a normal logon.
   The cookie is also re-sent and rotated on every Deactivation–Reactivation pass (each
   live resize and each blank-recovery heal). That is safe because the acceptor `take()`s
   the received cookie, so a reactivation never re-verifies, but it's more wire traffic
