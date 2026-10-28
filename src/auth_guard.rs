@@ -792,6 +792,7 @@ mod tests {
 
     #[test]
     fn handler_counts_a_fast_failure_after_auth_as_server_error() {
+        let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
         use ironrdp_server::{ConnectionHandler, ServerError, ServerErrorExt};
         let mut handler = AuthGuardHandler {
             core: AuthGuardCore::with_config(test_cfg()),
@@ -1103,6 +1104,13 @@ mod tests {
         assert!(!cleaned.chars().any(|c| c.is_control()));
     }
 
+    /// Held by the tests that capture audit events with a scoped subscriber and
+    /// by the tests that emit them without one. tracing caches each callsite's
+    /// enabled state process-wide, and an emitter registering a callsite on
+    /// another thread while a capture is running can leave it cached as disabled
+    /// for the capture (about 1 run in 40 lost the `success` event).
+    static AUDIT_EVENTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A cloneable `MakeWriter` that captures emitted log lines into a shared
     /// buffer, so we can assert the auth audit event's fields.
     #[derive(Clone, Default)]
@@ -1129,6 +1137,7 @@ mod tests {
     fn on_authenticated_emits_auth_audit_event() {
         use ironrdp_server::ConnectionHandler;
 
+        let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
         let buf = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -1163,6 +1172,7 @@ mod tests {
     fn on_client_fingerprint_emits_fingerprint_event() {
         use ironrdp_server::ConnectionHandler;
 
+        let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
         let buf = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
