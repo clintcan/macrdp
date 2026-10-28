@@ -4573,15 +4573,23 @@ impl RdpServer {
             });
         }
 
+        // (macrdp divergence 30) A cookie that fails verification falls back to a normal logon instead
+        // of denying the connection, as MS-RDPBCGR 3.3.5.3.11 asks: "If logon with the cookie fails, the
+        // credentials supplied in the Client Info PDU SHOULD be used". A cookie issued before a server
+        // restart never verifies, and FreeRDP keeps presenting it on every retry, so denying it looped
+        // the client and, in macrdp, tripped the auth lockout for its address. The fallback grants
+        // nothing extra: CredSSP or the acceptor's credential check has already authenticated the
+        // client, and with `is_auto_reconnect` false the credential validator below still runs.
         let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
-            if !self.verify_auto_reconnect_cookie(reconnect) {
-                warn!("Auto-reconnect cookie validation rejected");
-                send_access_denied(result.io_channel_id, result.user_channel_id, writer).await?;
-                return Err(ServerError::reason("auto-reconnect validation", "cookie rejected"));
+            if self.verify_auto_reconnect_cookie(reconnect) {
+                debug!("Auto-reconnect cookie validation accepted");
+                true
+            } else {
+                info!(
+                    "Auto-reconnect cookie not recognized (issued before a restart, or rotated out); continuing with a normal logon"
+                );
+                false
             }
-
-            debug!("Auto-reconnect cookie validation accepted");
-            true
         } else {
             false
         };
