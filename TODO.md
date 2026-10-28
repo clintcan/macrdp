@@ -15,6 +15,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
     presentation lag. Its new CI step is fine; the missing `--locked` is a follow-up (see the pin-bump
     item). Its divergence (29) collides with the AND-mask backport on the bump branch, and (30) is now
     the cookie fallback → renumber the AND mask to (31) and hand-port the encoder change at the next rebase.
+  - **#218** (@SferaDev, stats `frames_sent` + `connected:false` on disconnect) — approved 10-29. **When rebasing
+    #194 over it:** its `SessionHooks` wrapper (`src/connection_hooks.rs`) forwards only the four hooks `main`
+    has. The bump's trait adds `on_connection_info`, which has a do-nothing default, so the wrapper would
+    silently swallow it and break keyboard-layout auto-detect (`conn_hooks.rs::KeyboardLayoutHook`) with no
+    build error. Forward it, add a test, and fold the wrapper into `conn_hooks.rs`.
   - **#230** (@rophy, fixes #229: Win10 mstsc starts frozen, then the blank detector drops it) — not reviewed.
   - **#197 / #198** (@antonmos) — changes requested (AX hit-test timeout; slow-reply misattribution).
   - **Not reviewed:** @antonmos #200 #201 #204; @SferaDev #206 #217–#221 #223 #231–#234 (#233 touches
@@ -870,10 +875,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `open -a Terminal x.command`, since SSH can't touch the NFS mount); clipboard both ways
     (sdl-freerdp only announces a local copy on focus-in — client behaviour); Preempt takeover with
     ERRINFO; `/gfx:progressive` declined to legacy, stayed up.
-  - [x] **FIXED 2026-10-28 (vendored server divergence (30), uncommitted): falls back to a normal logon
+  - [x] **FIXED 2026-10-28 (vendored server divergence (30), d1412f7): falls back to a normal logon
     instead; test `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`, mutation-checked;
     live-verified on the mini (restart under FreeRDP → one reconnect, normal logon, H.264, no lockout;
-    rollback `~/macrdp.app.bump-cbd4aff.bak`). Still to do: check mstsc, and raise it upstream.**
+    rollback `~/macrdp.app.bump-cbd4aff.bak`). Raised upstream 2026-10-29 as Devolutions/IronRDP#2280 (fix + test on local IronRDP branch `scratch/arc-fallback`, PR on request); drop (30) once the pin carries a fix. Still to do: check mstsc.**
     Original report — **REGRESSION: a stale auto-reconnect cookie after a server restart denies the
     connection, evicts the live session and locks out the client's IP.** Repro: FreeRDP with
     `+auto-reconnect` connected, `launchctl kickstart -k` the agent. The client auto-reconnects
