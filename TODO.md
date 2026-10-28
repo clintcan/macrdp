@@ -7,46 +7,22 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Open PRs from @antonmos — review state (as of 2026-09-17).**
-  - **Vendored divergence numbering (revised 2026-09-17):** #182 is held for the pin bump and will never
-    land its divergence, so only two claimants remain: **#183 keeps (24)** and the **mic divergence takes
-    (25)**. If that changes, take the next free number on `main` at merge time.
-  - **#183** `fix(input): held modifiers on mouse events + Ctrl+click→Cmd+click` — round 3 (`01e86a8`,
-    verified against head `334cc3c75`, CI green) addressed all three follow-ups: the reset is now raised
-    once per SERVED connection via a new vendored handle (**divergence (24)**,
-    `RdpServer::set_input_reset_handle`, raised at the top of `run_connection`/`serve_negotiated`, not
-    `on_accept`); the latch and `remapped_keys` clear unconditionally on reconnect; held buttons are
-    released on reconnect, and the idle gap clears modifiers only. Remaining asks: (1) the synthetic
-    button-up is posted at the **pre-disconnect** cursor position on the new connection's first input
-    (a keystroke counts), so an interrupted Finder drag completes as a drop there — possibly into a folder
-    or onto the Trash. His reason for posting it is sound (otherwise macOS stays mid-drag and the next click
-    sends a second press with no release) — document the trade-off and live-test a real file drag;
-    (2) `01e86a8` adds no tests for the connection-edge path (suite still 208).
-  - **#182** `fix(ironrdp-server): bound accept_finalize` — mechanism sound (the bound is on the inner
-    call; verified). Asked (https://github.com/clintcan/macrdp/pull/182#issuecomment-5646629705) for a
-    **per-step (no-progress) deadline** instead of a 30 s total budget — cheap, since
-    `ironrdp_async::single_sequence_step` and `Acceptor::get_result` are already public — with a
-    ship-now fallback (raise the default + `MACRDP_FINALIZE_TIMEOUT_SECS`).
-    **DISPOSITION 2026-09-17 — HOLD for the pin bump; don't reshape it, don't land the vendored form**
-    (https://github.com/clintcan/macrdp/pull/182#issuecomment-5722493925). The identical 30 s bound is
-    already upstream in **Devolutions/IronRDP#1890** (merged 2026-09-04, by @antonmos, same const, same
-    inner `accept_finalize` call), so the bump HARVESTS it and the divergence never has to exist. Exposure
-    until then is mild: macrdp preempts unconditionally and eviction isn't gated on the incumbent having
-    activated, so a finalize-wedged client is displaced by the next authenticated connection — a parked
-    slot, not a lockout. His log data also settled the "is 30 s too tight?" worry (the 12.55 s-CredSSP
-    cellular link's finalize was 0.53 s; finalize doesn't inherit CredSSP's round-trip cost). **Left OPEN
-    on purpose** — the PR holds the regression test and the wedge diagnosis, and doubles as the bump
-    reminder. **At the bump:** confirm upstream's bound arrives via the pin, and pick his
-    `a_client_that_wedges_during_finalize_is_dropped` test back up.
-  - **#184** (Ctrl+, → Cmd+,) is **stacked on #183** — it contains #183's commits plus its own `2f61a34`.
-    Review after #183 merges. **#181** (`--lock-on-disconnect` + auto-unlock) — reviewed
-    2026-09-23; the `--shield-primary` lid-closed fix split out to its own PR (#187). Two
-    blocking asks addressed: the shared per-lock submission budget now caps actual Return
-    presses (not calls to `attempt_auto_unlock`) at 2, and `--auto-unlock` is now an opt-in
-    flag (was always-on with an env-only escape hatch). Non-blocking follow-ups also taken:
-    a Caps Lock guard (skips rather than guesses), a startup warning when
-    `sysadminctl -screenLock status` isn't Immediately, EXPERIMENTAL markers in the docs, and
-    a rebase onto v0.9.7.
+- [ ] **Open PRs — review state (as of 2026-10-27).** Merged since the last refresh: #181 #183 #184
+  #187 #188 #191 #192 #202 #203 #208–#210 #212 #213 #215 #216 #222 #224 #227.
+  - **#228** (@rophy, fixes #226: Win10 mstsc black screen) — reviewed as a COMMENT, static review clean.
+    **Before approving:** live-test Win11 mstsc + the macOS Windows App on the mini, since its SPS rewrite
+    (`src/h264_sps.rs`) reaches every H.264 client; also check whether it ends Win11 mstsc's 2-frame
+    presentation lag. Its new CI step is fine; the missing `--locked` is a follow-up (see the pin-bump
+    item). Its divergence (29) collides with the AND-mask backport on the bump branch, and (30) is now
+    the cookie fallback → renumber the AND mask to (31) and hand-port the encoder change at the next rebase.
+  - **#230** (@rophy, fixes #229: Win10 mstsc starts frozen, then the blank detector drops it) — not reviewed.
+  - **#197 / #198** (@antonmos) — changes requested (AX hit-test timeout; slow-reply misattribution).
+  - **Not reviewed:** @antonmos #200 #201 #204; @SferaDev #206 #217–#221 #223 #231–#234 (#233 touches
+    `auth_guard.rs`, #231 touches `private_api.rs` — review those with extra care).
+  - **#182** (@antonmos, bound `accept_finalize`) — **HELD for the pin bump, left open on purpose.** The
+    identical 30 s bound is upstream (Devolutions/IronRDP#1890), so the bump harvests it. At the bump:
+    confirm it arrives via the pin, pick up his `a_client_that_wedges_during_finalize_is_dropped` test,
+    then close.
   - Related: issue **#186** — `run_connection`'s `accept_begin`/TLS/CredSSP are unbounded pre-auth
     awaits, the serving-path half that #182 doesn't cover.
 
@@ -887,6 +863,40 @@ then delete; promote a parked item to *In flight* when work actually starts.
     codec choice, so that's inference + the `conn_test` canary). **Still to do:** mstsc UDP/RDPDR/smart
     card, USB, iOS. Mini helpers: `~/swap.sh bump|v096`, backups
     `~/macrdp.app.v0.9.6.prebump.bak` + `config.env.prebump.bak` + plist `.prebump.bak`.
+  - **▶ LIVE 2026-10-28, FreeRDP 3.26 from the MacBook over ZeroTier, build cbd4aff.** **PASS:** H.264
+    (picture live, checked by screenshot); AAC audio (client opened an AAC device, ~1,800 waves, 0
+    decode errors); minimize → 0 bytes in (video paused + audio muted) → restored; drive (3 MB read and
+    2 MB write byte-exact, append, mkdir + nested write, rename, delete — run in-session via
+    `open -a Terminal x.command`, since SSH can't touch the NFS mount); clipboard both ways
+    (sdl-freerdp only announces a local copy on focus-in — client behaviour); Preempt takeover with
+    ERRINFO; `/gfx:progressive` declined to legacy, stayed up.
+  - [x] **FIXED 2026-10-28 (vendored server divergence (30), uncommitted): falls back to a normal logon
+    instead; test `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`, mutation-checked;
+    live-verified on the mini (restart under FreeRDP → one reconnect, normal logon, H.264, no lockout;
+    rollback `~/macrdp.app.bump-cbd4aff.bak`). Still to do: check mstsc, and raise it upstream.**
+    Original report — **REGRESSION: a stale auto-reconnect cookie after a server restart denies the
+    connection, evicts the live session and locks out the client's IP.** Repro: FreeRDP with
+    `+auto-reconnect` connected, `launchctl kickstart -k` the agent. The client auto-reconnects
+    presenting its old cookie; CredSSP succeeds (`auth outcome=success`), then
+    `verify_auto_reconnect_cookie` fails → `send_access_denied` + `ServerError("cookie rejected")`
+    (`vendor/ironrdp-server/src/server.rs` ~4577). FreeRDP keeps the cookie and retries ~3/s with its
+    counter stuck at 0, and each try ends errored in < 1 s, so `auth_guard::classify_outcome` counts
+    it as a Failure → `reject reason=lockout` after 5 (30 s, then 59 s), blocking every client from
+    that IP. Preempt runs before the cookie check, so each try also EVICTS whoever is connected. `main`
+    is unaffected (its div 13 never validated the returning cookie). Likely fix: on an invalid cookie,
+    fall back to a normal logon (`is_auto_reconnect = false`, so the credential path still runs)
+    instead of denying — check MS-RDPBCGR's ARC rules first, and raise it upstream. mstsc likely hits
+    it too (it presents the cookie on auto-reconnect) — verify when at the Windows machine.
+  - [ ] **After the bump lands: lock the vendor-crate CI steps (supply chain).** The rdpeudp step, and
+    the `vendor/ironrdp-server` unit-test step from #228, run `cargo test --manifest-path vendor/…`
+    with no `--locked` and no committed lockfile (`.gitignore` has `vendor/*/Cargo.lock`), so every CI
+    run resolves crates.io fresh ("Locking 377 packages to latest…") and would execute a newly
+    published malicious release. Contained (no secrets, `contents: read`, harden-runner audit-only,
+    rust-cache keyed per job so release builds don't restore it), but unvetted code still runs.
+    Fix: un-ignore + commit those two `Cargo.lock`s, generated once against the new pin, and add
+    `--locked` to both steps; refresh them whenever a vendored crate changes. Running the server tests
+    from the root lockfile instead doesn't work: `cargo test -p ironrdp-server --lib --locked` fails
+    with "requires dev-dependencies and is not a member of the workspace" (checked 2026-10-27).
 - [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
