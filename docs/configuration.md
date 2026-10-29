@@ -21,7 +21,9 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 -v, --verbose             Show all the noisy logs the default filter hides
 --allow-sleep             Let the Mac sleep / auto-lock normally (default
                           is to spawn `caffeinate` so an idle Mac doesn't
-                          drop the connection mid-session)
+                          drop the connection mid-session). The displays
+                          still stay awake for 30 s after a client logs in,
+                          and for as long as a headless session runs
 --width / --height        Override autodetected display size
 --hidpi                   Capture the primary display at backing (Retina) pixel
                           resolution instead of logical points (e.g. 3024×1964

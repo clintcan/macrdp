@@ -22,6 +22,7 @@ mod clipboard_rich;
 mod conn_test;
 mod connection_hooks;
 mod cursor;
+mod display_awake;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
@@ -1920,6 +1921,33 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
     }
 }
 
+/// Installs the overlay, waking the displays between attempts (CGError 1014 while asleep).
+async fn install_overlay<T>(
+    label: &'static str,
+    install: fn(u32) -> Result<T>,
+    vd_id: u32,
+) -> Result<T> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match install(vd_id) {
+            Ok(ovr) => return Ok(ovr),
+            Err(e) if attempt < ATTEMPTS => {
+                warn!(label, attempt, error = %e, "headless overlay install failed; waking the displays and retrying");
+                tokio::task::spawn_blocking(|| {
+                    virtual_display::wake_displays_and_wait(std::time::Duration::from_secs(3))
+                })
+                .await
+                .ok();
+                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                    .await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
@@ -1993,7 +2021,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         was_zero = true;
                         continue;
                     }
-                    match install(vd_id) {
+                    match install_overlay(label, install, vd_id).await {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
                             info!(
@@ -3596,6 +3624,7 @@ async fn async_main() -> Result<()> {
     // (MACRDP_CONN_GUARD=0 disables).
     let conn_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
         auth_guard::AuthGuardHandler::from_env();
+    let conn_handler = Some(display_awake::AwakeHandler::wrap(conn_handler));
     // With --lock-on-disconnect, wrap it to record reconnect activity (every
     // hook still forwards unchanged); otherwise the handler is untouched.
     let conn_handler = match &lock_activity {

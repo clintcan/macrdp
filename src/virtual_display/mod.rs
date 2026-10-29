@@ -24,6 +24,73 @@ pub use stub::{
     PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
+/// Wakes a sleeping display the way a local keypress does, without unlocking.
+#[cfg(target_os = "macos")]
+pub fn wake_display() {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOPMAssertionDeclareUserActivity(
+            name: CFStringRef,
+            user_type: u32,
+            assertion_id: *mut u32,
+        ) -> i32;
+    }
+    // Reusing the id refreshes one assertion instead of piling up new ones.
+    static ASSERTION: AtomicU32 = AtomicU32::new(0);
+    let name = CFString::new("macrdp client connected");
+    let mut id = ASSERTION.load(Ordering::Relaxed);
+    // 0 is kIOPMUserActiveLocal.
+    let r = unsafe { IOPMAssertionDeclareUserActivity(name.as_concrete_TypeRef(), 0, &mut id) };
+    if r == 0 {
+        ASSERTION.store(id, Ordering::Relaxed);
+    } else {
+        tracing::warn!(ioreturn = r, "IOPMAssertionDeclareUserActivity failed");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn wake_display() {}
+
+/// Whether any active display is asleep.
+#[cfg(target_os = "macos")]
+pub fn any_display_asleep() -> bool {
+    extern "C" {
+        fn CGDisplayIsAsleep(display: u32) -> u32;
+    }
+    core_graphics::display::CGDisplay::active_displays()
+        .map(|ids| {
+            ids.into_iter()
+                .any(|id| unsafe { CGDisplayIsAsleep(id) } != 0)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn any_display_asleep() -> bool {
+    false
+}
+
+/// Wakes the displays and waits up to `timeout` for them to come up.
+pub fn wake_displays_and_wait(timeout: std::time::Duration) {
+    let asleep = any_display_asleep();
+    wake_display();
+    if !asleep {
+        return;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while any_display_asleep() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    tracing::info!(
+        still_asleep = any_display_asleep(),
+        "woke the displays for a client"
+    );
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::time::Duration;
@@ -496,6 +563,8 @@ mod macos {
                 detached_count = self.detached.len(),
                 "DetachedPrimary::drop running — re-enabling physical displays"
             );
+            // A reconfiguration while the displays sleep fails with CGError 1014.
+            super::wake_displays_and_wait(Duration::from_secs(3));
             let any = CGDisplay::new(self.virtual_id);
 
             // Two transactions: re-enable in tx 1, reposition in tx 2.
@@ -545,6 +614,7 @@ mod macos {
                     Err(e) => {
                         tracing::warn!(attempt, "enable-tx complete failed (CGError {e})");
                         if attempt < MAX_ENABLE_ATTEMPTS {
+                            super::wake_display();
                             std::thread::sleep(ENABLE_RETRY_BACKOFF);
                         }
                     }
