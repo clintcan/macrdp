@@ -132,7 +132,7 @@ fn send(msg: HudMsg) {
 /// on the captured display (see [`set_display_id`]).
 pub fn show(apps: Vec<(i32, String)>, cursor: usize) {
     send(HudMsg::Show {
-        display_id: DISPLAY_ID.load(Ordering::Relaxed),
+        display_id: crate::virtual_display::current_id(DISPLAY_ID.load(Ordering::Relaxed)),
         cursor: u16::try_from(cursor).unwrap_or(0),
         apps,
     });

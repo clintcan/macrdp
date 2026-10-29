@@ -159,9 +159,18 @@ pub(super) struct Handle {
 // thread boundaries in main's task setup.
 unsafe impl Send for Handle {}
 
+/// Vendor and product ids on every macrdp display descriptor ("macr").
+pub(super) const VENDOR_ID: u32 = 0x6D616372;
+pub(super) const PRODUCT_ID: u32 = 0x6D616372;
+
 impl Handle {
     pub(super) fn display_id(&self) -> u32 {
         self.display_id
+    }
+
+    /// The id the display reports now, which moves when WindowServer re-registers it.
+    pub(super) fn live_display_id(&self) -> u32 {
+        unsafe { msg_send![self.raw, displayID] }
     }
 
     /// Re-apply settings with a single new mode — the live-resize primitive.
@@ -265,8 +274,8 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         let _: () = msg_send![desc, setMaxPixelsHigh: 8192u32];
         // 600x338 mm ≈ a 27-inch 16:9 panel. Just a label.
         let _: () = msg_send![desc, setSizeInMillimeters: CGSize { width: 600.0, height: 338.0 }];
-        let _: () = msg_send![desc, setProductID: 0x6D616372u32]; // "macr"
-        let _: () = msg_send![desc, setVendorID: 0x6D616372u32];
+        let _: () = msg_send![desc, setProductID: PRODUCT_ID];
+        let _: () = msg_send![desc, setVendorID: VENDOR_ID];
         // Was hardcoded to 1: a second macrdp process (e.g. two concurrent
         // installs, or dev testing alongside a running instance) registering a
         // display with an identical vendor/product/serial triple gets its
