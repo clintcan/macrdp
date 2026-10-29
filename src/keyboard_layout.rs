@@ -233,6 +233,14 @@ mod macos {
             map
         }
 
+        /// Whether `kVK_ANSI_Grave` types a backtick, as on the US-style layouts.
+        pub fn grave_types_backtick(&mut self) -> bool {
+            let pending = std::mem::take(&mut self.dead_key_state);
+            let grave = self.translate(0x32, false, false, false);
+            self.dead_key_state = pending;
+            grave.as_deref() == Some("`")
+        }
+
         /// Translate a virtual keycode under the current modifier state into the
         /// character(s) it produces in this layout. Returns `Some("")` when the
         /// key is a pending dead key (caller should swallow it; the composed
@@ -502,6 +510,9 @@ mod macos {
                 Some("1")
             );
             assert_eq!(us.translate(0x12, true, false, false).as_deref(), Some("!"));
+            assert!(us.grave_types_backtick());
+            let mut es = KeyboardLayout::resolve("es").expect("Spanish layout resolves");
+            assert!(!es.grave_types_backtick());
         }
 
         #[test]
