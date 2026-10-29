@@ -49,7 +49,8 @@ type SLSGetGlobalCursorDataSizeFn = unsafe extern "C" fn(CGSConnectionID, *mut c
 //   bits_per_component: OUT bits per component (typically 8)
 // Pixel format in memory is little-endian BGRA premultiplied — i.e., the
 // CG-native bitmap layout (kCGBitmapByteOrder32Little |
-// kCGImageAlphaPremultipliedFirst). Byte 0 of each pixel is blue.
+// kCGImageAlphaPremultipliedFirst). Byte 0 of each pixel is blue. Rows are
+// top-down: row 0 holds the arrow's tip.
 type SLSGetGlobalCursorDataFn = unsafe extern "C" fn(
     CGSConnectionID,
     *mut c_void,
@@ -94,9 +95,8 @@ fn cursor_data_fn() -> Option<SLSGetGlobalCursorDataFn> {
 /// Snapshot the real WindowServer cursor.
 ///
 /// Returns `(rgba_unpremult, width, height, hot_x, hot_y)`. The pixel
-/// buffer is tightly packed, top-down, RGBA with non-premultiplied alpha
-/// — exactly what `RGBAPointer` wants. Returns `None` if any private
-/// symbol is missing or any SLS call fails.
+/// buffer is tightly packed, top-down, RGBA with non-premultiplied alpha.
+/// Returns `None` if any private symbol is missing or any SLS call fails.
 pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
     let main_conn = main_connection_fn()?;
     let size_fn = cursor_data_size_fn()?;
@@ -167,40 +167,27 @@ pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
             return None;
         }
 
-        // BGRA premult (host-endian little, so memory bytes are B,G,R,A)
-        // → RGBA non-premult, tightly packed.
-        //
-        // SLS lays the buffer out bottom-up (row 0 of `buf` = bottom
-        // scan-line of the cursor) — same convention as BMP/DIB and
-        // RDP wire-format pointers. The NSCursor fallback path produces
-        // top-down R,G,B,A and that's what mstsc/FreeRDP have been
-        // rendering correctly, so we feed `RGBAPointer` top-down too.
-        // Read source rows in reverse to flip into top-down.
-        let mut out = Vec::with_capacity(w * h * 4);
-        for row in 0..h {
-            let src_row_idx = h - 1 - row;
-            let src_row_start = src_row_idx * row_bytes;
-            if src_row_start + w * 4 > buf.len() {
-                return None;
-            }
-            let src_row = &buf[src_row_start..src_row_start + w * 4];
-            for px in src_row.chunks_exact(4) {
-                let b = px[0];
-                let g = px[1];
-                let r = px[2];
-                let a = px[3];
-                let (r, g, b) = un_premultiply(r, g, b, a);
-                out.push(r);
-                out.push(g);
-                out.push(b);
-                out.push(a);
-            }
-        }
+        let out = bgra_premultiplied_to_rgba(&buf, row_bytes, w, h)?;
 
         let hot_x = hot.x.round().max(0.0).min(f64::from(u16::MAX)) as u16;
         let hot_y = hot.y.round().max(0.0).min(f64::from(u16::MAX)) as u16;
         Some((out, w as u16, h as u16, hot_x, hot_y))
     }
+}
+
+/// Premultiplied BGRA rows `row_bytes` apart → tightly packed straight RGBA,
+/// keeping the row order.
+fn bgra_premultiplied_to_rgba(buf: &[u8], row_bytes: usize, w: usize, h: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        let start = row * row_bytes;
+        let src = buf.get(start..start + w * 4)?;
+        for &[b, g, r, a] in src.as_chunks::<4>().0 {
+            let (r, g, b) = un_premultiply(r, g, b, a);
+            out.extend_from_slice(&[r, g, b, a]);
+        }
+    }
+    Some(out)
 }
 
 fn un_premultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
@@ -214,5 +201,23 @@ fn un_premultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
             let b = ((b as u32 * 255 + a_u / 2) / a_u).min(255) as u8;
             (r, g, b)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bgra_premultiplied_to_rgba;
+
+    #[test]
+    fn conversion_swaps_to_rgb_unpremultiplies_and_keeps_row_order() {
+        // 1x2 with an 8-byte stride: opaque red on top, then blue premultiplied at A=128.
+        let buf = [0, 0, 255, 255, 9, 9, 9, 9, 128, 0, 0, 128, 9, 9, 9, 9];
+        let out = bgra_premultiplied_to_rgba(&buf, 8, 1, 2).unwrap();
+        assert_eq!(out, vec![255, 0, 0, 255, 0, 0, 255, 128]);
+    }
+
+    #[test]
+    fn short_buffer_is_rejected() {
+        assert_eq!(bgra_premultiplied_to_rgba(&[0; 11], 8, 1, 2), None);
     }
 }

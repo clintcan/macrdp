@@ -7,6 +7,10 @@
 //! correctly. Returns raw RGBA bytes + hotspot directly, no CGImage
 //! round-trip.
 //!
+//! When an app hides the cursor (full-screen video), WindowServer's cursor
+//! becomes a fully transparent image; the client then gets the hidden system
+//! pointer instead of a transparent bitmap.
+//!
 //! Fallback path: `NSCursor.currentSystemCursor` rendered via
 //! `NSBitmapImageRep` — process-local cursor stack, only sees cursors
 //! set in macrdp's own process. Kept as a last resort in case a future
@@ -57,7 +61,7 @@ impl CursorState {
     }
 
     /// Return any cursor-related DisplayUpdates that the client should see.
-    /// Cheap to call: the cost is one CGEvent::new + one NSCursor read.
+    /// Cheap to call: one SkyLight read.
     pub fn poll(&mut self) -> Vec<DisplayUpdate> {
         #[cfg(target_os = "macos")]
         return self.inner.poll();
@@ -175,24 +179,26 @@ mod macos {
         }
 
         fn poll_shape(&mut self, out: &mut Vec<DisplayUpdate>) {
-            let bytes_and_hot = unsafe { read_cursor_bitmap() };
-            let Some((data, w, h, hot_x, hot_y)) = bytes_and_hot else {
+            // A failed read keeps the last shape; `None` below is a hidden cursor.
+            let Some(cursor) = (unsafe { read_cursor_bitmap() }) else {
                 return;
             };
+            let cursor = (!fully_transparent(&cursor.0)).then_some(cursor);
 
-            let mut hasher = DefaultHasher::new();
-            data.hash(&mut hasher);
-            // Mix size/hot into hash so identical pixel patterns at different
+            // Size and hotspot are hashed too, so identical pixels at different
             // dimensions still register as a shape change.
-            w.hash(&mut hasher);
-            h.hash(&mut hasher);
-            hot_x.hash(&mut hasher);
-            hot_y.hash(&mut hasher);
+            let mut hasher = DefaultHasher::new();
+            cursor.hash(&mut hasher);
             let hash = hasher.finish();
             if hash == self.last_hash {
                 return;
             }
             self.last_hash = hash;
+            let Some((data, w, h, hot_x, hot_y)) = cursor else {
+                trace!("cursor hidden");
+                out.push(DisplayUpdate::HidePointer);
+                return;
+            };
             let (raw_w, raw_h) = (w, h);
             // Default (`cursor_scale == 1.0`): pass the SkyLight cursor through
             // at its native size — correct on 1× panels, Retina, and `--hidpi`
@@ -253,9 +259,21 @@ mod macos {
                 height: h,
                 hot_x,
                 hot_y,
-                data,
+                data: xor_mask_32bpp(&data, usize::from(w), usize::from(h)),
             }));
         }
+    }
+
+    /// Top-down straight RGBA → the 32 bpp XOR mask MS-RDPBCGR specifies:
+    /// B,G,R,A per pixel, bottom row first. The encoder sends it verbatim.
+    fn xor_mask_32bpp(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(w * h * 4);
+        for row in rgba.chunks_exact(w * 4).take(h).rev() {
+            for &[r, g, b, a] in row.as_chunks::<4>().0 {
+                out.extend_from_slice(&[b, g, r, a]);
+            }
+        }
+        out
     }
 
     /// Snapshot the current system cursor into a tightly-packed RGBA buffer.
@@ -490,9 +508,32 @@ mod macos {
         out
     }
 
+    /// An app hiding the cursor leaves WindowServer a cursor image with every alpha at 0.
+    fn fully_transparent(rgba: &[u8]) -> bool {
+        rgba.chunks_exact(4).all(|p| p[3] == 0)
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::{clamp_pointer_size, resample_rgba, scale_cursor};
+        use super::{
+            clamp_pointer_size, fully_transparent, resample_rgba, scale_cursor, xor_mask_32bpp,
+        };
+
+        #[test]
+        fn a_fully_transparent_cursor_reads_as_hidden() {
+            assert!(fully_transparent(&[255, 255, 255, 0]));
+            assert!(!fully_transparent(&[0, 0, 0, 0, 0, 0, 0, 1]));
+        }
+
+        #[test]
+        fn xor_mask_is_bgra_bottom_up() {
+            // 1x2: opaque red on top, translucent blue below.
+            let rgba = [255, 0, 0, 255, 0, 0, 255, 128];
+            assert_eq!(
+                xor_mask_32bpp(&rgba, 1, 2),
+                vec![255, 0, 0, 128, 0, 0, 255, 255]
+            );
+        }
 
         #[test]
         fn scale_one_is_passthrough() {
