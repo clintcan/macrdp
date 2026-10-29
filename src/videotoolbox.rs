@@ -1240,7 +1240,9 @@ mod ffi {
                         break;
                     }
                     let slice = std::slice::from_raw_parts(ptr_out, size_out);
-                    parameter_sets.push(slice.to_vec());
+                    // Windows 10 mstsc shows a black screen unless the SPS
+                    // states the decode buffering (see h264_sps.rs).
+                    parameter_sets.push(crate::h264_sps::fix_parameter_set(slice));
                     index += 1;
                     if count_out > 0 && index >= count_out {
                         break;

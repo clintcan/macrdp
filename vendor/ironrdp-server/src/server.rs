@@ -3621,7 +3621,7 @@ impl RdpServer {
                                 c,
                             )) if self.opts.has_image_remote_fx() => {
                                 for caps in c.caps_data.0.0 {
-                                    update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
+                                    update_codecs.set_image_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
                             }
                             CodecProperty::NsCodec(client_ns) if self.opts.has_nscodec() => {
