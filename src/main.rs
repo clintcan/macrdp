@@ -3605,7 +3605,12 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
-    let conn_handler = Some(connection_hooks::SessionHooks::wrap(conn_handler));
+    // Only the stats endpoint needs the hooks; with it off the handler stays as it was.
+    let conn_handler = if stats::global().is_some() {
+        Some(connection_hooks::SessionHooks::wrap(conn_handler))
+    } else {
+        conn_handler
+    };
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
