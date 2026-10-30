@@ -561,6 +561,10 @@ pub struct RdpServer {
     /// `MacInputHandler`) holds a clone and auto-selects a matching layout, so
     /// non-US clients type correctly with no manual configuration. 0 = unknown.
     keyboard_layout: Option<Arc<AtomicU32>>,
+    /// (vendored, divergence 29) Optional shared cell the server writes with
+    /// the client's announced desktop scale factor (percent; 0 = not sent)
+    /// when a client connects, before the display starts.
+    desktop_scale_factor: Option<Arc<AtomicU32>>,
     /// (vendored, divergence 15) Optional shared cell the server writes with the
     /// kernel's smoothed TCP round-trip time (milliseconds, from
     /// `TCP_CONNECTION_INFO`) for each accepted connection, sampled in the
@@ -1248,6 +1252,7 @@ impl RdpServer {
             connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
+            desktop_scale_factor: None,
             link_rtt_ms: None,
             #[cfg(feature = "multitransport")]
             current_offer_cookie: None,
@@ -1373,6 +1378,15 @@ impl RdpServer {
     /// called before any client connects.
     pub fn set_keyboard_layout_handle(&mut self, handle: Arc<AtomicU32>) {
         self.keyboard_layout = Some(handle);
+    }
+
+    /// (vendored, divergence 29) Share a cell the server fills with the
+    /// client's announced desktop scale factor (percent, from Client Core
+    /// Data; 0 = not sent) when a client connects — before the display's
+    /// `updates()` runs, so the display can size itself for it. Must be
+    /// called before any client connects.
+    pub fn set_desktop_scale_factor_handle(&mut self, handle: Arc<AtomicU32>) {
+        self.desktop_scale_factor = Some(handle);
     }
 
     /// (vendored, divergence 15) Share a cell the server fills with the
@@ -3472,6 +3486,15 @@ impl RdpServer {
         if let Some(handle) = &self.keyboard_layout {
             handle.store(result.keyboard_layout, Ordering::Relaxed);
             debug!(klid = result.keyboard_layout, "client keyboard layout announced");
+        }
+        // (vendored, divergence 29) Publish the client's desktop scale factor.
+        // Initial accept only: a reactivation carries the connect-time value
+        // over, and storing it again would undo a newer scale the client
+        // announced mid-session in a monitor layout (the embedder updates the
+        // cell from those).
+        if let (false, Some(handle)) = (result.reactivation, &self.desktop_scale_factor) {
+            handle.store(result.desktop_scale_factor, Ordering::Relaxed);
+            debug!(scale = result.desktop_scale_factor, "client desktop scale factor announced");
         }
 
         // (vendored, divergence (20)) Client-fingerprint log: the identity

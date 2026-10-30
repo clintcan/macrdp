@@ -14,15 +14,101 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    is_hidpi_virtual_display, screen_is_locked, shield_keeps_physical_main,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    is_hidpi_virtual_display, screen_is_locked, take_detach_reenable_failed, CapturedPrimary,
+    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
+
+/// When the virtual display runs HiDPI (`--virtual-display-hidpi`).
+#[derive(Clone, Debug)]
+pub enum HidpiPolicy {
+    /// Always 1:1 (the default).
+    Off,
+    /// Always HiDPI.
+    On,
+    /// Per connection, from the client's announced desktop scale factor
+    /// (percent; the cell is filled by the server when a client connects).
+    Auto(std::sync::Arc<std::sync::atomic::AtomicU32>),
+}
+
+impl HidpiPolicy {
+    /// May the display ever run HiDPI? Decides its panel size and product id
+    /// at creation, which can't change later.
+    pub fn capable(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Session pixels per UI point for the current (or next) connection:
+    /// 2 lays the UI out at half the session size (a Retina client), 1 at
+    /// the session size.
+    pub fn ui_scale(&self) -> u32 {
+        match self {
+            Self::Off => 1,
+            Self::On => 2,
+            Self::Auto(scale) => {
+                if scale_wants_hidpi(scale.load(std::sync::atomic::Ordering::Relaxed)) {
+                    2
+                } else {
+                    1
+                }
+            }
+        }
+    }
+
+    /// Record a scale factor the client announced mid-session, in a monitor
+    /// layout (MS-RDPEDISP), and say whether it changes the UI scale. Windows
+    /// App sends one when its window moves to a display with a different
+    /// scale, e.g. from a Retina panel to a 1x external monitor. Only `Auto`
+    /// follows it; `None` (the field absent or out of range) changes nothing.
+    pub fn observe_client_scale(&self, desktop_scale_factor: Option<u32>) -> bool {
+        let (Self::Auto(cell), Some(factor)) = (self, desktop_scale_factor) else {
+            return false;
+        };
+        let before = self.ui_scale();
+        cell.store(factor, std::sync::atomic::Ordering::Relaxed);
+        self.ui_scale() != before
+    }
+}
+
+/// Whether a client's desktop scale factor (percent) asks for a 2× display.
+/// Windows App sends 200 with "Optimize for Retina displays" on and 100 with
+/// it off; macOS only offers 2× scaling, so anything short of 200 stays 1:1.
+pub fn scale_wants_hidpi(desktop_scale_factor: u32) -> bool {
+    desktop_scale_factor >= 200
+}
+
+/// Physical panel size, in millimetres, that a virtual display reports for a
+/// `width_px × height_px` framebuffer.
+///
+/// Without HiDPI this is purely cosmetic (a 27-inch 16:9 label in
+/// Displays.app). With HiDPI it decides whether the display is actually
+/// scaled: macOS offers both the 2× mode and a 1:1 duplicate at twice the
+/// point size, and picks between them by pixel density, which it derives from
+/// this size. It only picks the scaled mode inside a band — roughly 160 to
+/// 450 PPI measured on macOS 26.6, with too dense falling back to 1:1 just
+/// like too sparse. The size is fixed when the display is created while a
+/// live resize changes the pixel count, so the width is a constant chosen to
+/// keep common Retina session widths inside the band, not derived from the
+/// initial size.
+pub fn panel_size_mm(width_px: u32, height_px: u32, hidpi: bool) -> (f64, f64) {
+    if !hidpi {
+        return (600.0, 338.0);
+    }
+    let aspect = f64::from(height_px.max(1)) / f64::from(width_px.max(1));
+    (HIDPI_PANEL_WIDTH_MM, HIDPI_PANEL_WIDTH_MM * aspect)
+}
+
+/// HiDPI panel width. On macOS 26.6 a panel this wide selected the scaled
+/// mode for framebuffers from 1440 to 4096 px wide (about 160 to 450 PPI);
+/// 1280 px fell back to 1:1. Outside that range the display runs 1:1 and
+/// `VirtualDisplay` reports it.
+const HIDPI_PANEL_WIDTH_MM: f64 = 233.0;
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -55,6 +141,19 @@ mod macos {
     /// (guard-type-generic) watcher.
     static DETACH_REENABLE_FAILED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+
+    /// Display id of the HiDPI virtual display (0 = none). The capture path
+    /// needs the display's backing pixel size, and `CGDisplayCopyDisplayMode`
+    /// returns nothing for a virtual display, so the scale is recorded here
+    /// when the display is created. Process-global because there is at most
+    /// one macrdp virtual display per process.
+    static HIDPI_DISPLAY_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// Whether `display_id` is macrdp's virtual display running HiDPI (2×
+    /// pixels per point) via `--virtual-display-hidpi`.
+    pub fn is_hidpi_virtual_display(display_id: u32) -> bool {
+        display_id != 0 && HIDPI_DISPLAY_ID.load(std::sync::atomic::Ordering::Relaxed) == display_id
+    }
 
     /// Read-and-clear the "detach left the physical panel stuck-disabled" flag
     /// (see [`DETACH_REENABLE_FAILED`]). Returns true at most once per failure.
@@ -109,11 +208,46 @@ mod macos {
         display_id: u32,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
+        /// Created HiDPI (`--virtual-display-hidpi`): every mode is applied
+        /// with `hiDPI=1` and only the point size changes. Whether macOS
+        /// actually chose the scaled mode is recorded in `HIDPI_DISPLAY_ID`,
+        /// which the capture path reads.
+        hidpi: bool,
+        /// Session pixels per UI point: 2 for a Retina client (the UI is laid
+        /// out at half the session size), 1 for a 1x client (UI at the
+        /// session size, captured down from the 2x backing). Always 1
+        /// without `hidpi`.
+        ui_scale: u32,
+        /// Framebuffer size in pixels the display was last asked for. Kept
+        /// separately from `size_pts × ui_scale` because an odd pixel count
+        /// can't be halved exactly.
+        mode_px: (u32, u32),
+    }
+
+    /// How long a reading that matches the pre-resize bounds is treated as
+    /// "not applied yet" rather than as the outcome of the new mode.
+    const SETTLE: Duration = Duration::from_millis(1000);
+
+    /// Point size of the mode for a `px`-pixel session at `ui_scale`.
+    fn mode_points(px: u32, ui_scale: u32) -> u32 {
+        (px / ui_scale.max(1)).max(1)
+    }
+
+    /// What a mode request actually produced.
+    enum Landed {
+        /// The requested point size.
+        Exact,
+        /// HiDPI requested, but macOS chose the 1:1 duplicate at twice the
+        /// point size (pixel density outside the band it accepts).
+        OneToOne,
+        /// HiDPI requested, but macOS chose the half-size HiDPI variant
+        /// (W/2 points at W pixels) — see `resize`.
+        HalfVariant,
     }
 
     impl VirtualDisplay {
-        /// Allocate a headless display at `width × height` pixels and
-        /// `refresh_hz` Hz. Refresh rate is mostly cosmetic — the RDP
+        /// Allocate a headless display for a `width × height`-pixel session
+        /// at `refresh_hz` Hz. Refresh rate is mostly cosmetic — the RDP
         /// server's frame cadence is independent — but a real value
         /// keeps `Displays.app` from looking weird.
         ///
@@ -121,9 +255,32 @@ mod macos {
         /// if any of the underlying CG symbols / Obj-C classes can't be
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
-        pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            let handle = private_api::create(width, height, refresh_hz, "macrdp")
-                .context("creating virtual display")?;
+        ///
+        /// With `hidpi` the display is a Retina-style 2× display for its
+        /// whole life, and `ui_scale` picks its point size (`width /
+        /// ui_scale`). It is never switched to 1:1: on the dense panel HiDPI
+        /// needs, a display created 1:1 comes up at a mode macOS picks itself,
+        /// and switching a live one HiDPI → 1:1 left the desktop composited
+        /// into a corner of the framebuffer.
+        pub fn new(
+            width: u32,
+            height: u32,
+            refresh_hz: u32,
+            hidpi: bool,
+            ui_scale: u32,
+        ) -> Result<Self> {
+            let ui_scale = if hidpi { ui_scale.max(1) } else { 1 };
+            let (mode_w, mode_h) = (mode_points(width, ui_scale), mode_points(height, ui_scale));
+            let handle = private_api::create(
+                mode_w,
+                mode_h,
+                refresh_hz,
+                "macrdp",
+                hidpi,
+                hidpi,
+                super::panel_size_mm(width, height, hidpi),
+            )
+            .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)
             // and the point-space size. macOS auto-arranges new displays
@@ -140,12 +297,55 @@ mod macos {
                 ));
             }
 
-            Ok(Self {
+            let mut vd = Self {
                 _handle: handle,
                 display_id: id,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
-            })
+                hidpi,
+                ui_scale,
+                mode_px: (width, height),
+            };
+            vd.record_scale(mode_w);
+            Ok(vd)
+        }
+
+        /// Work out which scale macOS actually gave the display after a mode
+        /// was applied, from its point width. With HiDPI requested, macOS can
+        /// still choose the 1:1 duplicate (twice the point size) when the
+        /// panel density is out of range; the capture path has to know, so
+        /// the shared registry follows what was chosen, not what was asked.
+        fn record_scale(&mut self, mode_w: u32) {
+            let scaled = self.hidpi && self.size_pts.0 as u32 == mode_w;
+            if scaled {
+                HIDPI_DISPLAY_ID.store(self.display_id, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            let _ = HIDPI_DISPLAY_ID.compare_exchange(
+                self.display_id,
+                0,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if self.hidpi {
+                tracing::warn!(
+                    requested_points = ?(mode_w, self.size_pts.1),
+                    bounds = ?self.size_pts,
+                    session_px = ?self.mode_px,
+                    "--virtual-display-hidpi: macOS did not select the scaled mode for this \
+                     size (pixel density out of range); the display is running 1:1"
+                );
+            }
+        }
+
+        /// Framebuffer size in pixels the display was last set to.
+        pub fn mode_px(&self) -> (u32, u32) {
+            self.mode_px
+        }
+
+        /// Session pixels per UI point the display was last set to.
+        pub fn ui_scale(&self) -> u32 {
+            self.ui_scale
         }
 
         pub fn display_id(&self) -> u32 {
@@ -160,34 +360,85 @@ mod macos {
             self.size_pts
         }
 
-        /// Live-resize the display to a new mode (client-driven session
-        /// resize). Re-applies settings with a single mode at the new size
-        /// — the WindowServer treats it like a physical monitor changing
-        /// resolution (windows re-layout, bounds update) — then polls
-        /// `CGDisplayBounds` until the new size is visible (the apply is
-        /// async on the WindowServer side; creation has the same
-        /// zero-size-rect race, handled there by erroring). The display id
-        /// is stable across the resize; the global-space origin can shift,
-        /// so both cached values are refreshed. Virtual displays are
-        /// always 1:1 points-to-pixels (no HiDPI backing — see the
-        /// known-quirks note), so the expected bounds equal the mode size.
-        pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        /// Live-resize the display for a `width × height`-pixel session
+        /// (client-driven session resize, or a new client). Re-applies
+        /// settings with a single mode — the WindowServer treats it like a
+        /// physical monitor changing resolution (windows re-layout, bounds
+        /// update) — then polls `CGDisplayBounds` until the new size is
+        /// visible. The display id is stable; the global-space origin can
+        /// shift, so both cached values are refreshed. On a HiDPI display the
+        /// mode is `width / ui_scale` points and stays HiDPI.
+        pub fn resize(&mut self, width: u32, height: u32, ui_scale: u32) -> Result<()> {
+            let ui_scale = if self.hidpi { ui_scale.max(1) } else { 1 };
+            let (mode_w, mode_h) = (mode_points(width, ui_scale), mode_points(height, ui_scale));
+            let mut landed = self.apply_and_wait(mode_w, mode_h)?;
+            // For a HiDPI mode of W points macOS has two variants — W points at
+            // 2W pixels, and W/2 points at W pixels — and can keep whichever
+            // matches the current framebuffer's pixel count (a 1728-point
+            // request after a 1728-pixel framebuffer came out as 864 points on
+            // an idle test display). Going through a slightly different HiDPI
+            // size first leaves neither variant matching, after which the
+            // request lands correctly. Only done when the bad variant actually
+            // shows up — the live agent display didn't do this when tested —
+            // and always staying in HiDPI, never through 1:1.
+            if matches!(landed, Landed::HalfVariant) {
+                tracing::info!(
+                    expected = ?(mode_w, mode_h),
+                    "virtual display landed on the half-size HiDPI variant — stepping through \
+                     another HiDPI size"
+                );
+                self.apply_and_wait(mode_w + 16, mode_h + 16)
+                    .context("stepping through another HiDPI size")?;
+                landed = self.apply_and_wait(mode_w, mode_h)?;
+                if matches!(landed, Landed::HalfVariant) {
+                    return Err(anyhow!(
+                        "virtual display still on the half-size HiDPI variant for \
+                         {mode_w}x{mode_h} points after stepping through another size"
+                    ));
+                }
+            }
+            self.mode_px = (width, height);
+            self.ui_scale = ui_scale;
+            self.record_scale(mode_w);
+            Ok(())
+        }
+
+        /// Apply one mode and wait (up to 3 s) for the WindowServer to show
+        /// it, reporting what it landed on. Refreshes the cached bounds.
+        fn apply_and_wait(&mut self, mode_w: u32, mode_h: u32) -> Result<Landed> {
+            let before = CGDisplay::new(self.display_id).bounds().size;
+            let before = (before.width as u32, before.height as u32);
             self._handle
-                .apply_mode(width, height, 60)
+                .apply_mode(mode_w, mode_h, 60, self.hidpi)
                 .context("re-applying virtual display mode")?;
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(3);
             loop {
                 let bounds = CGDisplay::new(self.display_id).bounds();
-                if bounds.size.width as u32 == width && bounds.size.height as u32 == height {
+                let (bw, bh) = (bounds.size.width as u32, bounds.size.height as u32);
+                // A reading equal to the pre-apply bounds may just be the old
+                // mode still showing, so the two "wrong mode" outcomes only
+                // count once it differs from before, or after a settle.
+                let settled = (bw, bh) != before || start.elapsed() >= SETTLE;
+                let landed = if (bw, bh) == (mode_w, mode_h) {
+                    Some(Landed::Exact)
+                } else if self.hidpi && settled && (bw, bh) == (mode_w * 2, mode_h * 2) {
+                    Some(Landed::OneToOne)
+                } else if self.hidpi && settled && (bw, bh) == (mode_w / 2, mode_h / 2) {
+                    Some(Landed::HalfVariant)
+                } else {
+                    None
+                };
+                if let Some(landed) = landed {
                     self.origin_pts = (bounds.origin.x, bounds.origin.y);
                     self.size_pts = (bounds.size.width, bounds.size.height);
-                    return Ok(());
+                    return Ok(landed);
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(anyhow!(
                         "virtual display mode applied but CGDisplayBounds still reports \
-                         {}x{} (expected {width}x{height}) after 3s — WindowServer hasn't \
+                         {}x{} (expected {mode_w}x{mode_h}) after 3s — WindowServer hasn't \
                          picked up the new mode",
                         bounds.size.width,
                         bounds.size.height,
@@ -1624,10 +1875,21 @@ mod stub {
         Some(false)
     }
 
+    /// No virtual display off macOS.
+    pub fn is_hidpi_virtual_display(_display_id: u32) -> bool {
+        false
+    }
+
     pub struct VirtualDisplay;
 
     impl VirtualDisplay {
-        pub fn new(_width: u32, _height: u32, _refresh_hz: u32) -> Result<Self> {
+        pub fn new(
+            _width: u32,
+            _height: u32,
+            _refresh_hz: u32,
+            _hidpi: bool,
+            _ui_scale: u32,
+        ) -> Result<Self> {
             Err(anyhow!(
                 "virtual display is macOS-only — this binary was built for a \
                  different target"
@@ -1642,7 +1904,13 @@ mod stub {
         pub fn size_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
         }
-        pub fn resize(&mut self, _width: u32, _height: u32) -> Result<()> {
+        pub fn mode_px(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        pub fn ui_scale(&self) -> u32 {
+            1
+        }
+        pub fn resize(&mut self, _width: u32, _height: u32, _ui_scale: u32) -> Result<()> {
             Err(anyhow!("virtual display is macOS-only"))
         }
         pub fn reanchor_as_main(&mut self) -> Result<bool> {
@@ -1686,5 +1954,106 @@ mod stub {
         pub fn reassert_blanking(&self) -> usize {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_2x_client_gets_hidpi() {
+        assert!(!scale_wants_hidpi(0)); // not announced
+        assert!(!scale_wants_hidpi(100)); // Windows App, Retina off
+        assert!(!scale_wants_hidpi(175)); // macOS has no fractional scaling
+        assert!(scale_wants_hidpi(200)); // Windows App, Retina on
+        assert!(scale_wants_hidpi(300));
+    }
+
+    #[test]
+    fn auto_policy_follows_the_announced_scale() {
+        use std::sync::{atomic::AtomicU32, Arc};
+        let scale = Arc::new(AtomicU32::new(100));
+        let policy = HidpiPolicy::Auto(scale.clone());
+        assert!(policy.capable());
+        assert_eq!(policy.ui_scale(), 1);
+        scale.store(200, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(policy.ui_scale(), 2);
+        assert!(!HidpiPolicy::Off.capable());
+        assert_eq!(HidpiPolicy::Off.ui_scale(), 1);
+        assert!(HidpiPolicy::On.capable());
+        assert_eq!(HidpiPolicy::On.ui_scale(), 2);
+    }
+
+    #[test]
+    fn a_mid_session_scale_change_switches_the_ui_scale() {
+        use std::sync::{atomic::AtomicU32, Arc};
+        let policy = HidpiPolicy::Auto(Arc::new(AtomicU32::new(200)));
+        // Window moved from the Retina panel to a 1x monitor.
+        assert!(policy.observe_client_scale(Some(100)));
+        assert_eq!(policy.ui_scale(), 1);
+        // Same scale again, or no scale in the layout: nothing to re-mode.
+        assert!(!policy.observe_client_scale(Some(100)));
+        assert!(!policy.observe_client_scale(None));
+        assert_eq!(policy.ui_scale(), 1);
+        // And back to the Retina panel.
+        assert!(policy.observe_client_scale(Some(200)));
+        assert_eq!(policy.ui_scale(), 2);
+        // A fixed policy ignores the client.
+        assert!(!HidpiPolicy::On.observe_client_scale(Some(100)));
+        assert_eq!(HidpiPolicy::On.ui_scale(), 2);
+    }
+
+    /// Live check of the HiDPI re-mode rules against the real WindowServer.
+    /// Creates (and destroys) a virtual display under a test-only identity,
+    /// so it can't disturb a running macrdp:
+    ///   cargo test --release hidpi_switching_live -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "creates a real virtual display"]
+    fn hidpi_switching_live() {
+        let mut vd = VirtualDisplay::new(3456, 2170, 60, true, 2).unwrap();
+        let id = vd.display_id();
+        let state = |vd: &VirtualDisplay| (vd.size_pts(), is_hidpi_virtual_display(id));
+        assert_eq!(state(&vd), ((1728.0, 1085.0), true), "created HiDPI");
+        // Retina client at 3456x2168: 1728x1084 points.
+        vd.resize(3456, 2168, 2).unwrap();
+        assert_eq!(state(&vd), ((1728.0, 1084.0), true), "2x client");
+        // 1x client at 1728x1084: the same 1728x1084-point HiDPI mode,
+        // captured at the session size. No scale switch.
+        vd.resize(1728, 1084, 1).unwrap();
+        assert_eq!(state(&vd), ((1728.0, 1084.0), true), "1x client");
+        assert_eq!(vd.ui_scale(), 1);
+        // A live resize down and back up while staying HiDPI: the second
+        // step is where the half-size variant can appear.
+        vd.resize(1728, 1084, 2).unwrap();
+        assert_eq!(state(&vd), ((864.0, 542.0), true), "small HiDPI");
+        vd.resize(3456, 2168, 2).unwrap();
+        assert_eq!(state(&vd), ((1728.0, 1084.0), true), "large HiDPI again");
+        // A 1x client at another size.
+        vd.resize(1440, 900, 1).unwrap();
+        assert_eq!(state(&vd), ((1440.0, 900.0), true), "1x client at 1440x900");
+    }
+
+    #[test]
+    fn panel_size_is_the_cosmetic_label_without_hidpi() {
+        assert_eq!(panel_size_mm(3456, 2168, false), (600.0, 338.0));
+    }
+
+    #[test]
+    fn hidpi_panel_keeps_common_retina_widths_in_the_scaled_band() {
+        let (w_mm, h_mm) = panel_size_mm(3456, 2168, true);
+        let ppi = |px: u32| f64::from(px) / (w_mm / 25.4);
+        // The band macOS selected the scaled mode in, measured on 26.6.
+        for px in [1440, 2560, 2880, 3024, 3456, 3840] {
+            assert!(
+                (155.0..=460.0).contains(&ppi(px)),
+                "{px} px -> {} PPI",
+                ppi(px)
+            );
+        }
+        // Fixed width (it can't change after creation), aspect follows.
+        assert_eq!(panel_size_mm(1920, 1080, true).0, w_mm);
+        assert!((h_mm / w_mm - 2168.0 / 3456.0).abs() < 1e-9);
     }
 }

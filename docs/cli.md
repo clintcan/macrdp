@@ -33,6 +33,29 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   silently ignored) — resize needs the client-resolution
                           #   auto-adopt path, which --hidpi pins off, same as it
                           #   pins the initial connect-time size.
+--virtual-display-hidpi   # make the --virtual-display a Retina-style 2x display.
+                          #   The session size (--width/--height, or what the
+                          #   client requests) is its PIXEL count; macOS lays the
+                          #   UI out at half that in points — e.g. a client asking
+                          #   for 3456x2168 gets a sharp desktop that looks like
+                          #   1728x1084. Set VD_WIDTH/VD_HEIGHT to twice the size
+                          #   you want the UI to look. Scales for session widths of
+                          #   ~1440-4096 px; outside that macOS runs it 1:1 (logged
+                          #   as a warning). ~4x the pixels of the same apparent
+                          #   size without it. Live resize and auto-adopt keep
+                          #   working. Needs --virtual-display. Config: VD_HIDPI=1.
+                          #   The client must request Retina pixels (Windows App:
+                          #   "Optimize for Retina displays"); a client asking for
+                          #   point-size resolution gets UI twice as big.
+--virtual-display-hidpi=auto # the display stays HiDPI; each connection picks
+                          #   the UI scale from the client's announced desktop
+                          #   scale factor (Client Core Data). A 2x client (scale
+                          #   >= 200; Windows App with "Optimize for Retina
+                          #   displays") gets the UI at half its size, captured
+                          #   1:1; any other client gets the UI at its own size,
+                          #   captured down from the 2x backing. Normal-size UI
+                          #   either way. 1x clients wider than ~2048 px fall back
+                          #   to half-size UI. Config: VD_HIDPI=auto.
 --fps N                   # default 60 with --enable-h264, else 15
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
@@ -218,6 +241,13 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   lock-state check. See the auto-unlock note in
                           #   known-quirks.md. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
+--h264-max-unacked-frames N # cap how many shipped frames may be awaiting the
+                          #   client's FrameAcknowledge on the TCP path; past it,
+                          #   captures drop (10 fps trickle) until the client
+                          #   catches up. Bounds lag when the client decodes at
+                          #   about the rate we send (otherwise every burst
+                          #   leaves a backlog that drains for seconds). 0 = off
+                          #   (default). Try 3-4. Config: H264_MAX_UNACKED_FRAMES.
 --bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
                           #   --enable-h264). With --adaptive-bitrate it's the
                           #   ceiling the encoder backs off from under congestion;

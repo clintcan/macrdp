@@ -1218,6 +1218,9 @@ pub struct Gfx {
     /// that a healthy high-RTT link never trips it; low enough to cap the decode
     /// backlog so video degrades to choppy-but-live instead of freezing.
     max_frame_lag: u64,
+    /// The same ack-lag cap on the TCP path (`--h264-max-unacked-frames`);
+    /// 0 = off, leaving TCP paced by socket backpressure alone.
+    tcp_max_frame_lag: u64,
     /// EGFX-over-UDP → TCP watchdog. On by default (disable with
     /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
     /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
@@ -1341,6 +1344,7 @@ impl Gfx {
         bitrate_bps: u32,
         keyframe_secs: f32,
         max_in_flight: u32,
+        tcp_max_unacked_frames: u32,
         egfx_on_lossy: Arc<AtomicBool>,
         egfx_on_udp: Arc<AtomicBool>,
         demigrate_request: Arc<AtomicBool>,
@@ -1553,6 +1557,7 @@ impl Gfx {
             egfx_on_lossy,
             egfx_on_udp,
             max_frame_lag,
+            tcp_max_frame_lag: u64::from(tcp_max_unacked_frames),
             watchdog_enabled,
             watchdog_wedge_timeout,
             watchdog_active_window,
@@ -1957,18 +1962,28 @@ impl Gfx {
             // → frozen video while audio (on TCP) keeps playing. When the client's
             // decode backlog (shipped − decoded, from FrameAcknowledge) exceeds the
             // threshold, drop this capture so the client catches up — video degrades
-            // to choppy-but-live instead of freezing. Gated to the UDP tunnel
-            // (TCP push path stays byte-identical), to acks actually flowing (a
-            // suspended-ack client falls back to the submitted−shipped throttle
-            // above), and to having seen ≥1 ack (no cold-start false drop). Dropping
-            // before encode keeps the H.264 reference chain valid.
-            if self.egfx_on_udp.load(Ordering::Relaxed) && ctx.egfx_acks_seen && !ctx.acks_suspended
-            {
+            // to choppy-but-live instead of freezing. Always on for the UDP tunnel;
+            // on TCP only with --h264-max-unacked-frames (default off, so the TCP
+            // push path stays byte-identical). TCP's socket backpressure doesn't
+            // help when the network is fine but the client's own decode/present
+            // loop runs at about the rate we send: every burst then leaves a
+            // backlog that drains at the small rate difference, which measured as
+            // 200–600 ms of lag for 10–20 s at a time (Windows App, 3456×2168).
+            // Gated to acks actually flowing (a suspended-ack client falls back to
+            // the submitted−shipped throttle above), and to having seen ≥1 ack (no
+            // cold-start false drop). Dropping before encode keeps the H.264
+            // reference chain valid.
+            let lag_limit = if self.egfx_on_udp.load(Ordering::Relaxed) {
+                self.max_frame_lag
+            } else {
+                self.tcp_max_frame_lag
+            };
+            if lag_limit > 0 && ctx.egfx_acks_seen && !ctx.acks_suspended {
                 let lag = ctx
                     .last_shipped_frame_id
                     .load(Ordering::Relaxed)
                     .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
-                if lag > self.max_frame_lag {
+                if lag > lag_limit {
                     // Client is behind. Drop MOST captures so it catches up — but
                     // keep a low-rate trickle, never zero: mstsc only presents (and
                     // thus frame-acks) an H.264 frame once a couple more arrive
@@ -1984,14 +1999,14 @@ impl Gfx {
                     if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
                         trace!(
                             lag,
-                            "EGFX-on-UDP lag high; dropping capture (trickle floor)"
+                            "EGFX client ack lag high; dropping capture (trickle floor)"
                         );
                         return Ok(true);
                     }
                     ctx.last_throttle_ship = now;
                     trace!(
                         lag,
-                        "EGFX-on-UDP lag high; letting a trickle frame through to drain client buffer"
+                        "EGFX client ack lag high; letting a trickle frame through to drain client buffer"
                     );
                     // fall through: ship this one to keep the client presenting/acking
                 }
@@ -2517,6 +2532,25 @@ impl Gfx {
     /// client-requested resize/reactivation window where the client expects
     /// a graphics reset — the same position it occupies on every fresh
     /// connection.
+    /// Whether this connection's H.264 pipeline is up.
+    pub(crate) fn pipeline_ready(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_ready)
+    }
+
+    /// Whether a client is connected whose graphics pipeline is still being
+    /// negotiated: neither ready nor declined.
+    pub(crate) fn pipeline_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| !ctx.is_ready && !ctx.egfx_declined.load(Ordering::Relaxed))
+    }
+
     pub(crate) fn reset_for_live_resize(&self) {
         let mut guard = self.ctx.lock().unwrap();
         if let Some(ctx) = guard.as_mut() {
@@ -4772,6 +4806,7 @@ mod tests {
             5_000_000,
             2.0,
             2,
+            0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -4878,5 +4913,40 @@ mod tests {
         let ctx = guard.as_ref().unwrap();
         assert!(!ctx.is_ready);
         assert_eq!(clocks(ctx), [built; 11]);
+    }
+
+    /// The capture loop holds a pre-EGFX frame only while the pipeline is
+    /// still coming: pending until the client's graphics channel is confirmed
+    /// (ready) or declined, and never without a connection.
+    #[test]
+    fn pipeline_state_tracks_the_graphics_channel() {
+        let gfx = gfx_with_context();
+        assert!(gfx.pipeline_pending());
+        assert!(!gfx.pipeline_ready());
+
+        gfx.ctx
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .client_supports_avc = true;
+        GfxHandler {
+            ctx: gfx.ctx.clone(),
+        }
+        .on_ready(&avc_ready());
+        assert!(gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
+
+        let declined = gfx_with_context();
+        GfxHandler {
+            ctx: declined.ctx.clone(),
+        }
+        .on_ready(&avc_ready()); // no AVC
+        assert!(!declined.pipeline_ready());
+        assert!(!declined.pipeline_pending());
+
+        *gfx.ctx.lock().unwrap() = None;
+        assert!(!gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
     }
 }

@@ -191,3 +191,13 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
     22621) + its hostname; FreeRDP hardcodes build 2600. Informational
     fingerprinting only — a client can claim anything.
+
+(5) Client desktop scale factor from GCC Client Core Data (NOT upstreamed; added
+    2026-10-11): `Acceptor` gains a private `desktop_scale_factor: u32`, captured
+    in `BasicSettingsWaitInitial` from `gcc_blocks.core.optional_data.
+    desktop_scale_factor` (0 when absent), carried across reactivation, and
+    surfaced as `pub desktop_scale_factor: u32` on `AcceptorResult`. Consumed by
+    the vendored server's divergence (29), which macrdp's `--virtual-display-hidpi
+    =auto` reads to pick a 2× display per connection (Windows App sends 200 with
+    "Optimize for Retina displays", 100 without). Same additive GCC-surfacing
+    shape as (2)/(4) → cleanly upstreamable.

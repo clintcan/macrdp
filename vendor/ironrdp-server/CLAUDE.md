@@ -2060,3 +2060,35 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (`CCtx`), so none of the three is reachable here; the bump is to keep the
     scan meaningful. Only `Cargo.toml` changes, no code. Drop it once upstream
     requires zstd-safe >= 8.2.
+
+(29) Publish the client's desktop scale factor to a shared cell (NOT upstreamed;
+    added 2026-10-11; pairs with `vendor/ironrdp-acceptor` divergence (5)).
+    `RdpServer` gains `desktop_scale_factor: Option<Arc<AtomicU32>>` (default
+    None) + setter `set_desktop_scale_factor_handle`, the same shape as the
+    keyboard-layout cell (10). `client_accepted` stores
+    `result.desktop_scale_factor` (percent; 0 = not sent) at its top, before
+    `client_loop` calls the display's `updates()` — so the display can size
+    itself for the connecting client. Runs for preemption winners too (they go
+    through `serve_negotiated` → `accept_finalize` → `client_accepted`). macrdp
+    installs it only for `--virtual-display-hidpi=auto`, which re-modes the
+    virtual display HiDPI for a 2× client; otherwise `None` and byte-identical.
+    Stored on the INITIAL accept only, not on a reactivation (2026-10-12): the
+    acceptor carries the connect-time value across reactivations, and macrdp
+    updates the cell mid-session from the monitor layout's per-monitor scale
+    (Windows App sends one when its window moves between a Retina panel and a
+    1× monitor). Re-storing it on the reactivation that resize triggers put the
+    connect-time 200 back right before the re-mode, so a 1× monitor got a 2× UI.
+
+(30) 32-bpp pointers carry an AND mask (NOT upstreamed; added 2026-10-11).
+    `UpdateEncoder::rgba_pointer` used to send `and_mask: &[]`. MS-RDPBCGR
+    2.2.9.1.1.4.4 makes the 1-bpp AND mask part of every color pointer, and
+    Windows App for macOS (build 68651) never changed its pointer from the
+    default arrow while macrdp was sending shapes (SkyLight reported I-beam,
+    hand and resize cursors the whole time). `rgba_and_mask` builds it: a bit
+    set where alpha is 0, scan lines padded to 2 bytes, same row order as the
+    XOR data. mstsc and FreeRDP accepted the empty mask, which is why this went
+    unnoticed. Upstream has the same empty mask (`ironrdp-server`
+    `rgba_pointer`/`large_pointer`). Live-verified 2026-10-11 (every shape now
+    draws on Windows App for macOS) and filed upstream as Devolutions/IronRDP#2108,
+    which also covers `large_pointer`. Drop this divergence at the pin bump past
+    its merge.

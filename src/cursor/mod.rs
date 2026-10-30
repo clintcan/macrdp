@@ -56,6 +56,15 @@ impl CursorState {
         })
     }
 
+    /// Change the size multiplier and resend the current shape at the new
+    /// size on the next poll.
+    pub fn set_scale(&mut self, cursor_scale: f64) {
+        #[cfg(target_os = "macos")]
+        self.inner.set_scale(cursor_scale);
+        #[cfg(not(target_os = "macos"))]
+        let _ = cursor_scale;
+    }
+
     /// Return any cursor-related DisplayUpdates that the client should see.
     /// Cheap to call: the cost is one CGEvent::new + one NSCursor read.
     pub fn poll(&mut self) -> Vec<DisplayUpdate> {
@@ -134,6 +143,13 @@ mod macos {
                 cursor_scale,
                 diag_logged: false,
             })
+        }
+
+        pub fn set_scale(&mut self, cursor_scale: f64) {
+            if cursor_scale.is_finite() && cursor_scale > 0.0 {
+                self.cursor_scale = cursor_scale;
+                self.last_hash = 0;
+            }
         }
 
         pub fn poll(&mut self) -> Vec<DisplayUpdate> {

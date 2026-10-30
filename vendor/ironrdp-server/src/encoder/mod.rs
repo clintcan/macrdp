@@ -181,6 +181,7 @@ impl UpdateEncoder {
 
     fn rgba_pointer(ptr: RGBAPointer) -> Result<UpdateFragmenter> {
         let xor_mask = ptr.data;
+        let and_mask = rgba_and_mask(&xor_mask, ptr.width, ptr.height);
 
         let hot_spot = Point16 {
             x: ptr.hot_x,
@@ -192,7 +193,7 @@ impl UpdateEncoder {
             width: ptr.width,
             height: ptr.height,
             xor_mask: &xor_mask,
-            and_mask: &[],
+            and_mask: &and_mask,
         };
         let ptr = PointerAttribute {
             xor_bpp: 32,
@@ -747,4 +748,25 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
     };
     let cmd = SurfaceCommand::SetSurfaceBits(pdu);
     Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
+}
+
+/// The 1-bpp AND mask for a 32-bpp pointer (MS-RDPBCGR 2.2.9.1.1.4.4): a bit
+/// per pixel, set where the pixel is fully transparent, each scan line padded
+/// to a 2-byte boundary, in the same row order as the XOR data. The spec makes
+/// the mask part of every color pointer, and Windows App for macOS keeps its
+/// default arrow when it is empty, though mstsc and FreeRDP accept that.
+fn rgba_and_mask(rgba: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let w = usize::from(width);
+    let h = usize::from(height);
+    let stride = w.div_ceil(16) * 2;
+    let mut mask = vec![0u8; stride * h];
+    for y in 0..h {
+        for x in 0..w {
+            let alpha = rgba.get((y * w + x) * 4 + 3).copied().unwrap_or(0);
+            if alpha == 0 {
+                mask[y * stride + x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    mask
 }
