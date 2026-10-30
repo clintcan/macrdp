@@ -512,6 +512,16 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
 
+    /// EXPERIMENTAL (only with --enable-h264): have ScreenCaptureKit deliver
+    /// full-range BT.709 NV12 and hand those buffers straight to VideoToolbox,
+    /// instead of BGRA that macrdp converts to NV12 on the CPU every frame.
+    /// Measured at a 3456x2168 virtual display: 14.3 → 3.3 ms of CPU per
+    /// encoded frame. Frames that still go out as legacy bitmaps (before H.264
+    /// is up, or a client without AVC) are converted back to BGRA on the CPU.
+    /// Config: CAPTURE_NV12.
+    #[arg(long)]
+    capture_nv12: bool,
+
     /// Disable lazy Windows→Mac file paste. Lazy paste is ON by default:
     /// temp files are pre-sized but empty when the Windows copy lands,
     /// and bytes stream only when the user actually pastes in Finder
@@ -2502,6 +2512,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
+    if on("CAPTURE_NV12", false) {
+        argv.push("--capture-nv12".into());
+    }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
     }
@@ -3345,6 +3358,9 @@ async fn async_main() -> Result<()> {
              For crisp H.264 on capable clients (mstsc, Microsoft Remote Desktop, FreeRDP, \
              Thincast) pass --enable-h264 (AVC420 over EGFX)."
         );
+        if args.capture_nv12 {
+            warn!("--capture-nv12 has no effect without --enable-h264; capturing BGRA");
+        }
     }
 
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
@@ -3475,6 +3491,7 @@ async fn async_main() -> Result<()> {
         keyframe_on_change,
         click_signal: click_signal.clone(),
         flush_frames: args.flush_frames,
+        capture_nv12: args.capture_nv12,
         display_suppressed: Some(display_suppressed.clone()),
         // Live in-session resize (client drags its window, sending an
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the

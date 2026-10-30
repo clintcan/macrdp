@@ -373,6 +373,10 @@ pub struct CaptureDisplay {
     /// Trailing flush frames re-sent after the last change to drain mstsc's
     /// presentation buffer (`--flush-frames`; EGFX/H.264 path only). 0 disables.
     pub flush_frames: u32,
+    /// `--capture-nv12` (experimental): ScreenCaptureKit delivers NV12 that the
+    /// encoder takes as-is, instead of BGRA it converts on the CPU. No effect
+    /// without H.264.
+    pub capture_nv12: bool,
     /// Shared "client minimized" flag from the vendor server's
     /// `SuppressOutput` handler. When set, `next_update` short-circuits
     /// (no SCK pull, no encode, no ship) and waits on a short timer
@@ -857,6 +861,7 @@ impl CaptureDisplay {
                 self.keyframe_on_change,
                 self.click_signal.clone(),
                 self.flush_frames,
+                self.capture_nv12,
                 self.display_suppressed.clone(),
                 self.auto_size,
                 self.stretch,
@@ -951,6 +956,12 @@ mod macos {
     /// holding it doesn't shrink the headroom SCK had before.
     const SCK_QUEUE_DEPTH: u32 = 4;
 
+    /// SCK's surface-pool depth in NV12 mode (its maximum). There the encoder
+    /// holds capture surfaces too — VideoToolbox retains each frame until it is
+    /// encoded — on top of the async buffer, the frame being handled, and the
+    /// retained flush frame.
+    const SCK_QUEUE_DEPTH_NV12: u32 = 8;
+
     /// How long the shared SuppressOutput flag must remain `true` before
     /// the gate engages. A real minimize lasts seconds-to-minutes and
     /// trips easily; backpressure flaps under heavy local CPU/IO last
@@ -1020,6 +1031,13 @@ mod macos {
         /// surface of SCK's pool, which is why the stream's queue depth is
         /// one above SCK's default (see `SCK_QUEUE_DEPTH`).
         last_frame: Option<CVPixelBuffer>,
+        /// Capturing NV12 for the encoder (`--capture-nv12`). Frames that still
+        /// ship as legacy bitmaps (before EGFX is ready, or a client without
+        /// AVC) are converted back to BGRA on the CPU.
+        nv12: bool,
+        /// BGRA converted from an NV12 frame for the legacy bitmap path.
+        /// Reused across frames; stays empty unless that path runs.
+        nv12_bgra: Vec<u8>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
         display_suppressed: Option<Arc<AtomicBool>>,
@@ -1097,6 +1115,7 @@ mod macos {
             keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
+            capture_nv12: bool,
             display_suppressed: Option<Arc<AtomicBool>>,
             auto_size: bool,
             stretch: bool,
@@ -1200,10 +1219,21 @@ mod macos {
                 .with_excluding_windows(&[])
                 .build();
 
+            let nv12 = gfx.is_some() && capture_nv12;
+            if nv12 {
+                tracing::info!(
+                    "capture: ScreenCaptureKit delivers full-range BT.709 NV12 to the \
+                     encoder (--capture-nv12, experimental)"
+                );
+            }
             let config = SCStreamConfiguration::new()
                 .with_width(u32::from(width))
                 .with_height(u32::from(height))
-                .with_pixel_format(SckPixelFormat::BGRA)
+                .with_pixel_format(if nv12 {
+                    SckPixelFormat::YCbCr_420f
+                } else {
+                    SckPixelFormat::BGRA
+                })
                 .with_fps(fps)
                 // Hide the macOS cursor in the captured framebuffer; we forward
                 // it separately as RGBAPointer so the client renders its own
@@ -1227,7 +1257,17 @@ mod macos {
                 // is the knob that picks letterbox vs stretch.
                 .with_scales_to_fit(true)
                 .with_preserves_aspect_ratio(letterbox)
-                .with_queue_depth(SCK_QUEUE_DEPTH);
+                .with_queue_depth(if nv12 {
+                    SCK_QUEUE_DEPTH_NV12
+                } else {
+                    SCK_QUEUE_DEPTH
+                });
+            // The encoder's NV12 is BT.709 (the session is tagged 709), and the
+            // BGRA path converts with that matrix too, so ask SCK for the same.
+            if nv12 {
+                set_color_matrix_709(&config);
+                tracing::debug!(color_matrix = ?config.color_matrix(), "capture: NV12 colour matrix");
+            }
 
             let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
             stream
@@ -1288,6 +1328,8 @@ mod macos {
                 flush_frames,
                 flush_remaining: 0,
                 last_frame: None,
+                nv12,
+                nv12_bgra: Vec::new(),
                 display_suppressed,
                 was_suppressed: false,
                 suppressed_since: None,
@@ -1298,6 +1340,123 @@ mod macos {
                 suppress_next_adopt,
             })
         }
+    }
+
+    /// Set `SCStreamConfiguration.colorMatrix` to BT.709.
+    ///
+    /// Not `with_color_matrix`: the crate stores a temporary CFString built
+    /// from its `&str`, but the property doesn't retain its value (Apple
+    /// expects one of the CoreGraphics constants), so `SCStream` later copies
+    /// a freed string and the process traps in `CFStringCreateCopy`. Hand it
+    /// the real, never-freed constant instead.
+    fn set_color_matrix_709(config: &SCStreamConfiguration) {
+        /// Opaque `struct __CFString`, so the argument carries the
+        /// `^{__CFString=}` type encoding objc2 checks against the method.
+        #[repr(C)]
+        struct CFStringOpaque {
+            _private: [u8; 0],
+        }
+        // SAFETY: matches CoreFoundation's declaration of `CFStringRef`.
+        unsafe impl objc2::encode::RefEncode for CFStringOpaque {
+            const ENCODING_REF: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+                &objc2::encode::Encoding::Struct("__CFString", &[]),
+            );
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            static kCGDisplayStreamYCbCrMatrix_ITU_R_709_2: *const CFStringOpaque;
+        }
+        // SAFETY: `SCStreamConfiguration` is `#[repr(transparent)]` over the
+        // retained `SCStreamConfiguration *`, so this reads that pointer; it
+        // stays valid while `config` is borrowed. `setColorMatrix:` takes a
+        // CFStringRef, and the constant lives for the process.
+        unsafe {
+            let obj =
+                *(config as *const SCStreamConfiguration as *const *mut objc2::runtime::AnyObject);
+            let matrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
+            let () = objc2::msg_send![obj, setColorMatrix: matrix];
+        }
+    }
+
+    /// The colour matrix must survive the configuration copy `SCStream` makes
+    /// (`-[SCStreamConfiguration copyWithZone:]`). The crate's own setter left
+    /// a dangling string there and the copy trapped, killing the server on
+    /// connect.
+    #[cfg(test)]
+    #[test]
+    fn color_matrix_survives_the_configuration_copy() {
+        let config = SCStreamConfiguration::new().with_pixel_format(SckPixelFormat::YCbCr_420f);
+        set_color_matrix_709(&config);
+        assert_eq!(config.color_matrix().as_deref(), Some("ITU_R_709_2"));
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let obj =
+                *(&config as *const SCStreamConfiguration as *const *mut objc2::runtime::AnyObject);
+            let copy: *mut objc2::runtime::AnyObject = objc2::msg_send![obj, copy];
+            assert!(!copy.is_null());
+            let () = objc2::msg_send![copy, release];
+        });
+    }
+
+    /// Hand one captured frame to the H.264 pipeline: the buffer itself in NV12
+    /// mode, its locked BGRA bytes otherwise. Same return contract as
+    /// [`crate::h264::Gfx::submit_bgra`].
+    fn submit_to_gfx(
+        gfx: &crate::h264::Gfx,
+        pixel_buffer: &CVPixelBuffer,
+        nv12: bool,
+        request_keyframe: bool,
+    ) -> Result<bool> {
+        if nv12 {
+            return gfx.submit_nv12(pixel_buffer, request_keyframe);
+        }
+        let guard = pixel_buffer
+            .lock(CVPixelBufferLockFlags::READ_ONLY)
+            .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
+        gfx.submit_bgra(guard.as_slice(), guard.bytes_per_row(), request_keyframe)
+    }
+
+    /// Convert a locked NV12 capture frame to tightly packed BGRA in `out`.
+    fn nv12_to_bgra(
+        guard: &screencapturekit::cv::CVPixelBufferLockGuard<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let y = guard
+            .plane_data(0)
+            .ok_or_else(|| anyhow!("NV12 frame has no luma plane"))?;
+        let cbcr = guard
+            .plane_data(1)
+            .ok_or_else(|| anyhow!("NV12 frame has no chroma plane"))?;
+        crate::videotoolbox::nv12_full_range_to_bgra(
+            y,
+            guard.bytes_per_row_of_plane(0),
+            cbcr,
+            guard.bytes_per_row_of_plane(1),
+            guard.width(),
+            guard.height(),
+            out,
+        )
+    }
+
+    /// Spike diagnostic, once per session: the luma range of the first NV12
+    /// frame. A desktop with true black and white reaches 0 and 255 when the
+    /// buffer really is full range; 16..235 would mean video range.
+    fn log_nv12_luma_range(pixel_buffer: &CVPixelBuffer) {
+        let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+            return;
+        };
+        let Some(y) = guard.plane_data(0) else {
+            return;
+        };
+        let (min, max) = y
+            .iter()
+            .step_by(61)
+            .fold((u8::MAX, u8::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        tracing::info!(
+            pixel_format = format_args!("{:#010x}", pixel_buffer.pixel_format()),
+            luma_min = min,
+            luma_max = max,
+            "capture: first NV12 frame"
+        );
     }
 
     /// Build a `BitmapUpdate` for a sub-rectangle of the captured frame by
@@ -1532,19 +1691,7 @@ mod macos {
                                 self.flush_remaining -= 1;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if let Some(pb) = self.last_frame.as_ref() {
-                                        let res = pb
-                                            .lock(CVPixelBufferLockFlags::READ_ONLY)
-                                            .map_err(|e| {
-                                                anyhow!("CVPixelBuffer::lock OSStatus {e}")
-                                            })
-                                            .and_then(|g| {
-                                                gfx.submit_bgra(
-                                                    g.as_slice(),
-                                                    g.bytes_per_row(),
-                                                    false,
-                                                )
-                                            });
-                                        if let Err(e) = res {
+                                        if let Err(e) = submit_to_gfx(gfx, pb, self.nv12, false) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
                                     }
@@ -1571,15 +1718,12 @@ mod macos {
                     continue;
                 };
 
-                let guard = pixel_buffer
-                    .lock(CVPixelBufferLockFlags::READ_ONLY)
-                    .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
-
-                let pb_width = u16::try_from(guard.width()).context("pixel buffer width > u16")?;
+                // Dimensions come from the buffer itself, no lock: in NV12 mode
+                // the EGFX path never needs the pixels on the CPU at all.
+                let pb_width =
+                    u16::try_from(pixel_buffer.width()).context("pixel buffer width > u16")?;
                 let pb_height =
-                    u16::try_from(guard.height()).context("pixel buffer height > u16")?;
-                let stride_bytes = guard.bytes_per_row();
-                let src = guard.as_slice();
+                    u16::try_from(pixel_buffer.height()).context("pixel buffer height > u16")?;
 
                 // Log the dimensions SCK actually delivers, once per session.
                 // `pb_width`/`pb_height` are the real captured buffer size — at
@@ -1590,10 +1734,13 @@ mod macos {
                     tracing::debug!(
                         pb_width,
                         pb_height,
-                        stride_bytes,
+                        pixel_format = format_args!("{:#010x}", pixel_buffer.pixel_format()),
                         force_full_frame = self.force_full_frame,
                         "capture: first frame delivered"
                     );
+                    if self.nv12 {
+                        log_nv12_luma_range(&pixel_buffer);
+                    }
                 }
 
                 // EGFX/H.264 path: submit the full frame to the encoder. Once
@@ -1680,7 +1827,12 @@ mod macos {
                     } else {
                         false
                     };
-                    match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
+                    match submit_to_gfx(
+                        gfx,
+                        &pixel_buffer,
+                        self.nv12,
+                        big_change || resume_keyframe,
+                    ) {
                         Ok(true) => {
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress
@@ -1703,6 +1855,17 @@ mod macos {
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
                 }
+
+                // Legacy bitmap path: needs the pixels as BGRA on the CPU.
+                let guard = pixel_buffer
+                    .lock(CVPixelBufferLockFlags::READ_ONLY)
+                    .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
+                let (src, stride_bytes): (&[u8], usize) = if self.nv12 {
+                    nv12_to_bgra(&guard, &mut self.nv12_bgra)?;
+                    (&self.nv12_bgra, usize::from(pb_width) * 4)
+                } else {
+                    (guard.as_slice(), guard.bytes_per_row())
+                };
 
                 // Decide the rect set to emit. On the first frame we always
                 // send the full frame so the client's bitmap cache is seeded.

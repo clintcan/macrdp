@@ -225,6 +225,12 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
                           #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
+--capture-nv12            # EXPERIMENTAL (--enable-h264 only): ScreenCaptureKit delivers
+                          #   full-range BT.709 NV12 (GPU-converted) and VideoToolbox
+                          #   encodes those buffers directly — no per-frame CPU colour
+                          #   conversion or copy (14.3 → 3.3 ms CPU/frame at 3456x2168).
+                          #   Frames sent as legacy bitmaps are converted back to BGRA.
+                          #   Config key: CAPTURE_NV12.
 --enable-aac              # Compress RDPSND audio as AAC-LC (WAVE_FORMAT_AAC_MS)
                           #   instead of raw PCM; ~11x less bandwidth. PCM fallback is
                           #   automatic for clients without AAC decode. Adds ~40-50 ms

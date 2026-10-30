@@ -177,6 +177,42 @@ impl Encoder {
         )
     }
 
+    /// Submit a capture-owned full-range NV12 (`420f`) pixel buffer for
+    /// encoding — the zero-conversion path, where ScreenCaptureKit did the
+    /// BGRA→Y'CbCr conversion on the GPU. VT retains the buffer until the
+    /// encode completes, so the caller can drop its reference right after.
+    /// The buffer must match the encoder's size and be `420f`; anything else
+    /// is refused rather than encoded wrong.
+    pub fn encode_pixel_buffer(
+        &mut self,
+        pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        let pixel_buffer = pixel_buffer.as_ptr() as *const c_void;
+        // SAFETY: `pixel_buffer` comes from a live, retained `CVPixelBuffer`
+        // borrowed for the whole call.
+        let (w, h, fmt) = unsafe {
+            (
+                ffi::CVPixelBufferGetWidth(pixel_buffer),
+                ffi::CVPixelBufferGetHeight(pixel_buffer),
+                ffi::CVPixelBufferGetPixelFormatType(pixel_buffer),
+            )
+        };
+        if w != usize::from(self.width) || h != usize::from(self.height) {
+            bail!(
+                "NV12 pixel buffer is {w}x{h}, encoder is {}x{}",
+                self.width,
+                self.height
+            );
+        }
+        if fmt != ffi::K_CV_PIXEL_FORMAT_TYPE_420F {
+            bail!("pixel buffer format {fmt:#010x} is not full-range NV12 ('420f')");
+        }
+        let pts = self.next_pts;
+        self.next_pts = self.next_pts.wrapping_add(1);
+        ffi::submit_to_vt(&self.inner, pixel_buffer, pts, self.fps, force_keyframe)
+    }
+
     /// Pull every encoded frame the callback has produced so far.
     /// Non-blocking; returns an empty vec if nothing is ready (or the receiver
     /// has been taken for the push pipeline).
@@ -205,6 +241,33 @@ impl Encoder {
 // (frames can be submitted from any thread). The Receiver is !Sync but
 // that's fine — we only call `drain()` from the owning thread.
 unsafe impl Send for Encoder {}
+
+/// Convert a locked full-range BT.709 NV12 (`420f`) frame to tightly packed
+/// BGRA (`width * 4` bytes per row) in `out`, resizing it as needed. Used by
+/// the NV12 capture mode for frames that still ship as legacy bitmaps.
+#[allow(clippy::too_many_arguments)]
+pub fn nv12_full_range_to_bgra(
+    y_plane: &[u8],
+    y_stride: usize,
+    cbcr_plane: &[u8],
+    cbcr_stride: usize,
+    width: usize,
+    height: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let dst_stride = width * 4;
+    out.resize(dst_stride * height, 0);
+    ffi::nv12_full_range_to_bgra_vimage(
+        y_plane,
+        y_stride,
+        cbcr_plane,
+        cbcr_stride,
+        width,
+        height,
+        out,
+        dst_stride,
+    )
+}
 
 mod ffi {
     use super::EncodedFrame;
@@ -342,6 +405,9 @@ mod ffi {
             pixel_buffer_attributes: CFDictionaryRef,
             pixel_buffer_out: *mut CVPixelBufferRef,
         ) -> i32;
+        pub(super) fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
+        pub(super) fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
+        pub(super) fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> OSType;
         pub(super) fn CVPixelBufferLockBaseAddress(
             pixel_buffer: CVPixelBufferRef,
             lock_flags: u64,
@@ -847,6 +913,136 @@ mod ffi {
         Ok(())
     }
 
+    // --- vImage full-range NV12 -> BGRA (legacy fallback for NV12 capture) ----
+    //
+    // When ScreenCaptureKit delivers NV12 (`--capture-nv12`), frames that still
+    // go out as legacy BitmapUpdates (before EGFX is ready, or a no-AVC client)
+    // need BGRA back. Inverse of the conversion above: same BT.709 matrix, same
+    // full-range pixel range.
+
+    /// `vImage_YpCbCrToARGB` — opaque 128-byte, 16-aligned conversion descriptor.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct VImageYpCbCrToArgb {
+        opaque: [u8; 128],
+    }
+
+    /// `vImage_YpCbCrToARGBMatrix` — opaque; only a pointer to the framework's
+    /// BT.709 constant is ever held.
+    #[repr(C)]
+    struct VImageYpCbCrToArgbMatrix {
+        _private: [u8; 0],
+    }
+
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        static kvImage_YpCbCrToARGBMatrix_ITU_R_709_2: *const VImageYpCbCrToArgbMatrix;
+        fn vImageConvert_YpCbCrToARGB_GenerateConversion(
+            matrix: *const VImageYpCbCrToArgbMatrix,
+            pixel_range: *const VImageYpCbCrPixelRange,
+            out_info: *mut VImageYpCbCrToArgb,
+            in_ypcbcr_type: u32,
+            out_argb_type: u32,
+            flags: u32,
+        ) -> isize;
+        fn vImageConvert_420Yp8_CbCr8ToARGB8888(
+            src_yp: *const VImageBuffer,
+            src_cbcr: *const VImageBuffer,
+            dest: *const VImageBuffer,
+            info: *const VImageYpCbCrToArgb,
+            permute_map: *const u8,
+            alpha: u8,
+            flags: u32,
+        ) -> isize;
+    }
+
+    fn vimage_inverse_conv_info() -> Option<&'static VImageYpCbCrToArgb> {
+        static INFO: std::sync::OnceLock<Option<VImageYpCbCrToArgb>> = std::sync::OnceLock::new();
+        INFO.get_or_init(|| {
+            let range = VImageYpCbCrPixelRange {
+                yp_bias: 0,
+                cbcr_bias: 128,
+                yp_range_max: 255,
+                cbcr_range_max: 255,
+                yp_max: 255,
+                yp_min: 0,
+                cbcr_max: 255,
+                cbcr_min: 0,
+            };
+            let mut info = VImageYpCbCrToArgb { opaque: [0u8; 128] };
+            let err = unsafe {
+                vImageConvert_YpCbCrToARGB_GenerateConversion(
+                    kvImage_YpCbCrToARGBMatrix_ITU_R_709_2,
+                    &range,
+                    &mut info,
+                    K_VIMAGE_420YP8_CBCR8,
+                    K_VIMAGE_ARGB8888,
+                    K_VIMAGE_NO_FLAGS,
+                )
+            };
+            (err == 0).then_some(info)
+        })
+        .as_ref()
+    }
+
+    /// Full-range BT.709 NV12 -> BGRA (opaque alpha) via vImage.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn nv12_full_range_to_bgra_vimage(
+        y_plane: &[u8],
+        y_stride: usize,
+        cbcr_plane: &[u8],
+        cbcr_stride: usize,
+        width: usize,
+        height: usize,
+        bgra: &mut [u8],
+        dst_stride: usize,
+    ) -> Result<()> {
+        if y_plane.len() < y_stride * height
+            || cbcr_plane.len() < cbcr_stride * (height / 2)
+            || bgra.len() < dst_stride * height
+        {
+            bail!("NV12->BGRA: plane or destination too small for {width}x{height}");
+        }
+        let info = vimage_inverse_conv_info()
+            .ok_or_else(|| anyhow!("vImage inverse conv-info unavailable"))?;
+        let src_yp = VImageBuffer {
+            data: y_plane.as_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: y_stride,
+        };
+        let src_cbcr = VImageBuffer {
+            data: cbcr_plane.as_ptr() as *mut c_void,
+            height: height / 2,
+            width: width / 2,
+            row_bytes: cbcr_stride,
+        };
+        let dest = VImageBuffer {
+            data: bgra.as_mut_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: dst_stride,
+        };
+        // vImage writes A,R,G,B; permuteMap[dest] = source channel, so
+        // {3,2,1,0} lays the bytes out as B,G,R,A.
+        let permute: [u8; 4] = [3, 2, 1, 0];
+        let err = unsafe {
+            vImageConvert_420Yp8_CbCr8ToARGB8888(
+                &src_yp,
+                &src_cbcr,
+                &dest,
+                info,
+                permute.as_ptr(),
+                255,
+                K_VIMAGE_NO_FLAGS,
+            )
+        };
+        if err != 0 {
+            bail!("vImageConvert_420Yp8_CbCr8ToARGB8888 failed: {err}");
+        }
+        Ok(())
+    }
+
     // --- BGRA -> full-range YUV444 planar (AVC444 scoping benchmark) ---------
     //
     // Two reference implementations of full-resolution chroma conversion, kept
@@ -1090,7 +1286,22 @@ mod ffi {
                 }
             }
             CVPixelBufferUnlockBaseAddress(pbuf, 0);
+            submit_to_vt(guard, pbuf, pts, fps, force_keyframe)
+        };
+        unsafe { CFRelease(pbuf) };
+        result
+    }
 
+    /// Hand one pixel buffer to the VT session (async). VT retains `pbuf` for
+    /// the encode, so the caller keeps ownership of its own reference.
+    pub(super) fn submit_to_vt(
+        guard: &SessionGuard,
+        pbuf: CVPixelBufferRef,
+        pts: i64,
+        fps: u32,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        unsafe {
             let presentation = CMTime {
                 value: pts,
                 timescale: i32::try_from(fps).unwrap_or(30),
@@ -1138,9 +1349,7 @@ mod ffi {
             } else {
                 Ok(())
             }
-        };
-        unsafe { CFRelease(pbuf) };
-        result
+        }
     }
 
     #[allow(dead_code)] // only reached via Encoder::flush (shutdown / tests)
@@ -1345,6 +1554,45 @@ mod tests {
                 cbcr_s[1],
                 cbcr_v[1]
             );
+        }
+    }
+
+    /// The NV12 capture mode's legacy fallback converts back to BGRA; it must
+    /// invert the encoder's conversion. BGRA -> NV12 -> BGRA on solid colours
+    /// (4:2:0 exact) lands within rounding of the original, which also pins the
+    /// output byte order (a swapped permute turns red into blue here).
+    #[test]
+    fn nv12_to_bgra_inverts_the_encoder_conversion() {
+        use super::ffi::bgra_to_nv12_full_range_vimage;
+        let colors: [[u8; 4]; 7] = [
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [0, 0, 255, 255],
+            [0, 255, 0, 255],
+            [255, 0, 0, 255],
+            [128, 128, 128, 255],
+            [30, 140, 220, 255],
+        ];
+        let (w, h) = (6usize, 4usize);
+        let stride = w * 4;
+        for c in colors {
+            let mut bgra = vec![0u8; stride * h];
+            for px in bgra.chunks_exact_mut(4) {
+                px.copy_from_slice(&c);
+            }
+            let (mut y, mut cbcr) = (vec![0u8; w * h], vec![0u8; w * (h / 2)]);
+            bgra_to_nv12_full_range_vimage(&bgra, stride, w, h, &mut y, w, &mut cbcr, w)
+                .expect("forward conversion");
+            let mut back = Vec::new();
+            nv12_full_range_to_bgra(&y, w, &cbcr, w, w, h, &mut back).expect("inverse conversion");
+            assert_eq!(back.len(), stride * h);
+            for px in back.chunks_exact(4) {
+                for ch in 0..3 {
+                    let d = (i32::from(px[ch]) - i32::from(c[ch])).abs();
+                    assert!(d <= 3, "channel {ch} of {c:?} came back as {px:?}");
+                }
+                assert_eq!(px[3], 255, "opaque alpha");
+            }
         }
     }
 
