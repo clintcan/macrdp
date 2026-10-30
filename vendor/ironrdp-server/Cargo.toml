@@ -33,7 +33,7 @@ nscodec = ["dep:ironrdp-nscodec"]
 # the standard build is byte-identical. M1 performs the negotiation handshake;
 # M3 adds the UDP listener + RDPEUDP SYN/SYN+ACK handshake (pulls in the
 # sans-I/O ironrdp-rdpeudp crate for the wire codecs + reliability SM).
-multitransport = ["dep:ironrdp-rdpeudp", "dep:getrandom", "dep:boring"]
+multitransport = ["dep:ironrdp-rdpeudp", "dep:boring"]
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at any time.
@@ -41,7 +41,7 @@ __bench = ["dep:visibility"]
 
 [dependencies]
 anyhow = "1.0"
-tokio = { version = "1", features = ["net", "macros", "sync", "rt"] } # public
+tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] } # public
 tokio-rustls = "0.26" # public
 async-trait = "0.1"
 # path = "../ironrdp-*" entries dropped — we live outside the upstream
@@ -74,7 +74,7 @@ ironrdp-rdpeusb = "0.1"
 # [patch.crates-io] is ignored in the macrdp build, where ironrdp-core resolves
 # via the root patch to the same git rev.
 ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", optional = true }
-getrandom = { version = "0.2", optional = true } # multitransport: CSPRNG cookie
+getrandom = "0.2" # multitransport cookies and network-detection payloads
 # (vendored, multitransport-only, Phase 2) DTLS 1.2 server for the LOSSY
 # (`UdpFecL`) flow — sans-I/O over boring's custom-BIO `SslStream`. BoringSSL is
 # vendored + built from source (needs cmake + Go + libclang at build time;

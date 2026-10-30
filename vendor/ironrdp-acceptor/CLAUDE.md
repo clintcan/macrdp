@@ -191,3 +191,9 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
     22621) + its hostname; FreeRDP hardcodes build 2600. Informational
     fingerprinting only — a client can claim anything.
+
+(5) Optional connect-time network-detection seam (added 2026-10-25): preserve
+    `SUPPORT_NET_CHAR_AUTODETECT` in `AcceptorResult`. Expose the message channel
+    after Client Info, before licensing, plus the MCS user-channel initiator.
+    The server drives RTT/bandwidth detection at this seam; the acceptor sends
+    no probes. Reactivation retains support but skips connect-time detection.
