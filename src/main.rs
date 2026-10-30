@@ -3359,10 +3359,11 @@ async fn async_main() -> Result<()> {
             no_remap_apps = ?args.no_remap_apps,
             "Ctrl→Cmd Windows-shortcut remap enabled (--map-ctrl-to-cmd)"
         );
-        // Event-driven frontmost-app tracking for the terminal/app suppression
-        // (catches click-focus + Electron apps that AX polling misses).
-        crate::input::init_focus_observer();
     }
+    // Event-driven frontmost-app tracking (catches activations AX polling
+    // misses). Feeds the Ctrl→Cmd terminal suppression AND the app switcher's
+    // MRU, so it's armed regardless of --map-ctrl-to-cmd.
+    crate::input::init_focus_observer();
 
     // App-switcher HUD overlay helper (macOS-only). Tell it which display to
     // center on (the captured one) and spawn it; it idles until a Cmd+Tab. Held

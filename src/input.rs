@@ -202,6 +202,16 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
     remap_on && ctrl && !cmd && !alt && !excluded
 }
 
+/// Does a button-down bring the app under the cursor to the front? Only a
+/// plain left click does: right/middle clicks open menus in place, Cmd+click
+/// on a background window acts on it without activating its app, and
+/// Ctrl+click is a secondary click (or, under --map-ctrl-to-cmd, a Cmd+click).
+/// Gates the click hit-test's feed into the app switcher's focus tracking.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_activating_click(left_button: bool, cmd: bool, ctrl: bool) -> bool {
+    left_button && !cmd && !ctrl
+}
+
 /// What `resync_modifiers_if_stale` must do for one trigger. Split out pure —
 /// like `should_remap_click` — so the decision table is unit-tested on every
 /// target; the method itself only gathers the inputs and performs the effects.
@@ -1846,10 +1856,21 @@ mod macos {
             // On a button-down, record which app's window is under the cursor so
             // the Ctrl→Cmd suppression knows the real focus target — the only way
             // to catch an Electron app (VSCode) clicked into in a headless session,
-            // which takes key focus without activating. Gated to when the remap is
-            // on (the only consumer); the hit-test runs off-thread, best-effort.
-            if down && super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed) {
-                update_focus_from_click(self.last_x, self.last_y);
+            // which takes key focus without activating. Also feeds the app
+            // switcher's MRU (so Alt+Tab after a click-switch returns to the
+            // previous app) — but only for a click that ACTIVATES the app it
+            // lands on: a plain left click. Right/middle clicks, Cmd+click on a
+            // background window and Ctrl+click (a secondary click, or a
+            // remapped Cmd+click) leave the current app in front. The hit-test
+            // runs off-thread, best-effort; only on button-down.
+            let activating_click = super::is_activating_click(
+                matches!(button, CGMouseButton::Left),
+                self.mods.has_cmd(),
+                self.mods.has_ctrl(),
+            );
+            let remap_on = super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed);
+            if down && (activating_click || remap_on) {
+                update_focus_from_click(self.last_x, self.last_y, activating_click);
             }
         }
 
@@ -1924,6 +1945,127 @@ mod macos {
         let mut guard = mru.lock().expect("MRU bundles mutex poisoned");
         guard.retain(|b| b != bundle);
         guard.insert(0, bundle.to_string());
+    }
+
+    /// The app the user is in right now, as far as the app switcher knows —
+    /// last-wins across EVERY focus signal: our own switcher commits, the AX
+    /// focus poller, the NSWorkspace activation observer, and the click
+    /// hit-test. A fresh Cmd/Alt+Tab session starts from this app (when it's a
+    /// live regular app), so the first Tab lands on the app used before it —
+    /// even when the user got here by clicking, the Dock, or anything other
+    /// than the switcher. Without it the session fell back to
+    /// `effective_front_pid`, which under the headless modes keeps returning
+    /// the last app WE activated (NSWorkspace stops tracking), so switching by
+    /// click and then Alt+Tab "switched" to the app you were already in.
+    static SWITCHER_FRONT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// Live pid of the `SWITCHER_FRONT` app, for callers that need "the app
+    /// the user is in" outside a switcher session (Cmd+`). Prefers the
+    /// instance AX reports as focused, then the MRU-pinned instance, then the
+    /// first running one. None if unknown or no longer running.
+    fn switcher_front_pid() -> Option<libc::pid_t> {
+        let bundle = SWITCHER_FRONT.lock().ok().and_then(|g| g.clone())?;
+        let alive = |p: libc::pid_t| unsafe { libc::kill(p, 0) == 0 };
+        let is_bundle =
+            |p: libc::pid_t| alive(p) && bundle_identifier_for_pid(p).as_deref() == Some(&bundle);
+        if let Some(p) = ax_focused_application_pid().filter(|p| is_bundle(*p)) {
+            return Some(p);
+        }
+        let pinned = mru_map().lock().ok().and_then(|g| g.get(&bundle).copied());
+        if let Some(p) = pinned.filter(|p| is_bundle(*p)) {
+            return Some(p);
+        }
+        pid_for_bundle(&bundle)
+    }
+
+    /// The AX focused-app pid the focus poller last observed (0 = none yet).
+    /// The poller has already OFFERED every change it saw to `SWITCHER_FRONT`
+    /// (it may have been declined: mid-cycle, inside the post-commit settle
+    /// window, or a non-regular app), so a live AX read that DIFFERS from this
+    /// is a change nothing has considered yet — the case Cmd+` trusts AX for.
+    static AX_POLLER_LAST_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// Which source names the app Cmd+` should act on. The live AX focus is
+    /// trusted when it has changed since the poller last saw it (an unseen,
+    /// newer change); otherwise `SWITCHER_FRONT` wins, because it already
+    /// includes that AX observation plus clicks/commits AX can miss — in the
+    /// headless modes AX was observed still naming the last app the switcher
+    /// activated after a click into another app. Pure (unit-tested).
+    fn pick_front_for_window_cycle(
+        live_ax: Option<libc::pid_t>,
+        ax_is_regular_app: bool,
+        poller_last_seen: libc::pid_t,
+        switcher_front: Option<libc::pid_t>,
+    ) -> Option<libc::pid_t> {
+        match live_ax {
+            Some(ax) if ax_is_regular_app && ax != poller_last_seen => Some(ax),
+            _ => switcher_front.or(live_ax),
+        }
+    }
+
+    /// Bundle + time of the last switcher commit. Activation notifications for
+    /// apps merely cycled THROUGH are delivered asynchronously and can land
+    /// just after Cmd/Alt release; within this window only the landed app is
+    /// accepted from the non-user-driven feeders.
+    static LAST_COMMIT: std::sync::Mutex<Option<(Instant, String)>> = std::sync::Mutex::new(None);
+    const POST_COMMIT_SETTLE: Duration = Duration::from_millis(750);
+
+    /// Should a focus report for `bundle` be accepted as the user's current
+    /// app? Pure decision table for `note_focus_change` (unit-tested).
+    fn accept_focus_report(
+        cycle_active: bool,
+        user_driven: bool,
+        bundle: &str,
+        last_commit: Option<(Duration, &str)>,
+    ) -> bool {
+        if cycle_active || bundle.is_empty() || bundle == "<no-bundle-id>" {
+            return false;
+        }
+        match last_commit {
+            Some((since, committed)) if !user_driven && since < POST_COMMIT_SETTLE => {
+                bundle == committed
+            }
+            _ => true,
+        }
+    }
+
+    /// Record an observed focus change (not one we caused mid-cycle) into the
+    /// switcher's MRU and `SWITCHER_FRONT`. `user_driven` = a click hit-test,
+    /// which is direct evidence and bypasses the post-commit settle window.
+    fn note_focus_change(bundle: &str, user_driven: bool) {
+        let cycle_active = CYCLE_SESSION.lock().is_ok_and(|g| g.is_some());
+        let commit = LAST_COMMIT.lock().ok().and_then(|g| g.clone());
+        let accepted = accept_focus_report(
+            cycle_active,
+            user_driven,
+            bundle,
+            commit.as_ref().map(|(t, b)| (t.elapsed(), b.as_str())),
+        );
+        if !accepted {
+            return;
+        }
+        promote_bundle_to_front(bundle);
+        if let Ok(mut g) = SWITCHER_FRONT.lock() {
+            *g = Some(bundle.to_string());
+        }
+    }
+
+    /// Bundle id for a focus report about `pid`, or None when the pid is a
+    /// real NON-regular app (Dock, SystemUIServer, Control Center…) — those
+    /// take clicks but aren't switcher targets, and recording them would mask
+    /// the real front app. Helper processes (no bundle id of their own, e.g.
+    /// Electron renderers) resolve to their owning app.
+    fn switcher_bundle_for_pid(pid: libc::pid_t) -> Option<String> {
+        let own = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) };
+        if let Some(app) = own {
+            let has_bundle = unsafe { app.bundleIdentifier() }.is_some_and(|b| !b.is_empty());
+            let regular =
+                unsafe { app.activationPolicy() } == NSApplicationActivationPolicy::Regular;
+            if has_bundle && !regular {
+                return None;
+            }
+        }
+        bundle_identifier_for_pid(pid).filter(|b| !b.is_empty())
     }
 
     /// Active Cmd+Tab session. `snapshot` is the MRU-ordered candidate
@@ -2323,7 +2465,8 @@ mod macos {
                 if let Some(bid) = bid {
                     let s = bid.to_string();
                     if !s.is_empty() {
-                        debug!(bundle = %s, "ctrl→cmd activation focus");
+                        debug!(bundle = %s, "activation focus");
+                        note_focus_change(&s, false);
                         if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
                             *g = Some(s);
                         }
@@ -2382,13 +2525,48 @@ mod macos {
     /// and resolves its owning app's bundle id. This is the only signal that
     /// catches an Electron app (VSCode) clicked into in a headless/virtual-display
     /// session: it takes key focus without emitting an activation, so the
-    /// activation observer and `AXFocusedApplication` never see it. Best-effort —
-    /// runs on the dedicated CFRunLoop thread (where AX is reliable, unlike the
-    /// input thread) and updates the cell before the user's next keystroke. Only
-    /// armed when `--map-ctrl-to-cmd` is on (the only consumer). No-op if AX can't
-    /// resolve a window/app at the point (menu bar, empty space).
-    fn update_focus_from_click(x: f64, y: f64) {
-        crate::runloop_thread::submit(move || unsafe {
+    /// activation observer and `AXFocusedApplication` never see it. Also feeds
+    /// the app switcher (`note_focus_change`) for activating clicks. No-op if AX
+    /// can't resolve a window/app at the point (menu bar, empty space).
+    ///
+    /// Runs on its OWN thread (`click-focus-hittest`), not the shared
+    /// `runloop_thread`, and coalesces latest-wins: a hit-test over a hung app
+    /// blocks until AX gives up (measured ~1.5 s), and since this now runs on
+    /// every plain left click for everyone, queueing those on the shared thread
+    /// would stall lazy file paste and the activation observer behind a few
+    /// clicks on a beachballing app. Here a hung app costs at most one blocked
+    /// hit-test; clicks that arrive meanwhile replace each other and only the
+    /// newest runs. (A shorter AX messaging timeout isn't used because setting
+    /// one on the system-wide element changes it process-wide, which would also
+    /// cut short the switcher's window raises on slow apps.)
+    fn update_focus_from_click(x: f64, y: f64, activating_click: bool) {
+        use std::sync::{Condvar, Mutex, OnceLock};
+        static SLOT: Mutex<Option<(f64, f64, bool)>> = Mutex::new(None);
+        static WAKE: Condvar = Condvar::new();
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let _ = std::thread::Builder::new()
+                .name("click-focus-hittest".into())
+                .spawn(|| loop {
+                    let job = {
+                        let mut g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+                        while g.is_none() {
+                            g = WAKE.wait(g).unwrap_or_else(|e| e.into_inner());
+                        }
+                        g.take()
+                    };
+                    if let Some((x, y, activating)) = job {
+                        hit_test_click_focus(x, y, activating);
+                    }
+                });
+        });
+        *SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, activating_click));
+        WAKE.notify_one();
+    }
+
+    /// The hit-test itself, for `update_focus_from_click`'s worker thread.
+    fn hit_test_click_focus(x: f64, y: f64, activating_click: bool) {
+        unsafe {
             use std::ffi::c_void;
             let systemwide = AXUIElementCreateSystemWide();
             if systemwide.is_null() {
@@ -2403,19 +2581,88 @@ mod macos {
             }
             let mut pid: libc::pid_t = 0;
             let pid_err = AXUIElementGetPid(element, &mut pid);
+            // A click on a Dock app icon activates THAT app, but the hit-test
+            // resolves to the Dock's own pid — and neither the activation
+            // observer nor the AX poller reliably reports the switch in the
+            // headless modes (observed live). Read the clicked icon's app.
+            let dock_target = if activating_click
+                && pid_err == AX_ERROR_SUCCESS
+                && bundle_identifier_for_pid(pid).as_deref() == Some("com.apple.dock")
+            {
+                dock_item_app_bundle(element)
+            } else {
+                None
+            };
+            // A menu-bar status item (menu extra) belongs to its app, but
+            // clicking it opens a menu without activating that app.
+            let menu_extra = ax_string_attr(element, "AXSubrole").as_deref() == Some("AXMenuExtra");
             CFRelease(element as *const c_void);
             if pid_err != AX_ERROR_SUCCESS || pid <= 0 {
                 return;
             }
+            if let Some(bundle) = dock_target {
+                debug!(bundle = %bundle, "click focus (Dock icon)");
+                note_focus_change(&bundle, true);
+                if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
+                    *g = Some(bundle);
+                }
+                return;
+            }
+            if activating_click && !menu_extra {
+                if let Some(bundle) = switcher_bundle_for_pid(pid) {
+                    note_focus_change(&bundle, true);
+                }
+            }
             if let Some(bundle) = bundle_identifier_for_pid(pid) {
                 if !bundle.is_empty() {
-                    debug!(pid, bundle = %bundle, "ctrl→cmd click focus");
+                    debug!(pid, bundle = %bundle, "click focus");
                     if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
                         *g = Some(bundle);
                     }
                 }
             }
-        });
+        }
+    }
+
+    /// Copy an AX attribute (+1 retained), or None if absent/failed.
+    unsafe fn ax_copy_attr(
+        element: *mut std::ffi::c_void,
+        name: &'static str,
+    ) -> Option<core_foundation::base::CFTypeRef> {
+        use core_foundation::base::TCFType;
+        let attr = core_foundation::string::CFString::from_static_string(name);
+        let mut v: core_foundation::base::CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef().cast(), &mut v);
+        (err == AX_ERROR_SUCCESS && !v.is_null()).then_some(v)
+    }
+
+    /// A string-valued AX attribute (e.g. AXRole/AXSubrole) of `element`.
+    unsafe fn ax_string_attr(element: *mut std::ffi::c_void, name: &'static str) -> Option<String> {
+        use core_foundation::base::TCFType;
+        let v = ax_copy_attr(element, name)?;
+        let cf = core_foundation::base::CFType::wrap_under_create_rule(v);
+        cf.downcast::<core_foundation::string::CFString>()
+            .map(|s| s.to_string())
+    }
+
+    /// Bundle id of the app a Dock element stands for, if it's an application
+    /// Dock item (`AXSubrole == AXApplicationDockItem`; folders, stacks, the
+    /// Trash and minimized-window tiles return None). Read from the item's
+    /// `AXURL` (the app's bundle path). `element` is borrowed, not released.
+    unsafe fn dock_item_app_bundle(element: *mut std::ffi::c_void) -> Option<String> {
+        use core_foundation::base::TCFType;
+        use core_foundation::url::CFURL;
+        if ax_string_attr(element, "AXSubrole").as_deref() != Some("AXApplicationDockItem") {
+            return None;
+        }
+        let url = ax_copy_attr(element, "AXURL")?;
+        let path = CFURL::wrap_under_create_rule(url.cast()).to_path()?;
+        let ns = objc2_foundation::NSString::from_str(path.to_str()?);
+        let bundle = objc2_foundation::NSBundle::bundleWithPath(&ns)?;
+        bundle
+            .bundleIdentifier()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
     }
 
     /// Find the pid of the first running app matching `bundle`. Walks
@@ -2437,6 +2684,7 @@ mod macos {
 
     fn ax_focus_mru_poller_loop() {
         let mut last_seen_pid: libc::pid_t = 0;
+        // (mirrored into AX_POLLER_LAST_SEEN for Cmd+`'s freshness check)
         loop {
             // Park while input-idle: no RDP input in the last minute (or ever)
             // means nobody is Cmd+Tab-ing or typing, so the system-wide AX
@@ -2455,6 +2703,7 @@ mod macos {
                 continue;
             }
             last_seen_pid = pid;
+            AX_POLLER_LAST_SEEN.store(pid, std::sync::atomic::Ordering::Relaxed);
 
             // Skip while a Cmd+Tab cycle is in flight — our own AX
             // activations are causing the focus changes the poller is
@@ -2468,13 +2717,10 @@ mod macos {
                 continue;
             }
 
-            let Some(bundle) = bundle_identifier_for_pid(pid) else {
+            let Some(bundle) = switcher_bundle_for_pid(pid) else {
                 continue;
             };
-            if bundle.is_empty() {
-                continue;
-            }
-            promote_bundle_to_front(&bundle);
+            note_focus_change(&bundle, false);
             debug!(
                 pid,
                 bundle = %bundle,
@@ -2523,6 +2769,12 @@ mod macos {
             .find(|(_, _, p)| *p == session.cursor_pid)
         {
             promote_bundle_to_front(bundle);
+            if let Ok(mut g) = SWITCHER_FRONT.lock() {
+                *g = Some(bundle.clone());
+            }
+            if let Ok(mut g) = LAST_COMMIT.lock() {
+                *g = Some((Instant::now(), bundle.clone()));
+            }
             // Record the landed app as the current focus for the Ctrl→Cmd
             // remap. Its `frontmost_is_excluded` reads LAST_FOCUS_BUNDLE
             // first, and our own Cmd+Tab/Option+Tab AX activation doesn't
@@ -2620,9 +2872,37 @@ mod macos {
             // the reconciled `front_pid` from here on means MRU
             // tracking actually survives a Cmd+Tab → release → Cmd+Tab
             // cycle.
-            let front_pid = effective_front_pid(workspace_front_pid, |p| {
+            let reconciled_front_pid = effective_front_pid(workspace_front_pid, |p| {
                 metas.iter().any(|m| m.pid == p && !m.terminated)
             });
+            // Prefer the switcher's own last-wins focus cell (commits + poller
+            // + activation observer + click hit-test): it tracks a click/Dock
+            // switch that the reconciliation above misses in headless setups.
+            // Only consulted at a FRESH session start — mid-hold, `front_pid`
+            // only feeds MRU-map pinning and the snapshot is frozen anyway.
+            let front_pid = SWITCHER_FRONT
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .and_then(|bundle| {
+                    let live = |p: libc::pid_t| {
+                        metas.iter().any(|m| {
+                            m.pid == p
+                                && !m.terminated
+                                && m.policy == NSApplicationActivationPolicy::Regular
+                                && m.bundle == bundle
+                        })
+                    };
+                    if live(reconciled_front_pid) {
+                        return Some(reconciled_front_pid);
+                    }
+                    let pinned = mru_map().lock().ok().and_then(|g| g.get(&bundle).copied());
+                    if let Some(p) = pinned.filter(|p| live(*p)) {
+                        return Some(p);
+                    }
+                    metas.iter().find(|m| live(m.pid)).map(|m| m.pid)
+                })
+                .unwrap_or(reconciled_front_pid);
 
             // Refresh MRU. Whichever bundle is currently frontmost is the
             // one the user just left (or was working in if this is their
@@ -2963,17 +3243,11 @@ mod macos {
                 *LAST_AX_ACTIVATED_PID
                     .lock()
                     .expect("last AX activated pid mutex poisoned") = Some(target_pid);
-                // Promote on every successful activation, not just on
-                // Cmd-release commit. Our cycle has no switcher UI, so
-                // each Tab press visibly switches apps and the user
-                // experiences every step as a real visit — MRU should
-                // reflect that or the next session's cycle order will
-                // disagree with what they just saw on screen. Snapshot
-                // is frozen so this doesn't disrupt the active cycle;
-                // it only affects what subsequent sessions consult.
-                if target_bundle != "<no-bundle-id>" {
-                    promote_bundle_to_front(&target_bundle);
-                }
+                // Deliberately NOT promoted to MRU here: like native macOS,
+                // only the app you LAND on (Cmd release → commit_cycle_session)
+                // becomes most-recent. Promoting every step made a quick
+                // Alt+Tab after cycling through A→B→C jump to B (the last
+                // app passed through) instead of the previously focused app.
                 debug!(target = %target_bundle, pid = target_pid, "cycle_apps: AX activation ok");
             } else {
                 warn!(
@@ -3035,6 +3309,7 @@ mod macos {
             value_ptr: *const std::ffi::c_void,
         ) -> core_foundation::base::CFTypeRef;
         fn CFRelease(cf: *const std::ffi::c_void);
+        fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
         fn CFEqual(a: *const std::ffi::c_void, b: *const std::ffi::c_void) -> u8;
         fn CFBooleanGetValue(boolean: core_foundation::base::CFTypeRef) -> u8;
         fn CFArrayGetCount(arr: *const std::ffi::c_void) -> isize;
@@ -3388,6 +3663,48 @@ mod macos {
         frontmost_err
     }
 
+    /// A retained AX/CF reference (released on drop) so window elements can
+    /// be kept across Cmd+` presses.
+    struct AxRef(*const std::ffi::c_void);
+    // SAFETY: AXUIElementRef is a CF object; CF retain/release and the AX
+    // calls made on it are thread-safe, and the store is mutex-guarded.
+    unsafe impl Send for AxRef {}
+    impl AxRef {
+        fn retain(p: *const std::ffi::c_void) -> Self {
+            Self(unsafe { CFRetain(p) })
+        }
+    }
+    impl Drop for AxRef {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    /// The stable window order Cmd+` steps through, for the app it last
+    /// cycled (pid). Reset when the app changes.
+    static WINDOW_CYCLE_ORDER: std::sync::Mutex<Option<(libc::pid_t, Vec<AxRef>)>> =
+        std::sync::Mutex::new(None);
+
+    /// Merge the stored cycle order with the app's current windows: keep the
+    /// stored windows that still exist, in their stored order, then append new
+    /// ones in their current (z-)order. A fresh app starts from z-order.
+    fn reconcile_window_order<T>(
+        stored: Vec<T>,
+        current: Vec<T>,
+        eq: impl Fn(&T, &T) -> bool,
+    ) -> Vec<T> {
+        let mut order: Vec<T> = stored
+            .into_iter()
+            .filter(|w| current.iter().any(|c| eq(w, c)))
+            .collect();
+        for c in current {
+            if !order.iter().any(|w| eq(w, &c)) {
+                order.push(c);
+            }
+        }
+        order
+    }
+
     /// Cycle through windows of the currently-frontmost app, the way
     /// native Cmd+` does. Pulls the app's window list via
     /// `kAXWindowsAttribute`, locates `kAXFocusedWindow` in that list,
@@ -3401,7 +3718,13 @@ mod macos {
         use std::ffi::c_void;
         use std::ptr;
 
-        // Source-of-truth for "what app is the user actually in": prefer the
+        // Source-of-truth for "what app is the user actually in": see
+        // `pick_front_for_window_cycle` — a live AX focus the poller hasn't
+        // seen yet, else the switcher's last-wins cell (`switcher_front_pid`,
+        // fed by commits, click/Dock-icon hit-tests, the activation observer
+        // and the poller). Observed live: after a click into Chrome, AX
+        // still reported the last app the switcher activated (Finder), so
+        // trusting AX alone cycled the wrong app. Historically: the
         // AX system-wide focused-application pid (`ax_focused_application_pid`,
         // the same primitive the MRU poller uses) over
         // `NSWorkspace.frontmostApplication`. NSWorkspace stops tracking
@@ -3413,7 +3736,14 @@ mod macos {
         // reconciliation (`effective_front_pid`) only if AX can't resolve a
         // focused app at all (e.g. a transient AX hiccup).
         let pid = unsafe {
-            match ax_focused_application_pid() {
+            let live_ax = ax_focused_application_pid();
+            let ax_is_regular_app = live_ax.and_then(switcher_bundle_for_pid).is_some();
+            match pick_front_for_window_cycle(
+                live_ax,
+                ax_is_regular_app,
+                AX_POLLER_LAST_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+                switcher_front_pid(),
+            ) {
                 Some(ax_pid) => ax_pid,
                 None => {
                     let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
@@ -3475,23 +3805,39 @@ mod macos {
                 &mut focused,
             )
         };
-        let mut focused_idx: isize = 0;
+        // Step through a STABLE per-app window order, not AXWindows' z-order:
+        // raising the next z-order window puts it in front, so the following
+        // press stepped straight back — Cmd+` ping-ponged between the top two
+        // windows. Native macOS keeps a fixed order and visits every window.
+        let current: Vec<AxRef> = (0..count)
+            .map(|i| AxRef::retain(unsafe { CFArrayGetValueAtIndex(windows.cast(), i) }))
+            .collect();
+        let ax_eq = |a: &AxRef, b: &AxRef| unsafe { CFEqual(a.0, b.0) } != 0;
+        let mut order_guard = WINDOW_CYCLE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let stored = match order_guard.take() {
+            Some((p, order)) if p == pid => order,
+            _ => Vec::new(),
+        };
+        let order = reconcile_window_order(stored, current, ax_eq);
+        let focused_ref = (!focused.is_null()).then(|| AxRef::retain(focused));
         if !focused.is_null() {
-            for i in 0..count {
-                let w = unsafe { CFArrayGetValueAtIndex(windows.cast(), i) };
-                if unsafe { CFEqual(w, focused) } != 0 {
-                    focused_idx = i;
-                    break;
-                }
-            }
             unsafe { CFRelease(focused.cast()) };
         }
+        let focused_idx = focused_ref
+            .as_ref()
+            .and_then(|f| order.iter().position(|w| ax_eq(w, f)))
+            .unwrap_or(0);
+        let count = order.len() as isize;
+        let focused_idx = focused_idx as isize;
         let next_idx = if reverse {
             (focused_idx + count - 1) % count
         } else {
             (focused_idx + 1) % count
         };
-        let next_window = unsafe { CFArrayGetValueAtIndex(windows.cast(), next_idx) };
+        let next_window = order[next_idx as usize].0;
+        // Keep the order alive (and the retained refs) for the next press.
+        *order_guard = Some((pid, order));
+        drop(order_guard);
         // Multi-strategy window raise. Native Cocoa apps (Terminal,
         // Finder) honor AXRaise on a window — that alone is enough.
         // Electron apps (VSCode, Slack, Discord) expose AXRaise but
@@ -3888,6 +4234,121 @@ mod macos {
             tm.tm_min,
             tm.tm_sec
         )
+    }
+
+    #[cfg(test)]
+    mod cycle_mru_tests {
+        use super::*;
+
+        /// Only the app you LAND on (commit) becomes most-recent — apps passed
+        /// through mid-cycle must not, so a quick Alt+Tab afterwards goes back
+        /// to the app you were in before, like native macOS. One test because
+        /// MRU_BUNDLES / CYCLE_SESSION are process-global.
+        #[test]
+        fn commit_promotes_only_the_landed_app() {
+            const A: &str = "test.cycle.a";
+            const B: &str = "test.cycle.b";
+            const C: &str = "test.cycle.c";
+            // Bogus pids: ax_make_frontmost on a nonexistent pid just errors.
+            let snapshot = vec![
+                (A.to_string(), "A".to_string(), 999_001),
+                (B.to_string(), "B".to_string(), 999_002),
+                (C.to_string(), "C".to_string(), 999_003),
+            ];
+            // A is frontmost (session origin); user cycles A→B→C, releasing on C.
+            *mru_bundles().lock().unwrap() = vec![A.into(), B.into(), C.into()];
+            *CYCLE_SESSION.lock().unwrap() = Some(CycleSession {
+                snapshot,
+                cursor_pid: 999_003,
+                last_press_at: Instant::now(),
+                cmd_release_gen: 0,
+            });
+            commit_cycle_session();
+
+            let mru = mru_bundles().lock().unwrap().clone();
+            assert_eq!(mru, vec![C, A, B], "landed app first, then the origin");
+            // Next session: front = C, first Tab target = index 1 = A, not B.
+            assert_eq!(mru[1], A);
+            assert_eq!(SWITCHER_FRONT.lock().unwrap().as_deref(), Some(C));
+
+            // Then the user clicks into B (not via the switcher): B becomes the
+            // front and C — the app they came from — is next.
+            note_focus_change(B, true);
+            assert_eq!(mru_bundles().lock().unwrap().clone(), vec![B, C, A]);
+            assert_eq!(SWITCHER_FRONT.lock().unwrap().as_deref(), Some(B));
+        }
+
+        #[test]
+        fn window_cycle_order_is_stable() {
+            let eq = |a: &i32, b: &i32| a == b;
+            // Fresh app: z-order.
+            let o = reconcile_window_order(vec![], vec![1, 2, 3], eq);
+            assert_eq!(o, vec![1, 2, 3]);
+            // After raising 2, z-order is [2,1,3] — the order must NOT follow,
+            // or the next step from 2 goes back to 1 (the ping-pong bug).
+            let o = reconcile_window_order(o, vec![2, 1, 3], eq);
+            assert_eq!(o, vec![1, 2, 3]);
+            // Closed window dropped, new window appended.
+            let o = reconcile_window_order(o, vec![4, 3, 1], eq);
+            assert_eq!(o, vec![1, 3, 4]);
+        }
+
+        #[test]
+        fn window_cycle_front_selection() {
+            // AX changed since the poller looked → newer than SWITCHER_FRONT.
+            assert_eq!(
+                pick_front_for_window_cycle(Some(7), true, 3, Some(5)),
+                Some(7)
+            );
+            // AX unchanged (possibly stale) → SWITCHER_FRONT, which already
+            // folds in that observation plus clicks AX missed.
+            assert_eq!(
+                pick_front_for_window_cycle(Some(3), true, 3, Some(5)),
+                Some(5)
+            );
+            // AX names a non-regular app (Dock etc.) → not trusted.
+            assert_eq!(
+                pick_front_for_window_cycle(Some(7), false, 3, Some(5)),
+                Some(5)
+            );
+            // Nothing recorded yet → whatever AX says.
+            assert_eq!(pick_front_for_window_cycle(Some(3), true, 3, None), Some(3));
+            assert_eq!(pick_front_for_window_cycle(None, false, 3, None), None);
+        }
+
+        #[test]
+        fn only_plain_left_clicks_switch_apps() {
+            assert!(super::super::is_activating_click(true, false, false));
+            assert!(
+                !super::super::is_activating_click(false, false, false),
+                "right/middle"
+            );
+            assert!(
+                !super::super::is_activating_click(true, true, false),
+                "Cmd+click"
+            );
+            assert!(
+                !super::super::is_activating_click(true, false, true),
+                "Ctrl+click"
+            );
+        }
+
+        #[test]
+        fn focus_reports_are_filtered() {
+            let just = Some((Duration::from_millis(100), "landed"));
+            let later = Some((Duration::from_secs(5), "landed"));
+            // Mid-cycle activations are ours, never the user's.
+            assert!(!accept_focus_report(true, true, "x", None));
+            // Late activation notice for an app cycled THROUGH: rejected…
+            assert!(!accept_focus_report(false, false, "passed", just));
+            // …but the landed app itself, a click, or anything later is fine.
+            assert!(accept_focus_report(false, false, "landed", just));
+            assert!(accept_focus_report(false, true, "clicked", just));
+            assert!(accept_focus_report(false, false, "other", later));
+            assert!(accept_focus_report(false, false, "other", None));
+            assert!(!accept_focus_report(false, false, "", None));
+            assert!(!accept_focus_report(false, false, "<no-bundle-id>", None));
+        }
     }
 
     #[cfg(test)]
