@@ -410,6 +410,7 @@ private struct InputTab: View {
             }
             Section("App switching") {
                 Toggle("Option+Tab switches apps", isOn: model.boolBinding("ALT_TAB_SWITCH"))
+                Toggle("Option+Q quits apps", isOn: model.boolBinding("ALT_Q_QUIT"))
                 Toggle("App-switcher HUD overlay", isOn: model.boolBinding("APP_SWITCHER_HUD"))
                 Toggle("Un-minimize on Cmd+Tab", isOn: model.boolBinding("UNMINIMIZE"))
             }

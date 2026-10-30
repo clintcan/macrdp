@@ -253,8 +253,8 @@ fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        is_remappable_shortcut, map_client_to_display, resync_plan, scroll_lines,
-        should_remap_click, ResyncPlan,
+        is_remappable_shortcut, map_client_to_display, remove_switcher_selection, resync_plan,
+        scroll_lines, should_alt_q_quit, should_remap_click, ResyncPlan,
     };
 
     #[test]
@@ -324,6 +324,43 @@ mod coord_tests {
             "buttons and latch survive an idle gap"
         );
         assert!(!resync_plan(false, [false; 3], false).post_flags_changed);
+    }
+
+    /// Quitting from the switcher keeps the selection in place (the next app
+    /// slides under it), wraps when the last entry goes, and ends at empty.
+    #[test]
+    fn switcher_quit_moves_selection_to_the_next_app() {
+        let mut apps = vec!["A", "B", "C"];
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(1));
+        assert_eq!(apps, ["A", "C"]);
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(0));
+        assert_eq!(apps, ["A"]);
+        assert_eq!(remove_switcher_selection(&mut apps, 0), None);
+        assert!(apps.is_empty());
+    }
+
+    /// `--alt-q-quit` fires for exactly one row: flag on + plain Option. In
+    /// particular Option+Shift+Q must NOT become Cmd+Shift+Q (log out).
+    #[test]
+    fn alt_q_quit_decision_table() {
+        // (on, opt, cmd, ctrl, shift) -> expected
+        let only_quitting_row = (true, true, false, false, false);
+        for on in [false, true] {
+            for opt in [false, true] {
+                for cmd in [false, true] {
+                    for ctrl in [false, true] {
+                        for shift in [false, true] {
+                            let row = (on, opt, cmd, ctrl, shift);
+                            assert_eq!(
+                                should_alt_q_quit(on, opt, cmd, ctrl, shift),
+                                row == only_quitting_row,
+                                "unexpected verdict for {row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
@@ -502,6 +539,41 @@ pub fn set_alt_space_spotlight(on: bool) {
     ALT_SPACE_SPOTLIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, Option+Q (i.e. Alt+Q forwarded from the client) is delivered to
+/// the focused app as Cmd+Q, so a Windows client can quit Mac apps without the
+/// Windows key (which mstsc gates when windowed, and which the macOS Windows
+/// App forwards only as a tap). Opt-in via `--alt-q-quit`; off by default so
+/// Option+Q otherwise reaches remote apps as a normal key (it types `œ` on the
+/// US layout). Plain Option only — see `should_alt_q_quit`.
+static ALT_Q_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_alt_q_quit(on: bool) {
+    ALT_Q_QUIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pure decision table for `--alt-q-quit`: should this Q key-down be posted
+/// as Cmd+Q? Only for a PLAIN Option — Shift is excluded because the result
+/// would be Cmd+Shift+Q (log out), and Cmd/Ctrl combos are left alone so
+/// they keep their own meaning. Unit-tested on every target.
+fn should_alt_q_quit(on: bool, opt: bool, cmd: bool, ctrl: bool, shift: bool) -> bool {
+    on && opt && !cmd && !ctrl && !shift
+}
+
+/// Drop the switcher's selected entry at `idx` (Q pressed in the switcher) and
+/// return the index the selection moves to: the entry that slid into `idx`,
+/// wrapping to the start when the last one was removed — the native Cmd+Tab
+/// behaviour. `None` once the list is empty. Pure, so it's unit-tested on
+/// every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn remove_switcher_selection<T>(items: &mut Vec<T>, idx: usize) -> Option<usize> {
+    items.remove(idx);
+    if items.is_empty() {
+        None
+    } else {
+        Some(idx % items.len())
+    }
+}
+
 /// When true, drive the `macrdphud` overlay helper so the remote client sees a
 /// visual app switcher during Cmd+Tab / Option+Tab. Opt-in via
 /// `--app-switcher-hud`; off by default. The switch itself works the same either
@@ -624,6 +696,7 @@ mod macos {
     const VK_CAPS_LOCK: u16 = 0x39;
     const VK_G: u16 = 0x05; // kVK_ANSI_G — the on-demand "gather windows" chord
     const VK_R: u16 = 0x0F; // kVK_ANSI_R — the on-demand "A/V resync" chord
+    const VK_Q: u16 = 0x0C; // kVK_ANSI_Q — Option+Q → Cmd+Q under --alt-q-quit
     const VK_LEFT: u16 = 0x7B; // kVK_LeftArrow — step the app switcher backward while it's up
     const VK_RIGHT: u16 = 0x7C; // kVK_RightArrow — step the app switcher forward while it's up
 
@@ -1476,6 +1549,39 @@ mod macos {
             }
         }
 
+        /// Post a full `Cmd+<vk>` tap in place of the held `Option+<vk>`
+        /// (--alt-q-quit). Same shape as `post_ctrl_as_cmd`, but the down and
+        /// up go out together: present Cmd-held (Option cleared) to both
+        /// modifier views, tap the key with those flags, then restore the real
+        /// state (Option still physically held) via `post_flags_changed`.
+        fn post_alt_as_cmd_tap(&self, vk: u16) {
+            let mut bits = self.mods.cg_flags().bits();
+            bits &= !CGEventFlags::CGEventFlagAlternate.bits();
+            bits &= !(NX_DEVICE_L_ALT | NX_DEVICE_R_ALT);
+            bits |= CGEventFlags::CGEventFlagCommand.bits();
+            bits |= NX_DEVICE_L_CMD;
+            let swapped = CGEventFlags::from_bits_retain(bits);
+
+            for source in [&self.source, &self.source_hid] {
+                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), VK_LCMD, true) else {
+                    warn!("CGEvent::new_keyboard_event failed (alt→cmd flags)");
+                    continue;
+                };
+                ev.set_flags(swapped);
+                ev.set_type(CGEventType::FlagsChanged);
+                ev.post(CGEventTapLocation::HID);
+            }
+            for down in [true, false] {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
+                    ev.set_flags(swapped);
+                    ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!(vk, down, "CGEvent::new_keyboard_event failed (alt→cmd key)");
+                }
+            }
+            self.post_flags_changed(VK_LCMD);
+        }
+
         /// Match the current modifier state + non-modifier vk against the
         /// set of symbolic hotkeys we re-implement. Returns true if we
         /// handled it (and the caller should suppress the keystroke).
@@ -1569,6 +1675,33 @@ mod macos {
                 && vk == VK_SPACE
             {
                 invoke_spotlight();
+                return true;
+            }
+
+            // Q while the switcher is up (Cmd+Tab, or Option+Tab with
+            // --alt-tab-switch, still held): quit the HIGHLIGHTED app, as the
+            // native switcher does. Checked before the Option+Q → Cmd+Q rule
+            // below, which would hit the frontmost app instead. Needs no flag:
+            // a session only exists while the switcher's modifier is held.
+            if (cmd || opt) && !ctrl && vk == VK_Q && quit_cycle_selection() {
+                return true;
+            }
+
+            // Opt+Q → Cmd+Q (opt-in via --alt-q-quit): quit the focused app
+            // from a Windows client without the Windows key. The whole tap is
+            // posted here on key-down; the caller swallows the matching key-up
+            // via `consumed_keys`.
+            if vk == VK_Q
+                && super::should_alt_q_quit(
+                    super::ALT_Q_QUIT.load(std::sync::atomic::Ordering::Relaxed),
+                    opt,
+                    cmd,
+                    ctrl,
+                    shift,
+                )
+            {
+                self.post_alt_as_cmd_tap(VK_Q);
+                tracing::debug!("Option+Q → Cmd+Q (--alt-q-quit)");
                 return true;
             }
 
@@ -1965,6 +2098,80 @@ mod macos {
     /// app, never swallow the arrow).
     fn cycle_session_active() -> bool {
         CYCLE_SESSION.lock().is_ok_and(|g| g.is_some())
+    }
+
+    /// Q pressed while the switcher is up: quit the HIGHLIGHTED app, like the
+    /// native Cmd+Tab switcher, rather than whatever happens to be frontmost.
+    /// Each Tab step already activates the highlighted app, but posting Cmd+Q
+    /// would race that activation and leave the quit app in the frozen
+    /// snapshot (and the HUD). So: drop it from the snapshot, ask it to quit
+    /// (`terminate` is a normal quit — unsaved-changes prompts still appear),
+    /// and keep the session going with the selection on the next app, which we
+    /// activate the same way a Tab step does. The last app gone ends the
+    /// session. Returns false when no session is active (the caller lets the
+    /// key through). The quit and the AX/HUD work run after the session lock
+    /// is released, like `commit_cycle_session`.
+    fn quit_cycle_selection() -> bool {
+        let (quit_pid, next) = {
+            let Ok(mut guard) = CYCLE_SESSION.lock() else {
+                return false;
+            };
+            let Some(session) = guard.as_mut() else {
+                return false;
+            };
+            let Some(idx) = session
+                .snapshot
+                .iter()
+                .position(|(_, _, p)| *p == session.cursor_pid)
+            else {
+                return false;
+            };
+            let quit_pid = session.cursor_pid;
+            match super::remove_switcher_selection(&mut session.snapshot, idx) {
+                Some(next_idx) => {
+                    session.cursor_pid = session.snapshot[next_idx].2;
+                    session.last_press_at = Instant::now();
+                    let apps: Vec<(i32, String)> = session
+                        .snapshot
+                        .iter()
+                        .map(|(_, name, pid)| (*pid, name.clone()))
+                        .collect();
+                    (quit_pid, Some((apps, next_idx, session.cursor_pid)))
+                }
+                None => {
+                    *guard = None;
+                    (quit_pid, None)
+                }
+            }
+        };
+
+        // SAFETY: NSRunningApplication lookup + terminate are documented
+        // thread-safe; a pid that already exited just yields None.
+        let sent = unsafe {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(quit_pid)
+                .is_some_and(|app| app.terminate())
+        };
+        tracing::info!(pid = quit_pid, sent, "app switcher: quit the selected app");
+
+        let hud = super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed);
+        match next {
+            Some((apps, next_idx, next_pid)) => {
+                if hud {
+                    crate::switcher_hud::show(apps, next_idx);
+                }
+                ax_make_frontmost(
+                    next_pid,
+                    super::UNMINIMIZE_ON_SWITCH.load(std::sync::atomic::Ordering::Relaxed),
+                    false,
+                );
+            }
+            None => {
+                if hud {
+                    crate::switcher_hud::hide();
+                }
+            }
+        }
+        true
     }
 
     /// Incremented every time both Cmd halves transition to released

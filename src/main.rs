@@ -775,6 +775,13 @@ struct Args {
     #[arg(long = "alt-space-spotlight")]
     alt_space_spotlight: bool,
 
+    /// Deliver Option+Q (Alt+Q from the client) as Cmd+Q, so a Windows client
+    /// can quit the focused Mac app without the Windows key. Off by default
+    /// (then Option+Q reaches remote apps as a normal key). Plain Option only:
+    /// Option+Shift+Q is NOT turned into Cmd+Shift+Q (log out). macOS-only.
+    #[arg(long = "alt-q-quit")]
+    alt_q_quit: bool,
+
     /// Show a visual app-switcher overlay (icon row) on the remote during Cmd+Tab
     /// / Option+Tab, like macOS's native switcher. Off by default. macrdp spawns a
     /// small helper process that draws a real on-screen panel; ScreenCaptureKit
@@ -2484,6 +2491,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ALT_SPACE_SPOTLIGHT", false) {
         argv.push("--alt-space-spotlight".into());
     }
+    if on("ALT_Q_QUIT", false) {
+        argv.push("--alt-q-quit".into());
+    }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
     }
@@ -3351,6 +3361,7 @@ async fn async_main() -> Result<()> {
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
     crate::input::set_alt_space_spotlight(args.alt_space_spotlight);
+    crate::input::set_alt_q_quit(args.alt_q_quit);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());

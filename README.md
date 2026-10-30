@@ -98,7 +98,7 @@ macrdp reimplements the macOS symbolic hotkeys in user space (WindowServer won't
 | **Ctrl+Alt+G** | Gather windows stranded off the virtual display (headless `--capture-primary`/`--detach-primary` modes) |
 | **Ctrl+Alt+Shift+R** | On-demand A/V resync — repaint a stale/idle-blanked screen (forced keyframe) and re-sync drifted audio, without disconnecting. Handy for mstsc after hours idle. |
 
-Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` / `--alt-space-spotlight` accept **Option+Tab** / **Option+\`** / **Option+Space** as the same triggers; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents.
+Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` / `--alt-space-spotlight` accept **Option+Tab** / **Option+\`** / **Option+Space** as the same triggers; `--alt-q-quit` sends **Option+Q** (Alt+Q from the client) as **Cmd+Q** to quit apps; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents.
 
 > **mstsc tip:** if **Cmd+Tab** seems ignored, set **Local Resources → Keyboard → "Apply Windows key combinations"** to **"On the remote computer"** (or go full-screen) — the windowed default eats **Win+Tab** locally as Task View.
 

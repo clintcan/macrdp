@@ -68,6 +68,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           --alt-tab-switch, for clients that forward Alt+` but
                           gate Win-key combos. Option+Shift+` cycles backward.
                           macOS-only.
+--alt-q-quit              Deliver Option+Q (Alt+Q from the client) as Cmd+Q, so
+                          a Windows client can quit the focused app without the
+                          Windows key. Off by default (Option+Q then reaches
+                          apps as a normal key). Plain Option only —
+                          Option+Shift+Q is NOT sent as Cmd+Shift+Q (log out).
+                          macOS-only.
 --alt-space-spotlight     Also accept Option+Space (Alt+Space from the client)
                           as the Spotlight trigger, in addition to Cmd+Space.
                           Off by default. For macOS clients, whose own Spotlight
