@@ -447,10 +447,10 @@ pub struct MacCliprdr {
     /// the session.
     #[cfg(target_os = "macos")]
     remote_write_cc: Arc<std::sync::atomic::AtomicI64>,
-    /// The pasteboard changeCount when the last clipboard channel closed (or
-    /// at startup). A later changeCount at the next connect means something
-    /// was copied on the Mac while no client was attached — see
-    /// [`skip_connect_time_fetch`].
+    /// The pasteboard changeCount when the last client-served clipboard
+    /// channel closed (or at startup). A later changeCount at the next connect
+    /// means something was copied on the Mac while no client was attached —
+    /// see [`skip_connect_time_fetch`].
     #[cfg(target_os = "macos")]
     session_end_cc: Arc<std::sync::atomic::AtomicI64>,
     /// Coordinates the advertise retry loop with the cliprdr backend's
@@ -768,7 +768,8 @@ struct MacCliprdrBackend {
     // See MacCliprdr::remote_write_cc — why this is NOT self_change_count.
     #[cfg(target_os = "macos")]
     remote_write_cc: Arc<std::sync::atomic::AtomicI64>,
-    // See MacCliprdr::session_end_cc. Stamped in Drop.
+    // See MacCliprdr::session_end_cc. Stamped in Drop, only by a backend that
+    // handled a client's list.
     #[cfg(target_os = "macos")]
     session_end_cc: Arc<std::sync::atomic::AtomicI64>,
     // Lets the `on_format_list_response` hook tell the poller's retry loop
@@ -840,9 +841,17 @@ impl Drop for MacCliprdrBackend {
             &self.paste_temp_dir,
             &self.self_change_count,
         );
+        // Only a backend that served a client ends a session. Backends are
+        // built before TLS and authentication, so a failed or abandoned
+        // connection attempt, or a preemption candidate that lost, drops one
+        // here too. Letting those stamp would erase the evidence of a copy
+        // made on the Mac while disconnected, and the next real connect would
+        // fetch the client's clipboard over it.
         #[cfg(target_os = "macos")]
-        self.session_end_cc
-            .store(pb::change_count(), std::sync::atomic::Ordering::Relaxed);
+        if !self.initial_remote_copy_pending {
+            self.session_end_cc
+                .store(pb::change_count(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -2574,6 +2583,31 @@ mod tests {
             rx.try_recv().is_err(),
             "the Mac's older clipboard must not be advertised over the client's"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_backend_that_served_a_client_stamps_the_session_end() {
+        use std::sync::atomic::Ordering;
+
+        // A failed connection attempt or a losing preemption candidate: built,
+        // then dropped without ever seeing a client's list.
+        let (mut attempt, _rx) = test_backend();
+        attempt.initial_remote_copy_pending = true;
+        let stamp = attempt.session_end_cc.clone();
+        pb::write_string("copied on the Mac while disconnected");
+        drop(attempt);
+        assert_eq!(
+            stamp.load(Ordering::Relaxed),
+            -1,
+            "an attempt that served nobody must not move the stamp"
+        );
+
+        // A backend that handled a client's list.
+        let (served, _rx) = test_backend();
+        let stamp = served.session_end_cc.clone();
+        drop(served);
+        assert_eq!(stamp.load(Ordering::Relaxed), pb::change_count());
     }
 
     fn named(id: u32, name: &'static str) -> ClipboardFormat {
