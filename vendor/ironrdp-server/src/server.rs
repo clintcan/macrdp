@@ -510,6 +510,7 @@ pub struct RdpServer {
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
+    autodetect_channel_id: Option<u16>,
     /// (vendored, divergence 23) Anti-ping-pong net for session preemption:
     /// the peer most recently EVICTED by a takeover, and when it last tried to
     /// come back.
@@ -1244,6 +1245,7 @@ impl RdpServer {
             creds: None,
             local_addr: None,
             autodetect: None,
+            autodetect_channel_id: None,
             recently_evicted: None,
             connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             display_suppressed: Arc::new(AtomicBool::new(false)),
@@ -1470,9 +1472,9 @@ impl RdpServer {
 
     /// Enable protocol-level auto-detect ([MS-RDPBCGR 2.2.14]).
     ///
-    /// Auto-detect uses lightweight Share Data PDUs on the IO channel,
-    /// separate from the ECHO DVC. It supports bandwidth measurement
-    /// in addition to RTT and works even when DVC is unavailable.
+    /// Auto-detect measures RTT and bandwidth before licensing and reports the
+    /// results to clients that advertise support, on their MCS message channel.
+    /// It works independently of UDP multitransport and the ECHO DVC.
     ///
     /// Send probes via [`ServerEvent::AutoDetectRttRequest`] and
     /// query results with [`rtt_snapshot()`](Self::rtt_snapshot).
@@ -2764,22 +2766,10 @@ impl RdpServer {
                     }
                 },
                 ServerEvent::AutoDetectRttRequest => {
-                    if let Some(ref mut ad) = self.autodetect {
+                    if let (Some(ad), Some(channel_id)) = (&mut self.autodetect, self.autodetect_channel_id) {
                         ad.expire_stale_probes(crate::autodetect::RTT_PROBE_MAX_AGE);
                         let request = ad.send_rtt_request();
-                        // (pin-bump a5d1c682) Autodetect moved out of ShareDataPdu into
-                        // rdp::autodetect and onto the MCS message channel. macrdp does
-                        // NOT use RDP network-autodetect (div-15 kernel TCP RTT replaces
-                        // it), so self.autodetect is never enabled and this is unreached;
-                        // adapt to the new PDU type so it compiles. No message channel is
-                        // plumbed here — harmless as it never runs.
-                        let pdu = rdp::autodetect::AutoDetectReqPdu::new(request);
-                        let mcs_pdu = SendDataIndication {
-                            initiator_id: user_channel_id,
-                            channel_id: io_channel_id,
-                            user_data: encode_vec(&pdu)?.into(),
-                        };
-                        let data = encode_vec(&X224(mcs_pdu))?;
+                        let data = crate::autodetect::encode_request(request, user_channel_id, channel_id)?;
                         writer.write_all(&data).await?;
                     }
                 }
@@ -2807,6 +2797,8 @@ impl RdpServer {
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
         let mut audio_writer = writer.clone();
+        let mut autodetect_writer = writer.clone();
+        let autodetect_channel_id = self.autodetect_channel_id;
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let audio_receiver = Arc::clone(&self.audio_receiver);
         // (M5c step 3b) Take this connection's inbound-tunnel receiver before `self`
@@ -2815,6 +2807,30 @@ impl RdpServer {
         let tunnel_inbound = self.multitransport_tunnel_inbound_rx.take();
         let input_handler = Arc::clone(&self.handler);
         let s = Rc::new(Mutex::new(self));
+
+        let this = Rc::clone(&s);
+        let dispatch_autodetect = async move {
+            let Some(channel_id) = autodetect_channel_id else {
+                return std::future::pending::<Result<RunState>>().await;
+            };
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let rtt = {
+                    let mut this = this.lock().await;
+                    let ad = this
+                        .autodetect
+                        .as_mut()
+                        .expect("auto-detect channel requires a manager");
+                    ad.expire_stale_probes(crate::autodetect::RTT_PROBE_MAX_AGE);
+                    ad.send_rtt_request()
+                };
+                let data = crate::autodetect::encode_request(rtt, user_channel_id, channel_id)?;
+                autodetect_writer.write_all(&data).await?;
+            }
+        };
 
         // (vendored, divergence 26) Read without the `Self` lock, which `dispatch_events` holds across its writes.
         let (x224_tx, mut x224_rx) = mpsc::channel(64);
@@ -3062,6 +3078,7 @@ impl RdpServer {
             state = dispatch_events => state,
             state = dispatch_audio => state,
             state = dispatch_tunnel_inbound => state,
+            state = dispatch_autodetect => state,
         );
 
         // Frames left in the queue would otherwise have stayed in the socket for the reactivation's backlog.
@@ -3783,13 +3800,6 @@ impl RdpServer {
                     return Ok(true);
                 }
 
-                // (pin-bump a5d1c682) The auto-detect RESPONSE is no longer a
-                // ShareDataPdu variant — it rides the MCS message channel
-                // (handle_message_channel_data upstream). macrdp doesn't use RDP
-                // network-autodetect (div-15 kernel TCP RTT), so the response is never
-                // received; the arm is removed rather than re-plumbed onto the message
-                // channel.
-
                 // Client requests the server stop or resume sending display
                 // updates. mstsc sends `desktop_rect: None` on minimize and
                 // `desktop_rect: Some(rect)` on refocus. Without honoring
@@ -3818,6 +3828,8 @@ impl RdpServer {
                     }
                 }
 
+                rdp::headers::ShareDataPdu::FrameAcknowledge(_) => {}
+
                 unexpected => {
                     warn!(?unexpected, "Unexpected share data pdu");
                 }
@@ -3844,6 +3856,18 @@ impl RdpServer {
                 debug!(?data, "McsMessage::SendDataRequest");
                 if data.channel_id == io_channel_id {
                     return self.handle_io_channel_data(data).await;
+                }
+
+                if Some(data.channel_id) == self.autodetect_channel_id {
+                    if let Ok(response) = decode::<rdp::autodetect::AutoDetectRspPdu>(data.user_data.as_ref()) {
+                        if let Some(ad) = &mut self.autodetect {
+                            if let Some(result) = ad.handle_continuous_response(&response.response) {
+                                let data = crate::autodetect::encode_request(result, user_channel_id, data.channel_id)?;
+                                writer.write_all(&data).await?;
+                            }
+                        }
+                        return Ok(false);
+                    }
                 }
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
@@ -3922,12 +3946,34 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
+        if self.autodetect.is_some() {
+            // The server object is reused across clients; measurements belong
+            // to this connection. Reactivation below preserves them.
+            self.autodetect = Some(AutoDetectManager::new());
+        }
+        self.autodetect_channel_id = None;
         loop {
-            let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
-                .await
-                .context("failed to accept client during finalize")?;
+            let mut buffer = ironrdp_core::WriteBuf::new();
+            let result = loop {
+                if let Some(result) = acceptor.get_result() {
+                    break result;
+                }
+                if let (Some(ad), Some(channel_id)) = (&mut self.autodetect, acceptor.network_autodetect_channel_id()) {
+                    ad.measure_connect_time(&mut framed, acceptor.user_channel_id(), channel_id)
+                        .await
+                        .context("connect-time network detection")?;
+                }
+                ironrdp_async::single_sequence_step(&mut framed, &mut acceptor, &mut buffer)
+                    .await
+                    .context("failed to accept client during finalize")?;
+            };
+            self.autodetect_channel_id = if result.network_autodetect_supported && self.autodetect.is_some() {
+                result.message_channel_id
+            } else {
+                None
+            };
 
-            let (mut reader, mut writer) = split_tokio_framed(new_framed);
+            let (mut reader, mut writer) = split_tokio_framed(framed);
 
             match self.client_accepted(&mut reader, &mut writer, result).await? {
                 RunState::Continue => {

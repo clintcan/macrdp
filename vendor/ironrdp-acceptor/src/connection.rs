@@ -31,6 +31,7 @@ pub struct Acceptor {
     io_channel_id: u16,
     user_channel_id: u16,
     message_channel_id: Option<u16>,
+    network_autodetect_supported: bool,
     desktop_size: DesktopSize,
     keyboard_layout: u32,
     multitransport_flags: gcc::MultiTransportFlags,
@@ -116,6 +117,8 @@ pub struct AcceptorResult {
     /// per section 2.2.14, multitransport bootstrap, heartbeat) are sent on this
     /// channel. `None` when the client did not request it.
     pub message_channel_id: Option<u16>,
+    /// Whether Client Core Data advertised network characteristics detection.
+    pub network_autodetect_supported: bool,
     pub reactivation: bool,
     /// Keyboard layout identifier (KLID) announced by the client in its GCC
     /// Client Core Data (section 2.2.1.3.2, `keyboardLayout`).
@@ -171,6 +174,7 @@ impl Acceptor {
             user_channel_id: USER_CHANNEL_ID,
             io_channel_id: IO_CHANNEL_ID,
             message_channel_id: None,
+            network_autodetect_supported: false,
             desktop_size,
             keyboard_layout: 0,
             multitransport_flags: gcc::MultiTransportFlags::empty(),
@@ -244,6 +248,24 @@ impl Acceptor {
         self.multitransport_offer = offer;
     }
 
+    /// Message channel for optional connect-time network detection, after Client
+    /// Info and before licensing. Reactivation must not repeat this phase.
+    pub fn network_autodetect_channel_id(&self) -> Option<u16> {
+        if self.network_autodetect_supported
+            && !self.reactivation
+            && matches!(self.state, AcceptorState::LicensingExchange { .. })
+        {
+            self.message_channel_id
+        } else {
+            None
+        }
+    }
+
+    /// MCS user channel ID used as the initiator of connect-time detection PDUs.
+    pub fn user_channel_id(&self) -> u16 {
+        self.user_channel_id
+    }
+
     pub fn new_deactivation_reactivation(
         mut consumed: Acceptor,
         static_channels: StaticChannelSet,
@@ -272,6 +294,7 @@ impl Acceptor {
             user_channel_id: consumed.user_channel_id,
             io_channel_id: consumed.io_channel_id,
             message_channel_id: consumed.message_channel_id,
+            network_autodetect_supported: consumed.network_autodetect_supported,
             desktop_size,
             keyboard_layout: consumed.keyboard_layout,
             multitransport_flags: consumed.multitransport_flags,
@@ -372,6 +395,7 @@ impl Acceptor {
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 message_channel_id: self.message_channel_id,
+                network_autodetect_supported: self.network_autodetect_supported,
                 keyboard_layout: self.keyboard_layout,
                 multitransport_flags: self.multitransport_flags,
                 client_name: self.client_name.clone(),
@@ -636,6 +660,8 @@ impl Sequence for Acceptor {
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
+                self.network_autodetect_supported = early_capability
+                    .is_some_and(|flags| flags.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT));
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.multitransport_flags = gcc_blocks
                     .multi_transport_channel

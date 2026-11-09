@@ -11,7 +11,9 @@ use ironrdp_pdu::pointer::{
     CachedPointerAttribute, ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute,
 };
 use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits};
-use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
+use ironrdp_pdu::surface_commands::{
+    ExtendedBitmapDataPdu, FrameAction, FrameMarkerPdu, SurfaceBitsPdu, SurfaceCommand,
+};
 use tracing::{debug, warn};
 
 use self::bitmap::BitmapEncoder;
@@ -109,6 +111,8 @@ pub(crate) struct UpdateEncoder {
     /// oversized bitmaps into strips that fit within the limit when sent as
     /// uncompressed surface commands.
     max_request_size: usize,
+    frame_markers: bool,
+    next_frame_id: u32,
 }
 
 impl fmt::Debug for UpdateEncoder {
@@ -160,6 +164,8 @@ impl UpdateEncoder {
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
             max_request_size: usize::try_from(max_request_size).context("max_request_size")?,
+            frame_markers: surface_flags.contains(CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER),
+            next_frame_id: 0,
         })
     }
 
@@ -232,6 +238,17 @@ impl UpdateEncoder {
 
     fn pointer_position(pos: PointerPositionAttribute) -> Result<UpdateFragmenter> {
         Ok(UpdateFragmenter::new(UpdateCode::PositionPointer, encode_vec(&pos)?))
+    }
+
+    fn frame_marker(&self, frame_action: FrameAction) -> Result<UpdateFragmenter> {
+        let command = SurfaceCommand::FrameMarker(FrameMarkerPdu {
+            frame_action,
+            frame_id: Some(self.next_frame_id),
+        });
+        Ok(UpdateFragmenter::new(
+            UpdateCode::SurfaceCommands,
+            encode_vec(&command)?,
+        ))
     }
 
     fn bitmap_diffs(&mut self, bitmap: &BitmapUpdate) -> Vec<Rect> {
@@ -382,7 +399,11 @@ impl EncoderIter<'_> {
                             continue;
                         }
                         let diffs = encoder.bitmap_diffs(&bitmap);
+                        let mark_frame = encoder.frame_markers && !diffs.is_empty();
                         self.state = State::BitmapDiffs { diffs, bitmap, pos: 0 };
+                        if mark_frame {
+                            return Some(encoder.frame_marker(FrameAction::Begin));
+                        }
                         continue;
                     }
                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
@@ -395,8 +416,14 @@ impl EncoderIter<'_> {
                 },
                 State::BitmapDiffs { diffs, bitmap, pos } => {
                     let Some(rect) = diffs.get(pos) else {
+                        let mark_frame = encoder.frame_markers && !diffs.is_empty();
                         encoder.bitmap_update_framebuffer(bitmap, &diffs);
                         self.state = State::Ended;
+                        if mark_frame {
+                            let marker = encoder.frame_marker(FrameAction::End);
+                            encoder.next_frame_id = encoder.next_frame_id.wrapping_add(1);
+                            return Some(marker);
+                        }
                         return None;
                     };
                     let Rect { x, y, width, height } = *rect;
@@ -747,4 +774,87 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
     };
     let cmd = SurfaceCommand::SetSurfaceBits(pdu);
     Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use core::num::NonZeroUsize;
+
+    use ironrdp_core::{ReadCursor, decode_cursor};
+    use ironrdp_graphics::image_processing::PixelFormat;
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu};
+    use ironrdp_pdu::surface_commands::FrameAction;
+
+    use super::*;
+
+    fn bitmap(value: u8) -> DisplayUpdate {
+        DisplayUpdate::Bitmap(BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(2).unwrap(),
+            height: NonZeroU16::new(2).unwrap(),
+            stride: NonZeroUsize::new(8).unwrap(),
+            format: PixelFormat::BgrA32,
+            data: vec![value; 16].into(),
+        })
+    }
+
+    async fn commands(encoder: &mut UpdateEncoder, value: u8) -> Vec<SurfaceCommand<'static>> {
+        let mut iter = encoder.update(bitmap(value));
+        let mut commands = Vec::new();
+        while let Some(fragmenter) = iter.next().await {
+            let mut fragmenter = fragmenter.unwrap();
+            let mut buf = vec![0; fragmenter.size_hint()];
+            let size = fragmenter.next(&mut buf).unwrap();
+            let mut cursor = ReadCursor::new(&buf[..size]);
+            let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+            assert_eq!(update.update_code, UpdateCode::SurfaceCommands);
+            // Only retain markers; surface pixels borrow the temporary buffer.
+            if let SurfaceCommand::FrameMarker(marker) = ironrdp_core::decode(update.data).unwrap() {
+                commands.push(SurfaceCommand::FrameMarker(marker));
+            }
+        }
+        commands
+    }
+
+    #[tokio::test]
+    async fn changed_bitmap_has_one_begin_end_pair_across_tiles() {
+        let mut encoder = UpdateEncoder::new(
+            DesktopSize { width: 2, height: 2 },
+            CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER,
+            UpdateEncoderCodecs::new(),
+            8, // Force two surface tiles, still one logical frame.
+        )
+        .unwrap();
+        for (value, frame_id) in [(10, 0), (20, 1)] {
+            let actual = commands(&mut encoder, value).await;
+            let expected: Vec<_> = [FrameAction::Begin, FrameAction::End]
+                .into_iter()
+                .map(|frame_action| {
+                    SurfaceCommand::FrameMarker(ironrdp_pdu::surface_commands::FrameMarkerPdu {
+                        frame_action,
+                        frame_id: Some(frame_id),
+                    })
+                })
+                .collect();
+            assert_eq!(actual, expected);
+            assert!(
+                commands(&mut encoder, value).await.is_empty(),
+                "unchanged pixels must not invent frames"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn client_without_frame_marker_capability_gets_no_markers() {
+        let mut encoder = UpdateEncoder::new(
+            DesktopSize { width: 2, height: 2 },
+            CmdFlags::SET_SURFACE_BITS,
+            UpdateEncoderCodecs::new(),
+            1024,
+        )
+        .unwrap();
+        assert!(commands(&mut encoder, 10).await.is_empty());
+    }
 }

@@ -3647,6 +3647,9 @@ async fn async_main() -> Result<()> {
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
     server.set_link_rtt_handle(link_rtt_ms.clone());
+    // Report measured network characteristics to the Windows connection-quality
+    // dialog. The server only probes clients that advertise auto-detect support.
+    server.enable_autodetect();
 
     // Client-resolution auto-adopt: the vendored acceptor reads the desktop
     // size the client requests in its GCC Client Core Data and negotiates
