@@ -33,6 +33,20 @@ Release cuts update that file, the README Status (replace the **Latest** line an
 previous release down as a one-line bullet in **Recent releases** — keep it a list, never a
 paragraph), and this Status line.
 
+## Before you call a change "live"
+
+- **`/Applications/macrdp.app` is not `target/release/macrdp`.** Restarting the LaunchAgent
+  re-launches the *installed* bundle; it never rebuilds. And a quiet startup proves
+  nothing, because `config.env` silently ignores unknown keys, so a stale binary just
+  drops a new setting. Rebuild, verify and watch the log using the steps in `docs/cli.md`
+  ("Deploying a change to the installed bundle").
+- **Synthetic-input bugs: ask the user what they *saw*.** The log often records only a
+  pass/fail outcome. Five different auto-unlock failures logged identically; "the field
+  shook" or "one dot short" is what found the causes.
+- **Connect-edge features need a real disconnect + reconnect to test.** Auto-unlock,
+  restore-windows and the connect-time gather run on the session watcher's 0→1 edge;
+  locking and unlocking inside a session that stays open never runs them.
+
 ## Project goal
 
 A native RDP server for macOS written in Rust on top of [`ironrdp`](https://github.com/Devolutions/IronRDP). Functionally analogous to `xrdp` on Linux: Windows / cross-platform RDP clients connect to the Mac and see its desktop, with keyboard/mouse forwarded back.

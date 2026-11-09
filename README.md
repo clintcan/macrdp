@@ -48,6 +48,20 @@ Details and the path to closing the gaps: [docs/production-readiness-roadmap.md]
 
 ## Quick start
 
+**With Homebrew** (Apple Silicon, macOS 14+), installing the same notarized build as the releases:
+
+```bash
+brew tap clintcan/tap
+brew trust clintcan/tap    # current Homebrew asks you to trust third-party taps
+brew install --cask macrdp
+```
+
+Then open **macrdpController** from /Applications. It's a menu-bar app, so no window opens and nothing appears in the Dock: look for a small display icon in the menu bar (dimmed while the server isn't running), click it and choose **Start (first run sets up)**. That asks for your Mac password, stores it in the Keychain, and sets the server to start at login; then turn on Screen Recording and Accessibility for macrdp in System Settings › Privacy & Security (the controller offers to open it). If you can't see the icon, it may be hidden behind the notch or by the Menu Bar settings in System Settings. After `brew upgrade`, restart the server with `launchctl kickstart -k gui/$UID/com.clintcan.macrdp`. It's a cask rather than a formula on purpose: only the signed app carries the entitlement USB redirection needs, and it keeps your permission grants across upgrades.
+
+**After a reboot, someone has to log in before you can connect.** macrdp runs in your user session, which only starts once you log in, so it can't show the login screen ([#237](https://github.com/clintcan/macrdp/issues/237)). With FileVault on, no remote-desktop server can, since the disk unlocks before macOS starts any network service. To get in after a reboot, log in once with macOS Screen Sharing (VNC) and then connect over RDP. For a planned reboot with FileVault on, `sudo fdesetup authrestart` unlocks the disk for that one restart. Automatic login (System Settings › Users & Groups, FileVault off only) also works, at the cost of the Mac booting straight to an unlocked desktop.
+
+**From source:**
+
 ```bash
 cargo build --release
 codesign -s - --force target/release/macrdp   # ad-hoc sign so TCC grants persist
@@ -124,7 +138,9 @@ Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml), w
 | `macrdp-<ver>-aarch64-apple-darwin-app.zip` | the full **`macrdp.app`**, with the embedded smart-card IFD handler + installer — the only artifact that carries everything `--enable-smartcard-redirection` needs |
 | `SHA256SUMS` | checksums for both |
 
-Both are **ad-hoc signed, not notarized** — open the app once via **right-click → Open** (or `xattr -dr com.apple.quarantine macrdp.app`). For a Developer-ID-signed + notarized build, or the menu-bar controller app (neither is produced in CI), build locally with [packaging/make-app.sh](packaging/README.md).
+Both are **ad-hoc signed, not notarized** — open the app once via **right-click → Open** (or `xattr -dr com.apple.quarantine macrdp.app`).
+
+Each release also carries **`macrdp-<ver>-usb.dmg`**, built and attached by hand rather than in CI: the **Developer-ID-signed, notarized, entitled** build with both the server and the menu-bar controller app. It's the only build in which `--enable-usb-redirection` works, and it's what the [Homebrew cask](#quick-start) installs. To make your own signed build, use [packaging/make-app.sh](packaging/README.md).
 
 ## Documentation
 

@@ -2036,3 +2036,27 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     fires exactly once per connection that is actually served — never for a
     reactivation, never for a losing candidate. Off by default (`None`), so the
     upstream-shaped path is byte-identical unless macrdp installs the handle.
+
+(26) Client input is read off the `Self` lock (NOT upstreamed; added 2026-10-26).
+    `client_loop` reads the socket in its own `read_pdus` arm: fast-path input
+    goes straight to the input handler, X224 PDUs go through a bounded queue
+    to `dispatch_pdu`, which still takes the lock. `dispatch_events` holds the lock across its
+    socket writes, so a write blocked on a client slow to drain used to stop
+    the server reading at all; input froze, and a client that sends input from
+    its UI thread then blocked on its own full socket. X224 PDUs still queued
+    when a reactivation ends the loop go into `read_ahead` and replay ahead of
+    the reactivation's input backlog, as they would have from the socket.
+
+(27) `TCP_NODELAY` on the accepted RDP socket (NOT upstreamed; added
+    2026-10-26). Upstream leaves Nagle on, so the short tail segment of each
+    frame waits for the ACK of the previous one, which the client may delay;
+    set at both accept sites (the idle listener and the preemption race).
+
+(28) `zstd-safe` 8.2 instead of upstream's 7.2 (NOT upstreamed; added
+    2026-10-27). zstd-safe 7.x has RUSTSEC-2026-0398 (`Seekable::decompress`)
+    and RUSTSEC-2026-0403 (streaming decompression of a legacy frame), and the
+    zstd-sys it pulls has RUSTSEC-2026-0410 (WebAssembly allocator), which
+    turned the daily cargo-deny scan red. The QOIZ encoder only compresses
+    (`CCtx`), so none of the three is reachable here; the bump is to keep the
+    scan meaningful. Only `Cargo.toml` changes, no code. Drop it once upstream
+    requires zstd-safe >= 8.2.

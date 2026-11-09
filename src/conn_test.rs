@@ -1139,3 +1139,106 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
         }
     }
 }
+
+/// Input must keep flowing while a server write is blocked on a client that is
+/// not reading. `dispatch_events` holds the server lock across its socket
+/// writes, and the PDU loop used to need that lock for every PDU it read, so a
+/// stalled write froze input until the client drained its socket.
+#[tokio::test]
+async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
+    use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent, KeyboardFlags};
+    use tokio::io::AsyncWriteExt as _;
+
+    struct ForwardInput(tokio::sync::mpsc::UnboundedSender<KeyboardEvent>);
+    impl RdpServerInputHandler for ForwardInput {
+        fn keyboard(&mut self, e: KeyboardEvent) {
+            let _ = self.0.send(e);
+        }
+        fn mouse(&mut self, _e: MouseEvent) {}
+    }
+
+    /// Sends full-screen frames forever, so a client that stops reading
+    /// leaves the server's socket write blocked.
+    struct FloodUpdates;
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for FloodUpdates {
+        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+            tokio::task::yield_now().await;
+            let (width, height) = (256_u16, 256_u16);
+            let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4)
+                .map(|i| (i * 7919 % 251) as u8)
+                .collect();
+            Ok(Some(DisplayUpdate::Bitmap(ironrdp_server::BitmapUpdate {
+                x: 0,
+                y: 0,
+                width: width.try_into()?,
+                height: height.try_into()?,
+                format: ironrdp_server::PixelFormat::BgrA32,
+                data: data.into(),
+                stride: (usize::from(width) * 4).try_into()?,
+            })))
+        }
+    }
+
+    struct FloodDisplay;
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for FloodDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 256,
+                height: 256,
+            }
+        }
+        async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+            Ok(Box::new(FloodUpdates))
+        }
+    }
+
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(ForwardInput(input_tx))
+        .with_display_handler(FloodDisplay)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+    let events = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let (_size, framed) = connect_client(client_io, 256, 256).await?;
+            let (mut stream, _leftover) = framed.into_inner();
+
+            // Stop reading so the frames fill the pipe, then queue an event
+            // whose write takes the server lock and blocks behind them.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            events
+                .send(ironrdp_server::ServerEvent::EvictedByOtherConnection)
+                .map_err(|_| anyhow::anyhow!("server event channel closed"))?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let key = FastPathInput::single(FastPathInputEvent::KeyboardEvent(
+                KeyboardFlags::empty(),
+                0x1e,
+            ));
+            stream.write_all(&ironrdp_core::encode_vec(&key)?).await?;
+            stream.flush().await?;
+
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(2), input_rx.recv()).await;
+            server_task.abort();
+            assert!(
+                matches!(received, Ok(Some(_))),
+                "a key press sent while a server write was blocked never reached the input handler"
+            );
+            anyhow::Ok(())
+        })
+        .await
+}

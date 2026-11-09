@@ -20,6 +20,7 @@ mod clipboard;
 mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;
+mod connection_hooks;
 mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
@@ -248,6 +249,14 @@ struct Args {
     /// Lets launchd start macrdp without an interactive terminal.
     #[arg(long)]
     keychain: bool,
+
+    /// Read the password from this file instead of prompting (one trailing
+    /// newline is stripped). Keeps the password out of `ps` and shell history
+    /// for headless / launchd runs where the Keychain is not an option. The
+    /// file must belong to the user running macrdp and give no access to
+    /// group or others (mode 0600 or 0400); otherwise startup fails.
+    #[arg(long, conflicts_with_all = ["password", "keychain"])]
+    password_file: Option<PathBuf>,
 
     /// Directory holding cert.pem / key.pem. Generated on first run and
     /// reused thereafter so clients see a stable fingerprint across restarts.
@@ -982,6 +991,139 @@ fn spawn_hud_helper() -> Option<std::process::Child> {
     }
 }
 
+/// Largest password file `--password-file` accepts.
+const MAX_PASSWORD_FILE_BYTES: usize = 4096;
+
+/// Read the password from `--password-file`. The file must belong to the
+/// user that runs macrdp and must give no access to group or others (mode
+/// 0600 or 0400), as ssh requires for private keys, and on macOS must have no
+/// access control list; otherwise it is refused.
+/// One trailing `\n` (or `\r\n`) is stripped; an empty password is an error.
+/// The bytes are read into one buffer of a fixed size that is never
+/// reallocated, so no unzeroized copy of the password is left on the heap.
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    // O_NONBLOCK: opening a FIFO without a writer would otherwise block
+    // startup with no log line; it is refused below as not a regular file.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening password file {}", path.display()))?;
+    // Check the opened file, not the path, so a swap between check and read
+    // cannot pass a different file.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("reading metadata of password file {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(anyhow!(
+            "password file {} is not a regular file",
+            path.display()
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_password_file_access(meta.mode(), meta.uid(), euid)
+        .with_context(|| format!("password file {}", path.display()))?;
+    // A macOS ACL can grant access that the mode bits do not show, for
+    // example one inherited from the parent folder.
+    #[cfg(target_os = "macos")]
+    if has_extended_acl(&file).with_context(|| format!("password file {}", path.display()))? {
+        return Err(anyhow!(
+            "password file {} has an access control list; remove it with `chmod -N {}`",
+            path.display(),
+            path.display()
+        ));
+    }
+
+    let mut buf = Zeroizing::new(vec![0u8; MAX_PASSWORD_FILE_BYTES + 1]);
+    let mut len = 0;
+    loop {
+        let n = file
+            .read(&mut buf[len..])
+            .with_context(|| format!("reading password file {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        if len == buf.len() {
+            return Err(anyhow!(
+                "password file {} is larger than {MAX_PASSWORD_FILE_BYTES} bytes",
+                path.display()
+            ));
+        }
+    }
+    buf.truncate(len); // keeps the allocation
+    let bytes = std::mem::take(&mut *buf);
+    let mut s = match String::from_utf8(bytes) {
+        Ok(s) => Zeroizing::new(s),
+        Err(e) => {
+            drop(Zeroizing::new(e.into_bytes()));
+            return Err(anyhow!(
+                "password file {} is not valid UTF-8",
+                path.display()
+            ));
+        }
+    };
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    if s.is_empty() {
+        return Err(anyhow!("password file {} is empty", path.display()));
+    }
+    Ok(s)
+}
+
+/// Whether the open file has an extended access control list (any entry).
+#[cfg(target_os = "macos")]
+fn has_extended_acl(file: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // <sys/acl.h>; the libc crate does not declare these.
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: the fd stays open while `file` is borrowed; a non-null result is
+    // freed once below.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let err = std::io::Error::last_os_error();
+        // ENOENT: no ACL. ENOTSUP: the file system has no ACLs.
+        return match err.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTSUP) => Ok(false),
+            _ => Err(err).context("reading its access control list"),
+        };
+    }
+    // SAFETY: `acl` came from acl_get_fd_np and is not used after this.
+    unsafe { acl_free(acl) };
+    Ok(true)
+}
+
+/// The access rule for `--password-file`: owned by `euid` and no permission
+/// bits for group or others.
+fn check_password_file_access(mode: u32, owner: u32, euid: u32) -> Result<()> {
+    if owner != euid {
+        return Err(anyhow!(
+            "is owned by uid {owner}, not by the user running macrdp (uid {euid})"
+        ));
+    }
+    if mode & 0o077 != 0 {
+        return Err(anyhow!(
+            "has mode {:04o}; group and others must have no access (chmod 600)",
+            mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
 /// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
 /// which prints the password on stdout. The Keychain entry has to be
 /// created out-of-band; this never prompts the user interactively.
@@ -1603,10 +1745,9 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // consumed waking/focusing the lock screen instead of entering text.
     // Round 1's mistake was using RETURN as that wake (it submitted an empty
     // password); a bare SHIFT tap cannot insert text and cannot submit, so
-    // it wakes the field harmlessly. Posted as FlagsChanged on BOTH event
-    // sources, the pattern `input.rs::post_flags_changed` established —
-    // `[NSEvent modifierFlags]` and the HID-level state are backed by
-    // different sources and both need to see it.
+    // it wakes the field harmlessly. Posted as FlagsChanged on both event
+    // sources, as live-tested; the lock screen ignores the doubled tap that
+    // `input.rs::post_flags_changed` now avoids for apps.
     const VK_SHIFT: u16 = 0x38;
     let post_flags = |flags: CGEventFlags| {
         for src in [&source, &source_hid] {
@@ -2314,7 +2455,22 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(username);
     }
 
-    if on("USE_KEYCHAIN", true) {
+    // PASSWORD_FILE replaces the Keychain, so USE_KEYCHAIN then defaults off.
+    let password_file = cfg.get("PASSWORD_FILE").filter(|p| !p.is_empty());
+    if let Some(p) = password_file {
+        argv.push("--password-file".into());
+        argv.push(p.clone());
+    }
+    if on("USE_KEYCHAIN", password_file.is_none()) {
+        if password_file.is_some() {
+            // Both set: say which line to change instead of clap's generic
+            // "cannot be used with" error.
+            return Err(anyhow!(
+                "{}: PASSWORD_FILE and USE_KEYCHAIN=1 are both set; set USE_KEYCHAIN=0 \
+                 (or remove that line) to read the password from the file",
+                path.display()
+            ));
+        }
         argv.push("--keychain".into());
     }
     if on("ENABLE_H264", false) {
@@ -2918,6 +3074,8 @@ async fn async_main() -> Result<()> {
         .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
     let password: Zeroizing<String> = if args.keychain {
         read_password_from_keychain(&username)?
+    } else if let Some(path) = args.password_file.as_deref() {
+        read_password_file(path)?
     } else if let Some(p) = args.password.take() {
         warn!(
             "--password is visible to any local user via `ps` and may be saved in \
@@ -2950,7 +3108,9 @@ async fn async_main() -> Result<()> {
                 args.bind,
             ));
         }
-        warn!("--skip-auth set; using --password verbatim without PAM check (loopback only)");
+        warn!(
+            "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
+        );
     }
 
     let session_tracker = capture::SessionTracker::default();
@@ -3462,6 +3622,7 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
+    let conn_handler = Some(connection_hooks::SessionHooks::wrap(conn_handler));
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -3963,6 +4124,166 @@ mod config_tests {
         let p = write_temp("br4", "BITRATE=\n");
         assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
         fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn password_file_config_bridge() {
+        // PASSWORD_FILE maps to --password-file and turns the Keychain default off.
+        let p = write_temp("pwf1", "PASSWORD_FILE=/tmp/x/pw\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert_eq!(a.password_file.as_deref(), Some(Path::new("/tmp/x/pw")));
+        assert!(!a.keychain);
+
+        // Both set explicitly is a conflict, not a silent pick, and the
+        // error says how to fix the config.
+        let p = write_temp("pwf2", "PASSWORD_FILE=/tmp/x/pw\nUSE_KEYCHAIN=1\n");
+        let e = args_from_config(&p).unwrap_err().to_string();
+        fs::remove_file(&p).ok();
+        assert!(e.contains("USE_KEYCHAIN=0"), "{e}");
+
+        // PASSWORD_FILE with USE_KEYCHAIN=0 (as config.env.example says).
+        let p = write_temp("pwf2b", "PASSWORD_FILE=/tmp/x/pw\nUSE_KEYCHAIN=0\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert!(a.password_file.is_some() && !a.keychain);
+
+        // Empty PASSWORD_FILE is ignored → Keychain default as before.
+        let p = write_temp("pwf3", "PASSWORD_FILE=\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert!(a.password_file.is_none());
+        assert!(a.keychain);
+    }
+
+    /// A 0600 password file for the tests.
+    fn write_pw(name: &str, body: &str) -> PathBuf {
+        let p = write_temp(name, body);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        p
+    }
+
+    #[test]
+    fn password_file_access_rule() {
+        assert!(check_password_file_access(0o100600, 501, 501).is_ok());
+        assert!(check_password_file_access(0o100400, 501, 501).is_ok());
+        // Any group/other bit is refused, not only read.
+        for mode in [0o100644, 0o100640, 0o100620, 0o100601, 0o100610] {
+            let e = check_password_file_access(mode, 501, 501)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(&format!("{:04o}", mode & 0o7777)), "{e}");
+        }
+        let e = check_password_file_access(0o100600, 0, 501)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("uid 0"), "{e}");
+    }
+
+    #[test]
+    fn password_file_refuses_open_permissions() {
+        let p = write_pw("pwf7", "s3cret\n");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("chmod 600"), "{e}");
+        assert!(!e.contains("s3cret"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn password_file_refuses_an_acl() {
+        let p = write_pw("pwf-acl", "s3cret\n");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        // Without the ACL the same file is accepted.
+        let status = std::process::Command::new("chmod")
+            .arg("-N")
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ok = read_password_file(&p);
+        fs::remove_file(&p).ok();
+        assert!(
+            e.contains("access control list") && e.contains("chmod -N"),
+            "{e}"
+        );
+        assert!(!e.contains("s3cret"));
+        assert_eq!(ok.unwrap().as_str(), "s3cret");
+    }
+
+    #[test]
+    fn password_file_must_be_a_regular_file() {
+        // A FIFO without a writer must not block startup.
+        let p = std::env::temp_dir().join(format!("macrdp-pwfifo-{}", std::process::id()));
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("not a regular file"), "{e}");
+        // A directory neither.
+        let e = format!(
+            "{:#}",
+            read_password_file(&std::env::temp_dir()).unwrap_err()
+        );
+        assert!(e.contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn password_file_size_and_encoding() {
+        let p = write_pw("pwf8", &"x".repeat(MAX_PASSWORD_FILE_BYTES));
+        assert_eq!(
+            read_password_file(&p).unwrap().len(),
+            MAX_PASSWORD_FILE_BYTES
+        );
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf9", &"x".repeat(MAX_PASSWORD_FILE_BYTES + 1));
+        assert!(read_password_file(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        let p = write_temp("pwf10", "");
+        fs::write(&p, [0x73u8, 0xff, 0x0a]).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("not valid UTF-8"), "{e}");
+    }
+
+    #[test]
+    fn password_file_reads_and_strips_one_newline() {
+        let p = write_pw("pwf4", "s3cret\r\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "s3cret");
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf5", "two\n\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "two\n");
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf6", "\n");
+        assert!(read_password_file(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        assert!(read_password_file(Path::new("/nonexistent/macrdp-pw")).is_err());
+    }
+
+    #[test]
+    fn password_file_conflicts_with_password_flag() {
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--password", "x"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--keychain"]).is_err()
+        );
+        assert!(Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw"]).is_ok());
     }
 
     #[test]

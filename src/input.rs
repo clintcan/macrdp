@@ -234,11 +234,46 @@ fn resync_plan(reconnected: bool, buttons_down: [bool; 3], mods_held: bool) -> R
     }
 }
 
+/// Wheel units per posted scroll line; see `Inner::scroll`.
+const SCROLL_UNITS_PER_LINE: i32 = 60;
+
+/// Adds a wheel delta to the running total and returns the lines to post (at
+/// most 5 per event) and the new total. Whatever the cap cuts off is dropped,
+/// and a reversal starts from zero.
+fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
+    let accum = if delta != 0 && accum != 0 && (accum < 0) != (delta < 0) {
+        delta
+    } else {
+        accum.saturating_add(delta)
+    };
+    let lines = accum / SCROLL_UNITS_PER_LINE;
+    (lines.clamp(-5, 5), accum - lines * SCROLL_UNITS_PER_LINE)
+}
+
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        is_remappable_shortcut, map_client_to_display, resync_plan, should_remap_click, ResyncPlan,
+        is_remappable_shortcut, map_client_to_display, resync_plan, scroll_lines,
+        should_remap_click, ResyncPlan,
     };
+
+    #[test]
+    fn scroll_drops_what_the_cap_cuts_off() {
+        assert_eq!(scroll_lines(0, -1236), (-5, -36));
+        assert_eq!(scroll_lines(0, 30), (0, 30));
+        assert_eq!(scroll_lines(30, 30), (1, 0));
+    }
+
+    #[test]
+    fn scroll_saturates_instead_of_overflowing() {
+        assert_eq!(scroll_lines(59, i32::MAX), (5, i32::MAX % 60));
+    }
+
+    #[test]
+    fn scroll_reversal_ignores_the_previous_direction() {
+        let (_, accum) = scroll_lines(0, -1236);
+        assert_eq!(scroll_lines(accum, 120), (2, 0));
+    }
 
     /// Connection edge: every tracked button is released, the gesture state is
     /// cleared, and `FlagsChanged` is posted only if a modifier was held.
@@ -564,7 +599,7 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
+    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode, to_iso_key_order};
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -818,8 +853,7 @@ mod macos {
 
     pub struct Inner {
         source: CGEventSource,
-        // Secondary source used *only* to mirror modifier FlagsChanged
-        // events. See `Inner::new` for why one source isn't enough.
+        // Source for modifier FlagsChanged events. See `Inner::new`.
         source_hid: CGEventSource,
         last_x: f64,
         last_y: f64,
@@ -910,12 +944,10 @@ mod macos {
             //   screenshot, Mission Control, Show Desktop) checks before
             //   firing. Cmd+Tab is the canonical case.
             //
-            // A flagsChanged event posted from one source does NOT update the
-            // other. So we maintain both: the session source is the canonical
-            // one used for every event, and `source_hid` exists solely to
-            // mirror modifier flagsChanged so symbolic hotkeys also see Cmd
-            // as held. Without the mirror, Cmd+Tab is a no-op; with it, both
-            // classes of shortcut work.
+            // The session source is used for every key event; modifier
+            // flagsChanged go through `source_hid` only, because HID state
+            // feeds the combined session state and symbolic hotkeys need it.
+            // Without it, Cmd+Tab is a no-op.
             let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
                 .map_err(|_| anyhow!("CGEventSource::new(CombinedSessionState) failed"))?;
             let source_hid = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -1140,6 +1172,9 @@ mod macos {
                     "clearing stale held modifiers"
                 );
                 self.post_flags_changed(VK_LCMD);
+                // The modifier that held an open Cmd+Tab or Option+Tab switcher is gone, so close it.
+                CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                commit_cycle_session();
             }
         }
 
@@ -1181,14 +1216,20 @@ mod macos {
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
-            let Some(vk) = scancode_to_cgkeycode(scancode, extended) else {
+            let Some(mut vk) = scancode_to_cgkeycode(scancode, extended) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
             self.refresh_auto_layout();
+            // Every Apple layout except the US-style ones is drawn for ISO key order.
+            if let (Some(iso_vk), Some(layout)) = (to_iso_key_order(vk), self.layout.as_mut()) {
+                if !layout.grave_types_backtick() {
+                    vk = iso_vk;
+                }
+            }
 
-            // Modifier path: update per-side state and emit FlagsChanged
-            // mirrored to both sources. We do this BEFORE any of the
+            // Modifier path: update per-side state and emit FlagsChanged.
+            // We do this BEFORE any of the
             // symbolic-hotkey logic so the held-modifier check in
             // try_symbolic_hotkey sees the just-pressed modifier.
             if ModifierState::is_modifier_vk(vk) {
@@ -1342,33 +1383,23 @@ mod macos {
             ev.post(CGEventTapLocation::HID);
         }
 
-        /// Emit a FlagsChanged event for `vk` from both sources. We send
-        /// the same event twice so two different parts of macOS see the
-        /// modifier as held:
-        ///   - CombinedSessionState backs `[NSEvent modifierFlags]` —
-        ///     what Cocoa apps query for Cmd+C / Cmd+Q / Cmd+~.
-        ///   - HIDSystemState backs the modifier view that WindowServer's
-        ///     symbolic-hotkey dispatcher (Dock, Spotlight, screencapture,
-        ///     Mission Control, Show Desktop) checks before firing.
-        ///
-        /// A FlagsChanged posted from one source does NOT update the other,
-        /// so without the mirror you get either app shortcuts or symbolic
-        /// hotkeys but not both.
+        /// Emit one FlagsChanged event for `vk` from the HID source. The
+        /// HIDSystemState feeds the CombinedSessionState, so a single post
+        /// updates both the symbolic-hotkey view and `[NSEvent modifierFlags]`.
+        /// Posting it from both sources delivered every modifier change to
+        /// apps twice, and double-tap shortcuts (VS Code's `shift shift`)
+        /// fired on a single press.
         fn post_flags_changed(&self, vk: u16) {
-            let flags = self.mods.cg_flags();
-            for source in [&self.source, &self.source_hid] {
-                // `down` parameter is ignored for FlagsChanged: macOS
-                // derives press-vs-release purely from the diff between
-                // the prior flags state and the new flags carried on the
-                // event. We pass `true` for shape only.
-                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), vk, true) else {
-                    warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
-                    continue;
-                };
-                ev.set_flags(flags);
-                ev.set_type(CGEventType::FlagsChanged);
-                ev.post(CGEventTapLocation::HID);
-            }
+            // `down` parameter is ignored for FlagsChanged: macOS derives
+            // press-vs-release purely from the diff between the prior flags
+            // state and the new flags carried on the event.
+            let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), vk, true) else {
+                warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
+                return;
+            };
+            ev.set_flags(self.mods.cg_flags());
+            ev.set_type(CGEventType::FlagsChanged);
+            ev.post(CGEventTapLocation::HID);
         }
 
         /// Swap Control→Command in both the public CGEventFlag bits and the
@@ -1430,14 +1461,13 @@ mod macos {
             let swapped = self.ctrl_to_cmd_flags();
 
             if down {
-                for source in [&self.source, &self.source_hid] {
-                    let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), VK_LCMD, true) else {
-                        warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
-                        continue;
-                    };
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true)
+                {
                     ev.set_flags(swapped);
                     ev.set_type(CGEventType::FlagsChanged);
                     ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
                 }
             }
             if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
@@ -1833,18 +1863,15 @@ mod macos {
             // RDP wheel rotation units are 120 per "tick", but this client
             // slices a single gesture into many small legacy MOUSE PDU
             // events (observed raw magnitude ~2-40 per event, not one
-            // 120-per-notch value). A flat `delta / SCALE` per event
+            // 120-per-notch value). A flat per-event division
             // truncates almost every one of those to zero — scroll never
             // moves at all. Accumulate the raw delta across calls instead,
             // and only emit whole lines once the running total crosses
-            // SCALE, carrying the remainder forward so no motion is lost.
-            const SCALE: i32 = 60;
-            self.scroll_v_accum += vertical;
-            self.scroll_h_accum += horizontal;
-            let v = (self.scroll_v_accum / SCALE).clamp(-5, 5);
-            let h = (self.scroll_h_accum / SCALE).clamp(-5, 5);
-            self.scroll_v_accum -= v * SCALE;
-            self.scroll_h_accum -= h * SCALE;
+            // SCROLL_UNITS_PER_LINE (see `scroll_lines`).
+            let (v, v_accum) = super::scroll_lines(self.scroll_v_accum, vertical);
+            let (h, h_accum) = super::scroll_lines(self.scroll_h_accum, horizontal);
+            self.scroll_v_accum = v_accum;
+            self.scroll_h_accum = h_accum;
             if v == 0 && h == 0 {
                 return;
             }
