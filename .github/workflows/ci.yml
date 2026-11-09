@@ -76,7 +76,7 @@ jobs:
 
   test-macos:
     name: test (macos)
-    runs-on: macos-14   # Apple Silicon
+    runs-on: macos-15   # Apple Silicon
     timeout-minutes: 30
     steps:
       - name: Harden runner
@@ -118,7 +118,7 @@ jobs:
   # (it runs the macOS server binary) and needs FreeRDP, so it's its own job.
   audit-integration:
     name: audit log (macos integration)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 25
     steps:
       - name: Harden runner
