@@ -20,6 +20,7 @@ mod clipboard;
 mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;
+mod connection_hooks;
 mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
@@ -3678,6 +3679,7 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
+    let conn_handler = Some(connection_hooks::SessionHooks::wrap(conn_handler));
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)

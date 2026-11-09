@@ -2302,10 +2302,6 @@ impl Gfx {
             s.rtt_ms
                 .store(self.link_rtt_ms.load(Ordering::Relaxed), Ordering::Relaxed);
             s.fps.store(self.fps, Ordering::Relaxed);
-            s.frames_sent.store(
-                ctx.last_shipped_frame_id.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
         }
         actions
     }
@@ -2754,6 +2750,10 @@ impl Gfx {
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+                    // stats: no-op unless --stats-endpoint.
+                    if let Some(s) = crate::stats::global() {
+                        s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);
+                    }
                     ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
                         (u64::from(frame_id), Instant::now());
                 }
@@ -3196,13 +3196,9 @@ impl GraphicsPipelineHandler for GfxHandler {
                      lapses back to zero)"
                 );
             }
-            // stats: keep frames/RTT live for mstsc sessions even without
+            // stats: keep RTT live for mstsc sessions even without
             // --adaptive-bitrate (no-op unless --stats-endpoint). ~8/s.
             if let Some(s) = crate::stats::global() {
-                s.frames_sent.store(
-                    ctx.last_shipped_frame_id.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
                 s.rtt_ms.store(ctx.link_rtt_ms, Ordering::Relaxed);
             }
         }

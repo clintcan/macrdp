@@ -996,6 +996,14 @@ fn capture_scaling_mode(
     (force_full_frame, letterbox)
 }
 
+/// Whether SCK needs a 1/fps minimum frame interval. On a display refreshing
+/// no faster than `fps` (0.5 Hz slack so 59.94 counts as 60) the cap saves no
+/// frames but makes SCK hold each one back to its pacing slot, adding latency.
+/// An unknown refresh rate (0) keeps the cap.
+fn sck_needs_frame_cap(fps: u32, display_hz: f64) -> bool {
+    !(display_hz > 0.0 && display_hz <= f64::from(fps) + 0.5)
+}
+
 /// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
 /// Returns the rect unchanged when it already fits.
 fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
@@ -1025,7 +1033,8 @@ mod macos {
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     use screencapturekit::prelude::{
-        PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
+        CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration,
+        SCStreamOutputType,
     };
 
     /// SCK's surface-pool depth: its default (3) plus one for the frame the
@@ -1312,15 +1321,14 @@ mod macos {
             // framebuffer. Only a size matching neither (explicit
             // --width/--height that asks SCK to scale) forces full frames,
             // because then dirty-rects arrive in source coords and misalign.
+            let mode = core_graphics::display::CGDisplay::new(display.display_id()).display_mode();
             let (backing_w, backing_h) =
                 if crate::virtual_display::is_hidpi_virtual_display(display.display_id()) {
                     // `CGDisplayCopyDisplayMode` returns nothing for a virtual
                     // display, so the HiDPI vd's 2× backing is derived here.
                     (native_w.saturating_mul(2), native_h.saturating_mul(2))
                 } else {
-                    use core_graphics::display::CGDisplay;
-                    CGDisplay::new(display.display_id())
-                        .display_mode()
+                    mode.as_ref()
                         .and_then(|m| {
                             Some((
                                 u16::try_from(m.pixel_width()).ok()?,
@@ -1360,11 +1368,20 @@ mod macos {
                 .with_excluding_windows(&[])
                 .build();
 
+            let display_hz = mode.map_or(0.0, |m| m.refresh_rate());
+            let frame_cap = sck_needs_frame_cap(fps, display_hz);
+            tracing::debug!(display_hz, fps, frame_cap, "SCK frame cap");
+            let min_frame_interval = if frame_cap {
+                CMTime::new(1, fps as i32)
+            } else {
+                CMTime::new(0, 1)
+            };
+
             let config = SCStreamConfiguration::new()
                 .with_width(u32::from(width))
                 .with_height(u32::from(height))
                 .with_pixel_format(SckPixelFormat::BGRA)
-                .with_fps(fps)
+                .with_minimum_frame_interval(&min_frame_interval)
                 // Hide the macOS cursor in the captured framebuffer; we forward
                 // it separately as RGBAPointer so the client renders its own
                 // (real-shape) cursor without doubling up.
@@ -2219,6 +2236,16 @@ mod tests {
             adopt_client_size(true, (1920, 1080), cap_client_size(size(3840, 2160), max)),
             None
         );
+    }
+
+    #[test]
+    fn sck_frame_cap_only_for_a_faster_or_unknown_display() {
+        assert!(!sck_needs_frame_cap(60, 60.0));
+        assert!(!sck_needs_frame_cap(60, 59.94));
+        assert!(!sck_needs_frame_cap(120, 60.0));
+        assert!(sck_needs_frame_cap(60, 120.0));
+        assert!(sck_needs_frame_cap(15, 60.0));
+        assert!(sck_needs_frame_cap(60, 0.0));
     }
 
     #[test]

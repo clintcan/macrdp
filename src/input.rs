@@ -599,7 +599,7 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
+    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode, to_iso_key_order};
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -1172,6 +1172,9 @@ mod macos {
                     "clearing stale held modifiers"
                 );
                 self.post_flags_changed(VK_LCMD);
+                // The modifier that held an open Cmd+Tab or Option+Tab switcher is gone, so close it.
+                CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                commit_cycle_session();
             }
         }
 
@@ -1213,11 +1216,17 @@ mod macos {
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
-            let Some(vk) = scancode_to_cgkeycode(scancode, extended) else {
+            let Some(mut vk) = scancode_to_cgkeycode(scancode, extended) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
             self.refresh_auto_layout();
+            // Every Apple layout except the US-style ones is drawn for ISO key order.
+            if let (Some(iso_vk), Some(layout)) = (to_iso_key_order(vk), self.layout.as_mut()) {
+                if !layout.grave_types_backtick() {
+                    vk = iso_vk;
+                }
+            }
 
             // Modifier path: update per-side state and emit FlagsChanged.
             // We do this BEFORE any of the
