@@ -700,6 +700,13 @@ struct MacCliprdrBackend {
 /// be holding `file:///tmp/macrdp-lazy-paste-…/foo` URLs whose backing
 /// files we just deleted — Finder paste would error out for the user).
 ///
+/// Only a backend that served a client does this. Backends are built before
+/// TLS and authentication, including for a preemption candidate while another
+/// client is being served, and the paste state is shared across backends. A
+/// failed attempt's Drop would otherwise tear down the LIVE session's paste.
+/// It has nothing of its own to clean up: pastes start from a client's Format
+/// List, and the first one fires `on_ready` before anything else handles it.
+///
 /// Best-effort: presenter removal is async (hops to the runloop thread),
 /// and temp-dir removal is std::fs blocking — we do NOT wait on either,
 /// because Drop runs synchronously on the ironrdp_server task thread
@@ -710,11 +717,14 @@ impl Drop for MacCliprdrBackend {
         // clipboard channel (balances build_cliprdr_backend's increment).
         self.active_backends
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // Still pending means `on_ready` never fired: no client list was handled.
         #[cfg(target_os = "macos")]
-        crate::file_promise_lazy::cleanup_on_disconnect(
-            &self.paste_temp_dir,
-            &self.self_change_count,
-        );
+        if !self.initial_advertise_pending {
+            crate::file_promise_lazy::cleanup_on_disconnect(
+                &self.paste_temp_dir,
+                &self.self_change_count,
+            );
+        }
     }
 }
 
@@ -2281,6 +2291,50 @@ mod tests {
             rx.try_recv(),
             Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id))) if id == ClipboardFormatId::CF_DIB
         ));
+    }
+
+    /// Backends are built before TLS and authentication, including for a
+    /// preemption candidate while another client is being served. When such an
+    /// attempt fails, its Drop must leave the paste state alone: that state
+    /// belongs to the live session, and deleting it would break a pending or
+    /// in-progress file paste. The backend that served a client still cleans up.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn only_a_backend_that_served_a_client_runs_the_disconnect_cleanup() {
+        use std::sync::atomic::Ordering;
+        let dir = tmpdir("live-session-paste");
+        let (mut live, _live_rx) = test_backend();
+        live.on_ready();
+        *live.paste_temp_dir.lock().unwrap() = Some(dir.0.clone());
+        live.active_backends.store(2, Ordering::Relaxed);
+
+        let (mut failed_attempt, _attempt_rx) = test_backend();
+        failed_attempt.paste_temp_dir = live.paste_temp_dir.clone();
+        failed_attempt.active_backends = live.active_backends.clone();
+        drop(failed_attempt);
+
+        assert!(
+            dir.0.exists(),
+            "a failed attempt deleted the live session's paste files"
+        );
+        assert_eq!(
+            live.paste_temp_dir.lock().unwrap().as_deref(),
+            Some(dir.0.as_path()),
+            "a failed attempt forgot the live session's paste dir"
+        );
+        assert_eq!(
+            live.active_backends.load(Ordering::Relaxed),
+            1,
+            "a failed attempt must still balance the poller's backend count"
+        );
+
+        let shared = live.paste_temp_dir.clone();
+        drop(live);
+        assert!(
+            !dir.0.exists(),
+            "the backend that served the client must clean up its paste files"
+        );
+        assert!(shared.lock().unwrap().is_none());
     }
 
     /// Regression pin for a bug caught in QA: publishing a remote TEXT/rich
