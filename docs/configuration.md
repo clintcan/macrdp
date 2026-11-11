@@ -390,7 +390,7 @@ defaults are right for almost everyone):
 ```
 BLANK_RECOVERY_ARM_MS=3000              # skip the connect-time churn before the detector evaluates     [MACRDP_BLANK_RECOVERY_ARM_MS]
 BLANK_RECOVERY_MIN_QOE=24               # all-zero QoE reports (~3 s) to declare an ACTIVE blank         [MACRDP_BLANK_RECOVERY_MIN_QOE]
-BLANK_RECOVERY_MAX_WAIT_MS=4000         # wall-clock fast-path: declare a STATIC blank after this many ms  [MACRDP_BLANK_RECOVERY_MAX_WAIT_MS]
+BLANK_RECOVERY_MAX_WAIT_MS=4000         # wall-clock fast-path: declare a STATIC blank after this many ms (first attempt only)  [MACRDP_BLANK_RECOVERY_MAX_WAIT_MS]
 BLANK_RECOVERY_MIN_WALL_REPORTS=1       # min all-zero reports the fast-path needs (skips QoE-less clients)  [MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS]
 BLANK_RECOVERY_HEAL_CONFIRM_MS=8000     # after a reactivation, wait this long for a sustained heal before the fallback drop  [MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS]
 BLANK_RECOVERY_RETRY_MS=4000            # spacing between recovery attempts                              [MACRDP_BLANK_RECOVERY_RETRY_MS]

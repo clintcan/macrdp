@@ -572,7 +572,7 @@ MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS=40  # nonzero reports (~5 s) that mark
 MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE=160  # all-zero reports (~20 s at the active cadence) required to recover an ESTABLISHED session — tolerates the brief zero-EDR windows a healthy client produces (a shorter window dropped a working 12-min session)
 MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS=30000  # wall-clock companion to the above: an established session is also declared blank once NOTHING nonzero has arrived for this long (with the report floor below) — bounds recovery on a STATIC blank, where QoE trickles at ~0.3/s and the 160-report count alone would take ~9 min
 MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS=16  # consecutive zeros the wall-clock branch needs — proves the client is still decoding, so an IDLE session (no frames, no QoE at all) never trips it
-MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank (never-established sessions only)
+MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank (never-established sessions, first attempt only)
 MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS=1  # min all-zero reports the fast-path needs (rules out QoE-less clients)
 MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS=8000  # post-attempt heal-confirmation deadline (0 disables): once a recovery attempt has run, the session must show a SUSTAINED nonzero-EDR run within this long or the next attempt (the fallback drop) fires — on cumulative-zero / total-silence evidence that interleaved phantom nonzero reports can't reset (Windows App for macOS starved the consecutive-zero paths for 12+ s live, 2026-07-23)
 MACRDP_BLANK_RECOVERY_ARM_MS=3000      # skip the connect-time churn window
@@ -580,6 +580,7 @@ MACRDP_BLANK_RECOVERY_RETRY_MS=4000    # spacing between attempts
 MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # forced to >=2 when REACTIVATE=1 so the fallback drop can fire
 MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = uncapped; only the drop fallback counts)
 MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie (only the drop fallback needs it)
+MACRDP_EGFX_LEGACY_HOLD_MS=3000        # hold legacy bitmap updates on a new connection until EGFX is ready, at most this long (0 = off); Windows 10 mstsc freezes on a legacy picture sent just before EGFX
 ```
 
 Testing against the server:
