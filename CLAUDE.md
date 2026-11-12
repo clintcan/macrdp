@@ -24,11 +24,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.1** (mstsc fixes: blank-recovery no longer drops a
-healed session, #248; adaptive bitrate counts delay as congestion only while it grows, spaces
-its cuts and slows its climb, and the resync hotkey drains before its IDR, #249). Next: move
-pasteboard reads off the server loop (the Universal Clipboard stall), then the IDR-backoff
-no-op, the RDPDR stale mount on restart, and the mstsc UDP tunnel going dead.
+(VPN/ZeroTier). **Latest release: v0.10.2** (Universal Clipboard promises are neither advertised
+nor read, so a Handoff item can't stall the session, #198; a failed attempt's clipboard backend
+leaves the live session's paste alone, #245; RDPDR mounts use `deadtimeout=60` and the reaper reads
+the mount table instead of stat'ing a possibly-dead mountpoint, #251). Next: the IDR-backoff no-op,
+the NFS NOENT log spam, and the mstsc UDP tunnel going dead.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

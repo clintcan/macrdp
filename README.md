@@ -18,10 +18,11 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.10.1](https://github.com/clintcan/macrdp/releases/latest)** — mstsc fixes: a session that recovered from a blank screen is no longer dropped on reconnect, `--adaptive-bitrate` no longer makes LAN video stutter, and the A/V resync hotkey clears queued video first.
+**Latest: [v0.10.2](https://github.com/clintcan/macrdp/releases/latest)** — the session no longer freezes on a Universal Clipboard (Handoff) item from another Apple device, a failed connection attempt can't break the live session's file paste, and restarting with a redirected drive no longer leaves a stuck mount.
 
 **Recent releases**
 
+- **v0.10.1** (2026-11-12) — mstsc fixes: no drop after a blank-screen recovery, no adaptive-bitrate stutter on a LAN
 - **v0.10.0** (2026-11-12) — IronRDP update: stalled-client timeout, iOS Windows App cursor, mute-on-minimize for FreeRDP/Thincast
 - **v0.9.11** (2026-10-01) — input fixes: held modifiers on clicks, Ctrl+click→Cmd+click under `--map-ctrl-to-cmd`
 - **v0.9.10** (2026-09-30) — microphone redirection *(experimental)*; `--lock-on-disconnect` no longer locks under a reconnecting client
