@@ -310,6 +310,9 @@ struct ConnectionContext {
     /// usable, so the connect-time backlog never enters it). Fed to
     /// [`congested_hysteresis`]. See [`ConnectionContext::queue_delay_ms`].
     adaptive_delay_ewma: f64,
+    /// The last `2 * DELAY_TREND_WINDOW` usable queue-delay samples (oldest
+    /// first), for [`delay_trend`].
+    adaptive_delay_samples: VecDeque<f64>,
     /// Hysteresis state: whether the controller is currently in a congestion episode
     /// (enters when the EWMA lag clears the high mark, exits below the low mark).
     adaptive_congested: bool,
@@ -1141,6 +1144,67 @@ fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
     retransmit_delta > tolerance
 }
 
+/// How many queue-delay samples (one per control interval) each half of the
+/// trend comparison averages. Two halves of 3 at the 300 ms default interval
+/// compare the last ~0.9 s against the ~0.9 s before it.
+const DELAY_TREND_WINDOW: usize = 3;
+
+/// Direction of the standing queue delay over the last ~2 trend windows, from
+/// [`delay_trend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelayTrend {
+    /// Fewer than `2 * DELAY_TREND_WINDOW` samples yet. The controller falls
+    /// back to the original level-only rule, so a link that is congested from
+    /// the first second (a thin VPN) is still backed off before a trend exists.
+    Unknown,
+    /// The queue is growing: sending faster than the bottleneck drains.
+    Rising,
+    /// The queue is shrinking: a previous back-off is draining it.
+    Falling,
+    /// Neither: a standing delay that isn't growing. At a high level this is
+    /// mstsc's decode pipeline during video, not congestion (2026-11-12).
+    Flat,
+}
+
+/// Classify the trend of the recent queue-delay samples (oldest first): the
+/// mean of the newest `DELAY_TREND_WINDOW` against the mean of the window
+/// before it, with `rise_ms` as the dead band. Pure, unit-tested.
+///
+/// Why a trend at all (2026-11-12, mstsc build 26100 on gigabit Ethernet,
+/// YouTube at 1080p60): the delay sat FLAT at ~120 ms at 3 Mbit/s (samples
+/// 123, 121, 118, 120, 122) with the TCP send queue empty, because mstsc keeps
+/// ~10 frames of video in its decode pipeline. The level-only rule read that as
+/// congestion, cut the bitrate (which didn't move the delay: it stayed
+/// 118-148 ms all the way down to 0.5 Mbit/s), hit the 10 fps floor, and the
+/// fps cap cleared the delay, so it climbed back: a stutter every 3-5 s. A real
+/// backlog keeps GROWING while the sender is over capacity, so a growing delay
+/// is the congestion evidence; a flat one isn't.
+fn delay_trend(samples: &VecDeque<f64>, rise_ms: f64) -> DelayTrend {
+    if samples.len() < 2 * DELAY_TREND_WINDOW {
+        return DelayTrend::Unknown;
+    }
+    let n = samples.len();
+    let mean = |from: usize| {
+        samples.range(from..from + DELAY_TREND_WINDOW).sum::<f64>() / DELAY_TREND_WINDOW as f64
+    };
+    let delta = mean(n - DELAY_TREND_WINDOW) - mean(n - 2 * DELAY_TREND_WINDOW);
+    if delta > rise_ms {
+        DelayTrend::Rising
+    } else if delta < -rise_ms {
+        DelayTrend::Falling
+    } else {
+        DelayTrend::Flat
+    }
+}
+
+/// Whether the smoothed delay is pressure to back off this interval: above
+/// the hard `ceiling` (a delay only a real backlog reaches) whatever the trend,
+/// or above `high` while growing (or before a trend exists). A flat or falling
+/// delay below the ceiling isn't. Pure, unit-tested.
+fn delay_pressure(ewma: f64, high: f64, ceiling: f64, trend: DelayTrend) -> bool {
+    ewma > ceiling || (ewma > high && matches!(trend, DelayTrend::Rising | DelayTrend::Unknown))
+}
+
 /// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
 /// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
 /// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
@@ -1153,10 +1217,20 @@ fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
 /// immediately (a definite loss, no smoothing). With acks unusable (suspended / not yet
 /// seen / cold-start warmup), the lag is uninferable so only the retransmit signal
 /// counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+///
+/// **Trend (2026-11-12):** `trend` and `ceiling` refine the delay rule (see
+/// [`delay_trend`]). Enter on [`delay_pressure`]. Stay while the delay is above
+/// `low` and still moving (rising, or falling as a back-off drains it), or
+/// above `ceiling`; a FLAT delay below the ceiling ends the episode, because a
+/// standing delay that isn't growing is not a backlog. With `DelayTrend::Unknown`
+/// this is exactly the original level-only rule.
+#[allow(clippy::too_many_arguments)]
 fn congested_hysteresis(
     ewma_lag: f64,
     high: f64,
     low: f64,
+    ceiling: f64,
+    trend: DelayTrend,
     retransmit_lossy: bool,
     acks_usable: bool,
     currently_congested: bool,
@@ -1168,9 +1242,12 @@ fn congested_hysteresis(
         return false;
     }
     if currently_congested {
-        ewma_lag > low // stay congested until the smoothed lag drops below the low mark
+        // stay congested until the smoothed lag drops below the low mark, or
+        // stops moving below the ceiling
+        ewma_lag > ceiling || (ewma_lag > low && trend != DelayTrend::Flat)
     } else {
-        ewma_lag > high // only enter once the smoothed lag clears the high mark
+        // only enter on real pressure (see `delay_pressure`)
+        delay_pressure(ewma_lag, high, ceiling, trend)
     }
 }
 
@@ -1196,14 +1273,19 @@ enum RateAction {
 /// increase once cleared. So a single spike = one step down then a plateau, while
 /// *sustained* congestion (lag stays above `high`) keeps decreasing toward the floor.
 /// Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+///
+/// With a trend (2026-11-12) the decrease needs [`delay_pressure`]: a flat or
+/// draining delay below `ceiling` holds or increases instead of cutting.
 fn rate_action(
     ewma_lag: f64,
     high: f64,
+    ceiling: f64,
+    trend: DelayTrend,
     retransmit_lossy: bool,
     acks_usable: bool,
     congested: bool,
 ) -> RateAction {
-    if retransmit_lossy || (acks_usable && ewma_lag > high) {
+    if retransmit_lossy || (acks_usable && delay_pressure(ewma_lag, high, ceiling, trend)) {
         RateAction::Decrease
     } else if !congested {
         RateAction::Increase
@@ -1358,6 +1440,17 @@ pub struct Gfx {
     /// queue is unambiguous congestion at any RTT (LEDBAT's classic target);
     /// `MACRDP_ADAPTIVE_QUEUE_HIGH_MS` overrides.
     adaptive_queue_high_ms: f64,
+    /// Dead band (ms) for the queue-delay trend ([`delay_trend`]): the mean of
+    /// the last ~0.9 s must differ from the ~0.9 s before by more than this to
+    /// count as rising or falling. 20 ms ≈ a backlog growing ~22 ms/s, i.e.
+    /// sending a few percent over the bottleneck. `MACRDP_ADAPTIVE_QUEUE_RISE_MS`.
+    adaptive_queue_rise_ms: f64,
+    /// Hard ceiling (ms): a smoothed delay above this is congestion whatever its
+    /// trend, so a backlog that has stopped growing at a very high level is
+    /// still worked down. Well above mstsc's ~120 ms video decode depth.
+    /// Clamped to at least `adaptive_queue_high_ms`.
+    /// `MACRDP_ADAPTIVE_QUEUE_CEILING_MS`, default 400.
+    adaptive_queue_ceiling_ms: f64,
     /// EWMA weight on each new queue-delay sample in (0,1]: `ewma = α·sample +
     /// (1−α)·ewma`. Smooths the spiky raw signal so single bursts don't pump the
     /// bitrate; lower = more smoothing (slower reaction). Default 0.3;
@@ -1504,6 +1597,16 @@ impl Gfx {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&n| n > 0.0)
             .unwrap_or(100.0);
+        let env_ms_f64 = |name: &str, default: f64| -> f64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|&n| n > 0.0)
+                .unwrap_or(default)
+        };
+        let adaptive_queue_rise_ms = env_ms_f64("MACRDP_ADAPTIVE_QUEUE_RISE_MS", 20.0);
+        let adaptive_queue_ceiling_ms =
+            env_ms_f64("MACRDP_ADAPTIVE_QUEUE_CEILING_MS", 400.0).max(adaptive_queue_high_ms);
         // EWMA smoothing weight for the queue-delay signal (clamped to (0,1]); default 0.3.
         let adaptive_ewma_alpha = std::env::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
             .ok()
@@ -1635,6 +1738,8 @@ impl Gfx {
                 decrease = adaptive_decrease,
                 interval_ms = adaptive_interval.as_millis() as u64,
                 queue_high_ms = adaptive_queue_high_ms,
+                queue_rise_ms = adaptive_queue_rise_ms,
+                queue_ceiling_ms = adaptive_queue_ceiling_ms,
                 ewma_alpha = adaptive_ewma_alpha,
                 normal_keyframe_frames,
                 stretched_keyframe_frames,
@@ -1667,6 +1772,8 @@ impl Gfx {
             adaptive_decrease,
             adaptive_interval,
             adaptive_queue_high_ms,
+            adaptive_queue_rise_ms,
+            adaptive_queue_ceiling_ms,
             adaptive_ewma_alpha,
             adaptive_retx_tolerance,
             normal_keyframe_frames,
@@ -2218,6 +2325,7 @@ impl Gfx {
             }
             // Stale UDP-side smoothing state doesn't apply to the fresh TCP path.
             ctx.adaptive_delay_ewma = 0.0;
+            ctx.adaptive_delay_samples.clear();
             ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
@@ -2292,7 +2400,12 @@ impl Gfx {
         if signal_usable {
             ctx.adaptive_delay_ewma = self.adaptive_ewma_alpha * sample_ms
                 + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_delay_ewma;
+            if ctx.adaptive_delay_samples.len() >= 2 * DELAY_TREND_WINDOW {
+                ctx.adaptive_delay_samples.pop_front();
+            }
+            ctx.adaptive_delay_samples.push_back(sample_ms);
         }
+        let trend = delay_trend(&ctx.adaptive_delay_samples, self.adaptive_queue_rise_ms);
         // Per-interval visibility even when the target doesn't change (the
         // adjusted-line below only logs on a change; Hold periods were opaque).
         trace!(
@@ -2301,14 +2414,18 @@ impl Gfx {
             ack_lag,
             acks_usable,
             distress,
+            ?trend,
             target_bps = ctx.adaptive_target_bps,
             "EGFX adaptive controller interval"
         );
         let high = self.adaptive_queue_high_ms;
+        let ceiling_ms = self.adaptive_queue_ceiling_ms;
         let congested = congested_hysteresis(
             ctx.adaptive_delay_ewma,
             high,
             high * 0.5, // exit threshold (hysteresis low mark)
+            ceiling_ms,
+            trend,
             retransmit_lossy,
             signal_usable,
             ctx.adaptive_congested,
@@ -2321,6 +2438,8 @@ impl Gfx {
         let action = rate_action(
             ctx.adaptive_delay_ewma,
             high,
+            ceiling_ms,
+            trend,
             retransmit_lossy,
             signal_usable,
             congested,
@@ -2353,6 +2472,7 @@ impl Gfx {
                 ewma_queue_ms = ctx.adaptive_delay_ewma,
                 ack_lag,
                 retransmit_delta,
+                ?trend,
                 ?action,
                 prev_bps = prev,
                 new_bps = new_target,
@@ -3008,6 +3128,7 @@ impl GfxServerFactory for Gfx {
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
             adaptive_delay_ewma: 0.0,
+            adaptive_delay_samples: VecDeque::with_capacity(2 * DELAY_TREND_WINDOW),
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
             qoe: QoeEvidence::default(),
@@ -3793,29 +3914,111 @@ mod tests {
         assert!(retransmit_is_lossy(1, 0));
     }
 
-    // congested_hysteresis(ewma_lag, high, low, retransmit_lossy, acks_usable, currently)
+    // congested_hysteresis(ewma_lag, high, low, ceiling, trend, retransmit_lossy, acks_usable, currently)
+    // These tests pass an infinite ceiling + DelayTrend::Unknown = the original level-only rule.
     #[test]
     fn hysteresis_enters_only_above_high() {
         // Not yet congested: enter only once the smoothed lag clears the HIGH mark.
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // below high
-        assert!(!congested_hysteresis(12.0, 12.0, 6.0, false, true, false)); // exactly at
-        assert!(congested_hysteresis(13.0, 12.0, 6.0, false, true, false)); // above high
+        assert!(!congested_hysteresis(
+            10.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // below high
+        assert!(!congested_hysteresis(
+            12.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // exactly at
+        assert!(congested_hysteresis(
+            13.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // above high
     }
 
     #[test]
     fn hysteresis_stays_until_below_low() {
         // Already congested: stay through the (low, high] band, exit at or below low.
-        assert!(congested_hysteresis(9.0, 12.0, 6.0, false, true, true)); // in the band → stay
-        assert!(congested_hysteresis(7.0, 12.0, 6.0, false, true, true)); // just above low → stay
-        assert!(!congested_hysteresis(6.0, 12.0, 6.0, false, true, true)); // at low → exit
-        assert!(!congested_hysteresis(5.0, 12.0, 6.0, false, true, true)); // below low → exit
+        assert!(congested_hysteresis(
+            9.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // in the band → stay
+        assert!(congested_hysteresis(
+            7.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // just above low → stay
+        assert!(!congested_hysteresis(
+            6.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // at low → exit
+        assert!(!congested_hysteresis(
+            5.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // below low → exit
     }
 
     #[test]
     fn hysteresis_retransmit_forces_congested() {
         // Loss above the tolerance is a definite loss → congested regardless of lag/acks.
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, true, false));
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, false, false)); // even acks-unusable
+        assert!(congested_hysteresis(
+            0.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            true,
+            true,
+            false
+        ));
+        assert!(congested_hysteresis(
+            0.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            true,
+            false,
+            false
+        )); // even acks-unusable
     }
 
     #[test]
@@ -3823,10 +4026,24 @@ mod tests {
         // Acks suspended / cold-start: lag uninferable → not congested (no retransmit),
         // and a stale-high EWMA can't keep an episode latched.
         assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, false
+            10_000.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            false,
+            false
         ));
         assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, true
+            10_000.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            false,
+            true
         ));
     }
 
@@ -3834,23 +4051,348 @@ mod tests {
     fn hysteresis_transport_specific_high() {
         // Same smoothed lag enters congestion at the UDP high (8) but not the TCP high
         // (12) — TCP's send buffer adds baseline depth, so it needs a higher mark.
-        assert!(congested_hysteresis(10.0, 8.0, 4.0, false, true, false)); // UDP
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // TCP
+        assert!(congested_hysteresis(
+            10.0,
+            8.0,
+            4.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // UDP
+        assert!(!congested_hysteresis(
+            10.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // TCP
     }
 
-    // rate_action(ewma_lag, high, retransmit_lossy, acks_usable, congested)
+    fn delay_samples(v: &[f64]) -> VecDeque<f64> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn delay_trend_classifies_rising_falling_flat_and_unknown() {
+        // Fewer than two windows → Unknown (level-only fallback).
+        assert_eq!(
+            delay_trend(&delay_samples(&[10.0, 50.0, 90.0, 130.0, 170.0]), 20.0),
+            DelayTrend::Unknown
+        );
+        // The measured mstsc plateau at 3 Mbit/s (11-12): flat.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[123.0, 121.0, 118.0, 120.0, 122.0, 121.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+        // The measured ramp into it (72, 72, 80 → 99, 103, 150): rising.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[72.0, 72.0, 80.0, 99.0, 103.0, 150.0]),
+                20.0
+            ),
+            DelayTrend::Rising
+        );
+        // A back-off draining a queue: falling.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[300.0, 280.0, 260.0, 200.0, 170.0, 140.0]),
+                20.0
+            ),
+            DelayTrend::Falling
+        );
+        // One jittery sample at the window edge doesn't flip it: the halves
+        // are averaged (110 vs 120 = +10, Flat), though the endpoints alone
+        // differ by 60.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[100.0, 130.0, 100.0, 100.0, 100.0, 160.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+        // Exactly the dead band either way is still Flat.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[100.0, 100.0, 100.0, 120.0, 120.0, 120.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+    }
+
+    #[test]
+    fn delay_pressure_needs_growth_below_the_ceiling() {
+        // Above high: only Rising (or Unknown, the old rule) is pressure.
+        assert!(delay_pressure(150.0, 100.0, 400.0, DelayTrend::Rising));
+        assert!(delay_pressure(150.0, 100.0, 400.0, DelayTrend::Unknown));
+        assert!(!delay_pressure(150.0, 100.0, 400.0, DelayTrend::Flat));
+        assert!(!delay_pressure(150.0, 100.0, 400.0, DelayTrend::Falling));
+        // Above the ceiling: always pressure.
+        for t in [
+            DelayTrend::Flat,
+            DelayTrend::Falling,
+            DelayTrend::Rising,
+            DelayTrend::Unknown,
+        ] {
+            assert!(delay_pressure(450.0, 100.0, 400.0, t));
+        }
+        // Below high: never.
+        assert!(!delay_pressure(90.0, 100.0, 400.0, DelayTrend::Rising));
+        // A flat episode ends below the ceiling; a moving one holds until `low`.
+        assert!(!congested_hysteresis(
+            150.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            false,
+            true,
+            true
+        ));
+        assert!(congested_hysteresis(
+            150.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Falling,
+            false,
+            true,
+            true
+        ));
+        assert!(congested_hysteresis(
+            450.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            false,
+            true,
+            true
+        ));
+        // Loss still forces it regardless.
+        assert!(congested_hysteresis(
+            0.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            true,
+            true,
+            false
+        ));
+    }
+
+    /// Result of [`simulate_adaptive`]: bitrate per interval and how many
+    /// intervals sat at the floor (where the fps floor engages).
+    struct AdaptiveSim {
+        bps: Vec<u32>,
+        at_floor_intervals: usize,
+        decreases: usize,
+        max_ewma: f64,
+    }
+
+    /// Closed-loop run of the controller's pure decision chain (EWMA → trend →
+    /// hysteresis → rate action → AIMD) at the production defaults, against a
+    /// `link` model mapping (interval, current bitrate) to the delay sample.
+    /// `use_trend = false` reproduces the pre-2026-11-12 level-only controller.
+    fn simulate_adaptive(
+        intervals: usize,
+        use_trend: bool,
+        mut link: impl FnMut(usize, u32) -> f64,
+    ) -> AdaptiveSim {
+        let (floor, ceiling_bps, inc, dec) = (500_000u32, 3_000_000u32, 250_000u32, 0.7f32);
+        let (high, low, ceiling_ms, rise, alpha) = (100.0, 50.0, 400.0, 20.0, 0.3);
+        let mut target = ceiling_bps;
+        let mut ewma = 0.0;
+        let mut samples = VecDeque::new();
+        let mut congested = false;
+        let mut sim = AdaptiveSim {
+            bps: Vec::new(),
+            at_floor_intervals: 0,
+            decreases: 0,
+            max_ewma: 0.0,
+        };
+        for i in 0..intervals {
+            let sample = link(i, target);
+            ewma = alpha * sample + (1.0 - alpha) * ewma;
+            sim.max_ewma = sim.max_ewma.max(ewma);
+            if samples.len() >= 2 * DELAY_TREND_WINDOW {
+                samples.pop_front();
+            }
+            samples.push_back(sample);
+            let trend = if use_trend {
+                delay_trend(&samples, rise)
+            } else {
+                DelayTrend::Unknown
+            };
+            let ceil = if use_trend { ceiling_ms } else { f64::INFINITY };
+            congested = congested_hysteresis(ewma, high, low, ceil, trend, false, true, congested);
+            let action = rate_action(ewma, high, ceil, trend, false, true, congested);
+            target = match action {
+                RateAction::Hold => target,
+                RateAction::Decrease => {
+                    sim.decreases += 1;
+                    aimd_bitrate(target, 1, floor, ceiling_bps, inc, dec)
+                }
+                RateAction::Increase => aimd_bitrate(target, 0, floor, ceiling_bps, inc, dec),
+            };
+            if target <= floor && congested {
+                sim.at_floor_intervals += 1;
+            }
+            sim.bps.push(target);
+        }
+        sim
+    }
+
+    #[test]
+    fn adaptive_controller_does_not_oscillate_on_mstsc_decode_depth() {
+        // THE 11-12 LAN STUTTER: mstsc keeps ~10 frames of 1080p60 video in
+        // its decoder, so the measured delay ramps to ~120 ms and sits there
+        // regardless of bitrate (it stayed 118-148 ms from 3 down to
+        // 0.5 Mbit/s). Model: a ramp then a flat 120 ms with the measured ±5 ms
+        // jitter, independent of the bitrate. 60 intervals = 18 s of video.
+        let jitter = [3.0, -2.0, -5.0, 0.0, 2.0, 1.0, -3.0, 4.0];
+        let mstsc = |i: usize, _bps: u32| {
+            if i < 6 {
+                20.0 + 20.0 * i as f64
+            } else {
+                120.0 + jitter[i % jitter.len()]
+            }
+        };
+        let fixed = simulate_adaptive(60, true, mstsc);
+        // Never reaches the floor (so the 10 fps cap never engages) and
+        // spends the second half at or near the 3 Mbit/s ceiling.
+        assert_eq!(
+            fixed.at_floor_intervals, 0,
+            "fixed controller hit the floor: {:?}",
+            fixed.bps
+        );
+        assert!(
+            fixed.bps[30..].iter().all(|&b| b >= 2_500_000),
+            "{:?}",
+            fixed.bps
+        );
+        assert!(
+            fixed.decreases <= 3,
+            "{} decreases: {:?}",
+            fixed.decreases,
+            fixed.bps
+        );
+        // The old level-only rule on the same input is what stuttered: it
+        // keeps cutting and reaches the floor.
+        let old = simulate_adaptive(60, false, mstsc);
+        assert!(
+            old.at_floor_intervals > 0,
+            "old controller never hit the floor: {:?}",
+            old.bps
+        );
+    }
+
+    /// A bottleneck of `capacity_bps` with an infinite buffer: each interval
+    /// the queue grows (or drains) by the over/under-send, in ms of link time.
+    fn thin_link(capacity_bps: u32) -> impl FnMut(usize, u32) -> f64 {
+        let mut queue_ms = 0.0f64;
+        move |_i, bps| {
+            let interval_ms = 300.0;
+            queue_ms +=
+                interval_ms * (f64::from(bps) - f64::from(capacity_bps)) / f64::from(capacity_bps);
+            queue_ms = queue_ms.max(0.0);
+            queue_ms
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_still_tracks_a_thin_link() {
+        // A 1.5 Mbit/s VPN-class bottleneck, starting at the 3 Mbit/s
+        // ceiling: the queue grows while over capacity, so the trend sees it.
+        let sim = simulate_adaptive(200, true, thin_link(1_500_000));
+        assert!(sim.decreases > 0);
+        // Settles around the capacity: over the last 30 s (100 intervals) the
+        // average stays within 60-120% of it, and the delay stays bounded
+        // well below the hard ceiling's order of magnitude.
+        let tail = &sim.bps[100..];
+        let avg = tail.iter().map(|&b| f64::from(b)).sum::<f64>() / tail.len() as f64;
+        assert!(
+            (900_000.0..=1_800_000.0).contains(&avg),
+            "avg {avg} bps: {:?}",
+            tail
+        );
+        assert!(
+            sim.max_ewma < 1_000.0,
+            "queue ran away: max ewma {}",
+            sim.max_ewma
+        );
+    }
+
+    #[test]
+    fn adaptive_controller_still_backs_off_a_saturated_link() {
+        // The 2026-07-04 lab case: a 500 Kbit/s pipe at a 3 Mbit/s start. The
+        // queue climbs fast; the controller must cut to the floor quickly.
+        let sim = simulate_adaptive(60, true, thin_link(500_000));
+        let first_floor = sim.bps.iter().position(|&b| b <= 500_000);
+        assert!(matches!(first_floor, Some(i) if i <= 15), "{:?}", sim.bps);
+        // And it backs off exactly as the old level-only controller did: on
+        // a growing queue the trend is Rising, so nothing here changed. (The
+        // model's 6x overshoot builds a multi-second queue before any
+        // controller can react; that part is the link, not the rule.)
+        let old = simulate_adaptive(60, false, thin_link(500_000));
+        assert_eq!(sim.bps, old.bps);
+    }
+
+    #[test]
+    fn adaptive_controller_backs_off_a_flat_delay_above_the_ceiling() {
+        // A backlog that stopped growing at a very high level is still worked
+        // down: flat 500 ms is over the 400 ms ceiling.
+        let sim = simulate_adaptive(30, true, |_i, _bps| 500.0);
+        assert!(sim.decreases >= 5, "{:?}", sim.bps);
+    }
+
+    // rate_action(ewma_lag, high, ceiling, trend, retransmit_lossy, acks_usable, congested) — again
+    // with an infinite ceiling + DelayTrend::Unknown, i.e. the original level-only rule.
     #[test]
     fn rate_action_decreases_above_high_or_on_retransmit() {
         assert_eq!(
-            rate_action(13.0, 12.0, false, true, true),
+            rate_action(
+                13.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                true
+            ),
             RateAction::Decrease
         ); // lag>high
         assert_eq!(
-            rate_action(0.0, 12.0, true, true, true),
+            rate_action(
+                0.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                true,
+                true,
+                true
+            ),
             RateAction::Decrease
         ); // loss>tolerance
         assert_eq!(
-            rate_action(0.0, 12.0, true, false, false),
+            rate_action(
+                0.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                true,
+                false,
+                false
+            ),
             RateAction::Decrease
         ); // loss>tolerance, acks unusable
     }
@@ -3859,20 +4401,47 @@ mod tests {
     fn rate_action_holds_in_band_while_congested() {
         // Latched congested but the smoothed lag has decayed below high (decaying through
         // the band) → hold, don't keep cratering. This is the "single spike" fix.
-        assert_eq!(rate_action(9.0, 12.0, false, true, true), RateAction::Hold);
+        assert_eq!(
+            rate_action(
+                9.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                true
+            ),
+            RateAction::Hold
+        );
     }
 
     #[test]
     fn rate_action_increases_when_cleared() {
         // Not congested (cleared below low) → climb back toward the ceiling.
         assert_eq!(
-            rate_action(2.0, 12.0, false, true, false),
+            rate_action(
+                2.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                false
+            ),
             RateAction::Increase
         );
         // Acks unusable (warmup/suspend) with no retransmit → not congested → increase
         // (target is already at ceiling at connect, so this is a clamp-no-op there).
         assert_eq!(
-            rate_action(99.0, 12.0, false, false, false),
+            rate_action(
+                99.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                false,
+                false
+            ),
             RateAction::Increase
         );
     }
@@ -3885,14 +4454,30 @@ mod tests {
         let lossy = retransmit_is_lossy(1, 2);
         assert!(!lossy);
         assert_eq!(
-            rate_action(1.0, 8.0, lossy, true, false),
+            rate_action(
+                1.0,
+                8.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                lossy,
+                true,
+                false
+            ),
             RateAction::Increase
         );
         // But sustained loss (delta=5) crosses the tolerance → back off.
         let lossy = retransmit_is_lossy(5, 2);
         assert!(lossy);
         assert_eq!(
-            rate_action(1.0, 8.0, lossy, true, true),
+            rate_action(
+                1.0,
+                8.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                lossy,
+                true,
+                true
+            ),
             RateAction::Decrease
         );
     }
