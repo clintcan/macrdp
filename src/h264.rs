@@ -313,6 +313,14 @@ struct ConnectionContext {
     /// The last `2 * DELAY_TREND_WINDOW` usable queue-delay samples (oldest
     /// first), for [`delay_trend`].
     adaptive_delay_samples: VecDeque<f64>,
+    /// When the last bitrate decrease happened (for [`hold_trend_decrease`]).
+    adaptive_last_decrease_at: Option<Instant>,
+    /// The bitrate where the last congestion episode began (for
+    /// [`increase_step`]); set on an episode's first decrease.
+    adaptive_congestion_bps: Option<u32>,
+    /// Whether the controller is inside a decrease episode (cleared by an
+    /// increase), so `adaptive_congestion_bps` records its START.
+    adaptive_in_decrease_episode: bool,
     /// While `Some`, the manual resync hotkey is draining the client's decoder
     /// before its IDR (see [`resync_drain_step`]); the deadline caps the hold.
     resync_drain_until: Option<Instant>,
@@ -1206,6 +1214,65 @@ fn delay_trend(samples: &VecDeque<f64>, rise_ms: f64) -> DelayTrend {
 /// delay below the ceiling isn't. Pure, unit-tested.
 fn delay_pressure(ewma: f64, high: f64, ceiling: f64, trend: DelayTrend) -> bool {
     ewma > ceiling || (ewma > high && matches!(trend, DelayTrend::Rising | DelayTrend::Unknown))
+}
+
+/// Least time between two trend-driven decreases (2026-11-12, second live
+/// round): after a cut the measured delay keeps rising for ~1.5 s while the
+/// frames already in flight drain, so cutting every 300 ms interval while it
+/// rose overshot all the way to the floor and the 10 fps cap (live: 3 → 0.5
+/// Mbit/s in 1.5 s, delay still climbing to 366 ms). One cut per second lets
+/// each one take effect. Not applied above the hard ceiling or on loss.
+const TREND_DECREASE_SPACING: Duration = Duration::from_secs(1);
+
+/// The increase step near the last congestion point is the normal step
+/// divided by this (see [`increase_step`]).
+const SLOW_APPROACH_DIVISOR: u32 = 5;
+
+/// Whether a `Decrease` from the rate rule should be held back for spacing
+/// (see [`TREND_DECREASE_SPACING`]): only a decrease driven by a RISING delay
+/// below the hard ceiling, within the spacing of the last decrease. Loss, the
+/// ceiling, and the level-only fallback (`Unknown`) are never held. Pure,
+/// unit-tested.
+fn hold_trend_decrease(
+    retransmit_lossy: bool,
+    ewma: f64,
+    ceiling: f64,
+    trend: DelayTrend,
+    since_last_decrease: Option<Duration>,
+    spacing: Duration,
+) -> bool {
+    !retransmit_lossy
+        && ewma <= ceiling
+        && trend == DelayTrend::Rising
+        && since_last_decrease.is_some_and(|d| d < spacing)
+}
+
+/// The additive-increase step: the normal `increase_bps`, slowed to
+/// `increase_bps / SLOW_APPROACH_DIVISOR` once the target is within 80% of the
+/// bitrate where the last congestion episode began (`congestion_bps`), so the
+/// climb doesn't race straight back into the backlog it just left (the
+/// second live round: +250 kbit/s per 300 ms took it from 1 to 2.5 Mbit/s in
+/// 2 s, past the ~2 Mbit/s where the reconnected mstsc's delay starts
+/// growing). Pure, unit-tested.
+fn increase_step(target_bps: u32, congestion_bps: Option<u32>, increase_bps: u32) -> u32 {
+    match congestion_bps {
+        Some(p) if u64::from(target_bps) * 5 >= u64::from(p) * 4 => {
+            (increase_bps / SLOW_APPROACH_DIVISOR).max(1)
+        }
+        _ => increase_bps,
+    }
+}
+
+/// Note a decrease for the slow approach: the FIRST decrease of an episode
+/// records the bitrate it started from (the trouble point [`increase_step`]
+/// slows down near); later cuts in the same episode leave it, or the point
+/// would sink to the floor with the cuts and slow the whole climb back. An
+/// increase ends the episode (the caller clears `in_episode`).
+fn note_decrease(in_episode: &mut bool, congestion_bps: &mut Option<u32>, target_bps: u32) {
+    if !*in_episode {
+        *in_episode = true;
+        *congestion_bps = Some(target_bps);
+    }
 }
 
 /// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
@@ -2387,6 +2454,9 @@ impl Gfx {
             // Stale UDP-side smoothing state doesn't apply to the fresh TCP path.
             ctx.adaptive_delay_ewma = 0.0;
             ctx.adaptive_delay_samples.clear();
+            ctx.adaptive_last_decrease_at = None;
+            ctx.adaptive_congestion_bps = None;
+            ctx.adaptive_in_decrease_episode = false;
             ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
@@ -2505,24 +2575,55 @@ impl Gfx {
             signal_usable,
             congested,
         );
+        // Let each trend-driven cut take effect before the next (see
+        // `TREND_DECREASE_SPACING`): hold instead.
+        let action = if action == RateAction::Decrease
+            && hold_trend_decrease(
+                retransmit_lossy,
+                ctx.adaptive_delay_ewma,
+                ceiling_ms,
+                trend,
+                ctx.adaptive_last_decrease_at
+                    .map(|t| now.saturating_duration_since(t)),
+                TREND_DECREASE_SPACING,
+            ) {
+            RateAction::Hold
+        } else {
+            action
+        };
         let new_target = match action {
             RateAction::Hold => ctx.adaptive_target_bps,
-            RateAction::Decrease => aimd_bitrate(
-                ctx.adaptive_target_bps,
-                1,
-                self.adaptive_floor_bps,
-                ceiling,
-                self.adaptive_increase_bps,
-                self.adaptive_decrease,
-            ),
-            RateAction::Increase => aimd_bitrate(
-                ctx.adaptive_target_bps,
-                0,
-                self.adaptive_floor_bps,
-                ceiling,
-                self.adaptive_increase_bps,
-                self.adaptive_decrease,
-            ),
+            RateAction::Decrease => {
+                note_decrease(
+                    &mut ctx.adaptive_in_decrease_episode,
+                    &mut ctx.adaptive_congestion_bps,
+                    ctx.adaptive_target_bps,
+                );
+                ctx.adaptive_last_decrease_at = Some(now);
+                aimd_bitrate(
+                    ctx.adaptive_target_bps,
+                    1,
+                    self.adaptive_floor_bps,
+                    ceiling,
+                    self.adaptive_increase_bps,
+                    self.adaptive_decrease,
+                )
+            }
+            RateAction::Increase => {
+                ctx.adaptive_in_decrease_episode = false;
+                aimd_bitrate(
+                    ctx.adaptive_target_bps,
+                    0,
+                    self.adaptive_floor_bps,
+                    ceiling,
+                    increase_step(
+                        ctx.adaptive_target_bps,
+                        ctx.adaptive_congestion_bps,
+                        self.adaptive_increase_bps,
+                    ),
+                    self.adaptive_decrease,
+                )
+            }
         };
         if new_target != ctx.adaptive_target_bps {
             let prev = ctx.adaptive_target_bps;
@@ -3199,6 +3300,9 @@ impl GfxServerFactory for Gfx {
             adaptive_warmup_until: None,
             adaptive_delay_ewma: 0.0,
             adaptive_delay_samples: VecDeque::with_capacity(2 * DELAY_TREND_WINDOW),
+            adaptive_last_decrease_at: None,
+            adaptive_congestion_bps: None,
+            adaptive_in_decrease_episode: false,
             resync_drain_until: None,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
@@ -4294,21 +4398,36 @@ mod tests {
         max_ewma: f64,
     }
 
+    /// Which controller [`simulate_adaptive`] runs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SimMode {
+        /// The pre-2026-11-12 level-only controller.
+        Old,
+        /// The trend gate alone (the first live round of this fix).
+        TrendOnly,
+        /// The trend gate plus decrease spacing and the slow approach.
+        Full,
+    }
+
     /// Closed-loop run of the controller's pure decision chain (EWMA → trend →
-    /// hysteresis → rate action → AIMD) at the production defaults, against a
+    /// hysteresis → rate action → decrease spacing → AIMD with the slow
+    /// approach) at the production defaults and the 300 ms interval, against a
     /// `link` model mapping (interval, current bitrate) to the delay sample.
-    /// `use_trend = false` reproduces the pre-2026-11-12 level-only controller.
     fn simulate_adaptive(
         intervals: usize,
-        use_trend: bool,
+        mode: SimMode,
         mut link: impl FnMut(usize, u32) -> f64,
     ) -> AdaptiveSim {
         let (floor, ceiling_bps, inc, dec) = (500_000u32, 3_000_000u32, 250_000u32, 0.7f32);
         let (high, low, ceiling_ms, rise, alpha) = (100.0, 50.0, 400.0, 20.0, 0.3);
+        let interval = ms(300);
         let mut target = ceiling_bps;
         let mut ewma = 0.0;
         let mut samples = VecDeque::new();
         let mut congested = false;
+        let mut last_decrease: Option<Duration> = None;
+        let mut congestion_bps: Option<u32> = None;
+        let mut in_episode = false;
         let mut sim = AdaptiveSim {
             bps: Vec::new(),
             at_floor_intervals: 0,
@@ -4316,6 +4435,7 @@ mod tests {
             max_ewma: 0.0,
         };
         for i in 0..intervals {
+            let now = interval * i as u32;
             let sample = link(i, target);
             ewma = alpha * sample + (1.0 - alpha) * ewma;
             sim.max_ewma = sim.max_ewma.max(ewma);
@@ -4323,21 +4443,43 @@ mod tests {
                 samples.pop_front();
             }
             samples.push_back(sample);
-            let trend = if use_trend {
-                delay_trend(&samples, rise)
+            let (trend, ceil) = if mode == SimMode::Old {
+                (DelayTrend::Unknown, f64::INFINITY)
             } else {
-                DelayTrend::Unknown
+                (delay_trend(&samples, rise), ceiling_ms)
             };
-            let ceil = if use_trend { ceiling_ms } else { f64::INFINITY };
             congested = congested_hysteresis(ewma, high, low, ceil, trend, false, true, congested);
-            let action = rate_action(ewma, high, ceil, trend, false, true, congested);
+            let mut action = rate_action(ewma, high, ceil, trend, false, true, congested);
+            if mode == SimMode::Full
+                && action == RateAction::Decrease
+                && hold_trend_decrease(
+                    false,
+                    ewma,
+                    ceil,
+                    trend,
+                    last_decrease.map(|t| now - t),
+                    TREND_DECREASE_SPACING,
+                )
+            {
+                action = RateAction::Hold;
+            }
             target = match action {
                 RateAction::Hold => target,
                 RateAction::Decrease => {
                     sim.decreases += 1;
+                    note_decrease(&mut in_episode, &mut congestion_bps, target);
+                    last_decrease = Some(now);
                     aimd_bitrate(target, 1, floor, ceiling_bps, inc, dec)
                 }
-                RateAction::Increase => aimd_bitrate(target, 0, floor, ceiling_bps, inc, dec),
+                RateAction::Increase => {
+                    in_episode = false;
+                    let step = if mode == SimMode::Full {
+                        increase_step(target, congestion_bps, inc)
+                    } else {
+                        inc
+                    };
+                    aimd_bitrate(target, 0, floor, ceiling_bps, step, dec)
+                }
             };
             if target <= floor && congested {
                 sim.at_floor_intervals += 1;
@@ -4362,7 +4504,7 @@ mod tests {
                 120.0 + jitter[i % jitter.len()]
             }
         };
-        let fixed = simulate_adaptive(60, true, mstsc);
+        let fixed = simulate_adaptive(60, SimMode::Full, mstsc);
         // Never reaches the floor (so the 10 fps cap never engages) and
         // spends the second half at or near the 3 Mbit/s ceiling.
         assert_eq!(
@@ -4383,7 +4525,7 @@ mod tests {
         );
         // The old level-only rule on the same input is what stuttered: it
         // keeps cutting and reaches the floor.
-        let old = simulate_adaptive(60, false, mstsc);
+        let old = simulate_adaptive(60, SimMode::Old, mstsc);
         assert!(
             old.at_floor_intervals > 0,
             "old controller never hit the floor: {:?}",
@@ -4408,7 +4550,7 @@ mod tests {
     fn adaptive_controller_still_tracks_a_thin_link() {
         // A 1.5 Mbit/s VPN-class bottleneck, starting at the 3 Mbit/s
         // ceiling: the queue grows while over capacity, so the trend sees it.
-        let sim = simulate_adaptive(200, true, thin_link(1_500_000));
+        let sim = simulate_adaptive(200, SimMode::Full, thin_link(1_500_000));
         assert!(sim.decreases > 0);
         // Settles around the capacity: over the last 30 s (100 intervals) the
         // average stays within 60-120% of it, and the delay stays bounded
@@ -4431,22 +4573,166 @@ mod tests {
     fn adaptive_controller_still_backs_off_a_saturated_link() {
         // The 2026-07-04 lab case: a 500 Kbit/s pipe at a 3 Mbit/s start. The
         // queue climbs fast; the controller must cut to the floor quickly.
-        let sim = simulate_adaptive(60, true, thin_link(500_000));
+        let sim = simulate_adaptive(60, SimMode::Full, thin_link(500_000));
         let first_floor = sim.bps.iter().position(|&b| b <= 500_000);
         assert!(matches!(first_floor, Some(i) if i <= 15), "{:?}", sim.bps);
         // And it backs off exactly as the old level-only controller did: on
         // a growing queue the trend is Rising, so nothing here changed. (The
         // model's 6x overshoot builds a multi-second queue before any
         // controller can react; that part is the link, not the rule.)
-        let old = simulate_adaptive(60, false, thin_link(500_000));
+        let old = simulate_adaptive(60, SimMode::Old, thin_link(500_000));
         assert_eq!(sim.bps, old.bps);
+    }
+
+    #[test]
+    fn trend_decreases_are_spaced_and_the_climb_slows_near_the_last_congestion() {
+        let s = TREND_DECREASE_SPACING;
+        // A rising-delay cut within the spacing of the last one is held…
+        assert!(hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        // …but not once the spacing has passed, nor for the first cut.
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(s),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            None,
+            s
+        ));
+        // Never held: loss, above the ceiling, or the level-only fallback.
+        assert!(!hold_trend_decrease(
+            true,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            450.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Unknown,
+            Some(ms(300)),
+            s
+        ));
+
+        // Full step until 80% of where the last episode began, then a fifth.
+        assert_eq!(increase_step(1_000_000, None, 250_000), 250_000);
+        assert_eq!(increase_step(1_500_000, Some(2_500_000), 250_000), 250_000);
+        assert_eq!(increase_step(2_000_000, Some(2_500_000), 250_000), 50_000);
+        assert_eq!(increase_step(2_900_000, Some(2_500_000), 250_000), 50_000);
+    }
+
+    /// A client whose decoder falls behind above `capacity_bps`, seen with a
+    /// lag of `lag` intervals (frames already in flight still have to be
+    /// decoded after a cut — the 11-12 second live round, a reconnected mstsc).
+    fn lagged_decoder(capacity_bps: u32, lag: usize) -> impl FnMut(usize, u32) -> f64 {
+        let mut queue_ms = 0.0f64;
+        let mut line: VecDeque<f64> = VecDeque::new();
+        move |_i, bps| {
+            queue_ms +=
+                300.0 * (f64::from(bps) - f64::from(capacity_bps)) / f64::from(capacity_bps);
+            queue_ms = queue_ms.max(0.0);
+            line.push_back(queue_ms);
+            20.0 + if line.len() > lag {
+                line.pop_front().unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_settles_instead_of_sawing_on_a_lagged_decoder() {
+        // THE 11-12 SECOND LIVE ROUND: on a reconnected mstsc the delay really
+        // grows above ~2 Mbit/s and keeps rising after each cut, so cutting
+        // every interval plunged to the floor and the 10 fps cap.
+        let tail_avg = |sim: &AdaptiveSim| {
+            let t = &sim.bps[60..];
+            t.iter().map(|&b| f64::from(b)).sum::<f64>() / t.len() as f64
+        };
+        let full = simulate_adaptive(200, SimMode::Full, lagged_decoder(2_000_000, 3));
+        let trend_only = simulate_adaptive(200, SimMode::TrendOnly, lagged_decoder(2_000_000, 3));
+        assert!(
+            full.at_floor_intervals * 2 < trend_only.at_floor_intervals,
+            "floor intervals: full {} vs trend-only {}",
+            full.at_floor_intervals,
+            trend_only.at_floor_intervals
+        );
+        assert!(
+            tail_avg(&full) > tail_avg(&trend_only) + 300_000.0,
+            "avg {} vs {}",
+            tail_avg(&full),
+            tail_avg(&trend_only)
+        );
+        // On the thin links the follow-up never costs throughput or delay
+        // against the old controller.
+        for cap in [1_000_000u32, 1_500_000, 2_500_000] {
+            let f = simulate_adaptive(200, SimMode::Full, thin_link(cap));
+            let o = simulate_adaptive(200, SimMode::Old, thin_link(cap));
+            let avg =
+                |s: &AdaptiveSim| s.bps[100..].iter().map(|&b| f64::from(b)).sum::<f64>() / 100.0;
+            assert!(avg(&f) >= avg(&o), "thin {cap}: {} < {}", avg(&f), avg(&o));
+            assert!(
+                f.max_ewma <= o.max_ewma + 1.0,
+                "thin {cap}: {} > {}",
+                f.max_ewma,
+                o.max_ewma
+            );
+            assert!(f.at_floor_intervals <= o.at_floor_intervals, "thin {cap}");
+        }
+    }
+
+    #[test]
+    fn the_climb_back_is_fast_until_near_where_the_episode_began() {
+        // One congestion episode cut 3 Mbit/s down through several spaced
+        // cuts; then the link clears. The trouble point is where the episode
+        // BEGAN (3 Mbit/s), so the climb runs at the full step up to 2.4
+        // Mbit/s. (Recording each cut instead would put it near the bottom
+        // and slow the whole climb to a fifth.)
+        let mut in_episode = false;
+        let mut point = None;
+        for bps in [3_000_000, 2_100_000, 1_470_000, 1_029_000] {
+            note_decrease(&mut in_episode, &mut point, bps);
+        }
+        assert_eq!(point, Some(3_000_000));
+        assert_eq!(increase_step(1_029_000, point, 250_000), 250_000);
+        assert_eq!(increase_step(2_300_000, point, 250_000), 250_000);
+        assert_eq!(increase_step(2_400_000, point, 250_000), 50_000);
+        // A new episode after an increase records its own start.
+        in_episode = false;
+        note_decrease(&mut in_episode, &mut point, 2_600_000);
+        assert_eq!(point, Some(2_600_000));
     }
 
     #[test]
     fn adaptive_controller_backs_off_a_flat_delay_above_the_ceiling() {
         // A backlog that stopped growing at a very high level is still worked
         // down: flat 500 ms is over the 400 ms ceiling.
-        let sim = simulate_adaptive(30, true, |_i, _bps| 500.0);
+        let sim = simulate_adaptive(30, SimMode::Full, |_i, _bps| 500.0);
         assert!(sim.decreases >= 5, "{:?}", sim.bps);
     }
 
