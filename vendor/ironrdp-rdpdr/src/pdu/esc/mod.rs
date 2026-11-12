@@ -4,6 +4,7 @@
 
 pub mod ndr;
 pub mod rpce;
+mod server_direction; // (macrdp divergence 2) encode `*Call`, decode `*Return`
 
 use bitflags::bitflags;
 use ironrdp_core::{
@@ -25,17 +26,28 @@ use crate::pdu::esc::ndr::{Decode as _, Encode as _};
 pub enum ScardCall {
     AccessStartedEventCall(ScardAccessStartedEventCall),
     EstablishContextCall(EstablishContextCall),
+    ListReaderGroupsCall(ListReaderGroupsCall),
     ListReadersCall(ListReadersCall),
     GetStatusChangeCall(GetStatusChangeCall),
+    LocateCardsCall(LocateCardsCall),
+    LocateCardsByAtrCall(LocateCardsByAtrCall),
     ConnectCall(ConnectCall),
+    ReconnectCall(ReconnectCall),
     HCardAndDispositionCall(HCardAndDispositionCall),
     TransmitCall(TransmitCall),
     StatusCall(StatusCall),
+    StateCall(StateCall),
+    ControlCall(ControlCall),
+    GetAttribCall(GetAttribCall),
+    SetAttribCall(SetAttribCall),
+    GetTransmitCountCall(GetTransmitCountCall),
     ContextCall(ContextCall),
     GetDeviceTypeIdCall(GetDeviceTypeIdCall),
     ReadCacheCall(ReadCacheCall),
     WriteCacheCall(WriteCacheCall),
     GetReaderIconCall(GetReaderIconCall),
+    ContextAndStringCall(ContextAndStringCall),
+    ContextAndTwoStringCall(ContextAndTwoStringCall),
     Unsupported,
 }
 
@@ -46,6 +58,9 @@ impl ScardCall {
                 ScardAccessStartedEventCall::decode(src)?,
             )),
             ScardIoCtlCode::EstablishContext => Ok(ScardCall::EstablishContextCall(EstablishContextCall::decode(src)?)),
+            ScardIoCtlCode::ListReaderGroupsW | ScardIoCtlCode::ListReaderGroupsA => {
+                Ok(ScardCall::ListReaderGroupsCall(ListReaderGroupsCall::decode(src)?))
+            }
             ScardIoCtlCode::ListReadersW => Ok(ScardCall::ListReadersCall(ListReadersCall::decode(
                 src,
                 Some(CharacterSet::Unicode),
@@ -62,6 +77,22 @@ impl ScardCall {
                 src,
                 Some(CharacterSet::Ansi),
             )?)),
+            ScardIoCtlCode::LocateCardsW => Ok(ScardCall::LocateCardsCall(LocateCardsCall::decode(
+                src,
+                Some(CharacterSet::Unicode),
+            )?)),
+            ScardIoCtlCode::LocateCardsA => Ok(ScardCall::LocateCardsCall(LocateCardsCall::decode(
+                src,
+                Some(CharacterSet::Ansi),
+            )?)),
+            ScardIoCtlCode::LocateCardsByAtrW => Ok(ScardCall::LocateCardsByAtrCall(LocateCardsByAtrCall::decode(
+                src,
+                Some(CharacterSet::Unicode),
+            )?)),
+            ScardIoCtlCode::LocateCardsByAtrA => Ok(ScardCall::LocateCardsByAtrCall(LocateCardsByAtrCall::decode(
+                src,
+                Some(CharacterSet::Ansi),
+            )?)),
             ScardIoCtlCode::ConnectW => Ok(ScardCall::ConnectCall(ConnectCall::decode(
                 src,
                 Some(CharacterSet::Unicode),
@@ -70,11 +101,17 @@ impl ScardCall {
                 src,
                 Some(CharacterSet::Ansi),
             )?)),
+            ScardIoCtlCode::Reconnect => Ok(ScardCall::ReconnectCall(ReconnectCall::decode(src)?)),
             ScardIoCtlCode::BeginTransaction => Ok(ScardCall::HCardAndDispositionCall(
                 HCardAndDispositionCall::decode(src)?,
             )),
             ScardIoCtlCode::Transmit => Ok(ScardCall::TransmitCall(TransmitCall::decode(src)?)),
             ScardIoCtlCode::StatusW | ScardIoCtlCode::StatusA => Ok(ScardCall::StatusCall(StatusCall::decode(src)?)),
+            ScardIoCtlCode::State => Ok(ScardCall::StateCall(StateCall::decode(src)?)),
+            ScardIoCtlCode::Control => Ok(ScardCall::ControlCall(ControlCall::decode(src)?)),
+            ScardIoCtlCode::GetAttrib => Ok(ScardCall::GetAttribCall(GetAttribCall::decode(src)?)),
+            ScardIoCtlCode::SetAttrib => Ok(ScardCall::SetAttribCall(SetAttribCall::decode(src)?)),
+            ScardIoCtlCode::GetTransmitCount => Ok(ScardCall::GetTransmitCountCall(GetTransmitCountCall::decode(src)?)),
             ScardIoCtlCode::ReleaseContext => Ok(ScardCall::ContextCall(ContextCall::decode(src)?)),
             ScardIoCtlCode::EndTransaction => Ok(ScardCall::HCardAndDispositionCall(HCardAndDispositionCall::decode(
                 src,
@@ -102,6 +139,28 @@ impl ScardCall {
                 Some(CharacterSet::Ansi),
             )?)),
             ScardIoCtlCode::GetReaderIcon => Ok(ScardCall::GetReaderIconCall(GetReaderIconCall::decode(src)?)),
+            ScardIoCtlCode::IntroduceReaderGroupW
+            | ScardIoCtlCode::ForgetReaderGroupW
+            | ScardIoCtlCode::ForgetReaderW => Ok(ScardCall::ContextAndStringCall(ContextAndStringCall::decode(
+                src,
+                Some(CharacterSet::Unicode),
+            )?)),
+            ScardIoCtlCode::IntroduceReaderGroupA
+            | ScardIoCtlCode::ForgetReaderGroupA
+            | ScardIoCtlCode::ForgetReaderA => Ok(ScardCall::ContextAndStringCall(ContextAndStringCall::decode(
+                src,
+                Some(CharacterSet::Ansi),
+            )?)),
+            ScardIoCtlCode::IntroduceReaderW
+            | ScardIoCtlCode::AddReaderToGroupW
+            | ScardIoCtlCode::RemoveReaderFromGroupW => Ok(ScardCall::ContextAndTwoStringCall(
+                ContextAndTwoStringCall::decode(src, Some(CharacterSet::Unicode))?,
+            )),
+            ScardIoCtlCode::IntroduceReaderA
+            | ScardIoCtlCode::AddReaderToGroupA
+            | ScardIoCtlCode::RemoveReaderFromGroupA => Ok(ScardCall::ContextAndTwoStringCall(
+                ContextAndTwoStringCall::decode(src, Some(CharacterSet::Ansi))?,
+            )),
             _ => {
                 warn!(?io_ctl_code, "Unsupported ScardIoCtlCode");
                 // TODO: maybe this should be an error
@@ -111,64 +170,119 @@ impl ScardCall {
     }
 }
 
-/// [2.2.1.1] REDIR_SCARDCONTEXT
-///
-/// [2.2.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/060abee1-e520-4149-9ef7-ce79eb500a59
-#[derive(Debug, PartialEq, Copy, Clone)]
-pub struct ScardContext {
-    /// The opaque context value as a little-endian integer, `length` bytes wide.
-    /// Real Windows uses a pointer-sized `SCARDCONTEXT` (4 bytes on 32-bit, 8 on
-    /// 64-bit), so this must echo back whatever width the client sent — NOT a
-    /// hardcoded 4. (MS-RDPESC allows `cbContext` 0..16; [`read_cb`] caps us at
-    /// 8, which covers every real client.)
-    pub value: u64,
-    /// `cbContext` — the byte width of `value` on the wire (typically 4 or 8).
-    pub length: u8,
+/// MS-RDPESC `cbContext` / `cbHandle` maximum (`range(0,16)`).
+const SCARD_OPAQUE_MAX_LEN: u32 = 16;
+
+fn scard_wire_len(length: u32) -> DecodeResult<u8> {
+    if length > SCARD_OPAQUE_MAX_LEN {
+        return Err(invalid_field_err!(
+            "decode_ptr",
+            "cbContext/cbHandle exceeds MS-RDPESC range 0..=16"
+        ));
+    }
+    // INVARIANT: length <= 16 fits in u8.
+    Ok(u8::try_from(length).expect("length <= 16 fits in u8"))
 }
 
-/// Maximum supported width of a `REDIR_SCARDCONTEXT`/`REDIR_SCARDHANDLE` value.
-/// The spec allows 0..16, but real clients use a pointer-sized handle (≤ 8).
-const SCARD_MAX_HANDLE_BYTES: usize = 8;
-
-/// Validate a wire `cbContext`/`cbHandle` and narrow it to `u8`.
-fn read_cb(len: u32, what: &'static str) -> DecodeResult<u8> {
-    u8::try_from(len)
-        .ok()
-        .filter(|&n| usize::from(n) <= SCARD_MAX_HANDLE_BYTES)
-        .ok_or_else(|| invalid_field_err!("decode", what, "context/handle length > 8 unsupported"))
+/// [2.2.1.1] REDIR_SCARDCONTEXT
+///
+/// Opaque client-owned context bytes. MS-RDPESC allows `cbContext` in `0..=16`;
+/// Windows clients commonly emit 4 (x86) or 8 (x64) native `SCARDCONTEXT` bytes.
+///
+/// [2.2.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/060abee1-e520-4149-9ef7-ce79eb500a59
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub struct ScardContext {
+    /// Number of significant bytes in [`Self::bytes`] (`0..=16`).
+    len: u8,
+    /// Opaque context; only the first `len` bytes are on the wire.
+    bytes: [u8; 16],
 }
 
 impl ScardContext {
+    /// Creates a 4-byte context value (legacy synthetic-id encoding).
     pub fn new(value: u32) -> Self {
-        Self {
-            value: u64::from(value),
-            length: 4,
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&value.to_le_bytes());
+        Self { len: 4, bytes }
+    }
+
+    /// Creates a context from opaque wire bytes (`0..=16`).
+    pub fn from_opaque(opaque: &[u8]) -> DecodeResult<Self> {
+        let len = scard_wire_len(u32::try_from(opaque.len()).unwrap_or(u32::MAX))?;
+        let mut bytes = [0u8; 16];
+        bytes[..opaque.len()].copy_from_slice(opaque);
+        Ok(Self { len, bytes })
+    }
+
+    /// Wire length of `pbContext`.
+    pub fn len(self) -> u8 {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Significant opaque bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// First four little-endian bytes as `u32` (0 when empty).
+    pub fn value(self) -> u32 {
+        if self.len == 0 {
+            return 0;
         }
+        let mut tmp = [0u8; 4];
+        let n = usize::from(self.len).min(4);
+        tmp[..n].copy_from_slice(&self.bytes[..n]);
+        u32::from_le_bytes(tmp)
+    }
+
+    /// Creates a context from a native WinSCard `SCARDCONTEXT` (4 bytes on x86, 8 on x64).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size_of::<usize>()` does not fit in `u8` (never on supported targets).
+    pub fn from_native(native: usize) -> Self {
+        let le = native.to_le_bytes();
+        let mut bytes = [0u8; 16];
+        bytes[..le.len()].copy_from_slice(&le);
+        Self {
+            // INVARIANT: `size_of::<usize>()` is 4 or 8, both fit in `u8`.
+            len: u8::try_from(le.len()).expect("usize byte length fits in u8"),
+            bytes,
+        }
+    }
+
+    /// Native WinSCard `SCARDCONTEXT` value (0 when empty).
+    pub fn native(self) -> usize {
+        let mut tmp = [0u8; size_of::<usize>()];
+        let n = usize::from(self.len).min(size_of::<usize>());
+        tmp[..n].copy_from_slice(&self.bytes[..n]);
+        usize::from_le_bytes(tmp)
     }
 }
 
 impl ndr::Encode for ScardContext {
     fn encode_ptr(&self, index: &mut u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        if self.length == 0 {
-            // Empty context (e.g. the embedded Context of a returned handle):
-            // cbContext = 0 and a NULL pbContext referent, with no deferred value.
-            // A NULL referent consumes no referent id, so `index` is not advanced.
+        // Empty context: cbContext=0 and NULL pointer (8 zero bytes), matching FreeRDP/mstscax.
+        if self.len == 0 {
             ensure_size!(in: dst, size: ndr::ptr_size(true));
-            dst.write_u32(0); // cbContext
-            dst.write_u32(0); // NULL pbContext referent
-            Ok(())
-        } else {
-            ndr::encode_ptr(Some(u32::from(self.length)), index, dst)
+            dst.write_u32(0);
+            dst.write_u32(0);
+            return Ok(());
         }
+        ndr::encode_ptr(Some(u32::from(self.len)), index, dst)
     }
 
     fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        if self.length == 0 {
-            return Ok(()); // NULL referent: no deferred conformant array
+        if self.len == 0 {
+            return Ok(());
         }
         ensure_size!(in: dst, size: self.size_value());
-        dst.write_u32(u32::from(self.length)); // conformant-array MaximumCount
-        dst.write_slice(&self.value.to_le_bytes()[..usize::from(self.length)]);
+        dst.write_u32(u32::from(self.len));
+        dst.write_slice(self.as_bytes());
         Ok(())
     }
 
@@ -177,10 +291,10 @@ impl ndr::Encode for ScardContext {
     }
 
     fn size_value(&self) -> usize {
-        if self.length == 0 {
+        if self.len == 0 {
             0
         } else {
-            size_of::<u32>() /* cbContext */ + usize::from(self.length) /* pbContext */
+            4 /* length */ + usize::from(self.len) /* pbContext */
         }
     }
 }
@@ -191,27 +305,40 @@ impl ndr::Decode for ScardContext {
         Self: Sized,
     {
         ensure_size!(in: src, size: size_of::<u32>());
-        let length = read_cb(src.read_u32(), "ScardContext")?;
-        let _ptr = ndr::decode_ptr(src, index)?;
-        Ok(Self { value: 0, length })
+        let length = src.read_u32();
+        let len = match scard_wire_len(length) {
+            Ok(len) => len,
+            Err(err) => {
+                error!(?length, "Unsupported value length in ScardContext");
+                return Err(err);
+            }
+        };
+
+        let ptr = ndr::decode_ptr(src, index)?;
+        if (length == 0) != (ptr == 0) {
+            return Err(invalid_field_err!(
+                "decode_ptr",
+                "ScardContext cbContext/pbContext inconsistency",
+                in: src
+            ));
+        }
+        Ok(Self { len, bytes: [0; 16] })
     }
 
     fn decode_value(&mut self, src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<()> {
         expect_no_charset(charset)?;
-        if self.length == 0 {
-            // Empty context with a NULL referent (e.g. the embedded Context of a
-            // returned handle) has no deferred conformant array — reading a
-            // MaximumCount here would consume the *next* field's bytes.
+        if self.len == 0 {
             return Ok(());
         }
         ensure_size!(in: src, size: size_of::<u32>());
-        let length = read_cb(src.read_u32(), "ScardContext")?;
-        let n = usize::from(length);
+        let length = src.read_u32();
+        if length != u32::from(self.len) {
+            error!(?length, expected = self.len, "ScardContext length mismatch");
+            return Err(invalid_field_err!("decode_value", "ScardContext length mismatch"));
+        }
+        let n = usize::from(self.len);
         ensure_size!(in: src, size: n);
-        let mut buf = [0u8; SCARD_MAX_HANDLE_BYTES];
-        buf[..n].copy_from_slice(src.read_slice(n));
-        self.value = u64::from_le_bytes(buf);
-        self.length = length;
+        self.bytes[..n].copy_from_slice(src.read_slice(n));
         Ok(())
     }
 }
@@ -407,6 +534,16 @@ impl TryFrom<u32> for ScardIoCtlCode {
     }
 }
 
+impl From<ScardIoCtlCode> for u32 {
+    #[expect(
+        clippy::as_conversions,
+        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
+    )]
+    fn from(io_ctl_code: ScardIoCtlCode) -> Self {
+        io_ctl_code as u32
+    }
+}
+
 /// Allow [`ScardIoCtlCode`] to be used as an [`IoCtlCode`].
 impl IoCtlCode for ScardIoCtlCode {}
 
@@ -428,7 +565,7 @@ impl ScardAccessStartedEventCall {
 /// [2.2.3.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/e77a1365-2379-4037-99c4-d30d14ba10fc
 #[derive(Debug, PartialEq, Clone)]
 pub struct LongReturn {
-    pub return_code: ReturnCode,
+    return_code: ReturnCode,
 }
 
 impl LongReturn {
@@ -675,8 +812,8 @@ impl TryFrom<u32> for Scope {
 /// [2.2.3.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/9135d95f-3740-411b-bdca-34ac7571fddc
 #[derive(Debug, PartialEq, Clone)]
 pub struct EstablishContextReturn {
-    pub return_code: ReturnCode,
-    pub context: ScardContext,
+    return_code: ReturnCode,
+    context: ScardContext,
 }
 
 impl EstablishContextReturn {
@@ -758,10 +895,8 @@ impl rpce::HeaderlessDecode for ListReadersCall {
         ensure_size!(in: src, size: size_of::<u32>());
         let groups_length = src.read_u32();
         if groups_length != groups_ptr_length {
-            return Err(invalid_field_err!(
-                "decode",
-                "mismatched reader groups length in NDR pointer and value"
-            ));
+            return Err(invalid_field_err!( "decode",
+                "mismatched reader groups length in NDR pointer and value", in: src));
         }
 
         let groups = read_multistring_from_cursor(src, charset)?;
@@ -784,14 +919,33 @@ impl rpce::HeaderlessDecode for ListReadersCall {
 #[derive(Debug, PartialEq, Clone)]
 pub struct ListReadersReturn {
     pub return_code: ReturnCode,
-    pub readers: Vec<String>,
+    pub encoding: CharacterSet,
+    /// Wire `cBytes` (byte length of multistring when present).
+    pub c_bytes: u32,
+    /// `None` => NULL `msz` (length-only / insufficient-buffer probe).
+    pub readers: Option<Vec<String>>,
 }
 
 impl ListReadersReturn {
     const NAME: &'static str = "ListReaders_Return";
 
-    pub fn new(return_code: ReturnCode, readers: Vec<String>) -> rpce::Pdu<Self> {
-        rpce::Pdu(Self { return_code, readers })
+    pub fn new(return_code: ReturnCode, readers: Vec<String>, encoding: CharacterSet) -> rpce::Pdu<Self> {
+        let c_bytes = u32::try_from(encoded_multistring_len(&readers, encoding)).unwrap_or(u32::MAX);
+        rpce::Pdu(Self {
+            return_code,
+            encoding,
+            c_bytes,
+            readers: Some(readers),
+        })
+    }
+
+    pub fn probe(return_code: ReturnCode, c_bytes: u32, encoding: CharacterSet) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            encoding,
+            c_bytes,
+            readers: None,
+        })
     }
 }
 
@@ -799,15 +953,24 @@ impl rpce::HeaderlessEncode for ListReadersReturn {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
         dst.write_u32(self.return_code.into());
-        let readers_length: u32 = cast_length!(
-            "ListReadersReturn",
-            "readers",
-            encoded_multistring_len(&self.readers, CharacterSet::Unicode)
-        )?;
-        let mut index = 0;
-        ndr::encode_ptr(Some(readers_length), &mut index, dst)?;
-        dst.write_u32(readers_length);
-        write_multistring_to_cursor(dst, &self.readers, CharacterSet::Unicode)?;
+        match &self.readers {
+            Some(readers) => {
+                let c_bytes: u32 = cast_length!(
+                    "ListReadersReturn",
+                    "readers",
+                    encoded_multistring_len(readers, self.encoding),
+                    in: dst
+                )?;
+                let mut index = 0;
+                ndr::encode_ptr(Some(c_bytes), &mut index, dst)?;
+                dst.write_u32(c_bytes);
+                write_multistring_to_cursor(dst, readers, self.encoding)?;
+            }
+            None => {
+                dst.write_u32(self.c_bytes);
+                dst.write_u32(0);
+            }
+        }
         Ok(())
     }
 
@@ -816,10 +979,11 @@ impl rpce::HeaderlessEncode for ListReadersReturn {
     }
 
     fn size(&self) -> usize {
-        self.return_code.size() // dst.write_u32(self.return_code.into());
-        + ndr::ptr_size(true) // ndr::encode_ptr(...);
-        + 4 // dst.write_u32(readers_length);
-        + encoded_multistring_len(&self.readers, CharacterSet::Unicode) // write_multistring_to_cursor(...);
+        self.return_code.size()
+            + match &self.readers {
+                Some(readers) => ndr::ptr_size(true) + 4 + encoded_multistring_len(readers, self.encoding),
+                None => 8,
+            }
     }
 }
 
@@ -940,6 +1104,237 @@ bitflags! {
     }
 }
 
+/// [2.2.1.4] LocateCards_ATRMask
+///
+/// [2.2.1.4]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/479fe1cf-eaf0-4d51-8964-d4195a61f573
+#[derive(Debug, PartialEq, Clone)]
+pub struct LocateCardsAtrMask {
+    pub atr_length: u32,
+    pub atr: [u8; 36],
+    pub mask: [u8; 36],
+}
+
+impl LocateCardsAtrMask {
+    const FIXED_PART_SIZE: usize = 4 /* cbAtr */ + 36 /* rgbAtr */ + 36 /* rgbMask */;
+
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE);
+        let atr_length = src.read_u32();
+        // MS-RDPESC: cbAtr range(0,36)
+        if atr_length > 36 {
+            return Err(invalid_field_err!("decode", "LocateCards_ATRMask cbAtr out of range"));
+        }
+        let atr = src.read_array::<36>();
+        let mask = src.read_array::<36>();
+        Ok(Self { atr_length, atr, mask })
+    }
+}
+
+/// [2.2.2.9] LocateCardsA_Call / [2.2.2.10] LocateCardsW_Call
+///
+/// [2.2.2.9]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/c6b49a98-99e6-43c0-af63-56e4918814f3
+/// [2.2.2.10]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/c40fb671-6a50-4ae1-b75d-f44b25612eb2
+#[derive(Debug, PartialEq, Clone)]
+pub struct LocateCardsCall {
+    pub context: ScardContext,
+    pub cards_ptr_length: u32,
+    pub cards_ptr: u32,
+    pub cards_length: u32,
+    pub cards: Vec<String>,
+    pub states_ptr_length: u32,
+    pub states_ptr: u32,
+    pub states_length: u32,
+    pub states: Vec<ReaderState>,
+}
+
+impl LocateCardsCall {
+    pub fn decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, charset)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for LocateCardsCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        let charset = expect_charset(charset)?;
+        let mut index = 0;
+        let mut context = ScardContext::decode_ptr(src, &mut index)?;
+
+        ensure_size!(in: src, size: size_of::<u32>());
+        let cards_ptr_length = src.read_u32();
+        let cards_ptr = ndr::decode_ptr(src, &mut index)?;
+
+        ensure_size!(in: src, size: size_of::<u32>());
+        let states_ptr_length = src.read_u32();
+        let states_ptr = ndr::decode_ptr(src, &mut index)?;
+
+        context.decode_value(src, None)?;
+
+        let (cards_length, cards) = if cards_ptr == 0 {
+            (0, Vec::new())
+        } else {
+            ensure_size!(in: src, size: size_of::<u32>());
+            let cards_length = src.read_u32();
+            if cards_length != cards_ptr_length {
+                return Err(invalid_field_err!(
+                    "decode",
+                    "mismatched cards length in NDR pointer and value"
+                ));
+            }
+            // MS-RDPESC: cBytes range(0, 65536)
+            if cards_length > 65_536 {
+                return Err(invalid_field_err!("decode", "LocateCards cBytes out of range"));
+            }
+            let cards_len: usize = cast_length!("LocateCardsCall", "cards_length", cards_length)?;
+            ensure_size!(in: src, size: cards_len);
+            // Limit the multistring parser to the declared byte count so it cannot
+            // consume subsequent NDR fields (for example reader states).
+            let mut cards_src = ReadCursor::new(src.read_slice(cards_len));
+            let cards = read_multistring_from_cursor(&mut cards_src, charset)?;
+            // Pad only when another NDR field follows; stub tail is RPCE packing.
+            if states_ptr != 0 {
+                ndr::skip_pad(src)?;
+            }
+            (cards_length, cards)
+        };
+
+        let (states_length, states) = if states_ptr == 0 {
+            (0, Vec::new())
+        } else {
+            ensure_size!(in: src, size: size_of::<u32>());
+            let states_length = src.read_u32();
+            // MS-RDPESC: cReaders range(0,10)
+            if states_length > 10 {
+                return Err(invalid_field_err!("decode", "LocateCards cReaders out of range"));
+            }
+            if states_length != states_ptr_length {
+                return Err(invalid_field_err!(
+                    "decode",
+                    "mismatched states length in NDR pointer and value"
+                ));
+            }
+            let mut states = Vec::new();
+            for _ in 0..states_length {
+                states.push(ReaderState::decode_ptr(src, &mut index)?);
+            }
+            for state in states.iter_mut() {
+                state.decode_value(src, Some(charset))?;
+            }
+            (states_length, states)
+        };
+
+        Ok(Self {
+            context,
+            cards_ptr_length,
+            cards_ptr,
+            cards_length,
+            cards,
+            states_ptr_length,
+            states_ptr,
+            states_length,
+            states,
+        })
+    }
+}
+
+/// [2.2.2.23] LocateCardsByATRA_Call / [2.2.2.24] LocateCardsByATRW_Call
+///
+/// [2.2.2.23]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/100a5cc6-cb6a-4f90-b0e4-659b872c26d5
+/// [2.2.2.24]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/c934cc70-c1c9-4193-8b1b-038d8055c000
+#[derive(Debug, PartialEq, Clone)]
+pub struct LocateCardsByAtrCall {
+    pub context: ScardContext,
+    pub atr_masks_ptr_length: u32,
+    pub atr_masks_ptr: u32,
+    pub atr_masks_length: u32,
+    pub atr_masks: Vec<LocateCardsAtrMask>,
+    pub states_ptr_length: u32,
+    pub states_ptr: u32,
+    pub states_length: u32,
+    pub states: Vec<ReaderState>,
+}
+
+impl LocateCardsByAtrCall {
+    pub fn decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, charset)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for LocateCardsByAtrCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        let mut index = 0;
+        let mut context = ScardContext::decode_ptr(src, &mut index)?;
+
+        ensure_size!(in: src, size: size_of::<u32>());
+        let atr_masks_ptr_length = src.read_u32();
+        let atr_masks_ptr = ndr::decode_ptr(src, &mut index)?;
+
+        ensure_size!(in: src, size: size_of::<u32>());
+        let states_ptr_length = src.read_u32();
+        let states_ptr = ndr::decode_ptr(src, &mut index)?;
+
+        context.decode_value(src, None)?;
+
+        let (atr_masks_length, atr_masks) = if atr_masks_ptr == 0 {
+            (0, Vec::new())
+        } else {
+            ensure_size!(in: src, size: size_of::<u32>());
+            let atr_masks_length = src.read_u32();
+            if atr_masks_length != atr_masks_ptr_length {
+                return Err(invalid_field_err!(
+                    "decode",
+                    "mismatched ATR mask length in NDR pointer and value"
+                ));
+            }
+            // MS-RDPESC: cAtrs range(0,1000)
+            if atr_masks_length > 1000 {
+                return Err(invalid_field_err!("decode", "LocateCardsByATR cAtrs out of range"));
+            }
+            let mut atr_masks = Vec::new();
+            for _ in 0..atr_masks_length {
+                atr_masks.push(LocateCardsAtrMask::decode(src)?);
+            }
+            (atr_masks_length, atr_masks)
+        };
+
+        let (states_length, states) = if states_ptr == 0 {
+            (0, Vec::new())
+        } else {
+            ensure_size!(in: src, size: size_of::<u32>());
+            let states_length = src.read_u32();
+            // MS-RDPESC: cReaders range(0,10)
+            if states_length > 10 {
+                return Err(invalid_field_err!("decode", "LocateCardsByATR cReaders out of range"));
+            }
+            if states_length != states_ptr_length {
+                return Err(invalid_field_err!(
+                    "decode",
+                    "mismatched states length in NDR pointer and value"
+                ));
+            }
+            let mut states = Vec::new();
+            for _ in 0..states_length {
+                states.push(ReaderState::decode_ptr(src, &mut index)?);
+            }
+            for state in states.iter_mut() {
+                state.decode_value(src, charset)?;
+            }
+            (states_length, states)
+        };
+
+        Ok(Self {
+            context,
+            atr_masks_ptr_length,
+            atr_masks_ptr,
+            atr_masks_length,
+            atr_masks,
+            states_ptr_length,
+            states_ptr,
+            states_length,
+            states,
+        })
+    }
+}
+
 /// [2.2.3.5] LocateCards_Return and GetStatusChange_Return
 ///
 /// [2.2.3.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/7b73e0c2-e0fc-46b1-9b03-50684ad2beba
@@ -964,7 +1359,8 @@ impl rpce::HeaderlessEncode for GetStatusChangeReturn {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
         dst.write_u32(self.return_code.into());
-        let reader_states_len = cast_length!("GetStatusChangeReturn", "reader_states", self.reader_states.len())?;
+        let reader_states_len =
+            cast_length!("GetStatusChangeReturn", "reader_states", self.reader_states.len(), in: dst)?;
         let mut index = 0;
         ndr::encode_ptr(Some(reader_states_len), &mut index, dst)?;
         dst.write_u32(reader_states_len);
@@ -1065,25 +1461,88 @@ bitflags! {
 
 /// [2.2.1.2] REDIR_SCARDHANDLE
 ///
+/// Reader handle associated with a [`ScardContext`]. MS-RDPESC allows `cbHandle`
+/// in `0..=16`; Windows clients commonly emit 4 or 8 native `SCARDHANDLE` bytes.
+///
 /// [2.2.1.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/b6276356-7c5f-4d3e-be92-a6c85e58d008
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct ScardHandle {
-    pub context: ScardContext,
-    /// The opaque handle value as a little-endian integer, `length` bytes wide.
-    /// Like [`ScardContext`], real Windows uses a pointer-sized `SCARDHANDLE`
-    /// (4 or 8 bytes); echo back whatever width the client sent.
-    pub value: u64,
-    /// `cbHandle` — the byte width of `value` on the wire (typically 4 or 8).
-    pub length: u8,
+    context: ScardContext,
+    /// Number of significant bytes in [`Self::bytes`] (`0..=16`).
+    len: u8,
+    /// Opaque handle; only the first `len` bytes are on the wire.
+    bytes: [u8; 16],
 }
 
 impl ScardHandle {
+    /// Creates a 4-byte handle value (legacy synthetic-id encoding).
     pub fn new(context: ScardContext, value: u32) -> Self {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&value.to_le_bytes());
+        Self { context, len: 4, bytes }
+    }
+
+    /// Creates a handle from opaque wire bytes (`0..=16`).
+    pub fn from_opaque(context: ScardContext, opaque: &[u8]) -> DecodeResult<Self> {
+        let len = scard_wire_len(u32::try_from(opaque.len()).unwrap_or(u32::MAX))?;
+        let mut bytes = [0u8; 16];
+        bytes[..opaque.len()].copy_from_slice(opaque);
+        Ok(Self { context, len, bytes })
+    }
+
+    /// Context that owns this handle.
+    pub fn context(self) -> ScardContext {
+        self.context
+    }
+
+    /// Wire length of `pbHandle`.
+    pub fn len(self) -> u8 {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Significant opaque bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// First four little-endian bytes as `u32` (0 when empty).
+    pub fn value(self) -> u32 {
+        if self.len == 0 {
+            return 0;
+        }
+        let mut tmp = [0u8; 4];
+        let n = usize::from(self.len).min(4);
+        tmp[..n].copy_from_slice(&self.bytes[..n]);
+        u32::from_le_bytes(tmp)
+    }
+
+    /// Creates a handle from a native WinSCard `SCARDHANDLE` (4 bytes on x86, 8 on x64).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size_of::<usize>()` does not fit in `u8` (never on supported targets).
+    pub fn from_native(context: ScardContext, native: usize) -> Self {
+        let le = native.to_le_bytes();
+        let mut bytes = [0u8; 16];
+        bytes[..le.len()].copy_from_slice(&le);
         Self {
             context,
-            value: u64::from(value),
-            length: 4,
+            // INVARIANT: `size_of::<usize>()` is 4 or 8, both fit in `u8`.
+            len: u8::try_from(le.len()).expect("usize byte length fits in u8"),
+            bytes,
         }
+    }
+
+    /// Native WinSCard `SCARDHANDLE` value (0 when empty).
+    pub fn native(self) -> usize {
+        let mut tmp = [0u8; size_of::<usize>()];
+        let n = usize::from(self.len).min(size_of::<usize>());
+        tmp[..n].copy_from_slice(&self.bytes[..n]);
+        usize::from_le_bytes(tmp)
     }
 }
 
@@ -1094,26 +1553,44 @@ impl ndr::Decode for ScardHandle {
     {
         let context = ScardContext::decode_ptr(src, index)?;
         ensure_size!(ctx: "ScardHandle::decode_ptr", in: src, size: size_of::<u32>());
-        let length = read_cb(src.read_u32(), "ScardHandle")?;
-        let _ptr = ndr::decode_ptr(src, index)?;
+        let length = src.read_u32();
+        let len = match scard_wire_len(length) {
+            Ok(len) => len,
+            Err(err) => {
+                error!(?length, "Unsupported value length in ScardHandle");
+                return Err(err);
+            }
+        };
+        let ptr = ndr::decode_ptr(src, index)?;
+        if (length == 0) != (ptr == 0) {
+            return Err(invalid_field_err!(
+                "decode_ptr",
+                "ScardHandle cbHandle/pbHandle inconsistency",
+                in: src
+            ));
+        }
         Ok(Self {
             context,
-            value: 0,
-            length,
+            len,
+            bytes: [0; 16],
         })
     }
 
     fn decode_value(&mut self, src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<()> {
         expect_no_charset(charset)?;
         self.context.decode_value(src, None)?;
+        if self.len == 0 {
+            return Ok(());
+        }
         ensure_size!(in: src, size: size_of::<u32>());
-        let length = read_cb(src.read_u32(), "ScardHandle")?;
-        let n = usize::from(length);
+        let length = src.read_u32();
+        if length != u32::from(self.len) {
+            error!(?length, expected = self.len, "ScardHandle length mismatch");
+            return Err(invalid_field_err!("decode_value", "ScardHandle length mismatch"));
+        }
+        let n = usize::from(self.len);
         ensure_size!(in: src, size: n);
-        let mut buf = [0u8; SCARD_MAX_HANDLE_BYTES];
-        buf[..n].copy_from_slice(src.read_slice(n));
-        self.value = u64::from_le_bytes(buf);
-        self.length = length;
+        self.bytes[..n].copy_from_slice(src.read_slice(n));
         Ok(())
     }
 }
@@ -1121,15 +1598,24 @@ impl ndr::Decode for ScardHandle {
 impl ndr::Encode for ScardHandle {
     fn encode_ptr(&self, index: &mut u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         self.context.encode_ptr(index, dst)?;
-        ndr::encode_ptr(Some(u32::from(self.length)), index, dst)?;
+        if self.len == 0 {
+            ensure_size!(in: dst, size: ndr::ptr_size(true));
+            dst.write_u32(0);
+            dst.write_u32(0);
+            return Ok(());
+        }
+        ndr::encode_ptr(Some(u32::from(self.len)), index, dst)?;
         Ok(())
     }
 
     fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size_value());
         self.context.encode_value(dst)?;
-        dst.write_u32(u32::from(self.length)); // conformant-array MaximumCount
-        dst.write_slice(&self.value.to_le_bytes()[..usize::from(self.length)]);
+        if self.len == 0 {
+            return Ok(());
+        }
+        dst.write_u32(u32::from(self.len));
+        dst.write_slice(self.as_bytes());
         Ok(())
     }
 
@@ -1138,7 +1624,12 @@ impl ndr::Encode for ScardHandle {
     }
 
     fn size_value(&self) -> usize {
-        self.context.size_value() + size_of::<u32>() /* cbHandle */ + usize::from(self.length) /* pbHandle */
+        let handle_value = if self.len == 0 {
+            0
+        } else {
+            4 /* length */ + usize::from(self.len) /* pbHandle */
+        };
+        self.context.size_value() + handle_value
     }
 }
 
@@ -1250,7 +1741,7 @@ impl rpce::HeaderlessDecode for TransmitCall {
 
         ensure_size!(in: src, size: size_of::<u32>());
         let send_length = src.read_u32();
-        let send_length_usize: usize = cast_length!("TransmitCall", "send_length", send_length)?;
+        let send_length_usize: usize = cast_length!("TransmitCall", "send_length", send_length, in: src)?;
         ensure_size!(in: src, size: send_length_usize);
         let send_buffer = src.read_slice(send_length_usize).to_vec();
 
@@ -1291,7 +1782,7 @@ impl ndr::Decode for SCardIORequest {
     {
         ensure_size!(in: src, size: size_of::<u32>() * 2);
         let protocol = CardProtocol::from_bits_retain(src.read_u32());
-        let extra_bytes_length = cast_length!("SCardIORequest", "extra_bytes_length", src.read_u32())?;
+        let extra_bytes_length = cast_length!("SCardIORequest", "extra_bytes_length", src.read_u32(), in: src)?;
         let _extra_bytes_ptr = ndr::decode_ptr(src, index)?;
         let extra_bytes = Vec::new();
         Ok(Self {
@@ -1313,22 +1804,11 @@ impl ndr::Encode for SCardIORequest {
     fn encode_ptr(&self, index: &mut u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size_ptr());
 
-        let extra_bytes_length = cast_length!("SCardIORequest", "extra_bytes_length", self.extra_bytes_length)?;
+        let extra_bytes_length =
+            cast_length!("SCardIORequest", "extra_bytes_length", self.extra_bytes_length, in: dst)?;
 
         dst.write_u32(self.protocol.bits());
-        if self.extra_bytes.is_empty() {
-            // No extra PCI bytes: cbExtraBytes = 0 and a NULL pbExtraBytes
-            // referent. A non-NULL referent here would make the peer expect a
-            // deferred conformant array (MaximumCount + bytes) that isn't present,
-            // misaligning everything after it — real Windows rejects the whole
-            // Transmit_Call with STATUS_UNSUCCESSFUL. A NULL referent also
-            // consumes no referent id, so `index` is intentionally not advanced.
-            dst.write_u32(0); // cbExtraBytes
-            dst.write_u32(0); // NULL pbExtraBytes referent
-            Ok(())
-        } else {
-            ndr::encode_ptr(Some(extra_bytes_length), index, dst)
-        }
+        ndr::encode_ptr(Some(extra_bytes_length), index, dst)
     }
 
     fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
@@ -1353,17 +1833,30 @@ impl ndr::Encode for SCardIORequest {
 pub struct TransmitReturn {
     pub return_code: ReturnCode,
     pub recv_pci: Option<SCardIORequest>,
-    pub recv_buffer: Vec<u8>,
+    /// `None` => NULL `pbRecvBuffer`; `recv_len` supplies `cbRecvLength`.
+    pub recv_buffer: Option<Vec<u8>>,
+    pub recv_len: u32,
 }
 
 impl TransmitReturn {
     const NAME: &'static str = "Transmit_Return";
 
     pub fn new(return_code: ReturnCode, recv_pci: Option<SCardIORequest>, recv_buffer: Vec<u8>) -> rpce::Pdu<Self> {
+        let recv_len = u32::try_from(recv_buffer.len()).unwrap_or(u32::MAX);
         rpce::Pdu(Self {
             return_code,
             recv_pci,
-            recv_buffer,
+            recv_buffer: Some(recv_buffer),
+            recv_len,
+        })
+    }
+
+    pub fn recv_probe(return_code: ReturnCode, recv_pci: Option<SCardIORequest>, recv_len: u32) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            recv_pci,
+            recv_buffer: None,
+            recv_len,
         })
     }
 }
@@ -1372,20 +1865,25 @@ impl rpce::HeaderlessEncode for TransmitReturn {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
         dst.write_u32(self.return_code.into());
-
         let mut index = 0;
         if let Some(recv_pci) = &self.recv_pci {
             recv_pci.encode_ptr(&mut index, dst)?;
             recv_pci.encode_value(dst)?;
         } else {
-            dst.write_u32(0); // null value
+            dst.write_u32(0);
         }
-
-        let recv_buffer_len: u32 = cast_length!("TransmitReturn", "recv_buffer_len", self.recv_buffer.len())?;
-        ndr::encode_ptr(Some(recv_buffer_len), &mut index, dst)?;
-        dst.write_u32(recv_buffer_len);
-        dst.write_slice(&self.recv_buffer);
-
+        match &self.recv_buffer {
+            Some(buf) => {
+                let n: u32 = cast_length!("TransmitReturn", "recv_buffer_len", buf.len(), in: dst)?;
+                ndr::encode_ptr(Some(n), &mut index, dst)?;
+                dst.write_u32(n);
+                dst.write_slice(buf);
+            }
+            None => {
+                dst.write_u32(self.recv_len);
+                dst.write_u32(0);
+            }
+        }
         Ok(())
     }
 
@@ -1394,15 +1892,12 @@ impl rpce::HeaderlessEncode for TransmitReturn {
     }
 
     fn size(&self) -> usize {
-        self.return_code.size() // dst.write_u32(self.return_code.into());
-        + if let Some(recv_pci) = &self.recv_pci {
-            recv_pci.size()
-        } else {
-            4 // null value
-        }
-        + ndr::ptr_size(true) // ndr::encode_ptr(Some(recv_buffer_len), &mut index, dst)?;
-        + 4 // dst.write_u32(recv_buffer_len);
-        + self.recv_buffer.len() // dst.write_slice(&self.recv_buffer);
+        self.return_code.size()
+            + self.recv_pci.as_ref().map_or(4, SCardIORequest::size)
+            + match &self.recv_buffer {
+                Some(buf) => ndr::ptr_size(true) + 4 + buf.len(),
+                None => 8,
+            }
     }
 }
 
@@ -1448,12 +1943,13 @@ impl rpce::HeaderlessDecode for StatusCall {
 #[derive(Debug, PartialEq, Clone)]
 pub struct StatusReturn {
     pub return_code: ReturnCode,
-    pub reader_names: Vec<String>,
+    /// `None` => NULL reader-name multistring (probe / insufficient buffer).
+    pub reader_names: Option<Vec<String>>,
+    pub reader_c_bytes: u32,
     pub state: CardState,
     pub protocol: CardProtocol,
     pub atr: [u8; 32],
     pub atr_length: u32,
-
     pub encoding: CharacterSet,
 }
 
@@ -1469,9 +1965,32 @@ impl StatusReturn {
         atr_length: u32,
         encoding: CharacterSet,
     ) -> rpce::Pdu<Self> {
+        let reader_c_bytes = u32::try_from(encoded_multistring_len(&reader_names, encoding)).unwrap_or(u32::MAX);
         rpce::Pdu(Self {
             return_code,
-            reader_names,
+            reader_names: Some(reader_names),
+            reader_c_bytes,
+            state,
+            protocol,
+            atr,
+            atr_length,
+            encoding,
+        })
+    }
+
+    pub fn names_probe(
+        return_code: ReturnCode,
+        reader_c_bytes: u32,
+        state: CardState,
+        protocol: CardProtocol,
+        atr: [u8; 32],
+        atr_length: u32,
+        encoding: CharacterSet,
+    ) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            reader_names: None,
+            reader_c_bytes,
             state,
             protocol,
             atr,
@@ -1485,19 +2004,32 @@ impl rpce::HeaderlessEncode for StatusReturn {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
         dst.write_u32(self.return_code.into());
-        let mut index = 0;
-        let reader_names_length: u32 = cast_length!(
-            "StatusReturn",
-            "reader_names_length",
-            encoded_multistring_len(&self.reader_names, self.encoding)
-        )?;
-        ndr::encode_ptr(Some(reader_names_length), &mut index, dst)?;
-        dst.write_u32(self.state.into());
-        dst.write_u32(self.protocol.bits());
-        dst.write_slice(&self.atr);
-        dst.write_u32(self.atr_length);
-        dst.write_u32(reader_names_length);
-        write_multistring_to_cursor(dst, &self.reader_names, self.encoding)?;
+        match &self.reader_names {
+            Some(names) => {
+                let c_bytes: u32 = cast_length!(
+                    "StatusReturn",
+                    "reader_names",
+                    encoded_multistring_len(names, self.encoding),
+                    in: dst
+                )?;
+                let mut index = 0;
+                ndr::encode_ptr(Some(c_bytes), &mut index, dst)?;
+                dst.write_u32(self.state.into());
+                dst.write_u32(self.protocol.bits());
+                dst.write_slice(&self.atr);
+                dst.write_u32(self.atr_length);
+                dst.write_u32(c_bytes);
+                write_multistring_to_cursor(dst, names, self.encoding)?;
+            }
+            None => {
+                dst.write_u32(self.reader_c_bytes);
+                dst.write_u32(0);
+                dst.write_u32(self.state.into());
+                dst.write_u32(self.protocol.bits());
+                dst.write_slice(&self.atr);
+                dst.write_u32(self.atr_length);
+            }
+        }
         Ok(())
     }
 
@@ -1506,10 +2038,16 @@ impl rpce::HeaderlessEncode for StatusReturn {
     }
 
     fn size(&self) -> usize {
-        size_of::<u32>() * 5 // dst.write_u32(self.return_code.into()); dst.write_u32(self.state.into()); dst.write_u32(self.protocol.bits()); dst.write_slice(&self.atr); dst.write_u32(self.atr_length);
-        + ndr::ptr_size(true) // ndr::encode_ptr(Some(reader_names_length), &mut index, dst)?;
-        + self.atr.len() // dst.write_slice(&self.atr);
-        + encoded_multistring_len(&self.reader_names, self.encoding) // write_multistring_to_cursor(dst, &self.reader_names, self.encoding)?;
+        // return + cBytes + msz ptr + state + protocol + atr[32] + atr_len
+        // + deferred [cBytes + msz bytes] when names are present
+        4 + 8
+            + 4
+            + 4
+            + 32
+            + 4
+            + self.reader_names.as_ref().map_or(0, |n| {
+                4 /* deferred cBytes */ + encoded_multistring_len(n, self.encoding)
+            })
     }
 }
 
@@ -1713,14 +2251,29 @@ impl ndr::Decode for ReadCacheCommon {
 #[derive(Debug, PartialEq, Clone)]
 pub struct ReadCacheReturn {
     pub return_code: ReturnCode,
-    pub data: Vec<u8>,
+    /// `None` => NULL `pbData`; `data_len` supplies `cbDataLen`.
+    pub data: Option<Vec<u8>>,
+    pub data_len: u32,
 }
 
 impl ReadCacheReturn {
     const NAME: &'static str = "ReadCache_Return";
 
     pub fn new(return_code: ReturnCode, data: Vec<u8>) -> rpce::Pdu<Self> {
-        rpce::Pdu(Self { return_code, data })
+        let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        rpce::Pdu(Self {
+            return_code,
+            data: Some(data),
+            data_len,
+        })
+    }
+
+    pub fn data_probe(return_code: ReturnCode, data_len: u32) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            data: None,
+            data_len,
+        })
     }
 }
 
@@ -1728,11 +2281,34 @@ impl rpce::HeaderlessEncode for ReadCacheReturn {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
         dst.write_u32(self.return_code.into());
-        let mut index = 0;
-        let data_len: u32 = cast_length!("ReadCacheReturn", "data_len", self.data.len())?;
-        ndr::encode_ptr(Some(data_len), &mut index, dst)?;
-        dst.write_u32(data_len);
-        dst.write_slice(&self.data);
+        // MS-RDPESC: cbDataLen range(0,65536)
+        match &self.data {
+            Some(data) => {
+                if data.len() > 65_536 {
+                    return Err(invalid_field_err!(
+                        "encode",
+                        "ReadCacheReturn cbDataLen out of range",
+                        in: dst
+                    ));
+                }
+                let data_len: u32 = cast_length!("ReadCacheReturn", "data_len", data.len(), in: dst)?;
+                let mut index = 0;
+                ndr::encode_ptr(Some(data_len), &mut index, dst)?;
+                dst.write_u32(data_len);
+                dst.write_slice(data);
+            }
+            None => {
+                if self.data_len > 65_536 {
+                    return Err(invalid_field_err!(
+                        "encode",
+                        "ReadCacheReturn cbDataLen out of range",
+                        in: dst
+                    ));
+                }
+                dst.write_u32(self.data_len);
+                dst.write_u32(0);
+            }
+        }
         Ok(())
     }
 
@@ -1741,10 +2317,11 @@ impl rpce::HeaderlessEncode for ReadCacheReturn {
     }
 
     fn size(&self) -> usize {
-        self.return_code.size() // dst.write_u32(self.return_code.into());
-        + ndr::ptr_size(true) // ndr::encode_ptr(Some(data_len), &mut index, dst)?;
-        + size_of::<u32>() // dst.write_u32(data_len);
-        + self.data.len() // dst.write_slice(&self.data);
+        self.return_code.size()
+            + match &self.data {
+                Some(data) => ndr::ptr_size(true) + 4 + data.len(),
+                None => 8,
+            }
     }
 }
 
@@ -1812,10 +2389,87 @@ impl ndr::Decode for WriteCacheCommon {
         ensure_size!(in: src, size: 16);
         self.card_uuid = src.read_slice(16).to_vec();
         ensure_size!(in: src, size: size_of::<u32>());
-        let data_len: usize = cast_length!("WriteCacheCommon", "data_len", src.read_u32())?;
+        let data_len: usize = cast_length!("WriteCacheCommon", "data_len", src.read_u32(), in: src)?;
         ensure_size!(in: src, size: data_len);
         self.data = src.read_slice(data_len).to_vec();
         Ok(())
+    }
+}
+
+/// [2.2.2.5] ContextAndStringA_Call / [2.2.2.6] ContextAndStringW_Call
+///
+/// Used by IntroduceReaderGroup, ForgetReaderGroup, and ForgetReader.
+///
+/// [2.2.2.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/a130c3df-016c-4ca1-b85e-ad450fa4fe6d
+/// [2.2.2.6]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/a42d07cc-b37b-4fe4-9df9-2ba6320d72fa
+#[derive(Debug, PartialEq, Clone)]
+pub struct ContextAndStringCall {
+    pub context: ScardContext,
+    pub sz: String,
+}
+
+impl ContextAndStringCall {
+    pub fn decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, charset)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for ContextAndStringCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        let charset = expect_charset(charset)?;
+        let mut index = 0;
+        let mut context = ScardContext::decode_ptr(src, &mut index)?;
+        // IDL pointer_default(unique): NULL contributes no referent.
+        let sz_ptr = ndr::decode_ptr(src, &mut index)?;
+        context.decode_value(src, None)?;
+        let sz = if sz_ptr == 0 {
+            String::new()
+        } else {
+            ndr::read_string_from_cursor(src, charset)?
+        };
+        Ok(Self { context, sz })
+    }
+}
+
+/// [2.2.2.7] ContextAndTwoStringA_Call / [2.2.2.8] ContextAndTwoStringW_Call
+///
+/// Used by IntroduceReader, AddReaderToGroup, and RemoveReaderFromGroup.
+///
+/// [2.2.2.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/9ce7270c-aad5-46f7-8a10-941cb94b57f5
+/// [2.2.2.8]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/34bec62b-b75c-4729-adb2-f6033484fe6b
+#[derive(Debug, PartialEq, Clone)]
+pub struct ContextAndTwoStringCall {
+    pub context: ScardContext,
+    pub sz1: String,
+    pub sz2: String,
+}
+
+impl ContextAndTwoStringCall {
+    pub fn decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, charset)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for ContextAndTwoStringCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        let charset = expect_charset(charset)?;
+        let mut index = 0;
+        let mut context = ScardContext::decode_ptr(src, &mut index)?;
+        // IDL pointer_default(unique): each [string] may be NULL independently.
+        let sz1_ptr = ndr::decode_ptr(src, &mut index)?;
+        let sz2_ptr = ndr::decode_ptr(src, &mut index)?;
+        context.decode_value(src, None)?;
+        let sz1 = if sz1_ptr == 0 {
+            String::new()
+        } else {
+            ndr::read_string_from_cursor(src, charset)?
+        };
+        let sz2 = if sz2_ptr == 0 {
+            String::new()
+        } else {
+            ndr::read_string_from_cursor(src, charset)?
+        };
+        Ok(Self { context, sz1, sz2 })
     }
 }
 
@@ -1859,6 +2513,8 @@ pub struct GetReaderIconReturn {
 
 impl GetReaderIconReturn {
     const NAME: &'static str = "GetReaderIcon_Return";
+    /// MS-RDPESC: `cbDataLen` range(0, 4194304).
+    pub const MAX_DATA_LEN: usize = 4_194_304;
 
     pub fn new(return_code: ReturnCode, data: Vec<u8>) -> rpce::Pdu<Self> {
         rpce::Pdu(Self { return_code, data })
@@ -1869,7 +2525,15 @@ impl rpce::HeaderlessEncode for GetReaderIconReturn {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
         dst.write_u32(self.return_code.into());
-        let data_len: u32 = cast_length!("GetReaderIconReturn", "data_len", self.data.len())?;
+        // MS-RDPESC: cbDataLen range(0,4194304)
+        if self.data.len() > Self::MAX_DATA_LEN {
+            return Err(invalid_field_err!(
+                "encode",
+                "GetReaderIconReturn cbDataLen out of range",
+                in: dst
+            ));
+        }
+        let data_len: u32 = cast_length!("GetReaderIconReturn", "data_len", self.data.len(), in: dst)?;
         let mut index = 0;
         ndr::encode_ptr(Some(data_len), &mut index, dst)?;
         dst.write_u32(data_len);
@@ -1889,630 +2553,592 @@ impl rpce::HeaderlessEncode for GetReaderIconReturn {
     }
 }
 
-// ===========================================================================
-// Server-direction halves (macrdp divergence — see vendor/ironrdp-rdpdr/CLAUDE.md).
-//
-// Upstream is client-oriented: it *decodes* `*Call` and *encodes* `*Return`.
-// macrdp is the RDP **server**, so it needs the mirror halves — *encode* each
-// `*Call` (the PC/SC request it sends to the client) and *decode* each `*Return`
-// (the result the client's real reader sends back). The wire layouts below
-// mirror the existing upstream encode/decode counterparts byte-for-byte; the
-// round-trip unit tests at the bottom of this file prove that against the
-// upstream halves. The server uses the W (Unicode) IOCTL variants, so strings
-// are encoded/decoded as UTF-16.
-// ===========================================================================
-
-impl ScardCall {
-    /// (server-direction) Marshal this call as the RPCE input buffer of a
-    /// DR_CONTROL_REQ. Only the variants the server issues are encodable.
-    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        match self {
-            ScardCall::EstablishContextCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            ScardCall::ContextCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            ScardCall::ListReadersCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            ScardCall::GetStatusChangeCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            ScardCall::ConnectCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            ScardCall::HCardAndDispositionCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            ScardCall::StatusCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            ScardCall::TransmitCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
-            _ => Err(other_err!("ScardCall::encode: unsupported call variant")),
-        }
-    }
-
-    /// The marshaled size of [`Self::encode`] (the DR_CONTROL_REQ input buffer length).
-    pub fn size(&self) -> usize {
-        match self {
-            ScardCall::EstablishContextCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            ScardCall::ContextCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            ScardCall::ListReadersCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            ScardCall::GetStatusChangeCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            ScardCall::ConnectCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            ScardCall::HCardAndDispositionCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            ScardCall::StatusCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            ScardCall::TransmitCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
-            _ => 0,
-        }
-    }
+/// [2.2.2.3] ListReaderGroups_Call
+///
+/// [2.2.2.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/dde8c811-c258-444f-8028-98311a9e0082
+#[derive(Debug, PartialEq, Clone)]
+pub struct ListReaderGroupsCall {
+    pub context: ScardContext,
+    pub groups_is_null: bool,
+    pub groups_size: u32,
 }
 
-impl From<Scope> for u32 {
-    #[expect(
-        clippy::as_conversions,
-        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
-    )]
-    fn from(val: Scope) -> Self {
-        val as u32
-    }
-}
-
-impl From<ScardIoCtlCode> for u32 {
-    #[expect(
-        clippy::as_conversions,
-        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
-    )]
-    fn from(val: ScardIoCtlCode) -> Self {
-        val as u32
-    }
-}
-
-impl TryFrom<u32> for CardState {
-    type Error = DecodeError;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            0x0000_0000 => Ok(CardState::Unknown),
-            0x0000_0001 => Ok(CardState::Absent),
-            0x0000_0002 => Ok(CardState::Present),
-            0x0000_0003 => Ok(CardState::Swallowed),
-            0x0000_0004 => Ok(CardState::Powered),
-            0x0000_0005 => Ok(CardState::Negotiable),
-            0x0000_0006 => Ok(CardState::SpecificMode),
-            _ => Err(invalid_field_err!("try_from", "CardState", "unsupported value")),
-        }
-    }
-}
-
-impl TryFrom<u32> for ReturnCode {
-    type Error = DecodeError;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        let code = match value {
-            0x0000_0000 => ReturnCode::Success,
-            0x8010_0001 => ReturnCode::InternalError,
-            0x8010_0002 => ReturnCode::Cancelled,
-            0x8010_0003 => ReturnCode::InvalidHandle,
-            0x8010_0004 => ReturnCode::InvalidParameter,
-            0x8010_0005 => ReturnCode::InvalidTarget,
-            0x8010_0006 => ReturnCode::NoMemory,
-            0x8010_0007 => ReturnCode::WaitedTooLong,
-            0x8010_0008 => ReturnCode::InsufficientBuffer,
-            0x8010_0009 => ReturnCode::UnknownReader,
-            0x8010_000A => ReturnCode::Timeout,
-            0x8010_000B => ReturnCode::SharingViolation,
-            0x8010_000C => ReturnCode::NoSmartcard,
-            0x8010_000D => ReturnCode::UnknownCard,
-            0x8010_000E => ReturnCode::CantDispose,
-            0x8010_000F => ReturnCode::ProtoMismatch,
-            0x8010_0010 => ReturnCode::NotReady,
-            0x8010_0011 => ReturnCode::InvalidValue,
-            0x8010_0012 => ReturnCode::SystemCancelled,
-            0x8010_0013 => ReturnCode::CommError,
-            0x8010_0014 => ReturnCode::UnknownError,
-            0x8010_0015 => ReturnCode::InvalidAtr,
-            0x8010_0016 => ReturnCode::NotTransacted,
-            0x8010_0017 => ReturnCode::ReaderUnavailable,
-            0x8010_0018 => ReturnCode::Shutdown,
-            0x8010_0019 => ReturnCode::PciTooSmall,
-            0x8010_001A => ReturnCode::ReaderUnsupported,
-            0x8010_001B => ReturnCode::DuplicateReader,
-            0x8010_001C => ReturnCode::CardUnsupported,
-            0x8010_001D => ReturnCode::NoService,
-            0x8010_001E => ReturnCode::ServiceStopped,
-            0x8010_001F => ReturnCode::Unexpected,
-            0x8010_0020 => ReturnCode::IccInstallation,
-            0x8010_0021 => ReturnCode::IccCreateorder,
-            0x8010_0022 => ReturnCode::UnsupportedFeature,
-            0x8010_0023 => ReturnCode::DirNotFound,
-            0x8010_0024 => ReturnCode::FileNotFound,
-            0x8010_0025 => ReturnCode::NoDir,
-            0x8010_0026 => ReturnCode::NoFile,
-            0x8010_0027 => ReturnCode::NoAccess,
-            0x8010_0028 => ReturnCode::WriteTooMany,
-            0x8010_0029 => ReturnCode::BadSeek,
-            0x8010_002A => ReturnCode::InvalidChv,
-            0x8010_002B => ReturnCode::UnknownResMsg,
-            0x8010_002C => ReturnCode::NoSuchCertificate,
-            0x8010_002D => ReturnCode::CertificateUnavailable,
-            0x8010_002E => ReturnCode::NoReadersAvailable,
-            0x8010_002F => ReturnCode::CommDataLost,
-            0x8010_0030 => ReturnCode::NoKeyContainer,
-            0x8010_0031 => ReturnCode::ServerTooBusy,
-            0x8010_0032 => ReturnCode::PinCacheExpired,
-            0x8010_0033 => ReturnCode::NoPinCache,
-            0x8010_0034 => ReturnCode::ReadOnlyCard,
-            0x8010_0065 => ReturnCode::UnsupportedCard,
-            0x8010_0066 => ReturnCode::UnresponsiveCard,
-            0x8010_0067 => ReturnCode::UnpoweredCard,
-            0x8010_0068 => ReturnCode::ResetCard,
-            0x8010_0069 => ReturnCode::RemovedCard,
-            0x8010_006A => ReturnCode::SecurityViolation,
-            0x8010_006B => ReturnCode::WrongChv,
-            0x8010_006C => ReturnCode::ChvBlocked,
-            0x8010_006D => ReturnCode::Eof,
-            0x8010_006E => ReturnCode::CancelledByUser,
-            0x8010_006F => ReturnCode::CardNotAuthenticated,
-            0x8010_0070 => ReturnCode::CacheItemNotFound,
-            0x8010_0071 => ReturnCode::CacheItemStale,
-            0x8010_0072 => ReturnCode::CacheItemTooBig,
-            _ => return Err(invalid_field_err!("try_from", "ReturnCode", "unsupported value")),
-        };
-        Ok(code)
-    }
-}
-
-impl ndr::Encode for ConnectCommon {
-    fn encode_ptr(&self, index: &mut u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        self.context.encode_ptr(index, dst)?;
-        ensure_size!(in: dst, size: size_of::<u32>() * 2);
-        dst.write_u32(self.share_mode);
-        dst.write_u32(self.preferred_protocols.bits());
-        Ok(())
-    }
-
-    fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        self.context.encode_value(dst)
-    }
-
-    fn size_ptr(&self) -> usize {
-        self.context.size_ptr() + size_of::<u32>() * 2
-    }
-
-    fn size_value(&self) -> usize {
-        self.context.size_value()
-    }
-}
-
-impl ndr::Encode for ReaderState {
-    fn encode_ptr(&self, index: &mut u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ndr::encode_ptr(None, index, dst)?; // szReader referent (no length prefix)
-        self.common.encode(dst)
-    }
-
-    fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ndr::write_string_to_cursor(dst, &self.reader, CharacterSet::Unicode)
-    }
-
-    fn size_ptr(&self) -> usize {
-        ndr::ptr_size(false) + ReaderStateCommonCall::size()
-    }
-
-    fn size_value(&self) -> usize {
-        ndr::string_size(&self.reader, CharacterSet::Unicode)
-    }
-}
-
-impl rpce::HeaderlessEncode for EstablishContextCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        dst.write_u32(self.scope.into());
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "EstablishContext_Call"
-    }
-
-    fn size(&self) -> usize {
-        Self::size()
-    }
-}
-
-impl rpce::HeaderlessEncode for ContextCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        let mut index = 0;
-        self.context.encode_ptr(&mut index, dst)?;
-        self.context.encode_value(dst)
-    }
-
-    fn name(&self) -> &'static str {
-        "Context_Call"
-    }
-
-    fn size(&self) -> usize {
-        self.context.size()
-    }
-}
-
-impl rpce::HeaderlessEncode for ListReadersCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        let mut index = 0;
-        self.context.encode_ptr(&mut index, dst)?;
-        dst.write_u32(self.groups_ptr_length);
-        if self.groups.is_empty() {
-            dst.write_u32(0); // NULL mszGroups referent
-        } else {
-            ndr::encode_ptr(None, &mut index, dst)?;
-        }
-        dst.write_u32(u32::from(self.readers_is_null));
-        dst.write_u32(self.readers_size);
-        self.context.encode_value(dst)?;
-        if !self.groups.is_empty() {
-            dst.write_u32(self.groups_length);
-            write_multistring_to_cursor(dst, &self.groups, CharacterSet::Unicode)?;
-        }
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "ListReaders_Call"
-    }
-
-    fn size(&self) -> usize {
-        self.context.size_ptr()
-            + size_of::<u32>() // groups_ptr_length
-            + size_of::<u32>() // groups referent (or NULL)
-            + size_of::<u32>() // readers_is_null
-            + size_of::<u32>() // readers_size
-            + self.context.size_value()
-            + if self.groups.is_empty() {
-                0
-            } else {
-                size_of::<u32>() + encoded_multistring_len(&self.groups, CharacterSet::Unicode)
-            }
-    }
-}
-
-impl rpce::HeaderlessEncode for GetStatusChangeCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        let mut index = 0;
-        self.context.encode_ptr(&mut index, dst)?;
-        dst.write_u32(self.timeout);
-        dst.write_u32(self.states_ptr_length);
-        ndr::encode_ptr(None, &mut index, dst)?; // rgReaderStates referent
-        self.context.encode_value(dst)?;
-        dst.write_u32(self.states_length);
-        for state in &self.states {
-            state.encode_ptr(&mut index, dst)?;
-        }
-        for state in &self.states {
-            state.encode_value(dst)?;
-        }
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "GetStatusChange_Call"
-    }
-
-    fn size(&self) -> usize {
-        self.context.size_ptr()
-            + size_of::<u32>() // timeout
-            + size_of::<u32>() // states_ptr_length
-            + ndr::ptr_size(false) // rgReaderStates referent
-            + self.context.size_value()
-            + size_of::<u32>() // states_length
-            + self.states.iter().map(|s| s.size()).sum::<usize>()
-    }
-}
-
-impl rpce::HeaderlessEncode for ConnectCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        let mut index = 0;
-        ndr::encode_ptr(None, &mut index, dst)?; // szReader referent
-        self.common.encode_ptr(&mut index, dst)?;
-        ndr::write_string_to_cursor(dst, &self.reader, CharacterSet::Unicode)?;
-        self.common.encode_value(dst)
-    }
-
-    fn name(&self) -> &'static str {
-        "Connect_Call"
-    }
-
-    fn size(&self) -> usize {
-        ndr::ptr_size(false) // szReader referent
-            + self.common.size_ptr()
-            + ndr::string_size(&self.reader, CharacterSet::Unicode)
-            + self.common.size_value()
-    }
-}
-
-impl rpce::HeaderlessEncode for HCardAndDispositionCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        let mut index = 0;
-        self.handle.encode_ptr(&mut index, dst)?;
-        dst.write_u32(self.disposition);
-        self.handle.encode_value(dst)
-    }
-
-    fn name(&self) -> &'static str {
-        "HCardAndDisposition_Call"
-    }
-
-    fn size(&self) -> usize {
-        self.handle.size_ptr() + size_of::<u32>() + self.handle.size_value()
-    }
-}
-
-impl rpce::HeaderlessEncode for StatusCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        let mut index = 0;
-        self.handle.encode_ptr(&mut index, dst)?;
-        dst.write_u32(u32::from(self.reader_names_is_null));
-        dst.write_u32(self.reader_length);
-        dst.write_u32(self.atr_length);
-        self.handle.encode_value(dst)
-    }
-
-    fn name(&self) -> &'static str {
-        "Status_Call"
-    }
-
-    fn size(&self) -> usize {
-        self.handle.size_ptr() + size_of::<u32>() * 3 + self.handle.size_value()
-    }
-}
-
-impl rpce::HeaderlessEncode for TransmitCall {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        let mut index = 0;
-        // Pointer section.
-        self.handle.encode_ptr(&mut index, dst)?;
-        self.send_pci.encode_ptr(&mut index, dst)?;
-        dst.write_u32(self.send_length);
-        ndr::encode_ptr(None, &mut index, dst)?; // pbSendBuffer referent
-        if self.recv_pci.is_some() {
-            ndr::encode_ptr(None, &mut index, dst)?; // pioRecvPci referent
-        } else {
-            dst.write_u32(0); // NULL pioRecvPci
-        }
-        dst.write_u32(u32::from(self.recv_buffer_is_null));
-        dst.write_u32(self.recv_length);
-
-        // Value section.
-        self.handle.encode_value(dst)?;
-        self.send_pci.encode_value(dst)?;
-        dst.write_u32(self.send_length);
-        dst.write_slice(&self.send_buffer);
-        // The pioRecvPci struct (if present) is serialized in full only here, after
-        // pbSendBuffer — its pointer-section entry above was just the referent.
-        if let Some(recv_pci) = &self.recv_pci {
-            recv_pci.encode_ptr(&mut index, dst)?;
-            recv_pci.encode_value(dst)?;
-        }
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "Transmit_Call"
-    }
-
-    fn size(&self) -> usize {
-        self.handle.size_ptr()
-            + self.send_pci.size_ptr()
-            + size_of::<u32>() // send_length (ptr section)
-            + ndr::ptr_size(false) // pbSendBuffer referent
-            + size_of::<u32>() // pioRecvPci referent (or NULL)
-            + size_of::<u32>() // recv_buffer_is_null
-            + size_of::<u32>() // recv_length
-            + self.handle.size_value()
-            + self.send_pci.size_value()
-            + size_of::<u32>() // send_length (value section)
-            + self.send_buffer.len()
-            + self.recv_pci.as_ref().map_or(0, ndr::Encode::size) // trailing pioRecvPci struct
-    }
-}
-
-// ---- Server-direction *Return decoders (macrdp reads the client's results) ----
-
-impl LongReturn {
+impl ListReaderGroupsCall {
     pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
     }
 }
 
-impl rpce::HeaderlessDecode for LongReturn {
+impl rpce::HeaderlessDecode for ListReaderGroupsCall {
     fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
         expect_no_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let return_code = ReturnCode::try_from(src.read_u32())?;
-        Ok(Self { return_code })
-    }
-}
-
-impl EstablishContextReturn {
-    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
-        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
-    }
-}
-
-impl rpce::HeaderlessDecode for EstablishContextReturn {
-    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
-        expect_no_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let return_code = ReturnCode::try_from(src.read_u32())?;
         let mut index = 0;
         let mut context = ScardContext::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let groups_is_null = src.read_u32() == 0x0000_0001;
+        let groups_size = src.read_u32();
         context.decode_value(src, None)?;
-        Ok(Self { return_code, context })
-    }
-}
-
-impl ListReadersReturn {
-    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
-        Ok(rpce::Pdu::<Self>::decode(src, Some(CharacterSet::Unicode))?.into_inner())
-    }
-}
-
-impl rpce::HeaderlessDecode for ListReadersReturn {
-    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
-        let charset = expect_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>() * 2);
-        let return_code = ReturnCode::try_from(src.read_u32())?;
-        let _readers_length = src.read_u32(); // MaximumCount from encode_ptr(Some(..))
-        let mut index = 0;
-        let _ptr = ndr::decode_ptr(src, &mut index)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let _readers_length2 = src.read_u32();
-        let readers = read_multistring_from_cursor(src, charset)?;
-        Ok(Self { return_code, readers })
-    }
-}
-
-impl GetStatusChangeReturn {
-    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
-        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
-    }
-}
-
-impl rpce::HeaderlessDecode for GetStatusChangeReturn {
-    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
-        expect_no_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>() * 2);
-        let return_code = ReturnCode::try_from(src.read_u32())?;
-        let _reader_states_length = src.read_u32(); // MaximumCount
-        let mut index = 0;
-        let _ptr = ndr::decode_ptr(src, &mut index)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let count = src.read_u32();
-        let mut reader_states = Vec::new();
-        for _ in 0..count {
-            reader_states.push(ReaderStateCommonCall::decode(src)?);
-        }
         Ok(Self {
-            return_code,
-            reader_states,
+            context,
+            groups_is_null,
+            groups_size,
         })
     }
 }
 
-impl ConnectReturn {
+/// [2.2.2.15] Reconnect_Call
+///
+/// [2.2.2.15]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/9c1eca52-3a99-403c-8ac8-6437f246a154
+#[derive(Debug, PartialEq, Clone)]
+pub struct ReconnectCall {
+    pub handle: ScardHandle,
+    pub share_mode: u32,
+    pub preferred_protocols: CardProtocol,
+    pub initialization: u32,
+}
+
+impl ReconnectCall {
     pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
     }
 }
 
-impl rpce::HeaderlessDecode for ConnectReturn {
+impl rpce::HeaderlessDecode for ReconnectCall {
     fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
         expect_no_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let return_code = ReturnCode::try_from(src.read_u32())?;
         let mut index = 0;
         let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let active_protocol = CardProtocol::from_bits_retain(src.read_u32());
+        ensure_size!(in: src, size: size_of::<u32>() * 3);
+        let share_mode = src.read_u32();
+        let preferred_protocols = CardProtocol::from_bits_retain(src.read_u32());
+        let initialization = src.read_u32();
         handle.decode_value(src, None)?;
         Ok(Self {
-            return_code,
             handle,
+            share_mode,
+            preferred_protocols,
+            initialization,
+        })
+    }
+}
+
+/// [2.2.3.7] Reconnect_Return
+///
+/// [2.2.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/e25a583f-ab82-4ba3-bebf-af656c58e6d8
+#[derive(Debug, PartialEq, Clone)]
+pub struct ReconnectReturn {
+    pub return_code: ReturnCode,
+    pub active_protocol: CardProtocol,
+}
+
+impl ReconnectReturn {
+    const NAME: &'static str = "Reconnect_Return";
+
+    pub fn new(return_code: ReturnCode, active_protocol: CardProtocol) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
             active_protocol,
         })
     }
 }
 
-impl StatusReturn {
-    pub fn decode(src: &mut ReadCursor<'_>, charset: CharacterSet) -> DecodeResult<Self> {
-        Ok(rpce::Pdu::<Self>::decode(src, Some(charset))?.into_inner())
+impl rpce::HeaderlessEncode for ReconnectReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        dst.write_u32(self.active_protocol.bits());
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size() + 4 /* dwActiveProtocol */
     }
 }
 
-impl rpce::HeaderlessDecode for StatusReturn {
-    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
-        let charset = expect_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>() * 2);
-        let return_code = ReturnCode::try_from(src.read_u32())?;
-        let _reader_names_length = src.read_u32(); // cBytes
-        let mut index = 0;
-        let reader_names_ptr = ndr::decode_ptr(src, &mut index)?;
-        // Fixed part after the pointer: dwState, dwProtocol, pbAtr[32], cbAtrLen.
-        ensure_size!(in: src, size: size_of::<u32>() * 2 + 32 + size_of::<u32>());
-        let state = CardState::try_from(src.read_u32())?;
-        let protocol = CardProtocol::from_bits_retain(src.read_u32());
-        let atr = src.read_array::<32>();
-        let atr_length = src.read_u32();
-        // The mszReaderNames conformant array (MaximumCount + chars) is present
-        // only when the referent is non-NULL. Real Windows often returns a NULL
-        // pointer here (ATR-only Status), so reading it unconditionally would
-        // overrun the buffer.
-        let reader_names = if reader_names_ptr != 0 {
-            ensure_size!(in: src, size: size_of::<u32>());
-            let _reader_names_length2 = src.read_u32(); // MaximumCount
-            read_multistring_from_cursor(src, charset)?
-        } else {
-            Vec::new()
-        };
-        Ok(Self {
-            return_code,
-            reader_names,
-            state,
-            protocol,
-            atr,
-            atr_length,
-            encoding: charset,
-        })
-    }
+/// [2.2.2.17] State_Call
+///
+/// [2.2.2.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/ba3b9097-02fe-4f6b-951c-05439a7d9da7
+#[derive(Debug, PartialEq, Clone)]
+pub struct StateCall {
+    pub handle: ScardHandle,
+    pub atr_is_null: bool,
+    pub atr_length: u32,
 }
 
-impl TransmitReturn {
+impl StateCall {
     pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
     }
 }
 
-impl rpce::HeaderlessDecode for TransmitReturn {
+impl rpce::HeaderlessDecode for StateCall {
     fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
         expect_no_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let return_code = ReturnCode::try_from(src.read_u32())?;
         let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let atr_is_null = src.read_u32() == 0x0000_0001;
+        let atr_length = src.read_u32();
+        handle.decode_value(src, None)?;
+        Ok(Self {
+            handle,
+            atr_is_null,
+            atr_length,
+        })
+    }
+}
 
-        // pioRecvPci: upstream writes a bare u32(0) for None, otherwise the
-        // SCardIORequest ptr part (dwProtocol first, which is non-zero for a real
-        // T=0/T=1 protocol) immediately followed by its value.
-        ensure_size!(in: src, size: size_of::<u32>());
-        let protocol_or_null = src.read_u32();
-        let recv_pci = if protocol_or_null == 0 {
-            None
-        } else {
-            ensure_size!(in: src, size: size_of::<u32>());
-            let extra_bytes_length = cast_length!("TransmitReturn", "extra_bytes_length", src.read_u32())?;
-            let _extra_ptr = ndr::decode_ptr(src, &mut index)?;
-            ensure_size!(in: src, size: extra_bytes_length);
-            let extra_bytes = src.read_slice(extra_bytes_length).to_vec();
-            Some(SCardIORequest {
-                protocol: CardProtocol::from_bits_retain(protocol_or_null),
-                extra_bytes_length,
-                extra_bytes,
-            })
-        };
+/// [2.2.3.9] State_Return
+///
+/// [2.2.3.9]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/574e5ec5-96ba-4b11-bfa9-52eb34307356
+#[derive(Debug, PartialEq, Clone)]
+pub struct StateReturn {
+    pub return_code: ReturnCode,
+    pub state: CardState,
+    pub protocol: CardProtocol,
+    /// `None` => NULL `rgAtr`; `atr_len` supplies `cbAtrLen`.
+    pub atr: Option<Vec<u8>>,
+    pub atr_len: u32,
+}
 
-        ensure_size!(in: src, size: size_of::<u32>());
-        let _cb_recv_length = src.read_u32(); // cbRecvLength
-        let recv_buffer_ptr = ndr::decode_ptr(src, &mut index)?;
-        // The pbRecvBuffer conformant array (MaximumCount + bytes) is present only
-        // when the referent is non-NULL. When the card returns no data (e.g. a
-        // failed transaction) real Windows sends a NULL pbRecvBuffer, so reading
-        // it unconditionally would overrun the buffer.
-        let recv_buffer = if recv_buffer_ptr != 0 {
+impl StateReturn {
+    const NAME: &'static str = "State_Return";
+
+    pub fn new(return_code: ReturnCode, state: CardState, protocol: CardProtocol, atr: Vec<u8>) -> rpce::Pdu<Self> {
+        let atr_len = u32::try_from(atr.len()).unwrap_or(u32::MAX);
+        rpce::Pdu(Self {
+            return_code,
+            state,
+            protocol,
+            atr: Some(atr),
+            atr_len,
+        })
+    }
+
+    pub fn atr_probe(
+        return_code: ReturnCode,
+        state: CardState,
+        protocol: CardProtocol,
+        atr_len: u32,
+    ) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            state,
+            protocol,
+            atr: None,
+            atr_len,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for StateReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        dst.write_u32(self.state.into());
+        dst.write_u32(self.protocol.bits());
+        match &self.atr {
+            Some(atr) => {
+                if atr.len() > 36 {
+                    return Err(invalid_field_err!("encode", "StateReturn cbAtrLen out of range"));
+                }
+                let atr_len: u32 = cast_length!("StateReturn", "atr_len", atr.len())?;
+                let mut index = 0;
+                ndr::encode_ptr(Some(atr_len), &mut index, dst)?;
+                dst.write_u32(atr_len);
+                dst.write_slice(atr);
+            }
+            None => {
+                if self.atr_len > 36 {
+                    return Err(invalid_field_err!("encode", "StateReturn cbAtrLen out of range"));
+                }
+                dst.write_u32(self.atr_len);
+                dst.write_u32(0);
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        12 + match &self.atr {
+            Some(atr) => ndr::ptr_size(true) + 4 + atr.len(),
+            None => 8,
+        }
+    }
+}
+
+/// [2.2.2.20] Control_Call
+///
+/// [2.2.2.20]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/002fc3a3-2ca2-492e-8463-aba8f3923e48
+#[derive(Debug, PartialEq, Clone)]
+pub struct ControlCall {
+    pub handle: ScardHandle,
+    pub control_code: u32,
+    pub in_buffer: Vec<u8>,
+    pub out_buffer_is_null: bool,
+    pub out_buffer_size: u32,
+}
+
+impl ControlCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for ControlCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let control_code = src.read_u32();
+        // MS-RDPESC: cbInBufferSize range(0,66560)
+        let in_buffer_len = src.read_u32();
+        if in_buffer_len > 66_560 {
+            return Err(invalid_field_err!("decode", "Control cbInBufferSize out of range"));
+        }
+        let in_buffer_ptr = ndr::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let out_buffer_is_null = src.read_u32() == 0x0000_0001;
+        let out_buffer_size = src.read_u32();
+        handle.decode_value(src, None)?;
+
+        let in_buffer = if in_buffer_ptr != 0 {
             ensure_size!(in: src, size: size_of::<u32>());
-            let recv_buffer_length = cast_length!("TransmitReturn", "recv_buffer_length", src.read_u32())?;
-            ensure_size!(in: src, size: recv_buffer_length);
-            src.read_slice(recv_buffer_length).to_vec()
+            let referent_len = src.read_u32();
+            if referent_len != in_buffer_len {
+                return Err(invalid_field_err!(
+                    "decode",
+                    "mismatched Control in-buffer length in NDR pointer and value"
+                ));
+            }
+            let in_len: usize = cast_length!("ControlCall", "in_buffer_len", referent_len)?;
+            ensure_size!(in: src, size: in_len);
+            src.read_slice(in_len).to_vec()
+        } else if in_buffer_len != 0 {
+            return Err(invalid_field_err!(
+                "decode",
+                "Control cbInBufferSize/pvInBuffer inconsistency"
+            ));
         } else {
             Vec::new()
         };
 
         Ok(Self {
-            return_code,
-            recv_pci,
-            recv_buffer,
+            handle,
+            control_code,
+            in_buffer,
+            out_buffer_is_null,
+            out_buffer_size,
         })
+    }
+}
+
+/// [2.2.3.6] Control_Return
+///
+/// [2.2.3.6]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/e7e854f8-0c5a-4814-bfdd-b72cb8aefe3e
+#[derive(Debug, PartialEq, Clone)]
+pub struct ControlReturn {
+    pub return_code: ReturnCode,
+    /// `None` => NULL `pvOutBuffer`; `out_len` supplies `cbOutBufferSize`.
+    pub out_buffer: Option<Vec<u8>>,
+    pub out_len: u32,
+}
+
+impl ControlReturn {
+    const NAME: &'static str = "Control_Return";
+
+    pub fn new(return_code: ReturnCode, out_buffer: Vec<u8>) -> rpce::Pdu<Self> {
+        let out_len = u32::try_from(out_buffer.len()).unwrap_or(u32::MAX);
+        rpce::Pdu(Self {
+            return_code,
+            out_buffer: Some(out_buffer),
+            out_len,
+        })
+    }
+
+    pub fn out_probe(return_code: ReturnCode, out_len: u32) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            out_buffer: None,
+            out_len,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for ControlReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        // MS-RDPESC: cbOutBufferSize range(0,66560)
+        match &self.out_buffer {
+            Some(buf) => {
+                if buf.len() > 66_560 {
+                    return Err(invalid_field_err!(
+                        "encode",
+                        "ControlReturn cbOutBufferSize out of range"
+                    ));
+                }
+                let data_len: u32 = cast_length!("ControlReturn", "out_buffer_len", buf.len())?;
+                let mut index = 0;
+                ndr::encode_ptr(Some(data_len), &mut index, dst)?;
+                dst.write_u32(data_len);
+                dst.write_slice(buf);
+            }
+            None => {
+                if self.out_len > 66_560 {
+                    return Err(invalid_field_err!(
+                        "encode",
+                        "ControlReturn cbOutBufferSize out of range"
+                    ));
+                }
+                dst.write_u32(self.out_len);
+                dst.write_u32(0);
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size()
+            + match &self.out_buffer {
+                Some(buf) => ndr::ptr_size(true) + 4 + buf.len(),
+                None => 8,
+            }
+    }
+}
+
+/// [2.2.2.21] GetAttrib_Call
+///
+/// [2.2.2.21]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/f4e36ff1-e7b3-4046-bddb-cd192a76c7ab
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetAttribCall {
+    pub handle: ScardHandle,
+    pub attr_id: u32,
+    pub attr_is_null: bool,
+    pub attr_length: u32,
+}
+
+impl GetAttribCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for GetAttribCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 3);
+        let attr_id = src.read_u32();
+        let attr_is_null = src.read_u32() == 0x0000_0001;
+        let attr_length = src.read_u32();
+        handle.decode_value(src, None)?;
+        Ok(Self {
+            handle,
+            attr_id,
+            attr_is_null,
+            attr_length,
+        })
+    }
+}
+
+/// [2.2.3.12] GetAttrib_Return
+///
+/// [2.2.3.12]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/ab3ac071-3fc5-44e6-9b94-c1eee1168266
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetAttribReturn {
+    pub return_code: ReturnCode,
+    /// `None` => NULL `pbAttr`; `attr_len` supplies `cbAttrLen`.
+    pub attr: Option<Vec<u8>>,
+    pub attr_len: u32,
+}
+
+impl GetAttribReturn {
+    const NAME: &'static str = "GetAttrib_Return";
+
+    pub fn new(return_code: ReturnCode, attr: Vec<u8>) -> rpce::Pdu<Self> {
+        let attr_len = u32::try_from(attr.len()).unwrap_or(u32::MAX);
+        rpce::Pdu(Self {
+            return_code,
+            attr: Some(attr),
+            attr_len,
+        })
+    }
+
+    pub fn attr_probe(return_code: ReturnCode, attr_len: u32) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            attr: None,
+            attr_len,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for GetAttribReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        // MS-RDPESC: cbAttrLen range(0,65536)
+        match &self.attr {
+            Some(attr) => {
+                if attr.len() > 65_536 {
+                    return Err(invalid_field_err!("encode", "GetAttribReturn cbAttrLen out of range"));
+                }
+                let data_len: u32 = cast_length!("GetAttribReturn", "attr_len", attr.len())?;
+                let mut index = 0;
+                ndr::encode_ptr(Some(data_len), &mut index, dst)?;
+                dst.write_u32(data_len);
+                dst.write_slice(attr);
+            }
+            None => {
+                if self.attr_len > 65_536 {
+                    return Err(invalid_field_err!("encode", "GetAttribReturn cbAttrLen out of range"));
+                }
+                dst.write_u32(self.attr_len);
+                dst.write_u32(0);
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size()
+            + match &self.attr {
+                Some(attr) => ndr::ptr_size(true) + 4 + attr.len(),
+                None => 8,
+            }
+    }
+}
+
+/// [2.2.2.22] SetAttrib_Call
+///
+/// [2.2.2.22]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/28f8dd60-35b7-45fb-ab75-15bbf81f5d11
+#[derive(Debug, PartialEq, Clone)]
+pub struct SetAttribCall {
+    pub handle: ScardHandle,
+    pub attr_id: u32,
+    pub attr: Vec<u8>,
+}
+
+impl SetAttribCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for SetAttribCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        ensure_size!(in: src, size: size_of::<u32>() * 2);
+        let attr_id = src.read_u32();
+        // MS-RDPESC: cbAttrLen range(0,65536)
+        let attr_len = src.read_u32();
+        if attr_len > 65_536 {
+            return Err(invalid_field_err!("decode", "SetAttrib cbAttrLen out of range"));
+        }
+        let attr_ptr = ndr::decode_ptr(src, &mut index)?;
+        handle.decode_value(src, None)?;
+
+        let attr = if attr_ptr != 0 {
+            ensure_size!(in: src, size: size_of::<u32>());
+            let referent_len = src.read_u32();
+            if referent_len != attr_len {
+                return Err(invalid_field_err!(
+                    "decode",
+                    "mismatched SetAttrib attr length in NDR pointer and value"
+                ));
+            }
+            let attr_len: usize = cast_length!("SetAttribCall", "attr_len", referent_len)?;
+            ensure_size!(in: src, size: attr_len);
+            src.read_slice(attr_len).to_vec()
+        } else if attr_len != 0 {
+            return Err(invalid_field_err!("decode", "SetAttrib cbAttrLen/pbAttr inconsistency"));
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self { handle, attr_id, attr })
+    }
+}
+
+/// [2.2.2.29] GetTransmitCount_Call
+///
+/// [2.2.2.29]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/f453f1b4-1291-4c69-8e97-f781b2d8e66f
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetTransmitCountCall {
+    pub handle: ScardHandle,
+}
+
+impl GetTransmitCountCall {
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        Ok(rpce::Pdu::<Self>::decode(src, None)?.into_inner())
+    }
+}
+
+impl rpce::HeaderlessDecode for GetTransmitCountCall {
+    fn headerless_decode(src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<Self> {
+        expect_no_charset(charset)?;
+        let mut index = 0;
+        let mut handle = ScardHandle::decode_ptr(src, &mut index)?;
+        handle.decode_value(src, None)?;
+        Ok(Self { handle })
+    }
+}
+
+/// [2.2.3.13] GetTransmitCount_Return
+///
+/// [2.2.3.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/32aea1d7-0edb-4807-bbd1-a6ee1fbb0087
+#[derive(Debug, PartialEq, Clone)]
+pub struct GetTransmitCountReturn {
+    pub return_code: ReturnCode,
+    pub transmit_count: u32,
+}
+
+impl GetTransmitCountReturn {
+    const NAME: &'static str = "GetTransmitCount_Return";
+
+    pub fn new(return_code: ReturnCode, transmit_count: u32) -> rpce::Pdu<Self> {
+        rpce::Pdu(Self {
+            return_code,
+            transmit_count,
+        })
+    }
+}
+
+impl rpce::HeaderlessEncode for GetTransmitCountReturn {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u32(self.return_code.into());
+        dst.write_u32(self.transmit_count);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        self.return_code.size() + 4 /* cTransmitCount */
     }
 }
 
@@ -2530,430 +3156,247 @@ fn expect_no_charset(charset: Option<CharacterSet>) -> DecodeResult<()> {
 }
 
 #[cfg(test)]
-mod server_direction_tests {
-    //! Round-trip tests: our server-direction halves encoded/decoded against the
-    //! existing client-direction halves prove byte-exactness without a live client.
-    //! `*Call`: our encode -> upstream decode. `*Return`: upstream encode -> our decode.
-    use ironrdp_core::{ReadCursor, encode_vec};
-
+mod tests {
     use super::*;
+    use crate::pdu::esc::rpce::HeaderlessEncode;
 
-    fn ctx() -> ScardContext {
-        ScardContext::new(0x0102_0304)
-    }
-
-    fn handle() -> ScardHandle {
-        ScardHandle::new(ctx(), 0xABCD_1234)
-    }
-
-    fn common_call() -> ReaderStateCommonCall {
-        ReaderStateCommonCall {
-            current_state: CardStateFlags::SCARD_STATE_UNAWARE,
-            event_state: CardStateFlags::SCARD_STATE_PRESENT,
-            atr_length: 11,
-            atr: {
-                let mut a = [0u8; 36];
-                a[..11].copy_from_slice(&[0x3b, 0x95, 0x13, 0x81, 0x01, 0x80, 0x73, 0xff, 0x01, 0x00, 0x0b]);
-                a
-            },
+    fn roundtrip_context(ctx: ScardContext) -> ScardContext {
+        let mut buf = vec![0u8; ctx.size()];
+        let mut index = 0;
+        {
+            let mut dst = WriteCursor::new(&mut buf);
+            ctx.encode_ptr(&mut index, &mut dst).unwrap();
+            ctx.encode_value(&mut dst).unwrap();
         }
+        index = 0;
+        let mut src = ReadCursor::new(&buf);
+        let mut decoded = ScardContext::decode_ptr(&mut src, &mut index).unwrap();
+        decoded.decode_value(&mut src, None).unwrap();
+        decoded
+    }
+
+    fn roundtrip_handle(handle: ScardHandle) -> ScardHandle {
+        let mut buf = vec![0u8; handle.size()];
+        let mut index = 0;
+        {
+            let mut dst = WriteCursor::new(&mut buf);
+            handle.encode_ptr(&mut index, &mut dst).unwrap();
+            handle.encode_value(&mut dst).unwrap();
+        }
+        index = 0;
+        let mut src = ReadCursor::new(&buf);
+        let mut decoded = ScardHandle::decode_ptr(&mut src, &mut index).unwrap();
+        decoded.decode_value(&mut src, None).unwrap();
+        decoded
     }
 
     #[test]
-    fn establish_context_call_roundtrip() {
-        let call = EstablishContextCall { scope: Scope::System };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = EstablishContextCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn context_call_roundtrip() {
-        let call = ContextCall { context: ctx() };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = ContextCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn list_readers_call_roundtrip_null_groups() {
-        let call = ListReadersCall {
-            context: ctx(),
-            groups_ptr_length: 0,
-            groups_length: 0,
-            groups_ptr: 0,
-            groups: Vec::new(),
-            readers_is_null: true,
-            readers_size: 0,
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = ListReadersCall::decode(&mut ReadCursor::new(&bytes), Some(CharacterSet::Unicode)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn get_status_change_call_roundtrip() {
-        let call = GetStatusChangeCall {
-            context: ctx(),
-            timeout: 1000,
-            states_ptr_length: 1,
-            states_ptr: 0x0002_0004,
-            states_length: 1,
-            states: vec![ReaderState {
-                reader: "macrdp".to_string(),
-                common: common_call(),
-            }],
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = GetStatusChangeCall::decode(&mut ReadCursor::new(&bytes), Some(CharacterSet::Unicode)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn connect_call_roundtrip() {
-        let call = ConnectCall {
-            reader: "macrdp".to_string(),
-            common: ConnectCommon {
-                context: ctx(),
-                share_mode: 2,
-                preferred_protocols: CardProtocol::SCARD_PROTOCOL_T1,
-            },
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = ConnectCall::decode(&mut ReadCursor::new(&bytes), Some(CharacterSet::Unicode)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn connect_call_roundtrip_odd_length_reader() {
-        // 7-char name => UTF-16 NDR string needs a 2-byte tail pad; exercises it.
-        let call = ConnectCall {
-            reader: "reader7".to_string(),
-            common: ConnectCommon {
-                context: ctx(),
-                share_mode: 2,
-                preferred_protocols: CardProtocol::SCARD_PROTOCOL_T0 | CardProtocol::SCARD_PROTOCOL_T1,
-            },
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = ConnectCall::decode(&mut ReadCursor::new(&bytes), Some(CharacterSet::Unicode)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn hcard_and_disposition_call_roundtrip() {
-        let call = HCardAndDispositionCall {
-            handle: handle(),
-            disposition: 1,
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = HCardAndDispositionCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn status_call_roundtrip() {
-        let call = StatusCall {
-            handle: handle(),
-            reader_names_is_null: false,
-            reader_length: 0,
-            atr_length: 0,
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = StatusCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn transmit_call_roundtrip_no_recv_pci() {
-        let send_buffer = vec![0x00, 0xa4, 0x04, 0x00, 0x00];
-        let call = TransmitCall {
-            handle: handle(),
-            send_pci: SCardIORequest {
-                protocol: CardProtocol::SCARD_PROTOCOL_T1,
-                extra_bytes_length: 0,
-                extra_bytes: Vec::new(),
-            },
-            send_length: send_buffer.len() as u32,
-            send_buffer,
-            recv_pci: None,
-            recv_buffer_is_null: false,
-            recv_length: 256,
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = TransmitCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn transmit_call_roundtrip_with_recv_pci() {
-        let send_buffer = vec![0x00, 0xc0, 0x00, 0x00, 0xff];
-        let call = TransmitCall {
-            handle: handle(),
-            send_pci: SCardIORequest {
-                protocol: CardProtocol::SCARD_PROTOCOL_T1,
-                extra_bytes_length: 0,
-                extra_bytes: Vec::new(),
-            },
-            send_length: send_buffer.len() as u32,
-            send_buffer,
-            recv_pci: Some(SCardIORequest {
-                protocol: CardProtocol::SCARD_PROTOCOL_T1,
-                extra_bytes_length: 0,
-                extra_bytes: Vec::new(),
-            }),
-            recv_buffer_is_null: false,
-            recv_length: 256,
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = TransmitCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
-    }
-
-    #[test]
-    fn long_return_roundtrip() {
-        let pdu = LongReturn::new(ReturnCode::Success);
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = LongReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-    }
-
-    #[test]
-    fn establish_context_return_roundtrip() {
-        let pdu = EstablishContextReturn::new(ReturnCode::Success, ScardContext::new(0xDEAD_BEEF));
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = EstablishContextReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-    }
-
-    #[test]
-    fn list_readers_return_roundtrip() {
-        let pdu = ListReadersReturn::new(ReturnCode::Success, vec!["macrdp".to_string()]);
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = ListReadersReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-    }
-
-    #[test]
-    fn get_status_change_return_roundtrip() {
-        let pdu = GetStatusChangeReturn::new(ReturnCode::Success, vec![common_call()]);
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = GetStatusChangeReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-    }
-
-    #[test]
-    fn connect_return_roundtrip() {
-        let pdu = ConnectReturn::new(
-            ReturnCode::Success,
-            ScardHandle::new(ctx(), 0x9999),
-            CardProtocol::SCARD_PROTOCOL_T1,
+    fn scard_context_and_handle_roundtrip() {
+        let c4 = ScardContext::new(0xA1B2_C3D4);
+        assert_eq!(roundtrip_context(c4), c4);
+        assert_eq!(c4.value(), 0xA1B2_C3D4);
+        let opaque = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        ];
+        assert_eq!(
+            roundtrip_context(ScardContext::from_opaque(&opaque).unwrap()).as_bytes(),
+            &opaque
         );
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = ConnectReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
+        assert!(ScardContext::from_opaque(&[0; 17]).is_err());
+        assert_eq!(roundtrip_context(ScardContext::from_opaque(&[]).unwrap()).len(), 0);
+        let ctx = ScardContext::new(0x1111_2222);
+        assert_eq!(
+            roundtrip_handle(ScardHandle::new(ctx, 0x3333_4444)),
+            ScardHandle::new(ctx, 0x3333_4444)
+        );
+        assert_eq!(
+            roundtrip_handle(ScardHandle::from_opaque(ctx, &opaque).unwrap()).as_bytes(),
+            &opaque
+        );
+        assert!(ScardHandle::from_opaque(ctx, &[0; 17]).is_err());
     }
 
     #[test]
-    fn status_return_roundtrip() {
-        let mut atr = [0u8; 32];
-        atr[..11].copy_from_slice(&[0x3b, 0x95, 0x13, 0x81, 0x01, 0x80, 0x73, 0xff, 0x01, 0x00, 0x0b]);
-        let pdu = StatusReturn::new(
+    fn context_and_string_null_unique_ptr() {
+        // empty context + NULL sz unique pointer
+        let mut pdu = vec![0x01, 0x10, 0x08, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 12, 0, 0, 0, 0, 0, 0, 0];
+        pdu.extend_from_slice(&[0u8; 12]);
+        let d = ContextAndStringCall::decode(&mut ReadCursor::new(&pdu), Some(CharacterSet::Unicode)).unwrap();
+        assert!(d.sz.is_empty());
+    }
+
+    /// `::new` 4-byte EstablishContext/Connect returns stay byte-identical to master.
+    #[test]
+    fn legacy_four_byte_return_encode_matches_master() {
+        fn enc(body: &impl HeaderlessEncode) -> Vec<u8> {
+            let mut buf = vec![0u8; HeaderlessEncode::size(body)];
+            HeaderlessEncode::encode(body, &mut WriteCursor::new(&mut buf)).unwrap();
+            buf
+        }
+        let est = EstablishContextReturn::new(ReturnCode::Success, ScardContext::new(0xA1B2_C3D4)).into_inner();
+        assert_eq!(
+            enc(&est),
+            [0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 2, 0, 4, 0, 0, 0, 0xD4, 0xC3, 0xB2, 0xA1]
+        );
+        let h = ScardHandle::new(ScardContext::new(0x1111_2222), 0x3333_4444);
+        let conn = ConnectReturn::new(ReturnCode::Success, h, CardProtocol::SCARD_PROTOCOL_T0).into_inner();
+        assert_eq!(
+            enc(&conn),
+            [
+                0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 2, 0, 4, 0, 0, 0, 4, 0, 2, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0x22, 0x22, 0x11,
+                0x11, 4, 0, 0, 0, 0x44, 0x44, 0x33, 0x33,
+            ]
+        );
+    }
+
+    fn enc_headerless(body: &impl HeaderlessEncode) -> Vec<u8> {
+        let mut buf = vec![0u8; HeaderlessEncode::size(body)];
+        HeaderlessEncode::encode(body, &mut WriteCursor::new(&mut buf)).unwrap();
+        buf
+    }
+
+    /// size() must match bytes written for full and probe variants (Status undercount was a live bug).
+    #[test]
+    fn esc_return_size_matches_encode_full_and_probe() {
+        let names = vec!["RDR".into()];
+        let atr = [0x3Bu8; 32];
+
+        let list_full = ListReadersReturn::new(ReturnCode::Success, names.clone(), CharacterSet::Unicode).into_inner();
+        let list_probe = ListReadersReturn::probe(ReturnCode::InsufficientBuffer, 12, CharacterSet::Ansi).into_inner();
+        assert_eq!(enc_headerless(&list_full).len(), HeaderlessEncode::size(&list_full));
+        assert_eq!(enc_headerless(&list_probe).len(), HeaderlessEncode::size(&list_probe));
+        let list_with_stale_length = ListReadersReturn {
+            return_code: ReturnCode::Success,
+            encoding: CharacterSet::Unicode,
+            c_bytes: 0,
+            readers: Some(vec!["RDR".into()]),
+        };
+        assert_eq!(
+            enc_headerless(&list_with_stale_length),
+            enc_headerless(&list_full),
+            "full replies derive cBytes from their live multistring"
+        );
+
+        let xmit_full = TransmitReturn::new(ReturnCode::Success, None, vec![0x90, 0x00]).into_inner();
+        let xmit_probe = TransmitReturn::recv_probe(ReturnCode::Success, None, 256).into_inner();
+        assert_eq!(enc_headerless(&xmit_full).len(), HeaderlessEncode::size(&xmit_full));
+        assert_eq!(enc_headerless(&xmit_probe).len(), HeaderlessEncode::size(&xmit_probe));
+
+        let status_full = StatusReturn::new(
             ReturnCode::Success,
-            vec!["macrdp".to_string()],
+            names,
+            CardState::Present,
+            CardProtocol::SCARD_PROTOCOL_T0,
+            atr,
+            5,
+            CharacterSet::Unicode,
+        )
+        .into_inner();
+        let status_probe = StatusReturn::names_probe(
+            ReturnCode::InsufficientBuffer,
+            20,
+            CardState::Present,
+            CardProtocol::SCARD_PROTOCOL_T0,
+            atr,
+            5,
+            CharacterSet::Unicode,
+        )
+        .into_inner();
+        assert_eq!(
+            HeaderlessEncode::size(&status_full),
+            4 * 5 + 8 + 32 + encoded_multistring_len(status_full.reader_names.as_ref().unwrap(), CharacterSet::Unicode)
+        );
+        assert_eq!(enc_headerless(&status_full).len(), HeaderlessEncode::size(&status_full));
+        assert_eq!(
+            enc_headerless(&status_probe).len(),
+            HeaderlessEncode::size(&status_probe)
+        );
+        let status_with_stale_length = StatusReturn {
+            return_code: ReturnCode::Success,
+            reader_names: Some(vec!["RDR".into()]),
+            reader_c_bytes: 0,
+            state: CardState::Present,
+            protocol: CardProtocol::SCARD_PROTOCOL_T0,
+            atr,
+            atr_length: 5,
+            encoding: CharacterSet::Unicode,
+        };
+        assert_eq!(
+            enc_headerless(&status_with_stale_length),
+            enc_headerless(&status_full),
+            "full replies derive cBytes from their live multistring"
+        );
+
+        let state_full = StateReturn::new(
+            ReturnCode::Success,
             CardState::Present,
             CardProtocol::SCARD_PROTOCOL_T1,
-            atr,
-            11,
-            CharacterSet::Unicode,
+            vec![1, 2, 3],
+        )
+        .into_inner();
+        let state_probe = StateReturn::atr_probe(
+            ReturnCode::InsufficientBuffer,
+            CardState::Present,
+            CardProtocol::SCARD_PROTOCOL_T1,
+            3,
+        )
+        .into_inner();
+        assert_eq!(enc_headerless(&state_full).len(), HeaderlessEncode::size(&state_full));
+        assert_eq!(enc_headerless(&state_probe).len(), HeaderlessEncode::size(&state_probe));
+
+        let control_full = ControlReturn::new(ReturnCode::Success, vec![1, 2, 3]).into_inner();
+        let control_probe = ControlReturn::out_probe(ReturnCode::InsufficientBuffer, 64).into_inner();
+        assert_eq!(
+            enc_headerless(&control_full).len(),
+            HeaderlessEncode::size(&control_full)
         );
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = StatusReturn::decode(&mut ReadCursor::new(&bytes), CharacterSet::Unicode).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-    }
-
-    #[test]
-    fn transmit_return_roundtrip_no_recv_pci() {
-        let pdu = TransmitReturn::new(ReturnCode::Success, None, vec![0x90, 0x00]);
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = TransmitReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-    }
-
-    #[test]
-    fn transmit_return_roundtrip_with_recv_pci() {
-        let pdu = TransmitReturn::new(
-            ReturnCode::Success,
-            Some(SCardIORequest {
-                protocol: CardProtocol::SCARD_PROTOCOL_T1,
-                extra_bytes_length: 0,
-                extra_bytes: Vec::new(),
-            }),
-            vec![0x6a, 0x82],
+        assert_eq!(
+            enc_headerless(&control_probe).len(),
+            HeaderlessEncode::size(&control_probe)
         );
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = TransmitReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
+
+        let attrib_full = GetAttribReturn::new(ReturnCode::Success, vec![9, 8]).into_inner();
+        let attrib_probe = GetAttribReturn::attr_probe(ReturnCode::Success, 16).into_inner();
+        assert_eq!(enc_headerless(&attrib_full).len(), HeaderlessEncode::size(&attrib_full));
+        assert_eq!(
+            enc_headerless(&attrib_probe).len(),
+            HeaderlessEncode::size(&attrib_probe)
+        );
+
+        let cache_full = ReadCacheReturn::new(ReturnCode::Success, vec![4, 5, 6, 7]).into_inner();
+        let cache_probe = ReadCacheReturn::data_probe(ReturnCode::Success, 32).into_inner();
+        assert_eq!(enc_headerless(&cache_full).len(), HeaderlessEncode::size(&cache_full));
+        assert_eq!(enc_headerless(&cache_probe).len(), HeaderlessEncode::size(&cache_probe));
     }
 
-    // Regression: real 64-bit Windows returns pointer-sized (8-byte) SCARDCONTEXT
-    // / SCARDHANDLE. The old hardcoded-4 decode rejected those with
-    // "unsupported value length"; these lock in the variable-length handling.
-    fn ctx8() -> ScardContext {
-        ScardContext {
-            value: 0x1122_3344_5566_7788,
-            length: 8,
-        }
-    }
-
+    /// 6-byte Unicode mszCards needs 2-byte NDR pad before reader states.
     #[test]
-    fn establish_context_return_roundtrip_8byte_context() {
-        let pdu = EstablishContextReturn::new(ReturnCode::Success, ctx8());
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = EstablishContextReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-        assert_eq!(decoded.context, ctx8());
-    }
-
-    #[test]
-    fn connect_return_roundtrip_8byte_handle() {
-        let handle = ScardHandle {
-            context: ctx8(),
-            value: 0xAABB_CCDD_EEFF_0011,
-            length: 8,
-        };
-        let pdu = ConnectReturn::new(ReturnCode::Success, handle.clone(), CardProtocol::SCARD_PROTOCOL_T1);
-        let bytes = encode_vec(&pdu).unwrap();
-        let decoded = ConnectReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(pdu.into_inner(), decoded);
-        assert_eq!(decoded.handle, handle);
-    }
-
-    #[test]
-    fn connect_return_decode_empty_handle_context() {
-        // Real Windows returns the handle with an EMPTY embedded context
-        // (cbContext=0, NULL pbContext referent → no deferred context value) and
-        // an 8-byte handle. The old decode read a context MaximumCount
-        // unconditionally, consuming the handle's bytes and leaving cbHandle=0.
-        use super::rpce::HeaderlessDecode;
-        let handle_bytes = [0u8, 0, 0, 0, 1, 0, 0, 0xea];
+    fn locate_cards_w_skips_msz_cards_ndr_pad() {
+        let cards = [0x41u8, 0x00, 0x00, 0x00, 0x00, 0x00]; // "A\0\0"
         let mut body = Vec::new();
-        body.extend_from_slice(&u32::from(ReturnCode::Success).to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes()); // cbContext = 0
-        body.extend_from_slice(&0u32.to_le_bytes()); // NULL pbContext referent
-        body.extend_from_slice(&8u32.to_le_bytes()); // cbHandle = 8
-        body.extend_from_slice(&0x0002_0000u32.to_le_bytes()); // pbHandle referent
-        body.extend_from_slice(&CardProtocol::SCARD_PROTOCOL_T1.bits().to_le_bytes());
-        body.extend_from_slice(&8u32.to_le_bytes()); // pbHandle MaximumCount
-        body.extend_from_slice(&handle_bytes);
+        body.extend_from_slice(&[0u8; 8]); // empty context ptr
+        body.extend_from_slice(&6u32.to_le_bytes());
+        body.extend_from_slice(&0x0002_0000u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0x0002_0004u32.to_le_bytes());
+        body.extend_from_slice(&6u32.to_le_bytes());
+        body.extend_from_slice(&cards);
+        body.extend_from_slice(&[0u8; 2]); // NDR pad
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0x0002_0008u32.to_le_bytes());
+        body.extend_from_slice(&[0u8; 12 + 36]); // ReaderState_Common_Call zeros
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(&[0x52, 0x00, 0x00, 0x00]); // "R"
 
-        let decoded = ConnectReturn::headerless_decode(&mut ReadCursor::new(&body), None).unwrap();
-        assert_eq!(decoded.return_code, ReturnCode::Success);
-        assert_eq!(decoded.active_protocol, CardProtocol::SCARD_PROTOCOL_T1);
-        assert_eq!(decoded.handle.context.length, 0);
-        assert_eq!(decoded.handle.length, 8);
-        assert_eq!(decoded.handle.value, u64::from_le_bytes(handle_bytes));
-    }
+        let mut pdu = vec![0x01, 0x10, 0x08, 0x00, 0xCC, 0xCC, 0xCC, 0xCC];
+        pdu.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+        pdu.extend_from_slice(&0u32.to_le_bytes());
+        pdu.extend_from_slice(&body);
 
-    #[test]
-    fn transmit_call_roundtrip_empty_context_handle() {
-        // A handle whose embedded context is empty (length 0) — as returned by
-        // Connect — must re-encode with cbHandle intact (not clobbered to 0).
-        let handle = ScardHandle {
-            context: ScardContext { value: 0, length: 0 },
-            value: u64::from_le_bytes([0, 0, 0, 0, 1, 0, 0, 0xea]),
-            length: 8,
-        };
-        let send_buffer = vec![0x00, 0xa4, 0x04, 0x00, 0x00];
-        let call = TransmitCall {
-            handle,
-            send_pci: SCardIORequest {
-                protocol: CardProtocol::SCARD_PROTOCOL_T1,
-                extra_bytes_length: 0,
-                extra_bytes: Vec::new(),
-            },
-            send_length: send_buffer.len() as u32,
-            send_buffer,
-            recv_pci: None,
-            recv_buffer_is_null: false,
-            recv_length: 0x2000,
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = TransmitCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
-        assert_eq!(decoded.handle.length, 8);
-        assert_eq!(decoded.handle.context.length, 0);
-    }
-
-    #[test]
-    fn transmit_return_decode_null_recv_buffer() {
-        // When the card returns no data (e.g. a failed transaction) real Windows
-        // sends a NULL pbRecvBuffer (and NULL pioRecvPci) — 16 bytes, no deferred
-        // arrays. Reading the recv-buffer value unconditionally would overrun.
-        use super::rpce::HeaderlessDecode;
-        let mut body = Vec::new();
-        body.extend_from_slice(&u32::from(ReturnCode::Success).to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes()); // pioRecvPci referent = NULL
-        body.extend_from_slice(&0u32.to_le_bytes()); // cbRecvLength = 0
-        body.extend_from_slice(&0u32.to_le_bytes()); // pbRecvBuffer referent = NULL
-
-        let decoded = TransmitReturn::headerless_decode(&mut ReadCursor::new(&body), None).unwrap();
-        assert_eq!(decoded.return_code, ReturnCode::Success);
-        assert!(decoded.recv_pci.is_none());
-        assert!(decoded.recv_buffer.is_empty());
-    }
-
-    #[test]
-    fn status_return_decode_null_reader_names() {
-        // Real Windows often returns Status_Return with a NULL mszReaderNames
-        // pointer (ATR-only). Hand-build that 56-byte headerless body (encode
-        // can't produce a NULL referent) and confirm the decode reads the ATR and
-        // yields empty reader names instead of overrunning.
-        use super::rpce::HeaderlessDecode;
-        let mut atr = [0u8; 32];
-        atr[..11].copy_from_slice(&[0x3b, 0x8d, 0x01, 0x80, 0xfb, 0xa0, 0x00, 0x00, 0x03, 0x97, 0x42]);
-        let mut body = Vec::new();
-        body.extend_from_slice(&u32::from(ReturnCode::Success).to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes()); // cBytes = 0
-        body.extend_from_slice(&0u32.to_le_bytes()); // mszReaderNames referent = NULL
-        body.extend_from_slice(&u32::from(CardState::Present).to_le_bytes());
-        body.extend_from_slice(&CardProtocol::SCARD_PROTOCOL_T1.bits().to_le_bytes());
-        body.extend_from_slice(&atr);
-        body.extend_from_slice(&11u32.to_le_bytes()); // cbAtrLen
-
-        let decoded =
-            StatusReturn::headerless_decode(&mut ReadCursor::new(&body), Some(CharacterSet::Unicode)).unwrap();
-        assert_eq!(decoded.return_code, ReturnCode::Success);
-        assert_eq!(decoded.state, CardState::Present);
-        assert_eq!(decoded.protocol, CardProtocol::SCARD_PROTOCOL_T1);
-        assert_eq!(decoded.atr_length, 11);
-        assert_eq!(&decoded.atr[..11], &atr[..11]);
-        assert!(decoded.reader_names.is_empty());
-    }
-
-    #[test]
-    fn transmit_call_roundtrip_8byte_handle() {
-        // Exercises the *Call encode path (server direction) with an 8-byte handle.
-        let send_buffer = vec![0x00, 0xa4, 0x04, 0x00, 0x00];
-        let call = TransmitCall {
-            handle: ScardHandle {
-                context: ctx8(),
-                value: 0xAABB_CCDD_EEFF_0011,
-                length: 8,
-            },
-            send_pci: SCardIORequest {
-                protocol: CardProtocol::SCARD_PROTOCOL_T1,
-                extra_bytes_length: 0,
-                extra_bytes: Vec::new(),
-            },
-            send_length: send_buffer.len() as u32,
-            send_buffer,
-            recv_pci: None,
-            recv_buffer_is_null: false,
-            recv_length: 256,
-        };
-        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
-        let decoded = TransmitCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
-        assert_eq!(call, decoded);
+        let decoded = LocateCardsCall::decode(&mut ReadCursor::new(&pdu), Some(CharacterSet::Unicode)).unwrap();
+        assert_eq!(decoded.cards, vec!["A".to_owned()]);
+        assert_eq!(decoded.states[0].reader, "R");
     }
 }

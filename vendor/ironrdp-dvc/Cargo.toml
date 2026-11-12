@@ -3,19 +3,16 @@ name = "ironrdp-dvc"
 version = "0.8.0"
 readme = "README.md"
 description = "DRDYNVC static channel implementation and traits to implement dynamic virtual channels"
-# Vendored copy of upstream master ironrdp-dvc (copied 2026-06-26 from
-# Devolutions/IronRDP@879ffed, same rev as the git pins in the root Cargo.toml).
-# Workspace-inherited fields are inlined below because we're not inside the
-# IronRDP cargo workspace. The divergence: server-side MS-RDPEDYC Soft-Sync
-# support (decode the client's SoftSyncResponse instead of erroring, encode the
-# server's SoftSyncRequest) needed to move dynamic virtual channels onto the UDP
-# multitransport tunnel. See CLAUDE.md for the divergence log.
+# Vendored copy of upstream ironrdp-dvc at Devolutions/IronRDP@e258f6a0 (same rev
+# as the git pins in the root Cargo.toml). Workspace-inherited fields are inlined
+# below because we're not inside the IronRDP cargo workspace. The divergence is one
+# method, `DrdynvcServer::request_soft_sync` — see CLAUDE.md for the log.
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Devolutions/IronRDP"
 repository = "https://github.com/Devolutions/IronRDP"
-authors = ["Devolutions Inc. <infos@devolutions.net>"]
+authors = ["Devolutions Inc. <infos@devolutions.net>", "Teleport <goteleport.com>"]
 keywords = ["rdp", "remote-desktop", "network", "client", "protocol"]
 categories = ["network-programming"]
 
@@ -40,6 +37,6 @@ tracing = { version = "0.1", features = ["log"] }
 # when it's a path dependency of macrdp (the root Cargo.toml's [patch] wins). Keep
 # the rev in sync with the root Cargo.toml when bumping the IronRDP pin.
 [patch.crates-io]
-ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-svc  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-pdu  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-svc  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-pdu  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }

@@ -26,4 +26,43 @@ Custom logic for your RDP server can be added by implementing these traits:
 
 This crate is part of the [IronRDP] project.
 
+## Echo RTT probes (feature `echo`)
+
+Enable the `echo` feature to use the ECHO dynamic virtual channel (`MS-RDPEECO`) and measure round-trip time.
+
+```rust
+use ironrdp_server::{RdpServer, ServerError, ServerErrorExt as _, ServerResult};
+
+# async fn demo(mut server: RdpServer) -> ServerResult<()> {
+// Grab and clone the shared handle before moving the server into a task.
+let echo = server.echo_handle().clone();
+
+let local = tokio::task::LocalSet::new();
+local
+	.run_until(async move {
+		let server_task = tokio::task::spawn_local(async move { server.run().await });
+
+		{
+			echo.send_request(b"ping".to_vec())?;
+
+			for measurement in echo.take_measurements() {
+				println!(
+					"echo payload size={} rtt={:?}",
+					measurement.payload.len(),
+					measurement.round_trip_time
+				);
+			}
+		}
+
+		server_task
+			.await
+			.map_err(|e| ServerError::custom("server task", e))??;
+		Ok::<(), ServerError>(())
+	})
+	.await?;
+# Ok(()) }
+```
+
+`send_request` queues a probe via the server event loop. If no client has opened the ECHO channel yet, the request is dropped.
+
 [IronRDP]: https://github.com/Devolutions/IronRDP

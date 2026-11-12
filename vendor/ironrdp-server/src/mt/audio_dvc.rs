@@ -171,9 +171,11 @@ pub fn lossy_wave_dvc_message(block_no: u8, audio_timestamp: u32, format_no: u16
 /// migrated lossy tunnel (verified). So the format/quality/training handshake runs
 /// on the RELIABLE `AUDIO_PLAYBACK_DVC` (over TCP) while `AUDIO_PLAYBACK_LOSSY_DVC`
 /// carries only `Wave2` data, Soft-Synced onto the lossy/DTLS tunnel and stamped
-/// with the format index the reliable channel negotiated. One handler type, two
-/// roles, selected at construction.
-pub struct AudioLossyDvc {
+/// with the format index the reliable channel negotiated. One handler, two roles,
+/// each behind its own type ([`AudioReliableDvc`], [`AudioLossyDvc`]): the DRDYNVC
+/// server keys its by-type channel lookup on the Rust type, so the two channels
+/// must not share one.
+struct AudioPlaybackDvc {
     /// Channel name: `AUDIO_PLAYBACK_DVC` (reliable) or `AUDIO_PLAYBACK_LOSSY_DVC`.
     channel_name: &'static str,
     /// When `true` (the lossy channel) `start()` sends NO formats — the channel is
@@ -191,38 +193,72 @@ pub struct AudioLossyDvc {
     negotiated: Option<NegotiatedAudioFormat>,
 }
 
-impl AudioLossyDvc {
-    /// The RELIABLE `AUDIO_PLAYBACK_DVC`: runs the full MS-RDPEA handshake over its
-    /// transport (TCP) and publishes the negotiated client-list format index to
-    /// `negotiated` for the lossy wave path.
-    pub fn reliable(formats: Vec<AudioFormat>, negotiated: NegotiatedAudioFormat) -> Self {
-        Self {
+/// The RELIABLE `AUDIO_PLAYBACK_DVC`: runs the full MS-RDPEA handshake over its
+/// transport (TCP) and publishes the negotiated client-list format index for the
+/// lossy wave path.
+pub struct AudioReliableDvc(AudioPlaybackDvc);
+
+/// The LOSSY `AUDIO_PLAYBACK_LOSSY_DVC`: data-only (Wave2 over the lossy/DTLS
+/// tunnel). Never sends formats; mstsc tears the socket down if it does.
+pub struct AudioLossyDvc(AudioPlaybackDvc);
+
+impl AudioReliableDvc {
+    pub fn new(formats: Vec<AudioFormat>, negotiated: NegotiatedAudioFormat) -> Self {
+        Self(AudioPlaybackDvc {
             channel_name: AUDIO_PLAYBACK_DVC,
             defer_formats: false,
             formats,
             chosen_format_no: None,
             training_confirmed: false,
             negotiated: Some(negotiated),
-        }
+        })
     }
+}
 
-    /// The LOSSY `AUDIO_PLAYBACK_LOSSY_DVC`: data-only (Wave2 over the lossy/DTLS
-    /// tunnel). Never sends formats — mstsc tears the socket down if it does.
-    pub fn lossy() -> Self {
-        Self {
+impl AudioLossyDvc {
+    pub fn new() -> Self {
+        Self(AudioPlaybackDvc {
             channel_name: AUDIO_PLAYBACK_LOSSY_DVC,
             defer_formats: true,
             formats: Vec::new(),
             chosen_format_no: None,
             training_confirmed: false,
             negotiated: None,
-        }
+        })
     }
 }
 
-impl_as_any!(AudioLossyDvc);
+impl Default for AudioLossyDvc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-impl DvcProcessor for AudioLossyDvc {
+macro_rules! delegate_audio_dvc {
+    ($($ty:ident),+) => {$(
+        impl_as_any!($ty);
+
+        impl DvcProcessor for $ty {
+            fn channel_name(&self) -> &str {
+                self.0.channel_name()
+            }
+
+            fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+                self.0.start(channel_id)
+            }
+
+            fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+                self.0.process(channel_id, payload)
+            }
+        }
+
+        impl DvcServerProcessor for $ty {}
+    )+};
+}
+
+delegate_audio_dvc!(AudioReliableDvc, AudioLossyDvc);
+
+impl AudioPlaybackDvc {
     fn channel_name(&self) -> &str {
         self.channel_name
     }
@@ -314,5 +350,3 @@ impl DvcProcessor for AudioLossyDvc {
         }
     }
 }
-
-impl DvcServerProcessor for AudioLossyDvc {}

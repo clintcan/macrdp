@@ -393,6 +393,8 @@ BLANK_RECOVERY_MIN_QOE=24               # all-zero QoE reports (~3 s) to declare
 BLANK_RECOVERY_MAX_WAIT_MS=4000         # wall-clock fast-path: declare a STATIC blank after this many ms  [MACRDP_BLANK_RECOVERY_MAX_WAIT_MS]
 BLANK_RECOVERY_MIN_WALL_REPORTS=1       # min all-zero reports the fast-path needs (skips QoE-less clients)  [MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS]
 BLANK_RECOVERY_HEAL_CONFIRM_MS=8000     # after a reactivation, wait this long for a sustained heal before the fallback drop  [MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS]
+BLANK_RECOVERY_POST_ATTEMPT_ZEROS=3     # after a reactivation, drop on this many zero-render reports...  [MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS]
+BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS=10000  # ...within this window (0 disables)              [MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS]
 BLANK_RECOVERY_RETRY_MS=4000            # spacing between recovery attempts                              [MACRDP_BLANK_RECOVERY_RETRY_MS]
 BLANK_RECOVERY_MAX_ATTEMPTS=1           # forced to >=2 when REACTIVATE=1 so the drop can be attempt 2   [MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS]
 BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # storm guard: stop dropping after N blank-drops with no heal between  [MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS]
