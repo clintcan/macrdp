@@ -4,6 +4,51 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.0 — IronRDP update + fixes since v0.9.11
+
+An update to IronRDP plus about four weeks of fixes from contributors. Most of the runtime is unchanged; the behaviour changes are listed below.
+
+**IronRDP update (#194).** macrdp now builds on IronRDP `e258f6a0`, up from `a5d1c682` (391 upstream commits). Several things macrdp used to patch locally are now upstream, so the vendored forks shrank: SuppressOutput, NSCodec, adopting the client's resolution, the keyboard-layout cell, the auto-reconnect cookie, mouse position before button, and auth-gated preemption. macrdp sets them through the builder, including `ConnectionPolicy::Preempt` (upstream's default, `Queue`, would bring back the second-client hang). What it changes for users:
+
+- **A client that stalls while connecting no longer holds the session.** IronRDP now gives the connection's finalize step 30 s (upstream #1890). Before, a wedged client could keep the session slot until another client connected. This replaces #182 (@antonmos).
+- **The cursor shows in the iOS Windows App (#211).** 32-bit cursors now carry an AND mask (a backport of upstream #2108, vendored server divergence 29). Reported and confirmed fixed by @JeffSteinbok, who also checked touch mode.
+- **FreeRDP and Thincast now get mute-on-minimize.** IronRDP now tells clients the server supports SuppressOutput, so these clients send it, and macrdp mutes the audio and pauses the video while they're minimized, as it already did for mstsc.
+- **The auto-reconnect cookie is verified and rotated.** IronRDP now checks a returning cookie and changes it hourly and on every reactivation. A client that reconnects after macrdp restarts carries a cookie that no longer checks out. Upstream refuses that connection, which in testing locked FreeRDP out through repeated retries; macrdp falls back to a normal logon instead, as MS-RDPBCGR 3.3.5.3.11 asks (vendored server divergence 30, reported upstream as Devolutions/IronRDP#2280).
+
+**Fixes and features since v0.9.11**
+
+- `--password-file` reads the password from a file you own with mode 600 or 400 (@rophy, #212).
+- `--alt-space-spotlight`: Option+Space opens Spotlight (@SferaDev, #209).
+- Input arrives while a write to a slow client is blocked, and Nagle is off on RDP sockets (@SferaDev, #222; vendored server divergence 26).
+- After display sleep, the capture reopens instead of freezing on the last frame (@SferaDev, #221).
+- Capture no longer holds frames back on displays that refresh no faster than `--fps`, which cuts typing latency (@SferaDev, #220).
+- ISO `<>`, JIS, F13–F20 and keypad keys are mapped, so Spanish, German and French clients can type `<` and `>` (@SferaDev, #223).
+- Modifier changes reach apps once instead of twice, so VS Code's Shift Shift no longer fires on one press (@SferaDev, #208).
+- A fast scroll no longer leaves a backlog that swallows the next reversal (@SferaDev, #210).
+- The app switcher closes when stale modifiers are cleared on a reconnect (@SferaDev, #234).
+- Auth lockout no longer counts a disconnect after successful authentication, so a client's own auto-reconnects can't lock it out (@SferaDev, #233).
+- A second copy on the Mac reaches the client promptly; it was 1–8.5 s late (@SferaDev, #217).
+- `--stats-endpoint` counts frames for every client and clears the count on disconnect (@SferaDev, #218).
+- On a multi-monitor Mac, mirror mode captures the main display, the one input maps to (#215).
+- `--max-client-size` also applies to the size adopted at connect (#216).
+- The blank detector's clocks start when the graphics channel is ready, not at TCP accept, so a slow login no longer sets off a needless recovery (#196).
+- Keyboard-layout lookups are serialized, so concurrent callers can't abort the process (#227).
+- The flush frame keeps a reference to its pixel buffer instead of copying it (@antonmos, #203).
+- Dependency security updates: rustls, rustls-webpki, tokio, crypto-bigint and ctutils (#213), libz-sys (RUSTSEC-2026-0418, #243).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 301 tests pass.
+- Live with mstsc (Windows 11) on a Mac mini: connect, reconnect, minimize, audio, clipboard (text, rich text and files, both directions), drive redirection, and a server restart while connected, which returns to a normal logon with no lockout. FreeRDP passed live on an earlier build of this branch, and the #211 reporter checked Windows App on iOS on one too.
+- A **48-hour soak** on the Mac mini (2026-11-10 01:20Z → 11-12 01:20Z): no restarts and no panics in 2,868 samples, memory 26–121 MB with no upward trend, a steady count of open files, the in-tree abuse harnesses, and one mstsc session that stayed connected for over 12 hours. The raw samples are in `~/macrdp-soak-samples.log` on the mini.
+
+**Known issues** (none are new in this release)
+
+- **`--adaptive-bitrate` makes video stutter every 3–5 s for mstsc on a fast LAN.** It reads mstsc's acknowledgement pace as congestion and keeps cutting the bitrate. Turning it off removed the stutter in a live A/B. The option is off by default; on a LAN, leave it off (`ADAPTIVE_BITRATE=0`). Separately, its keyframe backoff has no effect: periodic keyframes keep their normal interval under congestion. Fixes planned for v0.10.1.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+- Restarting macrdp while a drive is redirected can leave a stale mount until macOS offers "Disconnect All".
+- Reading a Universal Clipboard (Handoff) item can stall the session for many seconds; turning off Handoff on the Mac avoids it. Fix planned for v0.10.1.
+
 ## v0.9.11 — input fixes
 
 A bug-fix release for mouse and keyboard input, both contributed by @antonmos. The default runtime path changes only in that clicks, drags and scrolls now carry the modifiers you're holding.

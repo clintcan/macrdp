@@ -18,10 +18,11 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.9.11](https://github.com/clintcan/macrdp/releases/latest)** — input fixes: held modifiers now reach clicks, drags and scrolls (Shift-click selection, Cmd-click), a Ctrl+click becomes Cmd+click and Ctrl+, opens Preferences under `--map-ctrl-to-cmd`, and a disconnect mid-click no longer leaves a stuck button or modifier on the next connection (@antonmos, #183, #184).
+**Latest: [v0.10.0](https://github.com/clintcan/macrdp/releases/latest)** — IronRDP update (a client that stalls while connecting can no longer hold the session; the cursor shows on iOS Windows App; mute-on-minimize for FreeRDP/Thincast), plus fixes since v0.9.11: `--password-file`, `--alt-space-spotlight`, capture recovery after display sleep, ISO/JIS key mapping and lower typing latency.
 
 **Recent releases**
 
+- **v0.9.11** (2026-10-01) — input fixes: held modifiers on clicks, Ctrl+click→Cmd+click under `--map-ctrl-to-cmd`
 - **v0.9.10** (2026-09-30) — microphone redirection *(experimental)*; `--lock-on-disconnect` no longer locks under a reconnecting client
 - **v0.9.9** (2026-09-29) — rich-text clipboard in both directions
 - **v0.9.8** (2026-09-27) — lock while away: `--lock-on-disconnect` + `--auto-unlock` *(experimental)*
