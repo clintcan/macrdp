@@ -1275,6 +1275,28 @@ fn note_decrease(in_episode: &mut bool, congestion_bps: &mut Option<u32>, target
     }
 }
 
+/// Seconds of frames the IDR backoff stretches the periodic-keyframe interval to
+/// (see [`stretched_keyframe_interval`]).
+const STRETCHED_KEYFRAME_SECS: u32 = 10;
+
+/// The keyframe interval (frames) the IDR backoff uses under congestion: about
+/// [`STRETCHED_KEYFRAME_SECS`] of frames at the configured rate, and always
+/// longer than the normal interval. Pure; unit-tested.
+///
+/// It was ~10 minutes, which was harmless only because the stretch never took
+/// effect (VideoToolbox ignored it; fixed 2026-11-13 by scheduling keyframes in
+/// the encoder). Once it did, a session that stayed congested sent no healing
+/// keyframe at all, because the backoff is only lifted when the bitrate climbs
+/// back to the ceiling: live on 11-13 (mstsc decoding in software inside a
+/// remote Windows session) one keyframe went out in 2.5 minutes, so a decode
+/// glitch would have stayed on screen. Ten seconds still keeps the 2 s periodic
+/// IDR off a congested link. It counts frames, so under the 10 fps floor it
+/// stretches to about a minute.
+fn stretched_keyframe_interval(fps: u32, normal_keyframe_frames: u32) -> u32 {
+    fps.saturating_mul(STRETCHED_KEYFRAME_SECS)
+        .max(normal_keyframe_frames.saturating_add(1))
+}
+
 /// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
 /// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
 /// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
@@ -1733,12 +1755,10 @@ impl Gfx {
         let adaptive_floor_fps = env_u32("MACRDP_ADAPTIVE_FLOOR_FPS", 10).max(1);
         let adaptive_min_fps_interval = Duration::from_millis(1000 / u64::from(adaptive_floor_fps));
         // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
-        // derivation as Encoder::new), and a stretched value (~10 min) that
-        // effectively suppresses the periodic IDR for the duration of a congestion
-        // episode without a hard "never" (VT still honors forced keyframes).
+        // derivation as Encoder::new), and the stretched value used under congestion.
         let normal_keyframe_frames =
             (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let stretched_keyframe_frames = fps.saturating_mul(600).max(normal_keyframe_frames + 1);
+        let stretched_keyframe_frames = stretched_keyframe_interval(fps, normal_keyframe_frames);
         // Blank-presentation recovery (the mstsc reconnect-blank): on by default —
         // it only ever acts on the pcap-proven blank signature (QoE acks flowing
         // with decode+render time zero on EVERY frame of a whole window), so a
@@ -4580,6 +4600,16 @@ mod tests {
         // controller can react; that part is the link, not the rule.)
         let old = simulate_adaptive(60, SimMode::Old, thin_link(500_000));
         assert_eq!(sim.bps, old.bps);
+    }
+
+    #[test]
+    fn the_idr_backoff_stretch_is_bounded() {
+        // 60 fps with the default 2 s interval (120 frames): ten seconds.
+        assert_eq!(stretched_keyframe_interval(60, 120), 600);
+        // Always longer than the normal interval, even when that is long.
+        assert_eq!(stretched_keyframe_interval(60, 900), 901);
+        // Never the old ~10 minutes.
+        assert!(stretched_keyframe_interval(60, 120) < 60 * 600);
     }
 
     #[test]
