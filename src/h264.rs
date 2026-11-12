@@ -596,7 +596,10 @@ struct BlankRecoveryParams {
     /// zeros still form a burst. Withheld for an ESTABLISHED session (a heal
     /// that reached `established_render_reports`): live 11-12 a 75-long heal
     /// followed by 4 scattered zeros formed a burst and dropped a working
-    /// session; the established tier's slower paths own that case.
+    /// session; the established tier's slower paths own that case. Also
+    /// requires zeros to be at least half of the window's reports: with video
+    /// playing a healed mstsc emits scattered zeros (7-17% of the window,
+    /// live 11-12) that can still bunch into a burst.
     /// Trade-off: a still-black, fully STATIC screen
     /// is not escalated until something on it changes (the heal-confirmation
     /// deadline still catches total QoE silence).
@@ -986,8 +989,15 @@ fn should_blank_recover(
     // (the 160-report count and the 30 s blackout above). The Windows App
     // phantom runs (up to 18) stay well below the bar, so a real blank is
     // still escalated here.
+    // Also needs zeros to be at least HALF of the reports since the attempt:
+    // live 11-12 (third round, YouTube playing) four reconnects healed into
+    // runs of 15-33 and then 3-4 dense zeros formed a burst — zeros were only
+    // 7-17% of their windows and the user saw the desktop each time. Every
+    // logged real blank was 73-100% zeros; the Windows App phantom pattern is
+    // mostly zeros by definition.
     let post_attempt_zero_burst = attempts >= 1
         && !established
+        && qoe.zeros_since_reset.saturating_mul(2) >= qoe.reports_since_reset
         && !p.post_attempt_burst_window.is_zero()
         && post_attempt_zero_span.is_some_and(|span| span <= p.post_attempt_burst_window);
     // Blank evidence: EITHER the full all-zero report count (fast on an active
@@ -4404,6 +4414,27 @@ mod tests {
                     "dropped a healed window {reports}/{zeros}/{best} at {since_attempt:?}"
                 );
             }
+        }
+        // THE THIRD LIVE ROUND (11-12, YouTube playing): heals into runs of
+        // 15-33, then 3-4 zeros that DID form a burst, at 7-17% of the
+        // window. The majority rule holds them.
+        for (reports, zeros, best) in [(44, 4, 33), (38, 4, 20), (18, 3, 15), (50, 3, 25)] {
+            let w = window_ending_in_a_zero(reports, zeros, best);
+            assert!(
+                !should_blank_recover(
+                    w,
+                    true,
+                    false,
+                    ms(12_000),
+                    ms(500),
+                    ms(8_000),
+                    1,
+                    true,
+                    Some(ms(2_000)),
+                    &p
+                ),
+                "dropped a healed window {reports}/{zeros}/{best} during video"
+            );
         }
         // A healed STATIC session keeps collecting a clock-tick zero about
         // once a minute, forever: three of them never form a burst.
