@@ -68,6 +68,9 @@ nfsserve = "0.11.0"
 # src/conn_test.rs). Both are redirected to the pinned git rev by the
 # [patch.crates-io] section below, same as the runtime ironrdp-* deps.
 [dev-dependencies]
+# Paused test clock (`#[tokio::test(start_paused = true)]`) for timing tests
+# that must not depend on how fast the CI runner is.
+tokio = { version = "1", features = ["test-util"] }
 ironrdp-connector = "0.10"
 ironrdp-tokio = "0.10"
 # For the UDP multitransport loopback test: decode the listener's SYN+ACK reply.
