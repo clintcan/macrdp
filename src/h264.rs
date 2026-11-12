@@ -2384,9 +2384,7 @@ impl Gfx {
                 }
             }
             if let Some(frames) = adaptive.keyframe_frames {
-                if let Err(e) = encoder.set_keyframe_interval(frames) {
-                    trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
-                }
+                encoder.set_keyframe_interval(frames);
             }
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
