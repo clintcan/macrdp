@@ -131,7 +131,7 @@ over an MS-RDPEMT tunnel on MS-RDPEUDP — not a TCP-side bootstrap stub.
 
 **How it was built:** independently, by reverse-engineering packet captures of a real
 **mstsc ↔ Windows terminal server** session alongside the MS-RDPEUDP/RDPEMT specs, in
-macrdp's own sans-I/O `vendor/ironrdp-rdpeudp` crate plus the vendored server. No other
+macrdp's own sans-I/O `vendor/macrdp-rdpeudp` crate plus the vendored server. No other
 open-source server-side data path existed to build on (see the evidence below).
 
 **Evidence.** FreeRDP's client **hard-rejects** multitransport via a dedicated
