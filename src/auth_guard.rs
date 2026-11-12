@@ -182,6 +182,7 @@ pub enum Outcome {
     Failure,
     /// The client authenticated and the server then failed the session: no
     /// lockout strike, and the attempt is refunded from the rate-limit window.
+    /// Deliberately only for errored sessions: a clean disconnect keeps its attempt.
     ServerError,
 }
 
@@ -314,6 +315,7 @@ impl AuthGuardCore {
             Outcome::ServerError => {
                 entry.consecutive_failures = 0;
                 entry.cooldown_until = None;
+                // The newest attempt may be another connection's behind the same NAT; the count is what matters.
                 entry.attempts.pop_back();
             }
             Outcome::Failure => {
