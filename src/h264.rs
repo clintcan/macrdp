@@ -313,6 +313,9 @@ struct ConnectionContext {
     /// The last `2 * DELAY_TREND_WINDOW` usable queue-delay samples (oldest
     /// first), for [`delay_trend`].
     adaptive_delay_samples: VecDeque<f64>,
+    /// While `Some`, the manual resync hotkey is draining the client's decoder
+    /// before its IDR (see [`resync_drain_step`]); the deadline caps the hold.
+    resync_drain_until: Option<Instant>,
     /// Hysteresis state: whether the controller is currently in a congestion episode
     /// (enters when the EWMA lag clears the high mark, exits below the low mark).
     adaptive_congested: bool,
@@ -1294,6 +1297,42 @@ fn rate_action(
     }
 }
 
+/// Longest the manual resync hotkey holds new video while the client's
+/// decoder empties (see [`resync_drain_step`]).
+const RESYNC_DRAIN_MAX: Duration = Duration::from_millis(2000);
+
+/// What the manual-resync video drain does with this capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResyncDrain {
+    /// Not draining: ship normally.
+    Off,
+    /// Still draining: drop this capture (the armed IDR waits).
+    Hold,
+    /// The drain just ended (the client acked everything shipped, or the cap
+    /// ran out): ship this capture, which carries the armed IDR.
+    Done,
+}
+
+/// Pure decision for the manual-resync video drain (2026-11-12). The hotkey
+/// used to arm only an IDR, which then queued BEHIND the video backlog in
+/// mstsc's decoder, so the drift stayed; minimize→restore fixed it because
+/// SuppressOutput stops video for over a second first. The drain does the
+/// same: hold new captures until the client has acknowledged every frame we
+/// shipped (FrameAcknowledge comes after decode, so its decoder is then
+/// empty), at most `RESYNC_DRAIN_MAX`, then ship the IDR. Unit-tested.
+fn resync_drain_step(
+    drain_until: Option<Instant>,
+    now: Instant,
+    last_shipped: u64,
+    last_acked: u64,
+) -> ResyncDrain {
+    match drain_until {
+        None => ResyncDrain::Off,
+        Some(until) if last_acked >= last_shipped || now >= until => ResyncDrain::Done,
+        Some(_) => ResyncDrain::Hold,
+    }
+}
+
 /// P2b — pure decision: should this capture be DROPPED to enforce a frame-rate floor?
 ///
 /// Engages only once the bitrate controller has already cut the encoder to its floor
@@ -2120,6 +2159,28 @@ impl Gfx {
                     }
                 }
             }
+            // Manual-resync drain (the Ctrl+Alt+Shift+R hotkey): hold new
+            // captures until the client's decoder has emptied, then let the
+            // armed IDR through (see `resync_drain_step`). Dropping before
+            // encode keeps the reference chain valid, and `need_keyframe`
+            // persists across the drop. No-op unless the hotkey was pressed.
+            {
+                let now = Instant::now();
+                let shipped = ctx.last_shipped_frame_id.load(Ordering::Relaxed);
+                let acked = ctx.last_acked_frame_id.load(Ordering::Relaxed);
+                match resync_drain_step(ctx.resync_drain_until, now, shipped, acked) {
+                    ResyncDrain::Off => {}
+                    ResyncDrain::Hold => return Ok(true),
+                    ResyncDrain::Done => {
+                        ctx.resync_drain_until = None;
+                        info!(
+                            unacked_frames = shipped.saturating_sub(acked),
+                            "manual A/V resync: client decoder drained (or the cap ran out) — \
+                             shipping the IDR"
+                        );
+                    }
+                }
+            }
             // P2b frame-rate floor: once the adaptive controller has cut the bitrate to
             // its floor AND the link is still congested, lowering quality can't help —
             // so shed FRAMES. Cap the effective fps (drop captures arriving within
@@ -2796,13 +2857,22 @@ impl Gfx {
     /// flicker). If a plain IDR turns out not to un-blank the surface-retention
     /// case on some client, [`request_reactivation`] is the heavier escalation.
     /// `capture.rs` calls this when it observes the flag.
+    ///
+    /// Since 2026-11-12 it first DRAINS the client: new video is held until
+    /// the client has acknowledged everything already shipped (at most
+    /// [`RESYNC_DRAIN_MAX`]), so the IDR doesn't queue behind a video backlog.
+    /// See [`resync_drain_step`].
     pub(crate) fn force_keyframe(&self) {
         if let Ok(mut guard) = self.ctx.lock() {
             if let Some(ctx) = guard.as_mut() {
                 ctx.need_keyframe = true;
+                ctx.resync_drain_until = Some(Instant::now() + RESYNC_DRAIN_MAX);
             }
         }
-        info!("manual A/V resync (Ctrl+Alt+Shift+R): forcing an IDR keyframe");
+        info!(
+            "manual A/V resync (Ctrl+Alt+Shift+R): draining the client's video queue, then \
+             forcing an IDR keyframe"
+        );
     }
 
     /// Heavier manual-resync escalation: request the same bare core
@@ -3129,6 +3199,7 @@ impl GfxServerFactory for Gfx {
             adaptive_warmup_until: None,
             adaptive_delay_ewma: 0.0,
             adaptive_delay_samples: VecDeque::with_capacity(2 * DELAY_TREND_WINDOW),
+            resync_drain_until: None,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
             qoe: QoeEvidence::default(),
@@ -4071,6 +4142,30 @@ mod tests {
             true,
             false
         )); // TCP
+    }
+
+    #[test]
+    fn resync_drain_holds_until_the_client_catches_up_or_the_cap() {
+        let t0 = Instant::now();
+        let until = Some(t0 + RESYNC_DRAIN_MAX);
+        // Not pressed → ship normally.
+        assert_eq!(resync_drain_step(None, t0, 100, 90), ResyncDrain::Off);
+        // Pressed, 10 frames still in the client's decoder → hold.
+        assert_eq!(resync_drain_step(until, t0, 100, 90), ResyncDrain::Hold);
+        assert_eq!(
+            resync_drain_step(until, t0 + ms(1_999), 100, 99),
+            ResyncDrain::Hold
+        );
+        // Everything shipped is acked → done (ship the IDR now).
+        assert_eq!(
+            resync_drain_step(until, t0 + ms(300), 100, 100),
+            ResyncDrain::Done
+        );
+        // Acks never catch up (suspended, or a stuck client) → the cap ends it.
+        assert_eq!(
+            resync_drain_step(until, t0 + RESYNC_DRAIN_MAX, 100, 40),
+            ResyncDrain::Done
+        );
     }
 
     fn delay_samples(v: &[f64]) -> VecDeque<f64> {
