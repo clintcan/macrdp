@@ -44,6 +44,7 @@ An update to IronRDP plus about four weeks of fixes from contributors. Most of t
 
 **Known issues** (none are new in this release)
 
+- **Right after connecting, a session that recovered from a blank screen can still be dropped once**, and the client then reconnects on its own. Typically you see black, then the desktop, then a reconnect lasting about 10 s. The blank-recovery wall-clock fast path ignores the recovery's own heal evidence. Seen with mstsc over ZeroTier and on a LAN. Fix planned for v0.10.1.
 - **`--adaptive-bitrate` makes video stutter every 3–5 s for mstsc on a fast LAN.** It reads mstsc's acknowledgement pace as congestion and keeps cutting the bitrate. Turning it off removed the stutter in a live A/B. The option is off by default; on a LAN, leave it off (`ADAPTIVE_BITRATE=0`). Separately, its keyframe backoff has no effect: periodic keyframes keep their normal interval under congestion. Fixes planned for v0.10.1.
 - With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
 - Restarting macrdp while a drive is redirected can leave a stale mount until macOS offers "Disconnect All".
