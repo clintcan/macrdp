@@ -1868,9 +1868,13 @@ mod tests {
         assert_eq!(answer, RetryWait::Changed);
     }
 
-    #[tokio::test]
+    // On tokio's paused clock: each sleep advances exactly as long as asked,
+    // so the step count is deterministic. With real time a loaded CI runner
+    // oversleeps a 20 ms step, the 50 ms budget runs out after two checks,
+    // and the exact count fails (seen on a macOS runner 2026-11-12).
+    #[tokio::test(start_paused = true)]
     async fn an_unanswered_retry_wait_runs_out_on_time() {
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let mut checks = 0;
         let answer = wait_for_answer(
             Duration::from_millis(50),
