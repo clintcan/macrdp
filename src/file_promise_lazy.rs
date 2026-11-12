@@ -624,7 +624,7 @@ fn publish_to_pasteboard(urls: &[SendRetained<NSURL>], self_change_count: &SelfC
     let _pb_guard = crate::clipboard::pasteboard_guard();
     let new_change_count = unsafe {
         let pb = crate::clipboard::pasteboard();
-        pb.clearContents();
+        crate::clipboard::begin_local_write(&pb);
         pb.writeObjects(&array);
         pb.changeCount() as i64
     };
