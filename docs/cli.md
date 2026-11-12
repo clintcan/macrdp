@@ -398,6 +398,12 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (congestion threshold,
                           #   default 100 ms of standing queue; replaces the removed
                           #   MACRDP_{UDP,TCP}_ADAPTIVE_LAG_THRESHOLD),
+                          #   MACRDP_ADAPTIVE_QUEUE_RISE_MS (default 20: the delay
+                          #   only counts as congestion while it's GROWING by more
+                          #   than this between ~0.9 s windows; a flat standing delay,
+                          #   e.g. mstsc's ~120 ms video decode depth, doesn't),
+                          #   MACRDP_ADAPTIVE_QUEUE_CEILING_MS (default 400: above
+                          #   this it's congestion whatever the trend),
                           #   MACRDP_ADAPTIVE_EWMA_ALPHA, MACRDP_ADAPTIVE_FLOOR_FPS.
                           #   The RETX_TOLERANCE (default 2) is the per-interval
                           #   reliable-retransmit count tolerated before treating loss
