@@ -2669,6 +2669,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "BLANK_RECOVERY_HEAL_CONFIRM_MS",
             "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
         ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+        ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+        ),
         ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
         ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
         (
