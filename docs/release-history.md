@@ -4,6 +4,30 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.1 — mstsc reconnect and video fixes
+
+A bug-fix release for mstsc users: no more dropped sessions after a successful blank-screen recovery, and no more video stutter with `--adaptive-bitrate` on a LAN. By default, only blank recovery (on by default) and the resync hotkey behave differently; the adaptive-bitrate changes apply only when `--adaptive-bitrate` is on.
+
+- **A session that recovered from a blank screen is no longer dropped (#248).** Right after a reconnect, the server can repaint a blank mstsc window in place. Once it has, a single "nothing presented" report from mstsc used to drop the session anyway, so you saw black, then the desktop, then a reconnect dialog. On a static desktop the menu-bar clock tick could cause that once a minute in a loop. After a recovery, a drop now needs a burst of such reports (3 within 10 s) that also make up at least half of the reports since the recovery, and none once the session has shown 5 seconds of picture. Every logged false drop fails at least one of those tests; every logged real blank passes all three. Tunable with `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS` and `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS`, also settable in `config.env`. (In `should_blank_recover`: the one-zero wall-clock fast path is connect-phase only, the heal-confirmation deadline fires only on QoE silence, and the new zero-burst arm is withheld once established and needs a zero majority.)
+- **`--adaptive-bitrate` no longer makes mstsc video stutter on a LAN (#249).** It read mstsc's ~120 ms of decode depth during 1080p60 video as network congestion, though the TCP send queue was empty, and swung between 3 and 0.5 Mbit/s and a 10 fps cap every 3–5 s. Delay now counts as congestion only while it keeps growing, or above 400 ms. Cuts are spaced at least 1 s apart so each takes effect, and the climb back slows near the bitrate where trouble began. Tunable with `MACRDP_ADAPTIVE_QUEUE_RISE_MS` and `MACRDP_ADAPTIVE_QUEUE_CEILING_MS`. (`delay_trend`/`delay_pressure`, `hold_trend_decrease`, `increase_step`/`note_decrease`.) In a closed-loop simulation of the controller: the mstsc LAN model averages 2.89 Mbit/s with no floor intervals (0.85 Mbit/s and 48 before); thin 1.0/1.5/2.5 Mbit/s links average 0.99/1.48/2.49 Mbit/s (0.82/1.15/2.03 before) at the same peak delay; a saturated 500 Kbit link backs off exactly as before.
+- **The A/V resync hotkey clears queued video first (#249).** Ctrl+Alt+Shift+R now holds new video until mstsc's decoder has caught up, at most 2 s, before the fresh keyframe, which is what minimize→restore did (`resync_drain_step`).
+- A clipboard test that could fail on a slow CI runner now runs on a simulated clock (#250).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 314 tests pass. The new tests replay the logged false-drop and real-blank windows and the measured delay traces, and each part of both fixes is mutation-checked.
+- Live with mstsc (Windows 11) on a Mac mini over Ethernet, with YouTube playing, across four rounds. Final round: 7 connections, 3 blank reconnects all healed in place, 0 drops. Adaptive bitrate: 0–12 cuts per connection and no 10 fps periods on a freshly opened mstsc, against 119 cuts and 252 capped frames in one reconnected connection on an earlier build.
+- Not soaked: the mini has run this code for about half an hour. v0.10.0's 48-hour soak covered everything else.
+- Not tested live: VPN and ZeroTier links with `--adaptive-bitrate`, and Windows App for macOS. Both rest on the replayed logs and models.
+
+**Known issues** (none are new in this release)
+
+- An mstsc window that has reconnected several times decodes video more slowly above ~2 Mbit/s, so `--adaptive-bitrate` can still briefly dip there. Closing and reopening mstsc avoids it.
+- `--adaptive-bitrate`'s keyframe backoff has no effect: periodic keyframes keep their normal interval under congestion.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+- Restarting macrdp while a drive is redirected can leave a stale mount until macOS offers "Disconnect All".
+- Reading a Universal Clipboard (Handoff) item can stall the session for many seconds; turning off Handoff on the Mac avoids it.
+
 ## v0.10.0 — IronRDP update + fixes since v0.9.11
 
 An update to IronRDP plus about four weeks of fixes from contributors. Most of the runtime is unchanged; the behaviour changes are listed below.
