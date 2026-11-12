@@ -1021,8 +1021,8 @@ fn skip_connect_time_fetch(mac: &pb::Snapshot, session_end_cc: i64) -> bool {
 ///
 /// File copies and non-file copies take different code paths inside
 /// ironrdp-cliprdr: a regular format list goes via `SendInitiateCopy`, but
-/// file lists must go via `initiate_file_copy` (exposed here through the
-/// vendored `ServerEvent::ClipboardFileCopy` variant) so that the cliprdr
+/// file lists must go via `initiate_file_copy` (reached through
+/// `ClipboardMessage::SendInitiateFileCopy`) so that the cliprdr
 /// server populates its `local_file_list` and accepts subsequent
 /// FileContentsRequests instead of short-circuiting them with
 /// CB_RESPONSE_FAIL.
@@ -1062,7 +1062,10 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> Advertise
                 file_count = files.len(),
                 "advertising file copy to client (recursive)"
             );
-            return send(sender, ServerEvent::ClipboardFileCopy(files));
+            return send(
+                sender,
+                ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(files)),
+            );
         }
         // Files claimed but read empty (race) — fall through to format list.
     }
@@ -1386,7 +1389,7 @@ impl CliprdrBackend for MacCliprdrBackend {
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         // FileGroupDescriptorW is handled internally by upstream cliprdr
         // once we go through `initiate_file_copy` (the
-        // ServerEvent::ClipboardFileCopy path) — it answers the FormatData
+        // `SendInitiateFileCopy` path) — it answers the FormatData
         // request from its stored `local_file_list` without ever reaching
         // us. So we only deal with CF_UNICODETEXT and CF_DIB here.
         if pb::is_remote_clipboard() {
@@ -2206,9 +2209,13 @@ mod tests {
         assert_eq!(answer, RetryWait::Changed);
     }
 
-    #[tokio::test]
+    // On tokio's paused clock: each sleep advances exactly as long as asked,
+    // so the step count is deterministic. With real time a loaded CI runner
+    // oversleeps a 20 ms step, the 50 ms budget runs out after two checks,
+    // and the exact count fails (seen on a macOS runner 2026-11-12).
+    #[tokio::test(start_paused = true)]
     async fn an_unanswered_retry_wait_runs_out_on_time() {
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let mut checks = 0;
         let answer = wait_for_answer(
             Duration::from_millis(50),

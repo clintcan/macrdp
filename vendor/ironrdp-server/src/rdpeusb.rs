@@ -35,7 +35,7 @@ use ironrdp_core::{Encode, EncodeResult, ReadCursor, WriteCursor, decode, impl_a
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
 use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityRequest};
-use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{TsUrbResultPayload, TsUrbSelectConfigResult, UsbdPipeType};
+use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{Raw, TsUrbSelectConfigResult, UsbdPipeType};
 use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, SharedMsgHeader};
 use ironrdp_rdpeusb::pdu::iface_manipulation::InterfaceRelease;
 use ironrdp_rdpeusb::pdu::notify::{ChannelCreated, Direction};
@@ -158,6 +158,27 @@ fn rimcall_release(msg_id: u32) -> DvcMessage {
 /// decoder only — no parallel wire parsing.
 fn peek_function_id(payload: &[u8]) -> Option<FunctionId> {
     decode::<SharedMsgHeader>(payload).ok().and_then(|h| h.function_id)
+}
+
+/// The `TS_URB_RESULT` payload of a `URB_COMPLETION_NO_DATA` (MS-RDPEUSB 2.2.7.3),
+/// e.g. SelectConfiguration's pipe handles. The pinned crate decodes it into a `Raw`
+/// whose bytes are private (its typed `into_expected` is crate-private), so this is
+/// the one deliberate exception to "no parallel wire parsing": it re-reads the bytes,
+/// and is only called after that decode has validated this exact layout. Drop it once
+/// the crate exposes the bytes (or a typed result) publicly.
+fn urb_completion_no_data_result(payload: &[u8]) -> Vec<u8> {
+    // SHARED_MSG_HEADER (InterfaceId + MessageId) + FunctionId + RequestId + CbTsUrbResult.
+    const RESULT_OFFSET: usize = 4 * 5;
+    // TS_URB_RESULT_HEADER: Size (u16) + Padding (u16) + UsbdStatus (u32).
+    const RESULT_HEADER_SIZE: usize = 8;
+    let Some(&[lo, hi]) = payload.get(RESULT_OFFSET..RESULT_OFFSET + 2) else {
+        return Vec::new();
+    };
+    let result_size = usize::from(u16::from_le_bytes([lo, hi]));
+    payload
+        .get(RESULT_OFFSET + RESULT_HEADER_SIZE..RESULT_OFFSET + result_size)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default()
 }
 
 /// The fields of a standard 18-byte USB device descriptor we surface. Keeps the
@@ -1234,7 +1255,7 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
         // CAPABILITIES interface and only decodes as the CONTROL set — so decode DEVICE
         // first, then fall back to CONTROL to catch the caps response (the per-device
         // handshake mstsc REQUIRES — see divergence 16).
-        match decode::<UrbdrcClientDevicePdu>(payload) {
+        match decode::<UrbdrcClientDevicePdu<Raw>>(payload) {
             Ok(UrbdrcClientDevicePdu::ChanCreated(cc)) => {
                 // Channel-created handshake done — send RIMCALL_RELEASE, the barrier
                 // that makes the client send ADD_DEVICE (the descriptors) on THIS channel.
@@ -1261,15 +1282,13 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                 }
             }
             Ok(UrbdrcClientDevicePdu::UrbComp(comp)) => {
-                let urb_result = match comp.ts_urb_result.payload {
-                    TsUrbResultPayload::Raw(bytes) => bytes,
-                    _ => Vec::new(),
-                };
+                // A completion with data carries a result payload only for isochronous
+                // transfers, which this channel doesn't drive; callers read the data.
                 self.router.deliver(
                     comp.req_id.into(),
                     UrbReply {
                         output_buffer: comp.output_buffer,
-                        urb_result,
+                        urb_result: Vec::new(),
                         hresult: comp.hresult,
                     },
                 );
@@ -1282,15 +1301,11 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     hresult = format_args!("{:#010x}", comp.hresult),
                     "URBDRC URB_COMPLETION_NO_DATA"
                 );
-                let urb_result = match comp.ts_urb_result.payload {
-                    TsUrbResultPayload::Raw(bytes) => bytes,
-                    _ => Vec::new(),
-                };
                 self.router.deliver(
                     comp.req_id.into(),
                     UrbReply {
                         output_buffer: Vec::new(),
-                        urb_result,
+                        urb_result: urb_completion_no_data_result(payload),
                         hresult: comp.hresult,
                     },
                 );

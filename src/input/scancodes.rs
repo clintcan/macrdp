@@ -6,8 +6,8 @@
 /// PS/2 Set 1 scancode → macOS virtual keycode (US ANSI layout).
 ///
 /// Reference scancodes: SDL2_scancode.h, kbdscan.txt. Reference virtual
-/// keycodes: <HIToolbox/Events.h> (kVK_*). Only the common US keys are
-/// mapped — non-US layouts, media keys, and IME need follow-on work.
+/// keycodes: <HIToolbox/Events.h> (kVK_*). Media keys and IME need
+/// follow-on work.
 pub(crate) fn scancode_to_cgkeycode(scancode: u8, extended: bool) -> Option<u16> {
     let entry = if extended {
         SCANCODE_EXTENDED[scancode as usize]
@@ -18,6 +18,15 @@ pub(crate) fn scancode_to_cgkeycode(scancode: u8, extended: bool) -> Option<u16>
         None
     } else {
         Some(entry)
+    }
+}
+
+/// Apple's ISO layouts swap `kVK_ANSI_Grave` and `kVK_ISO_Section` (left of 1 vs left of Z).
+pub(crate) fn to_iso_key_order(vk: u16) -> Option<u16> {
+    match vk {
+        0x32 => Some(0x0A),
+        0x0A => Some(0x32),
+        _ => None,
     }
 }
 
@@ -112,8 +121,23 @@ const fn build_scancode_normal() -> [u16; 256] {
     t[0x51] = 0x55; // numpad 3
     t[0x52] = 0x52; // numpad 0
     t[0x53] = 0x41; // numpad .
+    t[0x56] = 0x0A; // ISO <> key, left of Z → kVK_ISO_Section
     t[0x57] = 0x67; // F11
     t[0x58] = 0x6F; // F12
+    t[0x59] = 0x51; // numpad = → kVK_ANSI_KeypadEquals
+    t[0x64] = 0x69; // F13
+    t[0x65] = 0x6B; // F14
+    t[0x66] = 0x71; // F15
+    t[0x67] = 0x6A; // F16
+    t[0x68] = 0x40; // F17
+    t[0x69] = 0x4F; // F18
+    t[0x6A] = 0x50; // F19
+    t[0x6B] = 0x5A; // F20
+    t[0x73] = 0x5E; // JIS Ro, ABNT2 /? → kVK_JIS_Underscore
+    t[0x79] = 0x68; // Henkan (right of Space) → kVK_JIS_Kana
+    t[0x7B] = 0x66; // Muhenkan (left of Space) → kVK_JIS_Eisu
+    t[0x7D] = 0x5D; // JIS Yen → kVK_JIS_Yen
+    t[0x7E] = 0x5F; // JIS / ABNT2 keypad comma → kVK_JIS_KeypadComma
     t
 }
 
@@ -135,6 +159,7 @@ const fn build_scancode_extended() -> [u16; 256] {
     t[0x53] = 0x75; // Delete (forward delete)
     t[0x5B] = 0x37; // left GUI / Windows → kVK_Command
     t[0x5C] = 0x36; // right GUI → kVK_RightCommand
+    t[0x5D] = 0x6E; // Menu / Apps → kVK_ContextualMenu
     t
 }
 
@@ -211,5 +236,44 @@ mod tests {
         assert!(!is_numeric_pad_vk(0x00)); // A
         assert!(!is_numeric_pad_vk(0x24)); // Return
         assert!(!is_numeric_pad_vk(0x46)); // reserved gap in the keypad range
+    }
+
+    #[test]
+    fn iso_key_order_swaps_only_grave_and_section() {
+        assert_eq!(scancode_to_cgkeycode(0x29, false), Some(0x32)); // left of 1
+        assert_eq!(scancode_to_cgkeycode(0x56, false), Some(0x0A)); // <>, left of Z
+        assert_eq!(to_iso_key_order(0x32), Some(0x0A));
+        assert_eq!(to_iso_key_order(0x0A), Some(0x32));
+        assert_eq!(to_iso_key_order(0x00), None);
+    }
+
+    #[test]
+    fn jis_function_and_menu_keys_map() {
+        assert_eq!(scancode_to_cgkeycode(0x73, false), Some(0x5E)); // Ro / ABNT2 /?
+        assert_eq!(scancode_to_cgkeycode(0x7D, false), Some(0x5D)); // Yen
+        assert_eq!(scancode_to_cgkeycode(0x7E, false), Some(0x5F)); // keypad comma
+        assert_eq!(scancode_to_cgkeycode(0x79, false), Some(0x68)); // Henkan → Kana
+        assert_eq!(scancode_to_cgkeycode(0x7B, false), Some(0x66)); // Muhenkan → Eisu
+        assert_eq!(scancode_to_cgkeycode(0x59, false), Some(0x51)); // keypad =
+        assert_eq!(scancode_to_cgkeycode(0x64, false), Some(0x69)); // F13
+        assert_eq!(scancode_to_cgkeycode(0x6B, false), Some(0x5A)); // F20
+        assert_eq!(scancode_to_cgkeycode(0x5D, true), Some(0x6E)); // Menu
+    }
+
+    #[test]
+    fn no_two_scancodes_share_a_keycode() {
+        let mut seen = std::collections::HashMap::new();
+        for extended in [false, true] {
+            for sc in 0u8..=0xFF {
+                if let Some(vk) = scancode_to_cgkeycode(sc, extended) {
+                    let prev = seen.insert(vk, (sc, extended));
+                    assert!(
+                        prev.is_none(),
+                        "vk 0x{vk:02X} from {prev:?} and {:?}",
+                        (sc, extended)
+                    );
+                }
+            }
+        }
     }
 }
