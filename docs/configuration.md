@@ -91,6 +91,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           apps with an embedded terminal that can't be auto-detected
                           (front app is the IDE, not a TTY), e.g.
                           --no-remap-apps com.microsoft.VSCode. macOS-only.
+--reverse-scroll          Reverse the mouse-wheel direction (vertical and
+                          horizontal) for the remote session. For a Mac with
+                          natural scrolling on: macOS applies it to macrdp's
+                          scroll events too, and a local tool that un-reverses
+                          the physical wheel (LinearMouse etc.) doesn't see
+                          them. Off by default. macOS-only.
 --keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
                           auto-detecting it from the client. By default the
                           layout is auto-detected from the client's announced
