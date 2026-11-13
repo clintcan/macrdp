@@ -56,6 +56,12 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Ctrl+click on a link opens it in a new tab instead
                           #   of a secondary click (right/middle click and
                           #   scroll keep the real modifiers). macOS-only.
+--alt-q-quit              # Deliver Option+Q (Alt+Q from the client) as Cmd+Q
+                          #   so a Windows client can quit the focused app
+                          #   without the Windows key. Off by default. Plain
+                          #   Option only (Option+Shift+Q is NOT sent as
+                          #   Cmd+Shift+Q = log out). Config ALT_Q_QUIT=1.
+                          #   macOS-only.
 --no-remap-apps LIST      # Comma-separated bundle ids where --map-ctrl-to-cmd is
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
