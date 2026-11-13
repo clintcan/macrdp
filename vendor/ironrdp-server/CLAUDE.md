@@ -60,6 +60,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (28) | `zstd-safe` 8.2 instead of upstream's 7.2 (RustSec advisories in 7.x; QOIZ only compresses, so unreachable) | `Cargo.toml` only | — |
 | (29) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
+| (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -84,6 +85,16 @@ Notes on the port:
   already authenticated the client, and the credential validator still runs. Test:
   `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`. Upstream
   candidate.
+
+- **(31)** Added 2026-11-13 while live-testing clintcan/macrdp#219 (hide the pointer
+  while an app hides it). The fragmenter's `encode_next` returned `None` for an empty
+  payload, so `DisplayUpdate::HidePointer` and `DefaultPointer` produced no bytes at
+  all: macrdp logged `cursor hidden`, yet FreeRDP's `restoreCursor` never saw a null
+  pointer and Windows App kept the arrow. Only the 3-line `fast_path.rs` part of #2274
+  is taken; its pointer-promotion and RemoteFX-buffer changes are not. Test:
+  `conn_test::hidden_and_default_pointer_updates_reach_the_client` (fails without the
+  fix; catches a dropped `index == 0` guard and a `First` fragment). **Drop it at the
+  next pin bump** (any rev at or after `904a7da6`).
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
