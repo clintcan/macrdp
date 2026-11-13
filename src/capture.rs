@@ -1091,11 +1091,6 @@ mod macos {
     /// trips easily; backpressure flaps under heavy local CPU/IO last
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
-    /// How long after a capture starts a pre-EGFX frame is kept for
-    /// re-sending over H.264. The pipeline is normally ready ~100-250 ms
-    /// after the first frame; this only bounds the copy for a client that
-    /// never opens the graphics channel.
-    const EGFX_PENDING_FRAME_WINDOW: Duration = Duration::from_secs(5);
 
     /// Samples kept for a consumer that falls behind; the oldest is dropped.
     const SAMPLE_BUFFER: usize = 4;
@@ -1239,14 +1234,6 @@ mod macos {
         /// surface of SCK's pool, which is why the stream's queue depth is
         /// one above SCK's default (see `SCK_QUEUE_DEPTH`).
         last_frame: Option<CVPixelBuffer>,
-        /// A frame captured while the EGFX pipeline was still being negotiated
-        /// is waiting in `last_frame` to be re-sent over H.264 once it comes up
-        /// (see `promote_frame_to_egfx`).
-        egfx_pending_frame: bool,
-        /// When this capture started; bounds how long a frame is held for
-        /// `egfx_pending_frame` (a client that never opens the graphics
-        /// channel would otherwise have every legacy frame retained).
-        started_at: Instant,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
         display_suppressed: Option<Arc<AtomicBool>>,
@@ -1312,61 +1299,6 @@ mod macos {
         /// applied to `cursor`.
         live_pointer_scale: Option<(Arc<std::sync::atomic::AtomicU32>, f64)>,
         applied_pointer_scale: u32,
-    }
-
-    impl ScreenCaptureUpdates {
-        /// Once H.264 is up, re-send the frame captured before it was, and
-        /// drop the legacy bitmap strips still queued for that frame.
-        ///
-        /// The first frame of a connection is usually captured ~100 ms before
-        /// the EGFX channel is ready, so it goes out as legacy bitmaps: up to
-        /// eight 1280x720 strips at 3456x2168. Over a WAN those strips took
-        /// 38-68 s to send, and the H.264 stream waited behind them, so the
-        /// desktop painted strip by strip. The client draws the H.264 surface
-        /// over the whole desktop anyway, so the unsent strips are dropped.
-        fn promote_frame_to_egfx(&mut self) {
-            if !self.egfx_pending_frame {
-                return;
-            }
-            let Some(gfx) = self.gfx.as_ref() else {
-                self.egfx_pending_frame = false;
-                return;
-            };
-            if !gfx.pipeline_ready() {
-                if !gfx.pipeline_pending() {
-                    self.egfx_pending_frame = false; // declined, or the client left
-                }
-                return;
-            }
-            let queued = self.pending.len();
-            self.pending
-                .retain(|update| !matches!(update, DisplayUpdate::Bitmap(_)));
-            let Some(pb) = self.last_frame.as_ref() else {
-                self.egfx_pending_frame = false;
-                return;
-            };
-            let submitted = pb
-                .lock(CVPixelBufferLockFlags::READ_ONLY)
-                .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))
-                .and_then(|g| gfx.submit_bgra(g.as_slice(), g.bytes_per_row(), true));
-            match submitted {
-                Ok(true) => {
-                    self.egfx_pending_frame = false;
-                    self.seeded = true;
-                    self.first_egfx_frame_sent = true;
-                    self.flush_remaining = self.flush_frames;
-                    tracing::info!(
-                        dropped_bitmap_updates = queued - self.pending.len(),
-                        "EGFX ready — re-sent the pre-EGFX frame over H.264"
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    self.egfx_pending_frame = false;
-                    tracing::warn!(error = ?e, "EGFX submit_bgra failed");
-                }
-            }
-        }
     }
 
     impl ScreenCaptureUpdates {
@@ -1587,8 +1519,6 @@ mod macos {
                 flush_frames,
                 flush_remaining: 0,
                 last_frame: None,
-                egfx_pending_frame: false,
-                started_at: Instant::now(),
                 display_suppressed,
                 was_suppressed: false,
                 suppressed_since: None,
@@ -1849,8 +1779,6 @@ mod macos {
                     }
                 }
 
-                self.promote_frame_to_egfx();
-
                 if let Some(update) = self.pending.pop_front() {
                     return Ok(Some(update));
                 }
@@ -2091,17 +2019,7 @@ mod macos {
                             self.flush_remaining = self.flush_frames;
                             continue;
                         }
-                        Ok(false) => {
-                            // Not ready yet: this frame goes out as legacy
-                            // bitmaps, but retain it to re-send over H.264
-                            // once the pipeline comes up.
-                            if gfx.pipeline_pending()
-                                && self.started_at.elapsed() < EGFX_PENDING_FRAME_WINDOW
-                            {
-                                self.last_frame = Some(pixel_buffer.clone());
-                                self.egfx_pending_frame = true;
-                            }
-                        }
+                        Ok(false) => {}
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
                 }
