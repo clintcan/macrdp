@@ -24,11 +24,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.2** (Universal Clipboard promises are neither advertised
-nor read, so a Handoff item can't stall the session, #198; a failed attempt's clipboard backend
-leaves the live session's paste alone, #245; RDPDR mounts use `deadtimeout=60` and the reaper reads
-the mount table instead of stat'ing a possibly-dead mountpoint, #251). Next: the IDR-backoff no-op,
-the NFS NOENT log spam, and the mstsc UDP tunnel going dead.
+(VPN/ZeroTier). **Latest release: v0.10.3** (redirected-drive nodes are owned by the server's
+user so Finder writes, and a rename keeps the fileid and moves cached descendant paths, #253; the
+encoder schedules periodic keyframes because VideoToolbox ignores a mid-session
+MaxKeyFrameInterval change, and the IDR backoff stretch is capped at ~10 s of frames, #252).
+Next: Windows 10 mstsc fixes in review (#228, #230), and the mstsc UDP tunnel going dead.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

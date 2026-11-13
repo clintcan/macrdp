@@ -18,10 +18,11 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.10.2](https://github.com/clintcan/macrdp/releases/latest)** — the session no longer freezes on a Universal Clipboard (Handoff) item from another Apple device, a failed connection attempt can't break the live session's file paste, and restarting with a redirected drive no longer leaves a stuck mount.
+**Latest: [v0.10.3](https://github.com/clintcan/macrdp/releases/latest)** — Finder can write to a redirected drive and renames there keep working, and `--adaptive-bitrate`'s keyframe backoff now actually holds back keyframes on a congested link.
 
 **Recent releases**
 
+- **v0.10.2** (2026-11-13) — no session freezes from Universal Clipboard items; no stuck drive mount after a restart
 - **v0.10.1** (2026-11-12) — mstsc fixes: no drop after a blank-screen recovery, no adaptive-bitrate stutter on a LAN
 - **v0.10.0** (2026-11-12) — IronRDP update: stalled-client timeout, iOS Windows App cursor, mute-on-minimize for FreeRDP/Thincast
 - **v0.9.11** (2026-10-01) — input fixes: held modifiers on clicks, Ctrl+click→Cmd+click under `--map-ctrl-to-cmd`

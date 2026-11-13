@@ -4,6 +4,37 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.3 — Finder writes to redirected drives, and the keyframe backoff works
+
+A bug-fix release. By default, only drive redirection behaves differently; the keyframe change also applies to every H.264 session, but keeps the same cadence.
+
+- **Finder can write to a redirected drive (#253).**
+  - **The bug:** the drive's files and folders were reported as owned by "system", with read-only access for everyone else. Finder therefore treated the drive as read-only: New Folder silently did nothing, and a rename failed with "another operation is in progress". Commands in Terminal still worked, which is how this went unnoticed.
+  - **The fix:** files and folders are now reported as owned by the user macrdp runs as (the server process's uid/gid in the node attributes).
+- **Renaming a file or folder on a redirected drive keeps its identity (#253).** A rename used to give the item a new identity on our side, while Finder kept using the old one. The visible effect was an error logged every 5 seconds for as long as the Finder window stayed open; files inside a renamed folder could still be looked for at the folder's old location. A renamed item now keeps its identity, and the paths of everything inside a renamed folder move with it (`FsCache::rename`).
+- **`--adaptive-bitrate`'s keyframe backoff now takes effect (#252).**
+  - **The bug:** under congestion, the backoff is meant to hold back the periodic keyframe, but VideoToolbox ignores a keyframe-interval change made after encoding starts. So the backoff never did anything.
+  - **The fix:** the encoder now schedules the periodic keyframe itself (`keyframe_due`; VideoToolbox gets a never-firing `VT_KEYFRAME_BACKSTOP`).
+  - **The cap:** with the backoff working, a session that stays congested would get no healing keyframe at all, so the held-back interval is capped at about 10 s of frames (`stretched_keyframe_interval`; about a minute under the 10 fps floor).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 339 tests pass. The new tests were mutation-checked, including one on a real VideoToolbox session.
+- **Drive redirection:** live on a Mac mini with FreeRDP redirecting a folder.
+  - Before the fix, Finder refused New Folder and rename without sending a request.
+  - With only the ownership fix, a rename produced the error every 5 s.
+  - With both fixes, creating a folder and renaming a file and a folder produced no errors.
+- **Keyframes:** live with mstsc on Windows 11.
+  - With adaptive bitrate off, 37 keyframes went out, exactly 120 frames apart: the normal 2 s cadence, now from our scheduler.
+  - With adaptive bitrate on in a congested session, keyframes came every 600 frames instead of stopping.
+- **Not soaked:** the mini has run this exact code for about half an hour.
+
+**Known issues** (none are new in this release)
+
+- An mstsc window that has reconnected several times decodes video more slowly above ~2 Mbit/s, so `--adaptive-bitrate` can still briefly dip there. Closing and reopening mstsc avoids it.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+- Windows 10 mstsc can start an H.264 session frozen (#229). Fixes are in review (#228, #230).
+
 ## v0.10.2 — clipboard and drive redirection fixes
 
 A bug-fix release: the session no longer freezes when the Mac's clipboard holds something copied on another Apple device, and restarting macrdp with a redirected drive no longer leaves a stuck mount behind. By default, only clipboard sync and drive redirection behave differently.
