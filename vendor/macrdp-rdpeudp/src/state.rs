@@ -87,7 +87,19 @@ pub struct Config {
     /// Ignored unless `mode == Lossy`. Default `false` (every existing caller is
     /// byte-identical).
     pub duplicate_lossy_sends: bool,
+    /// Keepalive: once established, if nothing has been sent for this many ms,
+    /// send a pure ACK of the last received datagram. MS-RDPEUDP §3.1.1.9: "If
+    /// there is no data to send, each endpoint MUST periodically acknowledge the
+    /// last received datagram", and a peer that hears nothing for 65 s closes the
+    /// connection (MS-RDPEUDP2 §3.1.1.3 bounds the interval at 16 s). Without it a
+    /// tunnel carrying no data goes silent from our side and mstsc drops it 65 s
+    /// in. `0` disables.
+    pub keepalive_ms: u64,
 }
+
+/// Default [`Config::keepalive_ms`]: inside MS-RDPEUDP2's 16 s bound, and well
+/// inside MS-RDPEUDP's 65 s.
+pub const DEFAULT_KEEPALIVE_MS: u64 = 10_000;
 
 impl Default for Config {
     fn default() -> Self {
@@ -98,6 +110,7 @@ impl Default for Config {
             rto_ms: 300,
             mode: DeliveryMode::Reliable,
             duplicate_lossy_sends: false,
+            keepalive_ms: DEFAULT_KEEPALIVE_MS,
         }
     }
 }
@@ -155,6 +168,8 @@ pub struct RdpeudpState {
     out_queue: VecDeque<u8>,
     unacked: VecDeque<Unacked>,
     syn_last_sent_ms: u64,
+    /// When we last emitted any datagram; drives the keepalive.
+    last_sent_ms: u64,
 
     // Receive side.
     recv_next: u32,
@@ -190,6 +205,7 @@ impl RdpeudpState {
             out_queue: VecDeque::new(),
             unacked: VecDeque::new(),
             syn_last_sent_ms: 0,
+            last_sent_ms: 0,
             recv_next: 0,
             reorder: BTreeMap::new(),
             need_ack: false,
@@ -430,6 +446,21 @@ impl RdpeudpState {
         if sent_data || self.need_ack {
             self.need_ack = false;
         }
+
+        // Keepalive: nothing at all sent for `keepalive_ms` (this pump included).
+        if out.to_send.is_empty()
+            && self.cfg.keepalive_ms > 0
+            && now_ms.wrapping_sub(self.last_sent_ms) >= self.cfg.keepalive_ms
+        {
+            out.to_send.push(
+                Datagram::ack(self.ack_num(), self.cfg.recv_window, self.ack_vector())
+                    .encode()
+                    .expect("encode keepalive ack"),
+            );
+        }
+        if !out.to_send.is_empty() {
+            self.last_sent_ms = now_ms;
+        }
     }
 
     fn ack_num(&self) -> i32 {
@@ -550,6 +581,7 @@ mod tests {
             rto_ms: 100,
             mode: DeliveryMode::Reliable,
             duplicate_lossy_sends: false,
+            keepalive_ms: 0,
         }
     }
 
@@ -576,6 +608,102 @@ mod tests {
         let (c, s, _) = handshook();
         assert!(c.is_established());
         assert!(s.is_established());
+    }
+
+    /// A server whose handshake finished at `now` (the SYN+ACK was its last
+    /// send), with the given keepalive.
+    fn handshook_with_keepalive(keepalive_ms: u64) -> (RdpeudpState, RdpeudpState, u64) {
+        let mut client = RdpeudpState::new(Role::Client, cfg(1000));
+        let mut server = RdpeudpState::new(
+            Role::Server,
+            Config {
+                keepalive_ms,
+                ..cfg(9000)
+            },
+        );
+        let now = 0;
+        for dg in client.start(now).to_send {
+            for back in server.step(now, Some(&dg)).to_send {
+                client.step(now, Some(&back));
+            }
+        }
+        assert!(client.is_established() && server.is_established());
+        (client, server, now)
+    }
+
+    /// Idle ticks from `from` to `to` ms (inclusive) every `step` ms; returns
+    /// `(tick time, datagram)` for everything sent.
+    fn idle(sm: &mut RdpeudpState, from: u64, to: u64, step: u64) -> Vec<(u64, Vec<u8>)> {
+        let mut sent = Vec::new();
+        let mut t = from;
+        while t <= to {
+            for dg in sm.step(t, None).to_send {
+                sent.push((t, dg));
+            }
+            t += step;
+        }
+        sent
+    }
+
+    /// MS-RDPEUDP §3.1.1.9: with nothing to send, an endpoint must still
+    /// acknowledge the last received datagram periodically, or the peer drops
+    /// the connection after 65 s. An idle established server sends one pure
+    /// ACK every `keepalive_ms`, and nothing in between.
+    #[test]
+    fn an_idle_server_sends_keepalive_acks() {
+        let (_client, mut server, now) = handshook_with_keepalive(10_000);
+        let sent = idle(&mut server, now + 100, now + 35_000, 100);
+        let times: Vec<u64> = sent.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, [10_000, 20_000, 30_000]);
+        for (_, dg) in &sent {
+            let d = Datagram::decode(dg).expect("keepalive decodes");
+            assert!(
+                d.fec.flags.contains(crate::pdu::FecFlags::ACK),
+                "a keepalive is an ACK"
+            );
+            assert!(d.source.is_none() && d.syn.is_none(), "and carries no data");
+        }
+    }
+
+    /// Any send resets the keepalive clock, so a flow carrying data never gets
+    /// extra keepalives.
+    #[test]
+    fn a_send_postpones_the_keepalive() {
+        let (mut client, mut server, now) = handshook_with_keepalive(10_000);
+        assert!(idle(&mut server, now + 100, now + 8_000, 100).is_empty());
+        // Data at 8 s, acknowledged by the client, so nothing is retransmitted.
+        let data = server.enqueue(now + 8_000, b"data").to_send;
+        assert!(!data.is_empty());
+        for dg in data {
+            for ack in client.step(now + 8_000, Some(&dg)).to_send {
+                server.step(now + 8_000, Some(&ack));
+            }
+        }
+        let sent = idle(&mut server, now + 8_100, now + 18_500, 100);
+        let times: Vec<u64> = sent.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            times,
+            [18_000],
+            "first keepalive 10 s after the data, not at 10 s"
+        );
+    }
+
+    #[test]
+    fn keepalive_zero_disables_it() {
+        let (_client, mut server, now) = handshook_with_keepalive(0);
+        assert!(idle(&mut server, now + 100, now + 70_000, 100).is_empty());
+    }
+
+    /// The peer takes a keepalive as a plain ACK: nothing delivered, it stays
+    /// established, and it doesn't answer (a pure ACK is not acknowledged).
+    #[test]
+    fn the_peer_accepts_a_keepalive_quietly() {
+        let (mut client, mut server, now) = handshook_with_keepalive(10_000);
+        let sent = idle(&mut server, now + 100, now + 10_000, 100);
+        assert_eq!(sent.len(), 1);
+        let out = client.step(now + 10_000, Some(&sent[0].1));
+        assert!(out.delivered.is_empty() && out.to_send.is_empty());
+        assert!(client.is_established());
     }
 
     #[test]
@@ -640,6 +768,7 @@ mod tests {
                 rto_ms: 300,
                 mode: DeliveryMode::Reliable,
                 duplicate_lossy_sends: false,
+                keepalive_ms: 0,
             },
         );
         let out = server.step(0, Some(&client_syn));
@@ -1035,6 +1164,7 @@ mod tests {
             rto_ms,
             mode: DeliveryMode::Reliable,
             duplicate_lossy_sends: false,
+            keepalive_ms: 0,
         };
         let mut client = RdpeudpState::new(Role::Client, mk(client_isn));
         let mut server = RdpeudpState::new(Role::Server, mk(server_isn));
@@ -1194,6 +1324,7 @@ mod tests {
                 rto_ms: 50,
                 mode: DeliveryMode::Lossy,
                 duplicate_lossy_sends: false,
+                keepalive_ms: 0,
             };
             let mut client = RdpeudpState::new(Role::Client, mk(1000));
             let mut server = RdpeudpState::new(Role::Server, mk(9000));

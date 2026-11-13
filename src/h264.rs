@@ -48,6 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -309,6 +310,20 @@ struct ConnectionContext {
     /// usable, so the connect-time backlog never enters it). Fed to
     /// [`congested_hysteresis`]. See [`ConnectionContext::queue_delay_ms`].
     adaptive_delay_ewma: f64,
+    /// The last `2 * DELAY_TREND_WINDOW` usable queue-delay samples (oldest
+    /// first), for [`delay_trend`].
+    adaptive_delay_samples: VecDeque<f64>,
+    /// When the last bitrate decrease happened (for [`hold_trend_decrease`]).
+    adaptive_last_decrease_at: Option<Instant>,
+    /// The bitrate where the last congestion episode began (for
+    /// [`increase_step`]); set on an episode's first decrease.
+    adaptive_congestion_bps: Option<u32>,
+    /// Whether the controller is inside a decrease episode (cleared by an
+    /// increase), so `adaptive_congestion_bps` records its START.
+    adaptive_in_decrease_episode: bool,
+    /// While `Some`, the manual resync hotkey is draining the client's decoder
+    /// before its IDR (see [`resync_drain_step`]); the deadline caps the hold.
+    resync_drain_until: Option<Instant>,
     /// Hysteresis state: whether the controller is currently in a congestion episode
     /// (enters when the EWMA lag clears the high mark, exits below the low mark).
     adaptive_congested: bool,
@@ -345,6 +360,29 @@ struct ConnectionContext {
     /// `on_qoe_metrics` (which only sees the context, not the owning `Gfx`) can
     /// set the [`QoeEvidence::presented_clean`] latch. Not RTT-scaled.
     min_render_reports: u64,
+    /// Arrival times of the most recent zero-EDR QoE reports since the last
+    /// recovery attempt (newest at the back, at most
+    /// [`MAX_POST_ATTEMPT_BURST_ZEROS`]). Recorded only while
+    /// `blank_recovery_attempts > 0` and cleared when an attempt fires, so it
+    /// feeds just the post-attempt zero-burst arm of [`should_blank_recover`].
+    post_attempt_zero_at: VecDeque<Instant>,
+}
+
+/// Capacity of [`ConnectionContext::post_attempt_zero_at`], and so the ceiling
+/// for `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS`.
+const MAX_POST_ATTEMPT_BURST_ZEROS: u64 = 32;
+
+/// Time from the oldest of the last `k` post-attempt zero reports until `now`,
+/// or `None` when fewer than `k` have arrived (or `k == 0`). The input to the
+/// zero-burst arm of [`should_blank_recover`]. Pure, unit-tested.
+fn post_attempt_zero_span(zeros: &VecDeque<Instant>, k: u64, now: Instant) -> Option<Duration> {
+    let k = usize::try_from(k).ok()?;
+    if k == 0 || zeros.len() < k {
+        return None;
+    }
+    zeros
+        .get(zeros.len() - k)
+        .map(|oldest| now.saturating_duration_since(*oldest))
 }
 
 impl ConnectionContext {
@@ -548,13 +586,46 @@ struct BlankRecoveryParams {
     /// ACKED frames since the attempt (the post-attempt IDR + flush frames
     /// give a live client something to ack; no acks ⇒ nothing shipped ⇒
     /// nothing to conclude) and either total QoE silence while acking (the
-    /// blank tell — this client emitted QoE fine before the attempt) or
-    /// `blank_min_reports` CUMULATIVE zeros since the attempt (immune to the
-    /// interleaved blips, which reset the streak but not the tally). A healed
-    /// static-desktop mstsc emits a few honest nonzero reports and no zeros
-    /// post-heal, so it matches neither arm. RTT-scaled like `blank_max_wait`.
-    /// `MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS`, default 8000; 0 disables.
+    /// blank tell — this client emitted QoE fine before the attempt). The
+    /// interleaved-phantom case is owned by the zero-burst arm
+    /// ([`Self::post_attempt_burst_zeros`]) since 2026-11-12: this deadline used
+    /// to also fire on `blank_min_reports` (1) cumulative zero, which dropped a
+    /// healed static-desktop mstsc on its first clock-tick zero. RTT-scaled like
+    /// `blank_max_wait`. `MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS`, default 8000;
+    /// 0 disables.
     heal_confirm_deadline: Duration,
+    /// Post-attempt zero BURST (2026-11-12): once a recovery attempt has run,
+    /// escalate (normally to the drop) when this many zero-EDR reports arrived
+    /// within [`Self::post_attempt_burst_window`]. This replaces the
+    /// one-zero wall-clock fast path for the post-attempt phase, which dropped
+    /// sessions the reactivation had HEALED: live on mstsc (11-09, 11-10,
+    /// 11-12), a healed session showed presented runs of 0–31 and then a single
+    /// zero (a static desktop's menu-bar clock tick reports zero EDR on a
+    /// presenting mstsc), and the fast path dropped it — on a static desktop,
+    /// once a minute, in a loop. Every logged false drop had 1–2 zeros in its
+    /// window; every logged real blank had 3+. A density rule, not a running
+    /// count, because a healed static session accrues ~1 zero per minute
+    /// forever. Run length can't separate the cases: Windows App for macOS
+    /// shows phantom runs up to 18 while black (07-23), and its interleaved
+    /// zeros still form a burst. Withheld for an ESTABLISHED session (a heal
+    /// that reached `established_render_reports`): live 11-12 a 75-long heal
+    /// followed by 4 scattered zeros formed a burst and dropped a working
+    /// session; the established tier's slower paths own that case. Also
+    /// requires zeros to be at least half of the window's reports: with video
+    /// playing a healed mstsc emits scattered zeros (7-17% of the window,
+    /// live 11-12) that can still bunch into a burst.
+    /// Trade-off: a still-black, fully STATIC screen
+    /// is not escalated until something on it changes (the heal-confirmation
+    /// deadline still catches total QoE silence).
+    /// `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS`, default 3 (clamped to
+    /// 1..=[`MAX_POST_ATTEMPT_BURST_ZEROS`]).
+    post_attempt_burst_zeros: u64,
+    /// The window for [`Self::post_attempt_burst_zeros`]. Not RTT-scaled: a
+    /// longer window only makes the burst easier to meet, and a healed
+    /// session's zeros are ~a minute apart, far outside any sane value.
+    /// `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS`, default 10000; 0
+    /// disables the burst arm.
+    post_attempt_burst_window: Duration,
     /// Total attempts per connection. All attempts but the last REMAP the
     /// output to a fresh surface (non-destructive); the LAST attempt drops the
     /// connection so the client auto-reconnects (a fresh attempt renders with
@@ -581,7 +652,10 @@ struct BlankRecoveryParams {
     /// no QoE at all), the session is conclusively blank — fire without waiting
     /// for the full count. Safe to be prompt because the reactivation heal is
     /// non-destructive: an occasional early fire costs a brief re-handshake, not
-    /// a dropped session. `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
+    /// a dropped session. **Connect phase only** (no attempt yet): after an
+    /// attempt the next lever is the DROP, which is not cheap, and a single
+    /// zero is not evidence there — see [`Self::post_attempt_burst_zeros`].
+    /// `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
     blank_max_wait: Duration,
     /// Minimum all-zero QoE reports for the wall-clock fast-path (above). Its
     /// only job is to rule out a client that sends NO QoE (e.g. FreeRDP, which
@@ -826,6 +900,10 @@ impl QoeEvidence {
 /// - `acked_since_attempt`: whether the client has acknowledged frames since
 ///   the last recovery attempt — only consulted by the post-attempt
 ///   heal-confirmation deadline (see [`BlankRecoveryParams::heal_confirm_deadline`]).
+/// - `post_attempt_zero_span`: time from the oldest of the last
+///   `post_attempt_burst_zeros` zero reports since the last attempt until now
+///   ([`post_attempt_zero_span`]); `None` when fewer have arrived. Only
+///   consulted after an attempt (see [`BlankRecoveryParams::post_attempt_burst_zeros`]).
 #[allow(clippy::too_many_arguments)]
 fn should_blank_recover(
     qoe: QoeEvidence,
@@ -836,6 +914,7 @@ fn should_blank_recover(
     since_last_attempt: Duration,
     attempts: u32,
     acked_since_attempt: bool,
+    post_attempt_zero_span: Option<Duration>,
     p: &BlankRecoveryParams,
 ) -> bool {
     // Durable clean-presentation latch (v0.9.2): a connection that produced a
@@ -899,31 +978,60 @@ fn should_blank_recover(
     // either interleaved phantom nonzero reports (each one resetting
     // `zero_streak`) or total QoE silence — so the fallback drop, the lever
     // that actually recovers it, never fired and the user reconnected by hand.
-    // Once an attempt has run, the burden of proof flips: the session must
-    // show a sustained nonzero run within the deadline, or the escalation
-    // fires on cumulative-zero / silence evidence the blips can't reset.
+    // This arm owns the SILENT case: the client acks our post-attempt frames
+    // but sends no QoE report at all, so nothing else here can ever fire.
+    // (The interleaved case is the zero-burst arm below. This arm used to also
+    // fire on `blank_min_reports` cumulative zeros, i.e. ONE zero with the
+    // production default, which dropped a healed static-desktop mstsc whose
+    // only post-attempt report was a clock-tick zero — 11-10, window 1/1/0.)
     // `acked_since_attempt` keeps an idle session out (no frames shipped ⇒
-    // nothing to conclude), and `nonzero_max_since_reset < min_render_reports`
-    // implies `!presenting_now` below, so the arms can't fight.
-    let post_attempt_unconfirmed = attempts >= 1
+    // nothing to conclude).
+    let post_attempt_silent = attempts >= 1
         && !p.heal_confirm_deadline.is_zero()
         && since_last_attempt >= p.heal_confirm_deadline
         && acked_since_attempt
-        && qoe.nonzero_max_since_reset < p.min_render_reports
-        && (qoe.reports_since_reset == 0 || qoe.zeros_since_reset >= p.blank_min_reports);
+        && qoe.reports_since_reset == 0;
+    // Post-attempt zero BURST (2026-11-12, see the param doc): after an
+    // attempt, escalate on `post_attempt_burst_zeros` zero reports within
+    // `post_attempt_burst_window`. A density rule — immune to the interleaved
+    // phantom nonzeros (they don't remove zeros from the burst), yet a healed
+    // session's occasional clock-tick zero (~1/min) never forms one.
+    // Withheld once the session is ESTABLISHED (a 40+ run, ~5 s of picture):
+    // live 11-12, a reactivation healed mstsc into a 75-long run, then 4
+    // scattered zeros formed a burst and dropped a session the user saw
+    // working. An established session has its own, slower relapse paths
+    // (the 160-report count and the 30 s blackout above). The Windows App
+    // phantom runs (up to 18) stay well below the bar, so a real blank is
+    // still escalated here.
+    // Also needs zeros to be at least HALF of the reports since the attempt:
+    // live 11-12 (third round, YouTube playing) four reconnects healed into
+    // runs of 15-33 and then 3-4 dense zeros formed a burst — zeros were only
+    // 7-17% of their windows and the user saw the desktop each time. Every
+    // logged real blank was 73-100% zeros; the Windows App phantom pattern is
+    // mostly zeros by definition.
+    let post_attempt_zero_burst = attempts >= 1
+        && !established
+        && qoe.zeros_since_reset.saturating_mul(2) >= qoe.reports_since_reset
+        && !p.post_attempt_burst_window.is_zero()
+        && post_attempt_zero_span.is_some_and(|span| span <= p.post_attempt_burst_window);
     // Blank evidence: EITHER the full all-zero report count (fast on an active
-    // screen), OR the established wall-clock blackout above, OR the
-    // post-attempt heal-confirmation deadline above, OR — for a STATIC
-    // connect-time blank whose QoE trickles in slowly — enough wall-clock
-    // elapsed with at least `blank_min_reports` all-zero reports (which rules
-    // out a client that sends no QoE, e.g. FreeRDP, from ever firing on the
-    // wall-clock branch). That last fast path is withheld once the session is
-    // established: with `blank_min_reports` as low as 1, a single stray zero
-    // from a healthy long-running session would otherwise satisfy it.
+    // screen), OR the established wall-clock blackout above, OR one of the two
+    // post-attempt arms above, OR — for a STATIC connect-time blank whose QoE
+    // trickles in slowly — enough wall-clock elapsed with at least
+    // `blank_min_reports` all-zero reports (which rules out a client that
+    // sends no QoE, e.g. FreeRDP, from ever firing on the wall-clock branch).
+    // That last fast path is CONNECT-PHASE ONLY (`attempts == 0`): after an
+    // attempt the next lever is the drop, and a single zero after a heal is
+    // normal mstsc noise (it dropped healed sessions live, 11-09..11-12). It is
+    // also withheld once the session is established: with `blank_min_reports`
+    // as low as 1, a single stray zero from a healthy long-running session
+    // would otherwise satisfy it.
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
-        || post_attempt_unconfirmed
-        || (since_connect >= p.blank_max_wait
+        || post_attempt_silent
+        || post_attempt_zero_burst
+        || (attempts == 0
+            && since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
             && !established);
     blank_evidence
@@ -1047,6 +1155,148 @@ fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
     retransmit_delta > tolerance
 }
 
+/// How many queue-delay samples (one per control interval) each half of the
+/// trend comparison averages. Two halves of 3 at the 300 ms default interval
+/// compare the last ~0.9 s against the ~0.9 s before it.
+const DELAY_TREND_WINDOW: usize = 3;
+
+/// Direction of the standing queue delay over the last ~2 trend windows, from
+/// [`delay_trend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelayTrend {
+    /// Fewer than `2 * DELAY_TREND_WINDOW` samples yet. The controller falls
+    /// back to the original level-only rule, so a link that is congested from
+    /// the first second (a thin VPN) is still backed off before a trend exists.
+    Unknown,
+    /// The queue is growing: sending faster than the bottleneck drains.
+    Rising,
+    /// The queue is shrinking: a previous back-off is draining it.
+    Falling,
+    /// Neither: a standing delay that isn't growing. At a high level this is
+    /// mstsc's decode pipeline during video, not congestion (2026-11-12).
+    Flat,
+}
+
+/// Classify the trend of the recent queue-delay samples (oldest first): the
+/// mean of the newest `DELAY_TREND_WINDOW` against the mean of the window
+/// before it, with `rise_ms` as the dead band. Pure, unit-tested.
+///
+/// Why a trend at all (2026-11-12, mstsc build 26100 on gigabit Ethernet,
+/// YouTube at 1080p60): the delay sat FLAT at ~120 ms at 3 Mbit/s (samples
+/// 123, 121, 118, 120, 122) with the TCP send queue empty, because mstsc keeps
+/// ~10 frames of video in its decode pipeline. The level-only rule read that as
+/// congestion, cut the bitrate (which didn't move the delay: it stayed
+/// 118-148 ms all the way down to 0.5 Mbit/s), hit the 10 fps floor, and the
+/// fps cap cleared the delay, so it climbed back: a stutter every 3-5 s. A real
+/// backlog keeps GROWING while the sender is over capacity, so a growing delay
+/// is the congestion evidence; a flat one isn't.
+fn delay_trend(samples: &VecDeque<f64>, rise_ms: f64) -> DelayTrend {
+    if samples.len() < 2 * DELAY_TREND_WINDOW {
+        return DelayTrend::Unknown;
+    }
+    let n = samples.len();
+    let mean = |from: usize| {
+        samples.range(from..from + DELAY_TREND_WINDOW).sum::<f64>() / DELAY_TREND_WINDOW as f64
+    };
+    let delta = mean(n - DELAY_TREND_WINDOW) - mean(n - 2 * DELAY_TREND_WINDOW);
+    if delta > rise_ms {
+        DelayTrend::Rising
+    } else if delta < -rise_ms {
+        DelayTrend::Falling
+    } else {
+        DelayTrend::Flat
+    }
+}
+
+/// Whether the smoothed delay is pressure to back off this interval: above
+/// the hard `ceiling` (a delay only a real backlog reaches) whatever the trend,
+/// or above `high` while growing (or before a trend exists). A flat or falling
+/// delay below the ceiling isn't. Pure, unit-tested.
+fn delay_pressure(ewma: f64, high: f64, ceiling: f64, trend: DelayTrend) -> bool {
+    ewma > ceiling || (ewma > high && matches!(trend, DelayTrend::Rising | DelayTrend::Unknown))
+}
+
+/// Least time between two trend-driven decreases (2026-11-12, second live
+/// round): after a cut the measured delay keeps rising for ~1.5 s while the
+/// frames already in flight drain, so cutting every 300 ms interval while it
+/// rose overshot all the way to the floor and the 10 fps cap (live: 3 → 0.5
+/// Mbit/s in 1.5 s, delay still climbing to 366 ms). One cut per second lets
+/// each one take effect. Not applied above the hard ceiling or on loss.
+const TREND_DECREASE_SPACING: Duration = Duration::from_secs(1);
+
+/// The increase step near the last congestion point is the normal step
+/// divided by this (see [`increase_step`]).
+const SLOW_APPROACH_DIVISOR: u32 = 5;
+
+/// Whether a `Decrease` from the rate rule should be held back for spacing
+/// (see [`TREND_DECREASE_SPACING`]): only a decrease driven by a RISING delay
+/// below the hard ceiling, within the spacing of the last decrease. Loss, the
+/// ceiling, and the level-only fallback (`Unknown`) are never held. Pure,
+/// unit-tested.
+fn hold_trend_decrease(
+    retransmit_lossy: bool,
+    ewma: f64,
+    ceiling: f64,
+    trend: DelayTrend,
+    since_last_decrease: Option<Duration>,
+    spacing: Duration,
+) -> bool {
+    !retransmit_lossy
+        && ewma <= ceiling
+        && trend == DelayTrend::Rising
+        && since_last_decrease.is_some_and(|d| d < spacing)
+}
+
+/// The additive-increase step: the normal `increase_bps`, slowed to
+/// `increase_bps / SLOW_APPROACH_DIVISOR` once the target is within 80% of the
+/// bitrate where the last congestion episode began (`congestion_bps`), so the
+/// climb doesn't race straight back into the backlog it just left (the
+/// second live round: +250 kbit/s per 300 ms took it from 1 to 2.5 Mbit/s in
+/// 2 s, past the ~2 Mbit/s where the reconnected mstsc's delay starts
+/// growing). Pure, unit-tested.
+fn increase_step(target_bps: u32, congestion_bps: Option<u32>, increase_bps: u32) -> u32 {
+    match congestion_bps {
+        Some(p) if u64::from(target_bps) * 5 >= u64::from(p) * 4 => {
+            (increase_bps / SLOW_APPROACH_DIVISOR).max(1)
+        }
+        _ => increase_bps,
+    }
+}
+
+/// Note a decrease for the slow approach: the FIRST decrease of an episode
+/// records the bitrate it started from (the trouble point [`increase_step`]
+/// slows down near); later cuts in the same episode leave it, or the point
+/// would sink to the floor with the cuts and slow the whole climb back. An
+/// increase ends the episode (the caller clears `in_episode`).
+fn note_decrease(in_episode: &mut bool, congestion_bps: &mut Option<u32>, target_bps: u32) {
+    if !*in_episode {
+        *in_episode = true;
+        *congestion_bps = Some(target_bps);
+    }
+}
+
+/// Seconds of frames the IDR backoff stretches the periodic-keyframe interval to
+/// (see [`stretched_keyframe_interval`]).
+const STRETCHED_KEYFRAME_SECS: u32 = 10;
+
+/// The keyframe interval (frames) the IDR backoff uses under congestion: about
+/// [`STRETCHED_KEYFRAME_SECS`] of frames at the configured rate, and always
+/// longer than the normal interval. Pure; unit-tested.
+///
+/// It was ~10 minutes, which was harmless only because the stretch never took
+/// effect (VideoToolbox ignored it; fixed 2026-11-13 by scheduling keyframes in
+/// the encoder). Once it did, a session that stayed congested sent no healing
+/// keyframe at all, because the backoff is only lifted when the bitrate climbs
+/// back to the ceiling: live on 11-13 (mstsc decoding in software inside a
+/// remote Windows session) one keyframe went out in 2.5 minutes, so a decode
+/// glitch would have stayed on screen. Ten seconds still keeps the 2 s periodic
+/// IDR off a congested link. It counts frames, so under the 10 fps floor it
+/// stretches to about a minute.
+fn stretched_keyframe_interval(fps: u32, normal_keyframe_frames: u32) -> u32 {
+    fps.saturating_mul(STRETCHED_KEYFRAME_SECS)
+        .max(normal_keyframe_frames.saturating_add(1))
+}
+
 /// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
 /// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
 /// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
@@ -1059,10 +1309,20 @@ fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
 /// immediately (a definite loss, no smoothing). With acks unusable (suspended / not yet
 /// seen / cold-start warmup), the lag is uninferable so only the retransmit signal
 /// counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+///
+/// **Trend (2026-11-12):** `trend` and `ceiling` refine the delay rule (see
+/// [`delay_trend`]). Enter on [`delay_pressure`]. Stay while the delay is above
+/// `low` and still moving (rising, or falling as a back-off drains it), or
+/// above `ceiling`; a FLAT delay below the ceiling ends the episode, because a
+/// standing delay that isn't growing is not a backlog. With `DelayTrend::Unknown`
+/// this is exactly the original level-only rule.
+#[allow(clippy::too_many_arguments)]
 fn congested_hysteresis(
     ewma_lag: f64,
     high: f64,
     low: f64,
+    ceiling: f64,
+    trend: DelayTrend,
     retransmit_lossy: bool,
     acks_usable: bool,
     currently_congested: bool,
@@ -1074,9 +1334,12 @@ fn congested_hysteresis(
         return false;
     }
     if currently_congested {
-        ewma_lag > low // stay congested until the smoothed lag drops below the low mark
+        // stay congested until the smoothed lag drops below the low mark, or
+        // stops moving below the ceiling
+        ewma_lag > ceiling || (ewma_lag > low && trend != DelayTrend::Flat)
     } else {
-        ewma_lag > high // only enter once the smoothed lag clears the high mark
+        // only enter on real pressure (see `delay_pressure`)
+        delay_pressure(ewma_lag, high, ceiling, trend)
     }
 }
 
@@ -1102,19 +1365,60 @@ enum RateAction {
 /// increase once cleared. So a single spike = one step down then a plateau, while
 /// *sustained* congestion (lag stays above `high`) keeps decreasing toward the floor.
 /// Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+///
+/// With a trend (2026-11-12) the decrease needs [`delay_pressure`]: a flat or
+/// draining delay below `ceiling` holds or increases instead of cutting.
 fn rate_action(
     ewma_lag: f64,
     high: f64,
+    ceiling: f64,
+    trend: DelayTrend,
     retransmit_lossy: bool,
     acks_usable: bool,
     congested: bool,
 ) -> RateAction {
-    if retransmit_lossy || (acks_usable && ewma_lag > high) {
+    if retransmit_lossy || (acks_usable && delay_pressure(ewma_lag, high, ceiling, trend)) {
         RateAction::Decrease
     } else if !congested {
         RateAction::Increase
     } else {
         RateAction::Hold
+    }
+}
+
+/// Longest the manual resync hotkey holds new video while the client's
+/// decoder empties (see [`resync_drain_step`]).
+const RESYNC_DRAIN_MAX: Duration = Duration::from_millis(2000);
+
+/// What the manual-resync video drain does with this capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResyncDrain {
+    /// Not draining: ship normally.
+    Off,
+    /// Still draining: drop this capture (the armed IDR waits).
+    Hold,
+    /// The drain just ended (the client acked everything shipped, or the cap
+    /// ran out): ship this capture, which carries the armed IDR.
+    Done,
+}
+
+/// Pure decision for the manual-resync video drain (2026-11-12). The hotkey
+/// used to arm only an IDR, which then queued BEHIND the video backlog in
+/// mstsc's decoder, so the drift stayed; minimize→restore fixed it because
+/// SuppressOutput stops video for over a second first. The drain does the
+/// same: hold new captures until the client has acknowledged every frame we
+/// shipped (FrameAcknowledge comes after decode, so its decoder is then
+/// empty), at most `RESYNC_DRAIN_MAX`, then ship the IDR. Unit-tested.
+fn resync_drain_step(
+    drain_until: Option<Instant>,
+    now: Instant,
+    last_shipped: u64,
+    last_acked: u64,
+) -> ResyncDrain {
+    match drain_until {
+        None => ResyncDrain::Off,
+        Some(until) if last_acked >= last_shipped || now >= until => ResyncDrain::Done,
+        Some(_) => ResyncDrain::Hold,
     }
 }
 
@@ -1264,6 +1568,17 @@ pub struct Gfx {
     /// queue is unambiguous congestion at any RTT (LEDBAT's classic target);
     /// `MACRDP_ADAPTIVE_QUEUE_HIGH_MS` overrides.
     adaptive_queue_high_ms: f64,
+    /// Dead band (ms) for the queue-delay trend ([`delay_trend`]): the mean of
+    /// the last ~0.9 s must differ from the ~0.9 s before by more than this to
+    /// count as rising or falling. 20 ms ≈ a backlog growing ~22 ms/s, i.e.
+    /// sending a few percent over the bottleneck. `MACRDP_ADAPTIVE_QUEUE_RISE_MS`.
+    adaptive_queue_rise_ms: f64,
+    /// Hard ceiling (ms): a smoothed delay above this is congestion whatever its
+    /// trend, so a backlog that has stopped growing at a very high level is
+    /// still worked down. Well above mstsc's ~120 ms video decode depth.
+    /// Clamped to at least `adaptive_queue_high_ms`.
+    /// `MACRDP_ADAPTIVE_QUEUE_CEILING_MS`, default 400.
+    adaptive_queue_ceiling_ms: f64,
     /// EWMA weight on each new queue-delay sample in (0,1]: `ewma = α·sample +
     /// (1−α)·ewma`. Smooths the spiky raw signal so single bursts don't pump the
     /// bitrate; lower = more smoothing (slower reaction). Default 0.3;
@@ -1418,6 +1733,16 @@ impl Gfx {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&n| n > 0.0)
             .unwrap_or(100.0);
+        let env_ms_f64 = |name: &str, default: f64| -> f64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|&n| n > 0.0)
+                .unwrap_or(default)
+        };
+        let adaptive_queue_rise_ms = env_ms_f64("MACRDP_ADAPTIVE_QUEUE_RISE_MS", 20.0);
+        let adaptive_queue_ceiling_ms =
+            env_ms_f64("MACRDP_ADAPTIVE_QUEUE_CEILING_MS", 400.0).max(adaptive_queue_high_ms);
         // EWMA smoothing weight for the queue-delay signal (clamped to (0,1]); default 0.3.
         let adaptive_ewma_alpha = std::env::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
             .ok()
@@ -1438,12 +1763,10 @@ impl Gfx {
         let adaptive_floor_fps = env_u32("MACRDP_ADAPTIVE_FLOOR_FPS", 10).max(1);
         let adaptive_min_fps_interval = Duration::from_millis(1000 / u64::from(adaptive_floor_fps));
         // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
-        // derivation as Encoder::new), and a stretched value (~10 min) that
-        // effectively suppresses the periodic IDR for the duration of a congestion
-        // episode without a hard "never" (VT still honors forced keyframes).
+        // derivation as Encoder::new), and the stretched value used under congestion.
         let normal_keyframe_frames =
             (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let stretched_keyframe_frames = fps.saturating_mul(600).max(normal_keyframe_frames + 1);
+        let stretched_keyframe_frames = stretched_keyframe_interval(fps, normal_keyframe_frames);
         // Blank-presentation recovery (the mstsc reconnect-blank): on by default —
         // it only ever acts on the pcap-proven blank signature (QoE acks flowing
         // with decode+render time zero on EVERY frame of a whole window), so a
@@ -1516,6 +1839,16 @@ impl Gfx {
             max_rtt_ms: env_u32_zero_ok("MACRDP_BLANK_RECOVERY_MAX_RTT_MS", 80),
             blank_max_wait: watchdog_ms("MACRDP_BLANK_RECOVERY_MAX_WAIT_MS", 4000),
             blank_min_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS", 1)),
+            post_attempt_burst_zeros: u64::from(env_u32(
+                "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+                3,
+            ))
+            .clamp(1, MAX_POST_ATTEMPT_BURST_ZEROS),
+            // Allows an explicit 0 (= disable the burst arm), so not watchdog_ms.
+            post_attempt_burst_window: Duration::from_millis(u64::from(env_u32_zero_ok(
+                "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+                10_000,
+            ))),
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
@@ -1539,6 +1872,8 @@ impl Gfx {
                 decrease = adaptive_decrease,
                 interval_ms = adaptive_interval.as_millis() as u64,
                 queue_high_ms = adaptive_queue_high_ms,
+                queue_rise_ms = adaptive_queue_rise_ms,
+                queue_ceiling_ms = adaptive_queue_ceiling_ms,
                 ewma_alpha = adaptive_ewma_alpha,
                 normal_keyframe_frames,
                 stretched_keyframe_frames,
@@ -1571,6 +1906,8 @@ impl Gfx {
             adaptive_decrease,
             adaptive_interval,
             adaptive_queue_high_ms,
+            adaptive_queue_rise_ms,
+            adaptive_queue_ceiling_ms,
             adaptive_ewma_alpha,
             adaptive_retx_tolerance,
             normal_keyframe_frames,
@@ -1832,6 +2169,11 @@ impl Gfx {
                         // alive and decoding our post-attempt IDR/flush frames
                         // (feeds the post-attempt heal-confirmation deadline).
                         ctx.last_ack_advance_at > ctx.last_blank_recovery_at,
+                        post_attempt_zero_span(
+                            &ctx.post_attempt_zero_at,
+                            p.post_attempt_burst_zeros,
+                            now,
+                        ),
                         p,
                     )
                 }) {
@@ -1876,6 +2218,9 @@ impl Gfx {
                         let window_zeros = ctx.qoe.zeros_since_reset;
                         let window_best_run = ctx.qoe.nonzero_max_since_reset;
                         ctx.qoe.reset_streaks();
+                        // A new evidence window: the next attempt needs its
+                        // own burst (see `post_attempt_burst_zeros`).
+                        ctx.post_attempt_zero_at.clear();
                         let (w, h) = ctx.dims;
                         if action == BlankAction::Reactivate {
                             // The surface survives the core reactivation, so the
@@ -1920,6 +2265,28 @@ impl Gfx {
                             "EGFX client is decoding but not presenting (QoE decode+render \
                              time zero across the whole window — the reconnect-blank) — \
                              running blank recovery"
+                        );
+                    }
+                }
+            }
+            // Manual-resync drain (the Ctrl+Alt+Shift+R hotkey): hold new
+            // captures until the client's decoder has emptied, then let the
+            // armed IDR through (see `resync_drain_step`). Dropping before
+            // encode keeps the reference chain valid, and `need_keyframe`
+            // persists across the drop. No-op unless the hotkey was pressed.
+            {
+                let now = Instant::now();
+                let shipped = ctx.last_shipped_frame_id.load(Ordering::Relaxed);
+                let acked = ctx.last_acked_frame_id.load(Ordering::Relaxed);
+                match resync_drain_step(ctx.resync_drain_until, now, shipped, acked) {
+                    ResyncDrain::Off => {}
+                    ResyncDrain::Hold => return Ok(true),
+                    ResyncDrain::Done => {
+                        ctx.resync_drain_until = None;
+                        info!(
+                            unacked_frames = shipped.saturating_sub(acked),
+                            "manual A/V resync: client decoder drained (or the cap ran out) — \
+                             shipping the IDR"
                         );
                     }
                 }
@@ -2060,9 +2427,7 @@ impl Gfx {
                 }
             }
             if let Some(frames) = adaptive.keyframe_frames {
-                if let Err(e) = encoder.set_keyframe_interval(frames) {
-                    trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
-                }
+                encoder.set_keyframe_interval(frames);
             }
             match frame {
                 FrameInput::Bgra { bgra, stride } => {
@@ -2134,6 +2499,10 @@ impl Gfx {
             }
             // Stale UDP-side smoothing state doesn't apply to the fresh TCP path.
             ctx.adaptive_delay_ewma = 0.0;
+            ctx.adaptive_delay_samples.clear();
+            ctx.adaptive_last_decrease_at = None;
+            ctx.adaptive_congestion_bps = None;
+            ctx.adaptive_in_decrease_episode = false;
             ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
@@ -2208,7 +2577,12 @@ impl Gfx {
         if signal_usable {
             ctx.adaptive_delay_ewma = self.adaptive_ewma_alpha * sample_ms
                 + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_delay_ewma;
+            if ctx.adaptive_delay_samples.len() >= 2 * DELAY_TREND_WINDOW {
+                ctx.adaptive_delay_samples.pop_front();
+            }
+            ctx.adaptive_delay_samples.push_back(sample_ms);
         }
+        let trend = delay_trend(&ctx.adaptive_delay_samples, self.adaptive_queue_rise_ms);
         // Per-interval visibility even when the target doesn't change (the
         // adjusted-line below only logs on a change; Hold periods were opaque).
         trace!(
@@ -2217,14 +2591,18 @@ impl Gfx {
             ack_lag,
             acks_usable,
             distress,
+            ?trend,
             target_bps = ctx.adaptive_target_bps,
             "EGFX adaptive controller interval"
         );
         let high = self.adaptive_queue_high_ms;
+        let ceiling_ms = self.adaptive_queue_ceiling_ms;
         let congested = congested_hysteresis(
             ctx.adaptive_delay_ewma,
             high,
             high * 0.5, // exit threshold (hysteresis low mark)
+            ceiling_ms,
+            trend,
             retransmit_lossy,
             signal_usable,
             ctx.adaptive_congested,
@@ -2237,28 +2615,61 @@ impl Gfx {
         let action = rate_action(
             ctx.adaptive_delay_ewma,
             high,
+            ceiling_ms,
+            trend,
             retransmit_lossy,
             signal_usable,
             congested,
         );
+        // Let each trend-driven cut take effect before the next (see
+        // `TREND_DECREASE_SPACING`): hold instead.
+        let action = if action == RateAction::Decrease
+            && hold_trend_decrease(
+                retransmit_lossy,
+                ctx.adaptive_delay_ewma,
+                ceiling_ms,
+                trend,
+                ctx.adaptive_last_decrease_at
+                    .map(|t| now.saturating_duration_since(t)),
+                TREND_DECREASE_SPACING,
+            ) {
+            RateAction::Hold
+        } else {
+            action
+        };
         let new_target = match action {
             RateAction::Hold => ctx.adaptive_target_bps,
-            RateAction::Decrease => aimd_bitrate(
-                ctx.adaptive_target_bps,
-                1,
-                self.adaptive_floor_bps,
-                ceiling,
-                self.adaptive_increase_bps,
-                self.adaptive_decrease,
-            ),
-            RateAction::Increase => aimd_bitrate(
-                ctx.adaptive_target_bps,
-                0,
-                self.adaptive_floor_bps,
-                ceiling,
-                self.adaptive_increase_bps,
-                self.adaptive_decrease,
-            ),
+            RateAction::Decrease => {
+                note_decrease(
+                    &mut ctx.adaptive_in_decrease_episode,
+                    &mut ctx.adaptive_congestion_bps,
+                    ctx.adaptive_target_bps,
+                );
+                ctx.adaptive_last_decrease_at = Some(now);
+                aimd_bitrate(
+                    ctx.adaptive_target_bps,
+                    1,
+                    self.adaptive_floor_bps,
+                    ceiling,
+                    self.adaptive_increase_bps,
+                    self.adaptive_decrease,
+                )
+            }
+            RateAction::Increase => {
+                ctx.adaptive_in_decrease_episode = false;
+                aimd_bitrate(
+                    ctx.adaptive_target_bps,
+                    0,
+                    self.adaptive_floor_bps,
+                    ceiling,
+                    increase_step(
+                        ctx.adaptive_target_bps,
+                        ctx.adaptive_congestion_bps,
+                        self.adaptive_increase_bps,
+                    ),
+                    self.adaptive_decrease,
+                )
+            }
         };
         if new_target != ctx.adaptive_target_bps {
             let prev = ctx.adaptive_target_bps;
@@ -2269,6 +2680,7 @@ impl Gfx {
                 ewma_queue_ms = ctx.adaptive_delay_ewma,
                 ack_lag,
                 retransmit_delta,
+                ?trend,
                 ?action,
                 prev_bps = prev,
                 new_bps = new_target,
@@ -2592,13 +3004,22 @@ impl Gfx {
     /// flicker). If a plain IDR turns out not to un-blank the surface-retention
     /// case on some client, [`request_reactivation`] is the heavier escalation.
     /// `capture.rs` calls this when it observes the flag.
+    ///
+    /// Since 2026-11-12 it first DRAINS the client: new video is held until
+    /// the client has acknowledged everything already shipped (at most
+    /// [`RESYNC_DRAIN_MAX`]), so the IDR doesn't queue behind a video backlog.
+    /// See [`resync_drain_step`].
     pub(crate) fn force_keyframe(&self) {
         if let Ok(mut guard) = self.ctx.lock() {
             if let Some(ctx) = guard.as_mut() {
                 ctx.need_keyframe = true;
+                ctx.resync_drain_until = Some(Instant::now() + RESYNC_DRAIN_MAX);
             }
         }
-        info!("manual A/V resync (Ctrl+Alt+Shift+R): forcing an IDR keyframe");
+        info!(
+            "manual A/V resync (Ctrl+Alt+Shift+R): draining the client's video queue, then \
+             forcing an IDR keyframe"
+        );
     }
 
     /// Heavier manual-resync escalation: request the same bare core
@@ -2924,6 +3345,11 @@ impl GfxServerFactory for Gfx {
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
             adaptive_delay_ewma: 0.0,
+            adaptive_delay_samples: VecDeque::with_capacity(2 * DELAY_TREND_WINDOW),
+            adaptive_last_decrease_at: None,
+            adaptive_congestion_bps: None,
+            adaptive_in_decrease_episode: false,
+            resync_drain_until: None,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
             qoe: QoeEvidence::default(),
@@ -2933,6 +3359,7 @@ impl GfxServerFactory for Gfx {
             link_rtt_ms,
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
+            post_attempt_zero_at: VecDeque::new(),
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -2968,6 +3395,21 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
     })
 }
 
+/// One log entry for a capability set that didn't parse: its version, the first
+/// four data bytes read as the flags word (every EGFX capset starts with one), and
+/// why it didn't parse. Never prints more than the flags word, so a long or
+/// garbage body can't flood the log.
+fn describe_unparsed_capset(version: u32, data: &[u8], reason: &str) -> String {
+    let flags = match data.first_chunk::<4>() {
+        Some(word) => format!("{:#010x}", u32::from_le_bytes(*word)),
+        None => "none".to_owned(),
+    };
+    format!(
+        "version={version:#010x} flags={flags} len={} ({reason})",
+        data.len()
+    )
+}
+
 /// Per-connection EGFX state callbacks from upstream `GraphicsPipelineServer`.
 /// MUST NOT lock `server_handle` from these — the server mutex is already held.
 struct GfxHandler {
@@ -2998,11 +3440,27 @@ impl GraphicsPipelineHandler for GfxHandler {
             .filter_map(|raw| raw.parsed().ok().flatten())
             .collect();
         let supports_avc = caps_indicate_avc(&typed);
+        // The sets that didn't parse, with their raw version and flags, so a
+        // client whose AVC support hides in a set this build can't read shows
+        // up in the log (#211).
+        let unparsed: Vec<String> = pdu
+            .0
+            .iter()
+            .filter_map(|raw| {
+                let reason = match raw.parsed() {
+                    Ok(Some(_)) => return None,
+                    Ok(None) => "unknown version".to_owned(),
+                    Err(e) => format!("decode error: {e}"),
+                };
+                Some(describe_unparsed_capset(raw.version.0, &raw.data, &reason))
+            })
+            .collect();
         info!(
             count = pdu.0.len(),
             parsed_count = typed.len(),
             supports_avc,
             caps = ?typed,
+            unparsed = ?unparsed,
             "EGFX: client advertised capabilities"
         );
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
@@ -3146,6 +3604,13 @@ impl GraphicsPipelineHandler for GfxHandler {
             ctx.qoe.record(metrics.time_diff_dr);
             if metrics.time_diff_dr > 0 {
                 ctx.last_nonzero_qoe_at = Instant::now();
+            } else if ctx.blank_recovery_attempts > 0 {
+                // Feeds the post-attempt zero-burst arm of
+                // `should_blank_recover`; bounded (oldest dropped).
+                if ctx.post_attempt_zero_at.len() as u64 >= MAX_POST_ATTEMPT_BURST_ZEROS {
+                    ctx.post_attempt_zero_at.pop_front();
+                }
+                ctx.post_attempt_zero_at.push_back(Instant::now());
             }
             // INFO (not debug) deliberately, and rare (once per recovery
             // attempt): the deployed agent runs at RUST_LOG=info, and the
@@ -3273,6 +3738,38 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #211: the iOS client sends two capsets this build can't parse. The log
+    /// line must say which versions they are, and the flags, without dumping
+    /// the body.
+    #[test]
+    fn unparsed_capsets_log_version_and_flags_only() {
+        use ironrdp_egfx::pdu::{CapabilityVersion, RawCapabilitySet};
+
+        // An undocumented "Azure" version FreeRDP knows about: unknown here.
+        let azure =
+            RawCapabilitySet::new(CapabilityVersion(0x000B_0101), vec![0x20, 0x00, 0x00, 0x00]);
+        assert!(matches!(azure.parsed(), Ok(None)));
+        assert_eq!(
+            describe_unparsed_capset(azure.version.0, &azure.data, "unknown version"),
+            "version=0x000b0101 flags=0x00000020 len=4 (unknown version)"
+        );
+
+        // A known version with a body too short to hold its flags word.
+        let short = RawCapabilitySet::new(CapabilityVersion::V10_7, vec![0x01]);
+        let e = short.parsed().unwrap_err();
+        assert_eq!(
+            describe_unparsed_capset(short.version.0, &short.data, &format!("decode error: {e}")),
+            format!("version=0x000a0701 flags=none len=1 (decode error: {e})")
+        );
+
+        // A long body still logs only the flags word.
+        let long = describe_unparsed_capset(0x000B_0300, &[0xAA; 4096], "unknown version");
+        assert_eq!(
+            long,
+            "version=0x000b0300 flags=0xaaaaaaaa len=4096 (unknown version)"
+        );
+    }
 
     fn recovery_params() -> RecoveryParams {
         RecoveryParams {
@@ -3638,29 +4135,111 @@ mod tests {
         assert!(retransmit_is_lossy(1, 0));
     }
 
-    // congested_hysteresis(ewma_lag, high, low, retransmit_lossy, acks_usable, currently)
+    // congested_hysteresis(ewma_lag, high, low, ceiling, trend, retransmit_lossy, acks_usable, currently)
+    // These tests pass an infinite ceiling + DelayTrend::Unknown = the original level-only rule.
     #[test]
     fn hysteresis_enters_only_above_high() {
         // Not yet congested: enter only once the smoothed lag clears the HIGH mark.
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // below high
-        assert!(!congested_hysteresis(12.0, 12.0, 6.0, false, true, false)); // exactly at
-        assert!(congested_hysteresis(13.0, 12.0, 6.0, false, true, false)); // above high
+        assert!(!congested_hysteresis(
+            10.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // below high
+        assert!(!congested_hysteresis(
+            12.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // exactly at
+        assert!(congested_hysteresis(
+            13.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // above high
     }
 
     #[test]
     fn hysteresis_stays_until_below_low() {
         // Already congested: stay through the (low, high] band, exit at or below low.
-        assert!(congested_hysteresis(9.0, 12.0, 6.0, false, true, true)); // in the band → stay
-        assert!(congested_hysteresis(7.0, 12.0, 6.0, false, true, true)); // just above low → stay
-        assert!(!congested_hysteresis(6.0, 12.0, 6.0, false, true, true)); // at low → exit
-        assert!(!congested_hysteresis(5.0, 12.0, 6.0, false, true, true)); // below low → exit
+        assert!(congested_hysteresis(
+            9.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // in the band → stay
+        assert!(congested_hysteresis(
+            7.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // just above low → stay
+        assert!(!congested_hysteresis(
+            6.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // at low → exit
+        assert!(!congested_hysteresis(
+            5.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // below low → exit
     }
 
     #[test]
     fn hysteresis_retransmit_forces_congested() {
         // Loss above the tolerance is a definite loss → congested regardless of lag/acks.
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, true, false));
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, false, false)); // even acks-unusable
+        assert!(congested_hysteresis(
+            0.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            true,
+            true,
+            false
+        ));
+        assert!(congested_hysteresis(
+            0.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            true,
+            false,
+            false
+        )); // even acks-unusable
     }
 
     #[test]
@@ -3668,10 +4247,24 @@ mod tests {
         // Acks suspended / cold-start: lag uninferable → not congested (no retransmit),
         // and a stale-high EWMA can't keep an episode latched.
         assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, false
+            10_000.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            false,
+            false
         ));
         assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, true
+            10_000.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            false,
+            true
         ));
     }
 
@@ -3679,23 +4272,564 @@ mod tests {
     fn hysteresis_transport_specific_high() {
         // Same smoothed lag enters congestion at the UDP high (8) but not the TCP high
         // (12) — TCP's send buffer adds baseline depth, so it needs a higher mark.
-        assert!(congested_hysteresis(10.0, 8.0, 4.0, false, true, false)); // UDP
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // TCP
+        assert!(congested_hysteresis(
+            10.0,
+            8.0,
+            4.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // UDP
+        assert!(!congested_hysteresis(
+            10.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // TCP
     }
 
-    // rate_action(ewma_lag, high, retransmit_lossy, acks_usable, congested)
+    #[test]
+    fn resync_drain_holds_until_the_client_catches_up_or_the_cap() {
+        let t0 = Instant::now();
+        let until = Some(t0 + RESYNC_DRAIN_MAX);
+        // Not pressed → ship normally.
+        assert_eq!(resync_drain_step(None, t0, 100, 90), ResyncDrain::Off);
+        // Pressed, 10 frames still in the client's decoder → hold.
+        assert_eq!(resync_drain_step(until, t0, 100, 90), ResyncDrain::Hold);
+        assert_eq!(
+            resync_drain_step(until, t0 + ms(1_999), 100, 99),
+            ResyncDrain::Hold
+        );
+        // Everything shipped is acked → done (ship the IDR now).
+        assert_eq!(
+            resync_drain_step(until, t0 + ms(300), 100, 100),
+            ResyncDrain::Done
+        );
+        // Acks never catch up (suspended, or a stuck client) → the cap ends it.
+        assert_eq!(
+            resync_drain_step(until, t0 + RESYNC_DRAIN_MAX, 100, 40),
+            ResyncDrain::Done
+        );
+    }
+
+    fn delay_samples(v: &[f64]) -> VecDeque<f64> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn delay_trend_classifies_rising_falling_flat_and_unknown() {
+        // Fewer than two windows → Unknown (level-only fallback).
+        assert_eq!(
+            delay_trend(&delay_samples(&[10.0, 50.0, 90.0, 130.0, 170.0]), 20.0),
+            DelayTrend::Unknown
+        );
+        // The measured mstsc plateau at 3 Mbit/s (11-12): flat.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[123.0, 121.0, 118.0, 120.0, 122.0, 121.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+        // The measured ramp into it (72, 72, 80 → 99, 103, 150): rising.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[72.0, 72.0, 80.0, 99.0, 103.0, 150.0]),
+                20.0
+            ),
+            DelayTrend::Rising
+        );
+        // A back-off draining a queue: falling.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[300.0, 280.0, 260.0, 200.0, 170.0, 140.0]),
+                20.0
+            ),
+            DelayTrend::Falling
+        );
+        // One jittery sample at the window edge doesn't flip it: the halves
+        // are averaged (110 vs 120 = +10, Flat), though the endpoints alone
+        // differ by 60.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[100.0, 130.0, 100.0, 100.0, 100.0, 160.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+        // Exactly the dead band either way is still Flat.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[100.0, 100.0, 100.0, 120.0, 120.0, 120.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+    }
+
+    #[test]
+    fn delay_pressure_needs_growth_below_the_ceiling() {
+        // Above high: only Rising (or Unknown, the old rule) is pressure.
+        assert!(delay_pressure(150.0, 100.0, 400.0, DelayTrend::Rising));
+        assert!(delay_pressure(150.0, 100.0, 400.0, DelayTrend::Unknown));
+        assert!(!delay_pressure(150.0, 100.0, 400.0, DelayTrend::Flat));
+        assert!(!delay_pressure(150.0, 100.0, 400.0, DelayTrend::Falling));
+        // Above the ceiling: always pressure.
+        for t in [
+            DelayTrend::Flat,
+            DelayTrend::Falling,
+            DelayTrend::Rising,
+            DelayTrend::Unknown,
+        ] {
+            assert!(delay_pressure(450.0, 100.0, 400.0, t));
+        }
+        // Below high: never.
+        assert!(!delay_pressure(90.0, 100.0, 400.0, DelayTrend::Rising));
+        // A flat episode ends below the ceiling; a moving one holds until `low`.
+        assert!(!congested_hysteresis(
+            150.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            false,
+            true,
+            true
+        ));
+        assert!(congested_hysteresis(
+            150.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Falling,
+            false,
+            true,
+            true
+        ));
+        assert!(congested_hysteresis(
+            450.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            false,
+            true,
+            true
+        ));
+        // Loss still forces it regardless.
+        assert!(congested_hysteresis(
+            0.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            true,
+            true,
+            false
+        ));
+    }
+
+    /// Result of [`simulate_adaptive`]: bitrate per interval and how many
+    /// intervals sat at the floor (where the fps floor engages).
+    struct AdaptiveSim {
+        bps: Vec<u32>,
+        at_floor_intervals: usize,
+        decreases: usize,
+        max_ewma: f64,
+    }
+
+    /// Which controller [`simulate_adaptive`] runs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SimMode {
+        /// The pre-2026-11-12 level-only controller.
+        Old,
+        /// The trend gate alone (the first live round of this fix).
+        TrendOnly,
+        /// The trend gate plus decrease spacing and the slow approach.
+        Full,
+    }
+
+    /// Closed-loop run of the controller's pure decision chain (EWMA → trend →
+    /// hysteresis → rate action → decrease spacing → AIMD with the slow
+    /// approach) at the production defaults and the 300 ms interval, against a
+    /// `link` model mapping (interval, current bitrate) to the delay sample.
+    fn simulate_adaptive(
+        intervals: usize,
+        mode: SimMode,
+        mut link: impl FnMut(usize, u32) -> f64,
+    ) -> AdaptiveSim {
+        let (floor, ceiling_bps, inc, dec) = (500_000u32, 3_000_000u32, 250_000u32, 0.7f32);
+        let (high, low, ceiling_ms, rise, alpha) = (100.0, 50.0, 400.0, 20.0, 0.3);
+        let interval = ms(300);
+        let mut target = ceiling_bps;
+        let mut ewma = 0.0;
+        let mut samples = VecDeque::new();
+        let mut congested = false;
+        let mut last_decrease: Option<Duration> = None;
+        let mut congestion_bps: Option<u32> = None;
+        let mut in_episode = false;
+        let mut sim = AdaptiveSim {
+            bps: Vec::new(),
+            at_floor_intervals: 0,
+            decreases: 0,
+            max_ewma: 0.0,
+        };
+        for i in 0..intervals {
+            let now = interval * i as u32;
+            let sample = link(i, target);
+            ewma = alpha * sample + (1.0 - alpha) * ewma;
+            sim.max_ewma = sim.max_ewma.max(ewma);
+            if samples.len() >= 2 * DELAY_TREND_WINDOW {
+                samples.pop_front();
+            }
+            samples.push_back(sample);
+            let (trend, ceil) = if mode == SimMode::Old {
+                (DelayTrend::Unknown, f64::INFINITY)
+            } else {
+                (delay_trend(&samples, rise), ceiling_ms)
+            };
+            congested = congested_hysteresis(ewma, high, low, ceil, trend, false, true, congested);
+            let mut action = rate_action(ewma, high, ceil, trend, false, true, congested);
+            if mode == SimMode::Full
+                && action == RateAction::Decrease
+                && hold_trend_decrease(
+                    false,
+                    ewma,
+                    ceil,
+                    trend,
+                    last_decrease.map(|t| now - t),
+                    TREND_DECREASE_SPACING,
+                )
+            {
+                action = RateAction::Hold;
+            }
+            target = match action {
+                RateAction::Hold => target,
+                RateAction::Decrease => {
+                    sim.decreases += 1;
+                    note_decrease(&mut in_episode, &mut congestion_bps, target);
+                    last_decrease = Some(now);
+                    aimd_bitrate(target, 1, floor, ceiling_bps, inc, dec)
+                }
+                RateAction::Increase => {
+                    in_episode = false;
+                    let step = if mode == SimMode::Full {
+                        increase_step(target, congestion_bps, inc)
+                    } else {
+                        inc
+                    };
+                    aimd_bitrate(target, 0, floor, ceiling_bps, step, dec)
+                }
+            };
+            if target <= floor && congested {
+                sim.at_floor_intervals += 1;
+            }
+            sim.bps.push(target);
+        }
+        sim
+    }
+
+    #[test]
+    fn adaptive_controller_does_not_oscillate_on_mstsc_decode_depth() {
+        // THE 11-12 LAN STUTTER: mstsc keeps ~10 frames of 1080p60 video in
+        // its decoder, so the measured delay ramps to ~120 ms and sits there
+        // regardless of bitrate (it stayed 118-148 ms from 3 down to
+        // 0.5 Mbit/s). Model: a ramp then a flat 120 ms with the measured ±5 ms
+        // jitter, independent of the bitrate. 60 intervals = 18 s of video.
+        let jitter = [3.0, -2.0, -5.0, 0.0, 2.0, 1.0, -3.0, 4.0];
+        let mstsc = |i: usize, _bps: u32| {
+            if i < 6 {
+                20.0 + 20.0 * i as f64
+            } else {
+                120.0 + jitter[i % jitter.len()]
+            }
+        };
+        let fixed = simulate_adaptive(60, SimMode::Full, mstsc);
+        // Never reaches the floor (so the 10 fps cap never engages) and
+        // spends the second half at or near the 3 Mbit/s ceiling.
+        assert_eq!(
+            fixed.at_floor_intervals, 0,
+            "fixed controller hit the floor: {:?}",
+            fixed.bps
+        );
+        assert!(
+            fixed.bps[30..].iter().all(|&b| b >= 2_500_000),
+            "{:?}",
+            fixed.bps
+        );
+        assert!(
+            fixed.decreases <= 3,
+            "{} decreases: {:?}",
+            fixed.decreases,
+            fixed.bps
+        );
+        // The old level-only rule on the same input is what stuttered: it
+        // keeps cutting and reaches the floor.
+        let old = simulate_adaptive(60, SimMode::Old, mstsc);
+        assert!(
+            old.at_floor_intervals > 0,
+            "old controller never hit the floor: {:?}",
+            old.bps
+        );
+    }
+
+    /// A bottleneck of `capacity_bps` with an infinite buffer: each interval
+    /// the queue grows (or drains) by the over/under-send, in ms of link time.
+    fn thin_link(capacity_bps: u32) -> impl FnMut(usize, u32) -> f64 {
+        let mut queue_ms = 0.0f64;
+        move |_i, bps| {
+            let interval_ms = 300.0;
+            queue_ms +=
+                interval_ms * (f64::from(bps) - f64::from(capacity_bps)) / f64::from(capacity_bps);
+            queue_ms = queue_ms.max(0.0);
+            queue_ms
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_still_tracks_a_thin_link() {
+        // A 1.5 Mbit/s VPN-class bottleneck, starting at the 3 Mbit/s
+        // ceiling: the queue grows while over capacity, so the trend sees it.
+        let sim = simulate_adaptive(200, SimMode::Full, thin_link(1_500_000));
+        assert!(sim.decreases > 0);
+        // Settles around the capacity: over the last 30 s (100 intervals) the
+        // average stays within 60-120% of it, and the delay stays bounded
+        // well below the hard ceiling's order of magnitude.
+        let tail = &sim.bps[100..];
+        let avg = tail.iter().map(|&b| f64::from(b)).sum::<f64>() / tail.len() as f64;
+        assert!(
+            (900_000.0..=1_800_000.0).contains(&avg),
+            "avg {avg} bps: {:?}",
+            tail
+        );
+        assert!(
+            sim.max_ewma < 1_000.0,
+            "queue ran away: max ewma {}",
+            sim.max_ewma
+        );
+    }
+
+    #[test]
+    fn adaptive_controller_still_backs_off_a_saturated_link() {
+        // The 2026-07-04 lab case: a 500 Kbit/s pipe at a 3 Mbit/s start. The
+        // queue climbs fast; the controller must cut to the floor quickly.
+        let sim = simulate_adaptive(60, SimMode::Full, thin_link(500_000));
+        let first_floor = sim.bps.iter().position(|&b| b <= 500_000);
+        assert!(matches!(first_floor, Some(i) if i <= 15), "{:?}", sim.bps);
+        // And it backs off exactly as the old level-only controller did: on
+        // a growing queue the trend is Rising, so nothing here changed. (The
+        // model's 6x overshoot builds a multi-second queue before any
+        // controller can react; that part is the link, not the rule.)
+        let old = simulate_adaptive(60, SimMode::Old, thin_link(500_000));
+        assert_eq!(sim.bps, old.bps);
+    }
+
+    #[test]
+    fn the_idr_backoff_stretch_is_bounded() {
+        // 60 fps with the default 2 s interval (120 frames): ten seconds.
+        assert_eq!(stretched_keyframe_interval(60, 120), 600);
+        // Always longer than the normal interval, even when that is long.
+        assert_eq!(stretched_keyframe_interval(60, 900), 901);
+        // Never the old ~10 minutes.
+        assert!(stretched_keyframe_interval(60, 120) < 60 * 600);
+    }
+
+    #[test]
+    fn trend_decreases_are_spaced_and_the_climb_slows_near_the_last_congestion() {
+        let s = TREND_DECREASE_SPACING;
+        // A rising-delay cut within the spacing of the last one is held…
+        assert!(hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        // …but not once the spacing has passed, nor for the first cut.
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(s),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            None,
+            s
+        ));
+        // Never held: loss, above the ceiling, or the level-only fallback.
+        assert!(!hold_trend_decrease(
+            true,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            450.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Unknown,
+            Some(ms(300)),
+            s
+        ));
+
+        // Full step until 80% of where the last episode began, then a fifth.
+        assert_eq!(increase_step(1_000_000, None, 250_000), 250_000);
+        assert_eq!(increase_step(1_500_000, Some(2_500_000), 250_000), 250_000);
+        assert_eq!(increase_step(2_000_000, Some(2_500_000), 250_000), 50_000);
+        assert_eq!(increase_step(2_900_000, Some(2_500_000), 250_000), 50_000);
+    }
+
+    /// A client whose decoder falls behind above `capacity_bps`, seen with a
+    /// lag of `lag` intervals (frames already in flight still have to be
+    /// decoded after a cut — the 11-12 second live round, a reconnected mstsc).
+    fn lagged_decoder(capacity_bps: u32, lag: usize) -> impl FnMut(usize, u32) -> f64 {
+        let mut queue_ms = 0.0f64;
+        let mut line: VecDeque<f64> = VecDeque::new();
+        move |_i, bps| {
+            queue_ms +=
+                300.0 * (f64::from(bps) - f64::from(capacity_bps)) / f64::from(capacity_bps);
+            queue_ms = queue_ms.max(0.0);
+            line.push_back(queue_ms);
+            20.0 + if line.len() > lag {
+                line.pop_front().unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_settles_instead_of_sawing_on_a_lagged_decoder() {
+        // THE 11-12 SECOND LIVE ROUND: on a reconnected mstsc the delay really
+        // grows above ~2 Mbit/s and keeps rising after each cut, so cutting
+        // every interval plunged to the floor and the 10 fps cap.
+        let tail_avg = |sim: &AdaptiveSim| {
+            let t = &sim.bps[60..];
+            t.iter().map(|&b| f64::from(b)).sum::<f64>() / t.len() as f64
+        };
+        let full = simulate_adaptive(200, SimMode::Full, lagged_decoder(2_000_000, 3));
+        let trend_only = simulate_adaptive(200, SimMode::TrendOnly, lagged_decoder(2_000_000, 3));
+        assert!(
+            full.at_floor_intervals * 2 < trend_only.at_floor_intervals,
+            "floor intervals: full {} vs trend-only {}",
+            full.at_floor_intervals,
+            trend_only.at_floor_intervals
+        );
+        assert!(
+            tail_avg(&full) > tail_avg(&trend_only) + 300_000.0,
+            "avg {} vs {}",
+            tail_avg(&full),
+            tail_avg(&trend_only)
+        );
+        // On the thin links the follow-up never costs throughput or delay
+        // against the old controller.
+        for cap in [1_000_000u32, 1_500_000, 2_500_000] {
+            let f = simulate_adaptive(200, SimMode::Full, thin_link(cap));
+            let o = simulate_adaptive(200, SimMode::Old, thin_link(cap));
+            let avg =
+                |s: &AdaptiveSim| s.bps[100..].iter().map(|&b| f64::from(b)).sum::<f64>() / 100.0;
+            assert!(avg(&f) >= avg(&o), "thin {cap}: {} < {}", avg(&f), avg(&o));
+            assert!(
+                f.max_ewma <= o.max_ewma + 1.0,
+                "thin {cap}: {} > {}",
+                f.max_ewma,
+                o.max_ewma
+            );
+            assert!(f.at_floor_intervals <= o.at_floor_intervals, "thin {cap}");
+        }
+    }
+
+    #[test]
+    fn the_climb_back_is_fast_until_near_where_the_episode_began() {
+        // One congestion episode cut 3 Mbit/s down through several spaced
+        // cuts; then the link clears. The trouble point is where the episode
+        // BEGAN (3 Mbit/s), so the climb runs at the full step up to 2.4
+        // Mbit/s. (Recording each cut instead would put it near the bottom
+        // and slow the whole climb to a fifth.)
+        let mut in_episode = false;
+        let mut point = None;
+        for bps in [3_000_000, 2_100_000, 1_470_000, 1_029_000] {
+            note_decrease(&mut in_episode, &mut point, bps);
+        }
+        assert_eq!(point, Some(3_000_000));
+        assert_eq!(increase_step(1_029_000, point, 250_000), 250_000);
+        assert_eq!(increase_step(2_300_000, point, 250_000), 250_000);
+        assert_eq!(increase_step(2_400_000, point, 250_000), 50_000);
+        // A new episode after an increase records its own start.
+        in_episode = false;
+        note_decrease(&mut in_episode, &mut point, 2_600_000);
+        assert_eq!(point, Some(2_600_000));
+    }
+
+    #[test]
+    fn adaptive_controller_backs_off_a_flat_delay_above_the_ceiling() {
+        // A backlog that stopped growing at a very high level is still worked
+        // down: flat 500 ms is over the 400 ms ceiling.
+        let sim = simulate_adaptive(30, SimMode::Full, |_i, _bps| 500.0);
+        assert!(sim.decreases >= 5, "{:?}", sim.bps);
+    }
+
+    // rate_action(ewma_lag, high, ceiling, trend, retransmit_lossy, acks_usable, congested) — again
+    // with an infinite ceiling + DelayTrend::Unknown, i.e. the original level-only rule.
     #[test]
     fn rate_action_decreases_above_high_or_on_retransmit() {
         assert_eq!(
-            rate_action(13.0, 12.0, false, true, true),
+            rate_action(
+                13.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                true
+            ),
             RateAction::Decrease
         ); // lag>high
         assert_eq!(
-            rate_action(0.0, 12.0, true, true, true),
+            rate_action(
+                0.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                true,
+                true,
+                true
+            ),
             RateAction::Decrease
         ); // loss>tolerance
         assert_eq!(
-            rate_action(0.0, 12.0, true, false, false),
+            rate_action(
+                0.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                true,
+                false,
+                false
+            ),
             RateAction::Decrease
         ); // loss>tolerance, acks unusable
     }
@@ -3704,20 +4838,47 @@ mod tests {
     fn rate_action_holds_in_band_while_congested() {
         // Latched congested but the smoothed lag has decayed below high (decaying through
         // the band) → hold, don't keep cratering. This is the "single spike" fix.
-        assert_eq!(rate_action(9.0, 12.0, false, true, true), RateAction::Hold);
+        assert_eq!(
+            rate_action(
+                9.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                true
+            ),
+            RateAction::Hold
+        );
     }
 
     #[test]
     fn rate_action_increases_when_cleared() {
         // Not congested (cleared below low) → climb back toward the ceiling.
         assert_eq!(
-            rate_action(2.0, 12.0, false, true, false),
+            rate_action(
+                2.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                false
+            ),
             RateAction::Increase
         );
         // Acks unusable (warmup/suspend) with no retransmit → not congested → increase
         // (target is already at ceiling at connect, so this is a clamp-no-op there).
         assert_eq!(
-            rate_action(99.0, 12.0, false, false, false),
+            rate_action(
+                99.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                false,
+                false
+            ),
             RateAction::Increase
         );
     }
@@ -3730,14 +4891,30 @@ mod tests {
         let lossy = retransmit_is_lossy(1, 2);
         assert!(!lossy);
         assert_eq!(
-            rate_action(1.0, 8.0, lossy, true, false),
+            rate_action(
+                1.0,
+                8.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                lossy,
+                true,
+                false
+            ),
             RateAction::Increase
         );
         // But sustained loss (delta=5) crosses the tolerance → back off.
         let lossy = retransmit_is_lossy(5, 2);
         assert!(lossy);
         assert_eq!(
-            rate_action(1.0, 8.0, lossy, true, true),
+            rate_action(
+                1.0,
+                8.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                lossy,
+                true,
+                true
+            ),
             RateAction::Decrease
         );
     }
@@ -3797,6 +4974,10 @@ mod tests {
             // 3 for the tests (the production default is a more aggressive 1);
             // the wall-clock test asserts against this value.
             blank_min_reports: 3,
+            // The production defaults (3 zeros within 10 s); the post-attempt
+            // tests assert against these values.
+            post_attempt_burst_zeros: 3,
+            post_attempt_burst_window: ms(10_000),
             reactivate: false,
         }
     }
@@ -3853,6 +5034,7 @@ mod tests {
             ms(7000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         assert!(!should_blank_recover(
@@ -3864,6 +5046,7 @@ mod tests {
             ms(7000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &s
         ));
     }
@@ -3960,6 +5143,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -3979,6 +5163,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // A long healthy run is likewise never touched.
@@ -3991,6 +5176,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4015,6 +5201,7 @@ mod tests {
             ms(10_000),
             1,     // i.e. the reactivation already ran; this is the fallback drop
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Mid-blip (the blip itself is the most recent report) it still holds
@@ -4028,6 +5215,7 @@ mod tests {
             ms(10_000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4044,8 +5232,9 @@ mod tests {
         let p = blank_params();
 
         // (a) The interleaved phantom pattern: the most recent report was a
-        // nonzero blip (zero_streak reset to 0!), runs never reached
-        // min_render_reports, but zeros kept accruing cumulatively.
+        // nonzero blip (zero_streak reset to 0!), but zeros kept arriving
+        // densely between the blips. Since 2026-11-12 this is the zero-burst
+        // arm's case (3 zeros within 10 s), not the deadline's.
         let interleaved = QoeEvidence {
             zero_streak: 0,
             nonzero_streak: 2,
@@ -4061,22 +5250,75 @@ mod tests {
             false,
             ms(30_000),
             ms(0),
-            ms(8000), // = heal_confirm_deadline
-            1,        // the reactivation already ran
-            true,     // client is acking our post-attempt frames
+            ms(8000),       // since the attempt (past retry_interval)
+            1,              // the reactivation already ran
+            true,           // client is acking our post-attempt frames
+            Some(ms(6000)), // the last 3 zeros span 6 s: a burst
             &p
         ));
-        // Same evidence BEFORE the deadline → hold (give the heal time).
+        // A phantom RUN as long as 18 (07-23) earlier in the window doesn't
+        // shield it: the burst is what decides, not run length.
+        assert!(should_blank_recover(
+            QoeEvidence {
+                nonzero_max_since_reset: 18,
+                max_nonzero_streak: 18,
+                ..interleaved
+            },
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000),
+            1,
+            true,
+            Some(ms(6000)),
+            &p
+        ));
+        // Inside retry_interval (5 s) → hold (give the heal time).
         assert!(!should_blank_recover(
             interleaved,
             true,
             false,
             ms(30_000),
             ms(0),
-            ms(6000),
+            ms(4000),
             1,
             true,
+            Some(ms(3000)),
             &p
+        ));
+        // Same tallies but the zeros were NOT dense (span past the window, or
+        // fewer than 3 recorded) → hold; the cumulative tally alone no longer
+        // escalates (that is what dropped healed sessions).
+        for span in [Some(ms(10_001)), None] {
+            assert!(!should_blank_recover(
+                interleaved,
+                true,
+                false,
+                ms(30_000),
+                ms(0),
+                ms(8000),
+                1,
+                true,
+                span,
+                &p
+            ));
+        }
+        // A zero-length window disables the burst arm.
+        assert!(!should_blank_recover(
+            interleaved,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000),
+            1,
+            true,
+            Some(ms(1)),
+            &BlankRecoveryParams {
+                post_attempt_burst_window: ms(0),
+                ..p
+            }
         ));
 
         // (b) Total QoE silence after the attempt, while frame acks flow: the
@@ -4095,6 +5337,7 @@ mod tests {
             ms(8000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // …but silence WITHOUT acks proves nothing (nothing shipped — an idle
@@ -4108,6 +5351,7 @@ mod tests {
             ms(8000),
             1,
             false,
+            None, // post_attempt_zero_span
             &p
         ));
         // …and the branch is strictly post-attempt (attempts == 0 → inert;
@@ -4121,8 +5365,227 @@ mod tests {
             ms(8000),
             0,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
+    }
+
+    /// The production defaults that matter for the post-attempt arms (the test
+    /// `blank_params` deliberately blunts the connect-phase fast path, which
+    /// would hide the 11-09..11-12 false drop).
+    fn production_like_blank_params() -> BlankRecoveryParams {
+        BlankRecoveryParams {
+            min_qoe_reports: 24,
+            established_render_reports: 40,
+            established_min_qoe: 160,
+            retry_interval: ms(4000),
+            blank_max_wait: ms(4000),
+            blank_min_reports: 1,
+            ..blank_params()
+        }
+    }
+
+    /// A post-attempt window as the recovery warning logs it, with the last
+    /// report a zero (the moment the old fast path fired).
+    fn window_ending_in_a_zero(reports: u64, zeros: u64, best_run: u64) -> QoeEvidence {
+        QoeEvidence {
+            zero_streak: 1,
+            nonzero_streak: 0,
+            max_nonzero_streak: best_run,
+            reports_since_reset: reports,
+            zeros_since_reset: zeros,
+            nonzero_max_since_reset: best_run,
+            presented_clean: false,
+        }
+    }
+
+    #[test]
+    fn blank_recovery_post_attempt_lone_zero_after_a_heal_does_not_drop() {
+        // THE 11-09 / 11-10 / 11-12 FALSE DROPS (mstsc build 26100, LAN and
+        // ZeroTier): the reactivation healed the session (the user saw the
+        // desktop), then ONE zero-EDR report — on a static desktop, the
+        // menu-bar clock tick — made the one-zero wall-clock fast path drop
+        // it; on 11-10 once a minute in a loop. Each tuple is a logged window:
+        // (window_reports, window_zeros, window_best_render_run).
+        let p = production_like_blank_params();
+        for (reports, zeros, best) in [
+            (22, 2, 20),
+            (1, 1, 0),
+            (9, 2, 7),
+            (4, 1, 3),
+            (33, 2, 31),
+            (2, 1, 1),
+        ] {
+            let w = window_ending_in_a_zero(reports, zeros, best);
+            // 5.6 s (11-12) and a minute (the 11-10 clock-tick loop) after
+            // the attempt; fewer than 3 post-attempt zeros ⇒ no span.
+            for since_attempt in [ms(5_600), ms(60_000)] {
+                assert!(
+                    !should_blank_recover(
+                        w,
+                        true,
+                        false,
+                        ms(120_000),
+                        ms(1_000),
+                        since_attempt,
+                        1,
+                        true,
+                        None,
+                        &p
+                    ),
+                    "dropped a healed window {reports}/{zeros}/{best} at {since_attempt:?}"
+                );
+            }
+        }
+        // THE THIRD LIVE ROUND (11-12, YouTube playing): heals into runs of
+        // 15-33, then 3-4 zeros that DID form a burst, at 7-17% of the
+        // window. The majority rule holds them.
+        for (reports, zeros, best) in [(44, 4, 33), (38, 4, 20), (18, 3, 15), (50, 3, 25)] {
+            let w = window_ending_in_a_zero(reports, zeros, best);
+            assert!(
+                !should_blank_recover(
+                    w,
+                    true,
+                    false,
+                    ms(12_000),
+                    ms(500),
+                    ms(8_000),
+                    1,
+                    true,
+                    Some(ms(2_000)),
+                    &p
+                ),
+                "dropped a healed window {reports}/{zeros}/{best} during video"
+            );
+        }
+        // A healed STATIC session keeps collecting a clock-tick zero about
+        // once a minute, forever: three of them never form a burst.
+        let w = window_ending_in_a_zero(40, 3, 20);
+        assert!(!should_blank_recover(
+            w,
+            true,
+            false,
+            ms(300_000),
+            ms(60_000),
+            ms(180_000),
+            1,
+            true,
+            Some(ms(120_000)),
+            &p
+        ));
+        // THE 11-12 LIVE FALSE DROP on the first cut of this fix: the heal
+        // reached a 75-long run (ESTABLISHED), then 4 scattered zeros, the
+        // last 3 within 10 s, formed a burst. The user saw a working desktop.
+        // An established session is judged by the slower established tier
+        // instead, so the burst must not fire.
+        assert!(!should_blank_recover(
+            QoeEvidence {
+                zero_streak: 2,
+                ..window_ending_in_a_zero(85, 4, 75)
+            },
+            true,
+            false,
+            ms(19_000),
+            ms(1_000),
+            ms(14_000),
+            1,
+            true,
+            Some(ms(8_000)),
+            &p
+        ));
+        // The connect-phase fast path is unchanged: before any attempt one
+        // zero past blank_max_wait still fires (the reactivation is cheap).
+        assert!(should_blank_recover(
+            qoe(1, 0, 0),
+            true,
+            false,
+            ms(4_000),
+            ms(4_000),
+            ms(4_000),
+            0,
+            false,
+            None,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_post_attempt_zero_burst_escalates_a_real_blank() {
+        // Logged windows of drops that were real blanks (Windows App for
+        // macOS, Aug 2026): mostly zeros, short runs. With the zeros arriving
+        // densely (the last 3 within 3 s) every one still escalates.
+        let p = production_like_blank_params();
+        for (reports, zeros, best) in [
+            (15, 11, 2),
+            (23, 18, 2),
+            (18, 17, 1),
+            (5, 5, 0),
+            (17, 15, 1),
+            (10, 9, 1),
+            (4, 3, 1),
+            (3, 3, 0),
+        ] {
+            let w = window_ending_in_a_zero(reports, zeros, best);
+            assert!(
+                should_blank_recover(
+                    w,
+                    true,
+                    false,
+                    ms(30_000),
+                    ms(5_000),
+                    ms(5_000),
+                    1,
+                    true,
+                    Some(ms(3_000)),
+                    &p
+                ),
+                "missed a real blank {reports}/{zeros}/{best}"
+            );
+        }
+        // The burst arm is post-attempt only: a span handed in at attempts 0
+        // (which the caller never does) can't fire on its own. Inside
+        // blank_max_wait, so the connect fast path is out of the way too.
+        assert!(!should_blank_recover(
+            window_ending_in_a_zero(5, 5, 0),
+            true,
+            false,
+            ms(3_500),
+            ms(3_500),
+            ms(3_500),
+            0,
+            true,
+            Some(ms(1_000)),
+            &p
+        ));
+        // Total silence after the attempt (acks flowing, no QoE at all) still
+        // escalates on the heal-confirmation deadline.
+        assert!(should_blank_recover(
+            QoeEvidence::default(),
+            true,
+            false,
+            ms(30_000),
+            ms(30_000),
+            ms(8_000),
+            1,
+            true,
+            None,
+            &p
+        ));
+    }
+
+    #[test]
+    fn post_attempt_zero_span_measures_the_kth_newest_zero() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let zeros: VecDeque<Instant> = [at(0), at(50), at(55), at(58)].into_iter().collect();
+        // k = 3 → the third-newest zero (t = 50 s) to now (t = 60 s).
+        assert_eq!(post_attempt_zero_span(&zeros, 3, at(60)), Some(ms(10_000)));
+        assert_eq!(post_attempt_zero_span(&zeros, 1, at(60)), Some(ms(2_000)));
+        assert_eq!(post_attempt_zero_span(&zeros, 4, at(60)), Some(ms(60_000)));
+        // Fewer zeros than k, or k = 0 → None.
+        assert_eq!(post_attempt_zero_span(&zeros, 5, at(60)), None);
+        assert_eq!(post_attempt_zero_span(&zeros, 0, at(60)), None);
+        assert_eq!(post_attempt_zero_span(&VecDeque::new(), 3, at(60)), None);
     }
 
     #[test]
@@ -4151,6 +5614,7 @@ mod tests {
             ms(9000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // A healed-but-static mstsc: a couple of honest nonzero reports and NO
@@ -4174,6 +5638,7 @@ mod tests {
             ms(9000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // A zero-length deadline disables the branch outright.
@@ -4191,6 +5656,7 @@ mod tests {
             ms(60_000),
             1,
             true,
+            None, // post_attempt_zero_span
             &disabled
         ));
     }
@@ -4217,6 +5683,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // A stray/short zero run likewise holds off.
@@ -4229,6 +5696,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // But the disarm is still REVOCABLE: a genuinely sustained blackout
@@ -4243,6 +5711,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4265,6 +5734,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Same zeros but the last nonzero was recent → the transient window.
@@ -4277,6 +5747,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Long silence but too few zero reports: an IDLE session (frames stop,
@@ -4290,6 +5761,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Not established → this branch never applies. (since_connect kept
@@ -4305,6 +5777,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4326,6 +5799,7 @@ mod tests {
             ms(10_000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Just over the established bar → the long window is required instead.
@@ -4338,6 +5812,7 @@ mod tests {
             ms(10_000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4376,6 +5851,7 @@ mod tests {
             ms(60_000),
             0,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // And it survives even the established wall-clock blackout inputs.
@@ -4388,6 +5864,7 @@ mod tests {
             ms(60_000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
     }
@@ -4411,6 +5888,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4429,6 +5907,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         assert!(!should_blank_recover(
@@ -4440,6 +5919,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4457,6 +5937,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Acks suspended (queueDepth sentinel) → congestion territory, not blank.
@@ -4469,6 +5950,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4486,6 +5968,7 @@ mod tests {
             ms(2999),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Too soon after the previous dance → hold.
@@ -4498,6 +5981,7 @@ mod tests {
             ms(4999),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Attempts exhausted → give up (client-side floor).
@@ -4510,6 +5994,7 @@ mod tests {
             ms(60_000),
             2,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Second attempt inside the cap, past the spacing → fires.
@@ -4522,6 +6007,7 @@ mod tests {
             ms(5000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4545,6 +6031,7 @@ mod tests {
             ms(60_000), // long since last attempt
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // …but NOT once the client is ESTABLISHED (presented for a meaningful
@@ -4562,6 +6049,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Same but only 2 reports → the >=3 floor blocks it (guards a client
@@ -4575,6 +6063,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Zero reports (QoE-less client) never fires on the wall-clock path.
@@ -4587,6 +6076,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Before blank_max_wait, with a low count → still holds (neither path
@@ -4600,6 +6090,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }

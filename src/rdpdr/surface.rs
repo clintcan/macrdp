@@ -53,6 +53,9 @@ const ROOT_ID: fileid3 = 1;
 /// is only that the redirected drive appears a few seconds after connect.
 const MOUNT_DEFER: Duration = Duration::from_secs(4);
 
+/// The `deadtimeout` mount option, in seconds (see [`run_mount`]).
+const DEAD_TIMEOUT_SECS: u32 = 60;
+
 /// One known node in the redirected tree.
 #[derive(Clone)]
 struct Node {
@@ -127,6 +130,53 @@ impl FsCache {
         }
     }
 
+    /// Move `id` to `to_path` (a child of `to_parent`), keeping its fileid.
+    ///
+    /// NFS keeps an object's identity across a rename, and macOS relies on it:
+    /// whatever already holds the object (an open file, the folder a Finder
+    /// window shows) keeps using the old fileid. Forgetting the id and
+    /// interning the new path under a fresh one, as this used to, made every
+    /// later `getattr` on the held id fail with NFS3ERR_NOENT — logged at ERROR
+    /// by nfsserve every 5 s (the attribute-cache interval) for as long as the
+    /// window stayed open. Reproduced live 2026-11-13 by creating a folder in
+    /// Finder (it makes "untitled folder" and then renames it).
+    ///
+    /// A node already at `to_path` was overwritten by the rename and is
+    /// dropped. For a folder, every cached path inside it moves too, or later
+    /// operations on its contents would use the old location.
+    fn rename(&mut self, id: fileid3, to_parent: fileid3, to_path: &str) {
+        let Some(old_path) = self.id_to_node.get(&id).map(|n| n.remote_path.clone()) else {
+            return;
+        };
+        if let Some(&replaced) = self.path_to_id.get(to_path) {
+            if replaced != id {
+                self.forget(replaced);
+            }
+        }
+        self.path_to_id.remove(&old_path);
+        if let Some(n) = self.id_to_node.get_mut(&id) {
+            n.remote_path = to_path.to_owned();
+            n.parent = to_parent;
+        }
+        self.path_to_id.insert(to_path.to_owned(), id);
+
+        let old_prefix = format!("{old_path}\\");
+        let moved: Vec<(fileid3, String)> = self
+            .id_to_node
+            .iter()
+            .filter(|(_, n)| n.remote_path.starts_with(&old_prefix))
+            .map(|(&cid, n)| (cid, n.remote_path.clone()))
+            .collect();
+        for (cid, path) in moved {
+            let new_path = join_remote(to_path, &path[old_prefix.len()..]);
+            self.path_to_id.remove(&path);
+            if let Some(n) = self.id_to_node.get_mut(&cid) {
+                n.remote_path = new_path.clone();
+            }
+            self.path_to_id.insert(new_path, cid);
+        }
+    }
+
     /// Update a node's cached size (after a write/truncate).
     fn set_size(&mut self, id: fileid3, size: u64) {
         if let Some(n) = self.id_to_node.get_mut(&id) {
@@ -185,16 +235,27 @@ impl RdpdrFs {
         }
     }
 
+    /// Attributes for a node. Files and folders are reported as owned by the
+    /// user macrdp runs as (who mounted the volume). Left at the default (uid 0,
+    /// gid 0), Finder showed them as owned by "system" with "everyone: Read
+    /// only", so New Folder silently did nothing and a rename failed with
+    /// "another operation is in progress" — Finder judges writability from
+    /// ownership and mode, even though the server's ACCESS reply allows writes
+    /// (shell commands worked). Found live 2026-11-13.
     fn attr(&self, id: fileid3, is_dir: bool, size: u64) -> fattr3 {
         let t = nfstime3 {
             seconds: self.created_secs,
             nseconds: 0,
         };
+        // SAFETY: getuid/getgid cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         if is_dir {
             fattr3 {
                 ftype: ftype3::NF3DIR,
                 mode: 0o755,
                 nlink: 2,
+                uid,
+                gid,
                 size: 4096,
                 used: 4096,
                 fileid: id,
@@ -208,6 +269,8 @@ impl RdpdrFs {
                 ftype: ftype3::NF3REG,
                 mode: 0o644,
                 nlink: 1,
+                uid,
+                gid,
                 size,
                 used: size,
                 fileid: id,
@@ -531,14 +594,15 @@ impl NFSFileSystem for RdpdrFs {
                     .and_then(|id| c.id_to_node.get(&id).map(|n| (id, n.is_dir, n.size)))
             };
         }
-        let (src_id, is_dir, size) = src.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let (src_id, _, _) = src.ok_or(nfsstat3::NFS3ERR_NOENT)?;
         self.handle
             .rename(self.device_id, &from_path, &to_path, true)
             .await
             .map_err(|e| nfs_err("rename failed", &e))?;
-        let mut c = self.cache.lock().unwrap();
-        c.forget(src_id);
-        c.intern(to_dirid, &to_path, is_dir, size);
+        self.cache
+            .lock()
+            .unwrap()
+            .rename(src_id, to_dirid, &to_path);
         Ok(())
     }
 
@@ -678,31 +742,161 @@ fn unregister_mount(mp: &Path) {
     live_mounts().lock().unwrap().retain(|p| p != mp);
 }
 
-/// `umount -f` the mountpoint, remove it, and prune the empty per-pid parent.
-/// Shared by `Surface::Drop` (disconnect) and [`shutdown_cleanup`] (signal exit).
-/// `umount` of an already-unmounted path is harmless, so double-calls are safe.
-fn unmount_at(mp: &Path) {
-    let status = std::process::Command::new("/sbin/umount")
-        .arg("-f")
-        .arg(mp)
-        .status();
-    if !matches!(status, Ok(s) if s.success()) {
-        debug!(mountpoint = ?mp, ?status, "rdpdr nfs: umount returned nonzero");
+/// How long one `umount` may run before we stop waiting. A forced unmount of
+/// a loopback NFS mount normally returns at once; the bound exists so that
+/// neither the shutdown path (launchd kills the process if it lingers) nor the
+/// startup reaper can be held up by one that doesn't.
+const UMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `cmd` to completion, or kill it once `timeout` has passed. Returns its
+/// output, or why there is none. Pure apart from the child process;
+/// unit-tested.
+fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {timeout:?}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(e.to_string()),
+        }
     }
+}
+
+/// Every current mountpoint, from the kernel's mount table.
+///
+/// `MNT_NOWAIT` returns the cached table without asking any filesystem for
+/// fresh statistics, so a mount whose NFS server has died can't make this
+/// hang. That is the point: a `stat()` on such a mountpoint blocks forever (a
+/// hard NFS mount waits for its server), which is what stalled the startup
+/// reaper after a restart with a drive mounted (2026-11-10).
+fn mount_points() -> Vec<PathBuf> {
+    // SAFETY: a null buffer asks only for the number of mounts.
+    let n = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    // Room for a few mounts appearing between the two calls.
+    let cap = n as usize + 8;
+    // SAFETY: `statfs` is plain old data; all-zero is a valid value.
+    let mut buf: Vec<libc::statfs> = vec![unsafe { std::mem::zeroed() }; cap];
+    let bytes = (cap * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+    // SAFETY: `buf` holds `cap` entries and `bytes` is exactly its size.
+    let got = unsafe { libc::getfsstat(buf.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    buf.truncate(got as usize);
+    buf.iter()
+        .map(|fs| {
+            // SAFETY: the kernel NUL-terminates f_mntonname.
+            let name = unsafe { std::ffi::CStr::from_ptr(fs.f_mntonname.as_ptr()) };
+            PathBuf::from(
+                <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(name.to_bytes()),
+            )
+        })
+        .collect()
+}
+
+/// The mountpoints in `mounts` that are `dir` itself or inside it. Compares
+/// path components, so `/t/macrdp-rdpdr-12` doesn't claim
+/// `/t/macrdp-rdpdr-123/x`. Pure; unit-tested.
+fn mounts_under(mounts: &[PathBuf], dir: &Path) -> Vec<PathBuf> {
+    mounts
+        .iter()
+        .filter(|m| m.starts_with(dir))
+        .cloned()
+        .collect()
+}
+
+/// `p` as the mount table spells it, without touching `p` itself: only its
+/// parent is resolved (`$TMPDIR` lives under the `/var` → `/private/var`
+/// symlink). Resolving `p` would `stat` it, and if `p` is a dead mountpoint
+/// that never returns.
+fn mount_table_path(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|c| c.join(name))
+            .unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// `umount -f` the mountpoint, then remove it and prune the empty per-pid
+/// parent. Shared by `Surface::Drop` (disconnect), [`shutdown_cleanup`] (signal
+/// exit) and [`reap_stale`] (startup). Returns whether it ended unmounted.
+///
+/// Checks the mount table first, so an already-unmounted path is just
+/// cleaned up (no `umount` error for a double call). A failed or stuck
+/// `umount` is logged at warn with its error output — it used to be debug
+/// only, which hid why a restart left a mount behind — and the directories are
+/// then left alone: removing them would touch a still-mounted, possibly dead,
+/// mountpoint.
+fn unmount_at(mp: &Path) -> bool {
+    let table_path = mount_table_path(mp);
+    if mounts_under(&mount_points(), &table_path).is_empty() {
+        remove_mountpoint_dirs(mp);
+        return true;
+    }
+    let mut cmd = std::process::Command::new("/sbin/umount");
+    cmd.arg("-f").arg(mp);
+    let unmounted = match run_with_timeout(cmd, UMOUNT_TIMEOUT) {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            warn!(
+                mountpoint = ?mp,
+                code = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "rdpdr nfs: umount failed"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(mountpoint = ?mp, error = %e, "rdpdr nfs: umount did not complete");
+            false
+        }
+    };
+    // Trust the table, not the exit code: macOS can report a failure for a
+    // forced unmount that did take effect.
+    if unmounted || mounts_under(&mount_points(), &table_path).is_empty() {
+        remove_mountpoint_dirs(mp);
+        debug!(mountpoint = ?mp, "rdpdr nfs: cleaned up mount");
+        true
+    } else {
+        false
+    }
+}
+
+/// Remove an (unmounted) mountpoint and prune its per-pid parent, which only
+/// succeeds once empty, so it's safe while other drives are mounted under it.
+fn remove_mountpoint_dirs(mp: &Path) {
     let _ = std::fs::remove_dir(mp);
-    // Prune the per-pid parent (only succeeds once empty, so it's safe while
-    // other drives are still mounted under it).
     if let Some(parent) = mp.parent() {
         let _ = std::fs::remove_dir(parent);
     }
-    debug!(mountpoint = ?mp, "rdpdr nfs: cleaned up mount");
 }
 
 /// Unmount every still-live RDPDR NFS volume. Called from the signal handler
 /// just before `std::process::exit` (which bypasses `Surface::Drop`), so a
 /// SIGINT/SIGTERM stop — Ctrl-C, `kill`, `launchctl bootout`/`kickstart -k` —
 /// doesn't strand a mount pointing at the now-dead NFS server. Synchronous and
-/// best-effort; runs to completion before exit.
+/// best-effort; each `umount` is bounded by [`UMOUNT_TIMEOUT`]. The NFS server
+/// is still running here (the process exits after this), so a plain forced
+/// unmount should succeed; anything that slips through is cleared by the
+/// `deadtimeout` mount option or the next start's [`reap_stale`].
 pub fn shutdown_cleanup() {
     let mounts: Vec<PathBuf> = std::mem::take(&mut *live_mounts().lock().unwrap());
     if mounts.is_empty() {
@@ -713,20 +907,26 @@ pub fn shutdown_cleanup() {
         "rdpdr nfs: unmounting volumes on shutdown"
     );
     for mp in mounts {
-        unmount_at(&mp);
+        if unmount_at(&mp) {
+            info!(mountpoint = ?mp, "rdpdr nfs: unmounted on shutdown");
+        }
     }
 }
 
 /// Reap mount leftovers from a PRIOR macrdp process that died uncleanly. A
 /// SIGKILL/panic skips both `Surface::Drop` and [`shutdown_cleanup`], so its
 /// `$TMPDIR/macrdp-rdpdr-<pid>/<label>` mountpoint(s) — and the stale NFS mounts
-/// pointing at its now-dead server — survive. We `umount -f` each child
-/// mountpoint (reusing [`unmount_at`]) and remove the per-pid dir. Only dirs
-/// tagged with a DEAD pid (never our own) are touched, so this is safe to run
-/// while another macrdp instance is live. Best-effort; called once at startup
-/// off the async runtime. `/Volumes/<label>` mounts (the un-tagged primary
-/// location) are NOT reaped — they only occur when running as root, and there's
-/// no pid to gate on.
+/// pointing at its now-dead server — survive. Only dirs tagged with a DEAD pid
+/// (never our own) are touched, so this is safe while another macrdp instance
+/// is live. Best-effort; called once at startup off the async runtime.
+///
+/// It never touches a mountpoint directly: the mounts are found in the kernel
+/// mount table ([`mount_points`]) and unmounted with a bounded `umount`. A
+/// `stat()` (`is_dir()`) on a dead NFS mountpoint never returns, which is how
+/// this used to hang until the user clicked "Disconnect All" (2026-11-10). If
+/// a mount still won't go, the dir is left for the `deadtimeout` mount option
+/// to clear rather than recursed into. `/Volumes/<label>` mounts (only when
+/// running as root) are not reaped — there's no pid to gate on.
 pub fn reap_stale() {
     crate::reaper::for_each_stale(
         &std::env::temp_dir(),
@@ -735,16 +935,24 @@ pub fn reap_stale() {
         std::process::id() as i32,
         &crate::reaper::process_is_alive,
         &mut |dir| {
-            if let Ok(children) = std::fs::read_dir(dir) {
-                for child in children.flatten() {
-                    let mp = child.path();
-                    if mp.is_dir() {
-                        unmount_at(&mp);
-                    }
-                }
+            // The per-pid dir itself is never a mountpoint, so resolving it
+            // is safe; its children may be dead mounts and are not touched.
+            let table_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            for mp in mounts_under(&mount_points(), &table_dir) {
+                unmount_at(&mp);
             }
-            let _ = std::fs::remove_dir_all(dir);
-            info!(stale_dir = ?dir, "rdpdr nfs: reaped mount dir from a dead prior macrdp process");
+            let left = mounts_under(&mount_points(), &table_dir);
+            if left.is_empty() {
+                let _ = std::fs::remove_dir_all(dir);
+                info!(stale_dir = ?dir, "rdpdr nfs: reaped mount dir from a dead prior macrdp process");
+            } else {
+                warn!(
+                    stale_dir = ?dir,
+                    mounts = ?left,
+                    "rdpdr nfs: a dead prior process's mount would not unmount — leaving it \
+                     for the kernel's deadtimeout to clear"
+                );
+            }
         },
     );
 }
@@ -764,9 +972,18 @@ pub fn reap_stale() {
 /// throughput (more round-trips) — the right trade for an interactive remote
 /// desktop, where smooth audio/video beats fast bulk file transfer. (Each NFS op
 /// is still one RDPDR open→act→close, mitigated by the kept-open handle cache.)
+///
+/// **`deadtimeout`** (2026-11-13): if the mount stays unresponsive this long
+/// after macOS first reports it unresponsive, the kernel marks it dead and
+/// force-unmounts it. The server lives in this process, so it only goes away
+/// when macrdp does: a restart whose unmount failed, a crash, SIGKILL, power
+/// loss. Without it, such a mount stayed until the user clicked "Disconnect
+/// All" in macOS's "Server connections interrupted" dialog, and any `stat()` on
+/// it hung. A live session only trips it if the client stops answering drive
+/// requests for over a minute, by which point the session is gone too.
 fn run_mount(port: u16, mountpoint: &Path) -> bool {
     let opts = format!(
-        "nolocks,vers=3,tcp,rsize=262144,wsize=262144,readahead=4,port={port},mountport={port},actimeo=5"
+        "nolocks,vers=3,tcp,rsize=262144,wsize=262144,readahead=4,port={port},mountport={port},actimeo=5,deadtimeout={DEAD_TIMEOUT_SECS}"
     );
     match std::process::Command::new("/sbin/mount_nfs")
         .arg("-o")
@@ -827,5 +1044,146 @@ fn sanitize_label(label: &str) -> String {
         "drive".to_owned()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path_of(c: &FsCache, id: fileid3) -> &str {
+        &c.id_to_node[&id].remote_path
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_its_fileid() {
+        // THE 2026-11-13 NOENT LOOP: Finder holds the object it renamed; a new
+        // id for the new name left the held one unknown.
+        let mut c = FsCache::new();
+        let f = c.intern(ROOT_ID, "\\hello.txt", false, 41);
+        c.rename(f, ROOT_ID, "\\renamed.txt");
+        assert_eq!(path_of(&c, f), "\\renamed.txt");
+        assert_eq!(c.path_to_id.get("\\renamed.txt"), Some(&f));
+        assert!(!c.path_to_id.contains_key("\\hello.txt"));
+        assert_eq!(c.id_to_node[&f].size, 41);
+    }
+
+    #[test]
+    fn a_rename_over_an_existing_file_drops_the_replaced_one() {
+        let mut c = FsCache::new();
+        let tmp = c.intern(ROOT_ID, "\\doc.tmp", false, 10);
+        let old = c.intern(ROOT_ID, "\\doc.txt", false, 5);
+        c.rename(tmp, ROOT_ID, "\\doc.txt"); // an atomic save
+        assert_eq!(c.path_to_id.get("\\doc.txt"), Some(&tmp));
+        assert!(!c.id_to_node.contains_key(&old));
+        assert!(!c.path_to_id.contains_key("\\doc.tmp"));
+    }
+
+    #[test]
+    fn a_renamed_folder_moves_everything_inside_it() {
+        let mut c = FsCache::new();
+        let dir = c.intern(ROOT_ID, "\\untitled folder", true, 0);
+        let sub = c.intern(dir, "\\untitled folder\\sub", true, 0);
+        let file = c.intern(sub, "\\untitled folder\\sub\\a.txt", false, 3);
+        // A sibling whose name merely starts the same way stays put.
+        let sibling = c.intern(ROOT_ID, "\\untitled folder 2", true, 0);
+        let other = c.intern(ROOT_ID, "\\other", true, 0);
+
+        c.rename(dir, other, "\\other\\Projects");
+
+        assert_eq!(path_of(&c, dir), "\\other\\Projects");
+        assert_eq!(c.id_to_node[&dir].parent, other);
+        assert_eq!(path_of(&c, sub), "\\other\\Projects\\sub");
+        assert_eq!(path_of(&c, file), "\\other\\Projects\\sub\\a.txt");
+        assert_eq!(
+            c.path_to_id.get("\\other\\Projects\\sub\\a.txt"),
+            Some(&file)
+        );
+        assert!(!c.path_to_id.contains_key("\\untitled folder\\sub\\a.txt"));
+        assert_eq!(path_of(&c, sibling), "\\untitled folder 2");
+        // Parents of the moved children are unchanged ids.
+        assert_eq!(c.id_to_node[&file].parent, sub);
+    }
+
+    #[test]
+    fn run_with_timeout_returns_output_or_kills_a_stuck_command() {
+        let ok = run_with_timeout(
+            std::process::Command::new("/bin/echo"),
+            Duration::from_secs(5),
+        )
+        .expect("echo runs");
+        assert!(ok.status.success());
+
+        let failed = run_with_timeout(
+            std::process::Command::new("/usr/bin/false"),
+            Duration::from_secs(5),
+        )
+        .expect("false runs");
+        assert!(!failed.status.success());
+
+        // A command that would outlive the bound is killed, promptly.
+        let mut sleep = std::process::Command::new("/bin/sleep");
+        sleep.arg("30");
+        let started = std::time::Instant::now();
+        let stuck = run_with_timeout(sleep, Duration::from_millis(200));
+        assert!(
+            matches!(&stuck, Err(e) if e.contains("timed out")),
+            "{stuck:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn mounts_under_matches_whole_path_components() {
+        let mounts = [
+            PathBuf::from("/"),
+            PathBuf::from("/private/var/folders/x/T/macrdp-rdpdr-12/D"),
+            PathBuf::from("/private/var/folders/x/T/macrdp-rdpdr-123/E"),
+            PathBuf::from("/Volumes/USB"),
+        ];
+        let dir = Path::new("/private/var/folders/x/T/macrdp-rdpdr-12");
+        assert_eq!(
+            mounts_under(&mounts, dir),
+            vec![PathBuf::from("/private/var/folders/x/T/macrdp-rdpdr-12/D")]
+        );
+        // The mountpoint itself counts as "under" itself.
+        let mp = Path::new("/Volumes/USB");
+        assert_eq!(
+            mounts_under(&mounts, mp),
+            vec![PathBuf::from("/Volumes/USB")]
+        );
+        assert!(mounts_under(&mounts, Path::new("/nowhere")).is_empty());
+    }
+
+    #[test]
+    fn mount_points_reads_the_live_table() {
+        // Read-only and never blocks (MNT_NOWAIT); the root is always mounted.
+        assert!(mount_points().contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn mount_table_path_resolves_only_the_parent() {
+        // /tmp is a symlink to /private/tmp; the leaf needn't exist, which
+        // shows it is never stat'ed.
+        assert_eq!(
+            mount_table_path(Path::new("/tmp/macrdp-no-such-mountpoint")),
+            PathBuf::from("/private/tmp/macrdp-no-such-mountpoint")
+        );
+    }
+
+    #[test]
+    fn unmount_at_cleans_up_a_mountpoint_that_is_not_mounted() {
+        // The double-call case (Drop then shutdown): nothing mounted, so no
+        // umount runs and the dirs are just removed.
+        let parent = std::env::temp_dir().join(format!(
+            "macrdp-rdpdr-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mp = parent.join("D");
+        std::fs::create_dir_all(&mp).unwrap();
+        assert!(unmount_at(&mp));
+        assert!(!mp.exists());
+        assert!(!parent.exists(), "the emptied per-pid parent is pruned");
     }
 }
