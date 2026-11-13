@@ -854,6 +854,7 @@ async fn run_recv_loop(
                         rto_ms: cfg.rto_ms,
                         mode,
                         duplicate_lossy_sends,
+                        keepalive_ms: macrdp_rdpeudp::state::DEFAULT_KEEPALIVE_MS,
                     },
                 ),
                 inbound: Vec::new(),

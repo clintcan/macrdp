@@ -73,6 +73,24 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
   listener behind `MACRDP_UDP_LOSSY_AUDIO_DUP` (lossy flow only; see ironrdp-server
   CLAUDE.md (12) P2.3).
 
+- **Keepalive (done, 2026-11-13):** `Config::keepalive_ms` (default
+  `DEFAULT_KEEPALIVE_MS` = 10 s, `0` disables). Once established, if the SM has
+  sent nothing for that long, `pump` emits a pure ACK of the last received
+  datagram (the same `Datagram::ack` the SM already sends for owed ACKs, which
+  mstsc accepts). MS-RDPEUDP §3.1.1.9: "If there is no data to send, each
+  endpoint MUST periodically acknowledge the last received datagram"; a peer
+  that hears nothing for 65 s closes the connection (MS-RDPEUDP2 §3.1.1.3: 16 s
+  bound, Windows uses 4 s). **Why it mattered:** the SM only sent to answer or
+  acknowledge data, and mstsc's idle keepalives are pure ACKs, which need no
+  reply. So a tunnel carrying no data (nothing migrated onto it, or a static
+  screen with EGFX on it) went silent from our side, mstsc dropped it 65 s in,
+  and the listener's 30 s inbound-silence detector logged "UDP tunnel DEAD" at
+  ~90 s — 90.2 s and 90.4 s after connect in two LAN sessions, every mstsc
+  session since at least 11-02. Tests: `an_idle_server_sends_keepalive_acks`,
+  `a_send_postpones_the_keepalive`, `keepalive_zero_disables_it`,
+  `the_peer_accepts_a_keepalive_quietly` (mutation-checked: no keepalive, a
+  keepalive every tick, `0` ignored). The existing tests set `keepalive_ms: 0`,
+  so their exact-output assertions are unchanged.
 - **P2.2 step 1 — lossy delivery mode (done, 2026-06-27; SM logic only, NOT yet
   wired):** `Config` gained `mode: DeliveryMode { Reliable, Lossy }` (default
   `Reliable`, so every existing caller/test is byte-identical). In
