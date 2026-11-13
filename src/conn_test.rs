@@ -1421,3 +1421,63 @@ async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result
         })
         .await
 }
+
+/// A peer that sends an X.224 Connection Request and then goes silent must not
+/// hold the serving connection forever (#186): the pre-finalize phase is
+/// bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s, vendored divergence 32). The
+/// clock is paused, so the wait is virtual.
+#[tokio::test(start_paused = true)]
+async fn a_silent_peer_cannot_hold_the_serving_connection() -> anyhow::Result<()> {
+    use ironrdp_pdu::nego::{ConnectionRequest, RequestFlags, SecurityProtocol};
+    use ironrdp_pdu::x224::X224;
+    use tokio::io::AsyncWriteExt as _;
+
+    init_tracing();
+    let (mut client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let request = X224(ConnectionRequest {
+                nego_data: None,
+                flags: RequestFlags::empty(),
+                protocol: SecurityProtocol::SSL | SecurityProtocol::HYBRID,
+                correlation_info: None,
+            });
+            client_io.write_all(&ironrdp_core::encode_vec(&request)?).await?;
+            client_io.flush().await?;
+
+            // Still waiting just short of the budget: a slow human typing a
+            // password inside this phase must not be cut off early.
+            tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+            assert!(
+                !server_task.is_finished(),
+                "the serving connection gave up before the 60 s budget"
+            );
+
+            let done = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
+            assert!(
+                done.is_ok(),
+                "a peer that went silent after its Connection Request still holds the serving connection"
+            );
+            drop(client_io);
+            anyhow::Ok(())
+        })
+        .await
+}
