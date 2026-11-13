@@ -945,8 +945,11 @@ impl CaptureDisplay {
                 // surface at a size the client isn't showing (a client at
                 // 1728×1084 then sees the top-left quarter of a 3456×2170
                 // surface). Capture scales from whatever mode the display is
-                // in, and the next `updates()` retries the re-mode, since
-                // `mode_px` still records the old size.
+                // in, and the next `updates()` retries the re-mode: a failed
+                // `resize` clears `mode_px`, so the retry happens even when
+                // the next client asks for the size that last succeeded.
+                // Input maps onto the display's current points.
+                self.screen_size_pts = vd.size_pts();
                 tracing::warn!(
                     error = ?e,
                     requested_w = width,

@@ -233,6 +233,14 @@ mod macos {
         (px / ui_scale.max(1)).max(1)
     }
 
+    /// Smaller HiDPI point sizes to try when macOS won't give `w × h`
+    /// points: 90%, 80% and 70% of it, aspect kept.
+    pub(super) fn fallback_points(w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
+        [9u32, 8, 7]
+            .into_iter()
+            .map(move |tenths| ((w * tenths / 10).max(1), (h * tenths / 10).max(1)))
+    }
+
     /// What a mode request actually produced.
     enum Landed {
         /// The requested point size.
@@ -371,6 +379,11 @@ mod macos {
         pub fn resize(&mut self, width: u32, height: u32, ui_scale: u32) -> Result<()> {
             let ui_scale = if self.hidpi { ui_scale.max(1) } else { 1 };
             let (mode_w, mode_h) = (mode_points(width, ui_scale), mode_points(height, ui_scale));
+            // Until this succeeds the display is in no known mode (a failure
+            // can leave it on a variant, or half-way through the steps
+            // below), so forget the last size. Otherwise a later request for
+            // that same size would look already applied and skip the re-mode.
+            self.mode_px = (0, 0);
             let mut landed = self.apply_and_wait(mode_w, mode_h)?;
             // For a HiDPI mode of W points macOS has two variants — W points at
             // 2W pixels, and W/2 points at W pixels — and can keep whichever
@@ -390,16 +403,41 @@ mod macos {
                 self.apply_and_wait(mode_w + 16, mode_h + 16)
                     .context("stepping through another HiDPI size")?;
                 landed = self.apply_and_wait(mode_w, mode_h)?;
-                if matches!(landed, Landed::HalfVariant) {
+            }
+            let mut applied_w = mode_w;
+            if matches!(landed, Landed::HalfVariant) {
+                // Still on the variant: seen live for a 1x mstsc at 1920x1080
+                // (3840-px backing) on an M1 Mac mini, though not reproducible
+                // on another M1. Rather than serve a desktop at twice the
+                // size, take the largest smaller HiDPI size macOS does honour:
+                // the UI comes out slightly larger than asked, and capture
+                // scales it to the session.
+                let mut fallback = None;
+                for (w, h) in fallback_points(mode_w, mode_h) {
+                    if matches!(self.apply_and_wait(w, h)?, Landed::Exact) {
+                        fallback = Some(w);
+                        break;
+                    }
+                }
+                let Some(w) = fallback else {
                     return Err(anyhow!(
                         "virtual display still on the half-size HiDPI variant for \
-                         {mode_w}x{mode_h} points after stepping through another size"
+                         {mode_w}x{mode_h} points after stepping through another size, \
+                         and no smaller HiDPI size took"
                     ));
-                }
+                };
+                tracing::warn!(
+                    requested_points = ?(mode_w, mode_h),
+                    points = ?self.size_pts,
+                    session_px = ?(width, height),
+                    "virtual display kept landing on the half-size HiDPI variant — serving \
+                     the largest smaller HiDPI size that took (UI slightly larger than asked)"
+                );
+                applied_w = w;
             }
             self.mode_px = (width, height);
             self.ui_scale = ui_scale;
-            self.record_scale(mode_w);
+            self.record_scale(applied_w);
             Ok(())
         }
 
@@ -2033,6 +2071,13 @@ mod tests {
         // A 1x client at another size.
         vd.resize(1440, 900, 1).unwrap();
         assert_eq!(state(&vd), ((1440.0, 900.0), true), "1x client at 1440x900");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn half_variant_fallback_steps_down_keeping_the_aspect() {
+        let sizes: Vec<_> = macos::fallback_points(1920, 1080).collect();
+        assert_eq!(sizes, [(1728, 972), (1536, 864), (1344, 756)]);
     }
 
     #[test]
