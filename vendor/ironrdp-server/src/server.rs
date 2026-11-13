@@ -96,6 +96,22 @@ const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 *
 /// reconnects (immediately, if it holds an auto-reconnect cookie).
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// (macrdp 32) Budget for the serving path's pre-finalize phase in
+/// `run_connection`: X.224 negotiation, the TLS handshake and CredSSP.
+///
+/// All three read from a peer that has not authenticated yet, so without a
+/// bound a client that connects, sends a Connection Request and goes silent
+/// holds the serving connection forever (clintcan/macrdp#186). The candidate
+/// path has the same three legs, bounded by [`CANDIDATE_NEGOTIATION_TIMEOUT`],
+/// and finalize is bounded by [`FINALIZE_TIMEOUT`]; this closes the last one.
+///
+/// Much longer than the candidate budget on purpose: some clients (Windows App
+/// for macOS) prompt for the password in the middle of this phase, so a person
+/// typing is inside it. Measured accept-to-authentication: 7-11 s with that
+/// prompt, 12.5 s for CredSSP over a cellular link. A false timeout drops the
+/// connection, and the client can simply connect again.
+const SERVE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Monotonic milliseconds since first use, for feeding the auto-detect state machine.
 ///
 /// The clock lives here, in the I/O driver, rather than inside [`AutoDetectManager`]:
@@ -2507,7 +2523,26 @@ impl RdpServer {
 
         self.attach_channels(pending.acceptor_mut(), monitor_count);
 
-        let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
+        // (macrdp 32) Bounded: see `SERVE_NEGOTIATION_TIMEOUT`.
+        let negotiated = match tokio::time::timeout(
+            SERVE_NEGOTIATION_TIMEOUT,
+            pending.negotiate_and_authenticate(stream, tls),
+        )
+        .await
+        {
+            Ok(negotiated) => negotiated?,
+            Err(_) => {
+                warn!(
+                    timeout = ?SERVE_NEGOTIATION_TIMEOUT,
+                    "client did not finish negotiating and authenticating in time -- dropping the connection"
+                );
+                return Err(ServerError::io(
+                    "timed out waiting for the client to negotiate and authenticate",
+                    std::io::Error::from(std::io::ErrorKind::TimedOut),
+                ));
+            }
+        };
+        let Some(negotiated) = negotiated else {
             return Ok(());
         };
 

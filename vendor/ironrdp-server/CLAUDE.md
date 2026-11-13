@@ -61,6 +61,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (29) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
 | (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
+| (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection | `run_connection_inner`, around `negotiate_and_authenticate` | — |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -95,6 +96,16 @@ Notes on the port:
   `conn_test::hidden_and_default_pointer_updates_reach_the_client` (fails without the
   fix; catches a dropped `index == 0` guard and a `First` fragment). **Drop it at the
   next pin bump** (any rev at or after `904a7da6`).
+
+- **(32)** Added 2026-11-13 for clintcan/macrdp#186. The candidate path was already
+  bounded (`CANDIDATE_NEGOTIATION_TIMEOUT`, 10 s) and finalize by upstream's
+  `FINALIZE_TIMEOUT`, but `run_connection_inner` awaited `negotiate_and_authenticate`
+  with no bound, so a peer that sent a Connection Request and went silent held the
+  serving connection forever, pre-authentication. 60 s rather than 10 s because Windows
+  App for macOS prompts for the password inside this phase (7-11 s measured
+  accept-to-auth) and a cellular CredSSP took 12.5 s. Upstream master has the same
+  gap. Test: `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused
+  clock; fails without the bound, and with a 30 s one). Upstream candidate.
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
