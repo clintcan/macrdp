@@ -9,7 +9,13 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 ```
 --bind 0.0.0.0:3390       Listen address (3390 by default; 3389 needs root)
 --username NAME           Defaults to $USER
---password PASS           Skip the interactive prompt
+--password PASS           Skip the interactive prompt (visible in `ps`)
+--password-file PATH      Read the password from a file (mode 600, owned by
+                          you, no ACL; otherwise refused). Not visible in `ps`.
+                          One trailing newline is stripped. Config key
+                          PASSWORD_FILE (set USE_KEYCHAIN=0 with it; a
+                          config.env made by the menu-bar app has
+                          USE_KEYCHAIN=1, so change it to 0)
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
 -v, --verbose             Show all the noisy logs the default filter hides
@@ -62,6 +68,10 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           --alt-tab-switch, for clients that forward Alt+` but
                           gate Win-key combos. Option+Shift+` cycles backward.
                           macOS-only.
+--alt-space-spotlight     Also accept Option+Space (Alt+Space from the client)
+                          as the Spotlight trigger, in addition to Cmd+Space.
+                          Off by default. For macOS clients, whose own Spotlight
+                          takes Cmd+Space first. macOS-only.
 --app-switcher-hud        Show a visual app-switcher overlay (icon row, like
                           macOS's native Cmd+Tab) on the remote during Cmd+Tab /
                           Option+Tab. Off by default. macrdp spawns a small helper
@@ -81,6 +91,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           apps with an embedded terminal that can't be auto-detected
                           (front app is the IDE, not a TTY), e.g.
                           --no-remap-apps com.microsoft.VSCode. macOS-only.
+--reverse-scroll          Reverse the mouse-wheel direction (vertical and
+                          horizontal) for the remote session. For a Mac with
+                          natural scrolling on: macOS applies it to macrdp's
+                          scroll events too, and a local tool that un-reverses
+                          the physical wheel (LinearMouse etc.) doesn't see
+                          them. Off by default. macOS-only.
 --keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
                           auto-detecting it from the client. By default the
                           layout is auto-detected from the client's announced
@@ -383,6 +399,8 @@ BLANK_RECOVERY_MIN_QOE=24               # all-zero QoE reports (~3 s) to declare
 BLANK_RECOVERY_MAX_WAIT_MS=4000         # wall-clock fast-path: declare a STATIC blank after this many ms  [MACRDP_BLANK_RECOVERY_MAX_WAIT_MS]
 BLANK_RECOVERY_MIN_WALL_REPORTS=1       # min all-zero reports the fast-path needs (skips QoE-less clients)  [MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS]
 BLANK_RECOVERY_HEAL_CONFIRM_MS=8000     # after a reactivation, wait this long for a sustained heal before the fallback drop  [MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS]
+BLANK_RECOVERY_POST_ATTEMPT_ZEROS=3     # after a reactivation, drop on this many zero-render reports...  [MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS]
+BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS=10000  # ...within this window (0 disables)              [MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS]
 BLANK_RECOVERY_RETRY_MS=4000            # spacing between recovery attempts                              [MACRDP_BLANK_RECOVERY_RETRY_MS]
 BLANK_RECOVERY_MAX_ATTEMPTS=1           # forced to >=2 when REACTIVATE=1 so the drop can be attempt 2   [MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS]
 BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # storm guard: stop dropping after N blank-drops with no heal between  [MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS]

@@ -408,6 +408,11 @@ private struct InputTab: View {
                     ExcludeAppsView(model: model)
                 }
             }
+            Section("Mouse") {
+                Toggle("Reverse scroll direction", isOn: model.boolBinding("REVERSE_SCROLL"))
+                Text("For a Mac with natural scrolling on, if remote scrolling comes out backwards.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             Section("App switching") {
                 Toggle("Option+Tab switches apps", isOn: model.boolBinding("ALT_TAB_SWITCH"))
                 Toggle("App-switcher HUD overlay", isOn: model.boolBinding("APP_SWITCHER_HUD"))

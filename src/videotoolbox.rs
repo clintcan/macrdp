@@ -67,6 +67,28 @@ pub struct Encoder {
     /// blacks there. FreeRDP honors the range flag so it stays correct either
     /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
     full_range: bool,
+    /// The periodic keyframe interval in frames, enforced HERE by
+    /// [`Encoder::encode_bgra`], not by VideoToolbox (see [`VT_KEYFRAME_BACKSTOP`]).
+    keyframe_interval: u32,
+    /// Frames encoded since the last keyframe, counting that keyframe.
+    frames_since_keyframe: u32,
+}
+
+/// The `MaxKeyFrameInterval` handed to VideoToolbox at session creation: high
+/// enough never to fire, so [`Encoder::encode_bgra`] alone schedules the
+/// periodic keyframes. VideoToolbox fixes the interval when the session is
+/// created and silently ignores later changes: measured 2026-11-13, a session
+/// made with a 6-frame interval still emitted a keyframe every 6 frames after
+/// `MaxKeyFrameInterval` was set to 36000 (the set returned success). That made
+/// the adaptive controller's keyframe backoff a no-op, so the periodic IDR kept
+/// landing on a congested link. ~24 h at 60 fps; a backstop, not a schedule.
+const VT_KEYFRAME_BACKSTOP: u32 = 5_000_000;
+
+/// Whether the periodic keyframe is due: `frames_since_keyframe` counts the
+/// last keyframe, so with an interval of N the keyframes land on frames
+/// 0, N, 2N, … Pure; unit-tested.
+fn keyframe_due(frames_since_keyframe: u32, interval: u32) -> bool {
+    frames_since_keyframe >= interval.max(1)
 }
 
 impl Encoder {
@@ -97,7 +119,8 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
+        let session =
+            ffi::create_session(width, height, bitrate_bps, VT_KEYFRAME_BACKSTOP, tx_ptr)?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -107,6 +130,9 @@ impl Encoder {
             next_pts: 0,
             fps,
             full_range,
+            keyframe_interval: keyframe_frames,
+            // Due at once: the first frame is a keyframe either way.
+            frames_since_keyframe: keyframe_frames,
         })
     }
 
@@ -126,12 +152,14 @@ impl Encoder {
         unsafe { ffi::set_average_bitrate(self.inner.session, bitrate_bps) }
     }
 
-    /// Live-update the periodic keyframe (IDR) interval (in frames), for
-    /// congestion-responsive IDR backoff (`h264.rs`). Stretch it under congestion to
-    /// suppress the periodic IDR; restore on recovery. No encoder rebuild.
-    pub fn set_keyframe_interval(&self, keyframe_frames: u32) -> Result<()> {
-        // SAFETY: `self.inner.session` is valid for the lifetime of the Encoder.
-        unsafe { ffi::set_max_keyframe_interval(self.inner.session, keyframe_frames) }
+    /// Change the periodic keyframe (IDR) interval (in frames), for
+    /// congestion-responsive IDR backoff (`h264.rs`): stretch it under congestion
+    /// to suppress the periodic IDR, restore it on recovery. Takes effect on the
+    /// next frame, because this encoder schedules the keyframes itself (see
+    /// [`VT_KEYFRAME_BACKSTOP`] for why VideoToolbox can't). Shrinking it below the
+    /// frames already encoded since the last keyframe makes the next frame one.
+    pub fn set_keyframe_interval(&mut self, keyframe_frames: u32) {
+        self.keyframe_interval = keyframe_frames.max(1);
     }
 
     /// Submit a BGRA frame for encoding. `stride` is in bytes per row
@@ -164,6 +192,13 @@ impl Encoder {
         }
         let pts = self.next_pts;
         self.next_pts = self.next_pts.wrapping_add(1);
+        let due = keyframe_due(self.frames_since_keyframe, self.keyframe_interval);
+        let force_keyframe = force_keyframe || due;
+        self.frames_since_keyframe = if force_keyframe {
+            1
+        } else {
+            self.frames_since_keyframe.saturating_add(1)
+        };
         ffi::encode_frame(
             &self.inner,
             bgra,
@@ -538,7 +573,10 @@ mod ffi {
             // faster recovery, higher = smoother typing. The session's first
             // keyframe is still forced explicitly in encode_bgra(); this governs
             // only the periodic safety net. (Was fps*30 ≈ 30s, which let mstsc
-            // corruption persist for half a minute.) Set via --keyframe-interval
+            // corruption persist for half a minute.) Since 2026-11-13 the caller
+            // passes VT_KEYFRAME_BACKSTOP here and Encoder::encode_bgra schedules
+            // the periodic keyframe itself, because VideoToolbox ignores a later
+            // change to this property. The interval comes from --keyframe-interval
             // (seconds), already converted to a frame count by the caller.
             set_i32(
                 session,
@@ -567,23 +605,6 @@ mod ffi {
             session,
             kVTCompressionPropertyKey_AverageBitRate,
             bitrate_bps.max(1) as i32,
-        )
-    }
-
-    /// Live-update the periodic keyframe (IDR) interval, in frames, on a running
-    /// session — for congestion-responsive IDR backoff. Settable mid-session: under
-    /// congestion we stretch it (effectively suppressing the periodic IDR, since a
-    /// big intra frame is the worst thing to inject into a backed-up tunnel) and
-    /// restore it on recovery. *Forced* keyframes (first frame, recovery) are
-    /// independent — they go through `encode_bgra(force_keyframe=true)`.
-    pub(super) unsafe fn set_max_keyframe_interval(
-        session: VTCompressionSessionRef,
-        keyframe_frames: u32,
-    ) -> Result<()> {
-        set_i32(
-            session,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval,
-            keyframe_frames.max(1) as i32,
         )
     }
 
@@ -1691,6 +1712,58 @@ mod tests {
             !first.parameter_sets.is_empty(),
             "keyframe should carry SPS/PPS parameter sets"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn keyframe_due_every_interval_frames() {
+        // Interval 6: due once 6 frames (counting the last keyframe) are out.
+        assert!(!keyframe_due(1, 6));
+        assert!(!keyframe_due(5, 6));
+        assert!(keyframe_due(6, 6));
+        assert!(keyframe_due(7, 6));
+        // A zero interval is treated as 1: every frame.
+        assert!(keyframe_due(1, 0));
+    }
+
+    /// Encode `n` distinct frames and return which of them came out as
+    /// keyframes (indices within this batch).
+    fn keyframe_positions(enc: &mut Encoder, first: u32, n: u32) -> Result<Vec<u32>> {
+        let (w, h) = (enc.width, enc.height);
+        let stride = usize::from(w) * 4;
+        let mut out = Vec::new();
+        for f in first..first + n {
+            let mut frame = vec![0u8; stride * usize::from(h)];
+            for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+                px[0] = ((i as u32 + f * 7) % 251) as u8;
+                px[1] = (f * 13 % 255) as u8;
+                px[2] = 0x40;
+                px[3] = 0xff;
+            }
+            enc.encode_bgra(&frame, stride, false)?;
+            for fr in enc.flush()? {
+                if fr.is_keyframe {
+                    out.push(f - first);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// THE 2026-11-13 BUG: VideoToolbox ignores a mid-session change to
+    /// `MaxKeyFrameInterval`, so the adaptive controller's keyframe backoff
+    /// did nothing. The encoder now schedules keyframes itself, so stretching
+    /// the interval stops them and restoring it brings them back at once.
+    #[test]
+    fn the_keyframe_interval_can_be_changed_mid_session() -> Result<()> {
+        let mut enc = Encoder::new(320, 240, 30, 2_000_000, 0.2)?; // 6 frames
+        assert_eq!(keyframe_positions(&mut enc, 0, 18)?, vec![0, 6, 12]);
+
+        enc.set_keyframe_interval(36_000); // the backoff's stretch
+        assert_eq!(keyframe_positions(&mut enc, 18, 30)?, Vec::<u32>::new());
+
+        enc.set_keyframe_interval(6); // restored: overdue, so at once
+        assert_eq!(keyframe_positions(&mut enc, 48, 13)?, vec![0, 6, 12]);
         Ok(())
     }
 }

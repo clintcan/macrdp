@@ -4,6 +4,140 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.3 — Finder writes to redirected drives, and the keyframe backoff works
+
+A bug-fix release. By default, only drive redirection behaves differently; the keyframe change also applies to every H.264 session, but keeps the same cadence.
+
+- **Finder can write to a redirected drive (#253).**
+  - **The bug:** the drive's files and folders were reported as owned by "system", with read-only access for everyone else. Finder therefore treated the drive as read-only: New Folder silently did nothing, and a rename failed with "another operation is in progress". Commands in Terminal still worked, which is how this went unnoticed.
+  - **The fix:** files and folders are now reported as owned by the user macrdp runs as (the server process's uid/gid in the node attributes).
+- **Renaming a file or folder on a redirected drive keeps its identity (#253).** A rename used to give the item a new identity on our side, while Finder kept using the old one. The visible effect was an error logged every 5 seconds for as long as the Finder window stayed open; files inside a renamed folder could still be looked for at the folder's old location. A renamed item now keeps its identity, and the paths of everything inside a renamed folder move with it (`FsCache::rename`).
+- **`--adaptive-bitrate`'s keyframe backoff now takes effect (#252).**
+  - **The bug:** under congestion, the backoff is meant to hold back the periodic keyframe, but VideoToolbox ignores a keyframe-interval change made after encoding starts. So the backoff never did anything.
+  - **The fix:** the encoder now schedules the periodic keyframe itself (`keyframe_due`; VideoToolbox gets a never-firing `VT_KEYFRAME_BACKSTOP`).
+  - **The cap:** with the backoff working, a session that stays congested would get no healing keyframe at all, so the held-back interval is capped at about 10 s of frames (`stretched_keyframe_interval`; about a minute under the 10 fps floor).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 339 tests pass. The new tests were mutation-checked, including one on a real VideoToolbox session.
+- **Drive redirection:** live on a Mac mini with FreeRDP redirecting a folder.
+  - Before the fix, Finder refused New Folder and rename without sending a request.
+  - With only the ownership fix, a rename produced the error every 5 s.
+  - With both fixes, creating a folder and renaming a file and a folder produced no errors.
+- **Keyframes:** live with mstsc on Windows 11.
+  - With adaptive bitrate off, 37 keyframes went out, exactly 120 frames apart: the normal 2 s cadence, now from our scheduler.
+  - With adaptive bitrate on in a congested session, keyframes came every 600 frames instead of stopping.
+- **Not soaked:** the mini has run this exact code for about half an hour.
+
+**Known issues** (none are new in this release)
+
+- An mstsc window that has reconnected several times decodes video more slowly above ~2 Mbit/s, so `--adaptive-bitrate` can still briefly dip there. Closing and reopening mstsc avoids it.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+- Windows 10 mstsc can start an H.264 session frozen (#229). Fixes are in review (#228, #230).
+
+## v0.10.2 — clipboard and drive redirection fixes
+
+A bug-fix release: the session no longer freezes when the Mac's clipboard holds something copied on another Apple device, and restarting macrdp with a redirected drive no longer leaves a stuck mount behind. By default, only clipboard sync and drive redirection behave differently.
+
+- **No more session freezes from Universal Clipboard (Handoff) (#198, @antonmos).** When the Mac's clipboard held an item copied on an iPhone or another Mac, a paste on the RDP client made macrdp read it, and macOS then fetched it from the other device over Bluetooth while the whole session waited. That took 70–662 ms in testing, and 17–21 s on the Mac mini on 11-10. macrdp now neither offers nor reads such items (`is_remote_clipboard`), and macrdp's own clipboard writes stay on the Mac instead of being handed to Handoff. On connect, something copied on the Mac while no client was connected now wins over the client's clipboard; otherwise the client's clipboard is used, as before (`skip_connect_time_fetch`, with `session_end_cc` stamped only by a connection that served a client). A lost fetch reply now holds up later copies for at most 60 s (`STALE_REPLY_GRACE`).
+  - Trade-off: an item copied on a third Apple device isn't relayed to the RDP client until something is copied again.
+- **A failed connection attempt can no longer break the live session's file paste (#245, @antonmos).** Clipboard state is created for every connection attempt, before authentication. When an attempt failed or lost a preemption, its cleanup could delete the live session's in-progress Windows→Mac paste files. Only a connection that actually served a client cleans up now (its `on_ready` fired).
+- **Restarting macrdp with a drive redirected no longer leaves a stuck mount (#251).** A restart could leave the drive's NFS mount pointing at the stopped server. The next start then hung on it until "Disconnect All" was clicked in macOS's "Server connections interrupted" dialog. Now:
+  - the mount is made with `deadtimeout=60`, so macOS removes it by itself about a minute after its server disappears, whether from a restart, a crash or a freeze;
+  - startup cleanup finds leftover mounts in the kernel's mount table (`getfsstat` with `MNT_NOWAIT`) without touching them, so it can't hang, and each `umount` is bounded at 10 s;
+  - a failed unmount is logged at warn with its error.
+- Two clarifying comments in `auth_guard.rs` (#242, @SferaDev).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 333 tests pass. The new tests were mutation-checked: breaking each fix fails its test.
+- **Clipboard:** live on a Mac mini with Handoff on, copying on an iPhone and pasting on a Windows 11 PC. v0.10.1 froze the session for 70 ms, and for 662 ms with the phone locked. This release refused the request in about 2 ms with no freeze, and normal copy and paste in both directions still worked.
+- **Drive redirection:** live on the Mac mini with FreeRDP redirecting a folder.
+
+  | Case | Result |
+  |---|---|
+  | Restart with the drive mounted | unmounted in 51 ms |
+  | Process killed (SIGKILL) | the next start cleaned up the mount in under a second, with no hang |
+  | Process frozen (SIGSTOP) | macOS removed the mount by itself after 80 s, and the session survived |
+- **#245** is a bug found by reading the code. It wasn't reproduced with a real client.
+- **Not soaked:** the mini has run this code for a few hours.
+
+**Known issues** (none are new in this release)
+
+- An mstsc window that has reconnected several times decodes video more slowly above ~2 Mbit/s, so `--adaptive-bitrate` can still briefly dip there. Closing and reopening mstsc avoids it.
+- `--adaptive-bitrate`'s keyframe backoff has no effect: periodic keyframes keep their normal interval under congestion.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+
+## v0.10.1 — mstsc reconnect and video fixes
+
+A bug-fix release for mstsc users: no more dropped sessions after a successful blank-screen recovery, and no more video stutter with `--adaptive-bitrate` on a LAN. By default, only blank recovery (on by default) and the resync hotkey behave differently; the adaptive-bitrate changes apply only when `--adaptive-bitrate` is on.
+
+- **A session that recovered from a blank screen is no longer dropped (#248).** Right after a reconnect, the server can repaint a blank mstsc window in place. Once it has, a single "nothing presented" report from mstsc used to drop the session anyway, so you saw black, then the desktop, then a reconnect dialog. On a static desktop the menu-bar clock tick could cause that once a minute in a loop. After a recovery, a drop now needs a burst of such reports (3 within 10 s) that also make up at least half of the reports since the recovery, and none once the session has shown 5 seconds of picture. Every logged false drop fails at least one of those tests; every logged real blank passes all three. Tunable with `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS` and `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS`, also settable in `config.env`. (In `should_blank_recover`: the one-zero wall-clock fast path is connect-phase only, the heal-confirmation deadline fires only on QoE silence, and the new zero-burst arm is withheld once established and needs a zero majority.)
+- **`--adaptive-bitrate` no longer makes mstsc video stutter on a LAN (#249).** It read mstsc's ~120 ms of decode depth during 1080p60 video as network congestion, though the TCP send queue was empty, and swung between 3 and 0.5 Mbit/s and a 10 fps cap every 3–5 s. Delay now counts as congestion only while it keeps growing, or above 400 ms. Cuts are spaced at least 1 s apart so each takes effect, and the climb back slows near the bitrate where trouble began. Tunable with `MACRDP_ADAPTIVE_QUEUE_RISE_MS` and `MACRDP_ADAPTIVE_QUEUE_CEILING_MS`. (`delay_trend`/`delay_pressure`, `hold_trend_decrease`, `increase_step`/`note_decrease`.) In a closed-loop simulation of the controller: the mstsc LAN model averages 2.89 Mbit/s with no floor intervals (0.85 Mbit/s and 48 before); thin 1.0/1.5/2.5 Mbit/s links average 0.99/1.48/2.49 Mbit/s (0.82/1.15/2.03 before) at the same peak delay; a saturated 500 Kbit link backs off exactly as before.
+- **The A/V resync hotkey clears queued video first (#249).** Ctrl+Alt+Shift+R now holds new video until mstsc's decoder has caught up, at most 2 s, before the fresh keyframe, which is what minimize→restore did (`resync_drain_step`).
+- A clipboard test that could fail on a slow CI runner now runs on a simulated clock (#250).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 314 tests pass. The new tests replay the logged false-drop and real-blank windows and the measured delay traces, and each part of both fixes is mutation-checked.
+- Live with mstsc (Windows 11) on a Mac mini over Ethernet, with YouTube playing, across four rounds. Final round: 7 connections, 3 blank reconnects all healed in place, 0 drops. Adaptive bitrate: 0–12 cuts per connection and no 10 fps periods on a freshly opened mstsc, against 119 cuts and 252 capped frames in one reconnected connection on an earlier build.
+- Not soaked: the mini has run this code for about half an hour. v0.10.0's 48-hour soak covered everything else.
+- Not tested live: VPN and ZeroTier links with `--adaptive-bitrate`, and Windows App for macOS. Both rest on the replayed logs and models.
+
+**Known issues** (none are new in this release)
+
+- An mstsc window that has reconnected several times decodes video more slowly above ~2 Mbit/s, so `--adaptive-bitrate` can still briefly dip there. Closing and reopening mstsc avoids it.
+- `--adaptive-bitrate`'s keyframe backoff has no effect: periodic keyframes keep their normal interval under congestion.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+- Restarting macrdp while a drive is redirected can leave a stale mount until macOS offers "Disconnect All".
+- Reading a Universal Clipboard (Handoff) item can stall the session for many seconds; turning off Handoff on the Mac avoids it.
+
+## v0.10.0 — IronRDP update + fixes since v0.9.11
+
+An update to IronRDP plus about four weeks of fixes from contributors. Most of the runtime is unchanged; the behaviour changes are listed below.
+
+**IronRDP update (#194).** macrdp now builds on IronRDP `e258f6a0`, up from `a5d1c682` (391 upstream commits). Several things macrdp used to patch locally are now upstream, so the vendored forks shrank: SuppressOutput, NSCodec, adopting the client's resolution, the keyboard-layout cell, the auto-reconnect cookie, mouse position before button, and auth-gated preemption. macrdp sets them through the builder, including `ConnectionPolicy::Preempt` (upstream's default, `Queue`, would bring back the second-client hang). What it changes for users:
+
+- **A client that stalls while connecting no longer holds the session.** IronRDP now gives the connection's finalize step 30 s (upstream #1890). Before, a wedged client could keep the session slot until another client connected. This replaces #182 (@antonmos).
+- **The cursor shows in the iOS Windows App (#211).** 32-bit cursors now carry an AND mask (a backport of upstream #2108, vendored server divergence 29). Reported and confirmed fixed by @JeffSteinbok, who also checked touch mode.
+- **FreeRDP and Thincast now get mute-on-minimize.** IronRDP now tells clients the server supports SuppressOutput, so these clients send it, and macrdp mutes the audio and pauses the video while they're minimized, as it already did for mstsc.
+- **The auto-reconnect cookie is verified and rotated.** IronRDP now checks a returning cookie and changes it hourly and on every reactivation. A client that reconnects after macrdp restarts carries a cookie that no longer checks out. Upstream refuses that connection, which in testing locked FreeRDP out through repeated retries; macrdp falls back to a normal logon instead, as MS-RDPBCGR 3.3.5.3.11 asks (vendored server divergence 30, reported upstream as Devolutions/IronRDP#2280).
+
+**Fixes and features since v0.9.11**
+
+- `--password-file` reads the password from a file you own with mode 600 or 400 (@rophy, #212).
+- `--alt-space-spotlight`: Option+Space opens Spotlight (@SferaDev, #209).
+- Input arrives while a write to a slow client is blocked, and Nagle is off on RDP sockets (@SferaDev, #222; vendored server divergence 26).
+- After display sleep, the capture reopens instead of freezing on the last frame (@SferaDev, #221).
+- Capture no longer holds frames back on displays that refresh no faster than `--fps`, which cuts typing latency (@SferaDev, #220).
+- ISO `<>`, JIS, F13–F20 and keypad keys are mapped, so Spanish, German and French clients can type `<` and `>` (@SferaDev, #223).
+- Modifier changes reach apps once instead of twice, so VS Code's Shift Shift no longer fires on one press (@SferaDev, #208).
+- A fast scroll no longer leaves a backlog that swallows the next reversal (@SferaDev, #210).
+- The app switcher closes when stale modifiers are cleared on a reconnect (@SferaDev, #234).
+- Auth lockout no longer counts a disconnect after successful authentication, so a client's own auto-reconnects can't lock it out (@SferaDev, #233).
+- A second copy on the Mac reaches the client promptly; it was 1–8.5 s late (@SferaDev, #217).
+- `--stats-endpoint` counts frames for every client and clears the count on disconnect (@SferaDev, #218).
+- On a multi-monitor Mac, mirror mode captures the main display, the one input maps to (#215).
+- `--max-client-size` also applies to the size adopted at connect (#216).
+- The blank detector's clocks start when the graphics channel is ready, not at TCP accept, so a slow login no longer sets off a needless recovery (#196).
+- Keyboard-layout lookups are serialized, so concurrent callers can't abort the process (#227).
+- The flush frame keeps a reference to its pixel buffer instead of copying it (@antonmos, #203).
+- Dependency security updates: rustls, rustls-webpki, tokio, crypto-bigint and ctutils (#213), libz-sys (RUSTSEC-2026-0418, #243).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 301 tests pass.
+- Live with mstsc (Windows 11) on a Mac mini: connect, reconnect, minimize, audio, clipboard (text, rich text and files, both directions), drive redirection, and a server restart while connected, which returns to a normal logon with no lockout. FreeRDP passed live on an earlier build of this branch, and the #211 reporter checked Windows App on iOS on one too.
+- A **48-hour soak** on the Mac mini (2026-11-10 01:20Z → 11-12 01:20Z): no restarts and no panics in 2,868 samples, memory 26–121 MB with no upward trend, a steady count of open files, the in-tree abuse harnesses, and one mstsc session that stayed connected for over 12 hours. The raw samples are in `~/macrdp-soak-samples.log` on the mini.
+
+**Known issues** (none are new in this release)
+
+- **Right after connecting, a session that recovered from a blank screen can still be dropped once**, and the client then reconnects on its own. Typically you see black, then the desktop, then a reconnect lasting about 10 s. The blank-recovery wall-clock fast path ignores the recovery's own heal evidence. Seen with mstsc over ZeroTier and on a LAN. Fix planned for v0.10.1.
+- **`--adaptive-bitrate` makes video stutter every 3–5 s for mstsc on a fast LAN.** It reads mstsc's acknowledgement pace as congestion and keeps cutting the bitrate. Turning it off removed the stutter in a live A/B. The option is off by default; on a LAN, leave it off (`ADAPTIVE_BITRATE=0`). Separately, its keyframe backoff has no effect: periodic keyframes keep their normal interval under congestion. Fixes planned for v0.10.1.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+- Restarting macrdp while a drive is redirected can leave a stale mount until macOS offers "Disconnect All".
+- Reading a Universal Clipboard (Handoff) item can stall the session for many seconds; turning off Handoff on the Mac avoids it. Fix planned for v0.10.1.
+
 ## v0.9.11 — input fixes
 
 A bug-fix release for mouse and keyboard input, both contributed by @antonmos. The default runtime path changes only in that clicks, drags and scrolls now carry the modifiers you're holding.

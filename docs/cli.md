@@ -17,6 +17,12 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --bind 0.0.0.0:3390       # listen address
 --username NAME           # default: $USER
 --password PASS           # avoid the interactive prompt (logs are warned)
+--password-file PATH      # read the password from a file (not visible in `ps`); the file
+                          #   must be yours with mode 600 and no ACL, else macrdp refuses
+                          #   it. Only a regular file: pipes, `<(...)` and /dev/stdin are
+                          #   refused.
+                          #   Config key PASSWORD_FILE (turns the USE_KEYCHAIN default off;
+                          #   an explicit USE_KEYCHAIN=1 with it is an error)
 --skip-auth               # bypass PAM (also skips password validation)
 --width  / --height       # override autodetected display size
 --hidpi                   # capture the primary display at backing (Retina) pixels
@@ -54,6 +60,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
                           #   auto-detected (e.g. com.microsoft.VSCode). macOS-only.
+--reverse-scroll          # Reverse the mouse-wheel direction (both axes) for the
+                          #   remote session. For a Mac with natural scrolling on,
+                          #   where a local tool (LinearMouse etc.) un-reverses the
+                          #   physical wheel but can't see macrdp's scroll events.
+                          #   Off by default. Config: REVERSE_SCROLL=1. macOS-only.
 MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   held modifiers are presumed stale and cleared on the
                           #   next input event (a key-up lost when the client lost
@@ -392,6 +403,12 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (congestion threshold,
                           #   default 100 ms of standing queue; replaces the removed
                           #   MACRDP_{UDP,TCP}_ADAPTIVE_LAG_THRESHOLD),
+                          #   MACRDP_ADAPTIVE_QUEUE_RISE_MS (default 20: the delay
+                          #   only counts as congestion while it's GROWING by more
+                          #   than this between ~0.9 s windows; a flat standing delay,
+                          #   e.g. mstsc's ~120 ms video decode depth, doesn't),
+                          #   MACRDP_ADAPTIVE_QUEUE_CEILING_MS (default 400: above
+                          #   this it's congestion whatever the trend),
                           #   MACRDP_ADAPTIVE_EWMA_ALPHA, MACRDP_ADAPTIVE_FLOOR_FPS.
                           #   The RETX_TOLERANCE (default 2) is the per-interval
                           #   reliable-retransmit count tolerated before treating loss
@@ -566,9 +583,11 @@ MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS=40  # nonzero reports (~5 s) that mark
 MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE=160  # all-zero reports (~20 s at the active cadence) required to recover an ESTABLISHED session — tolerates the brief zero-EDR windows a healthy client produces (a shorter window dropped a working 12-min session)
 MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS=30000  # wall-clock companion to the above: an established session is also declared blank once NOTHING nonzero has arrived for this long (with the report floor below) — bounds recovery on a STATIC blank, where QoE trickles at ~0.3/s and the 160-report count alone would take ~9 min
 MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS=16  # consecutive zeros the wall-clock branch needs — proves the client is still decoding, so an IDLE session (no frames, no QoE at all) never trips it
-MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank (never-established sessions only)
+MACRDP_BLANK_RECOVERY_MAX_WAIT_MS=4000 # wall-clock fast-path: fire after this on a static blank (never-established sessions, and only before the first recovery attempt)
 MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS=1  # min all-zero reports the fast-path needs (rules out QoE-less clients)
-MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS=8000  # post-attempt heal-confirmation deadline (0 disables): once a recovery attempt has run, the session must show a SUSTAINED nonzero-EDR run within this long or the next attempt (the fallback drop) fires — on cumulative-zero / total-silence evidence that interleaved phantom nonzero reports can't reset (Windows App for macOS starved the consecutive-zero paths for 12+ s live, 2026-07-23)
+MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS=8000  # post-attempt heal-confirmation deadline (0 disables): once a recovery attempt has run, the session must show a SUSTAINED nonzero-EDR run within this long or the next attempt (the fallback drop) fires — on total-silence evidence (Windows App for macOS starved the consecutive-zero paths for 12+ s live, 2026-07-23); the interleaved-phantom case is the zero burst below
+MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS=3  # after a recovery attempt, escalate (the fallback drop) when this many zero-EDR reports arrive within the window below — a density rule, so a healed session's lone clock-tick zero (~1/min on a static desktop) never drops it; and only while zeros are at least half of the reports since the attempt; not applied once the session is ESTABLISHED (see ESTABLISHED_REPORTS), which uses the slower established-tier checks (1..=32)
+MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS=10000  # the window for the above (0 disables the zero-burst arm)
 MACRDP_BLANK_RECOVERY_ARM_MS=3000      # skip the connect-time churn window
 MACRDP_BLANK_RECOVERY_RETRY_MS=4000    # spacing between attempts
 MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # forced to >=2 when REACTIVATE=1 so the fallback drop can fire
@@ -596,3 +615,29 @@ and point Wireshark at that file (Preferences → Protocols → TLS → "(Pre)-M
 filename"). Covers the TCP RDP connection and the reliable-UDP multitransport flow (rustls);
 the lossy flow's DTLS is not covered. macrdp warns loudly at startup while the var is set —
 session keys on disk break the capture's confidentiality, so use it only for protocol debugging.
+
+Deploying a change to the installed bundle (the LaunchAgent runs
+`/Applications/macrdp.app`, never `target/release`):
+```bash
+# Don't reinstall over a live session; a restart drops it.
+# An `accept` with no later `disconnect` means a client is connected.
+grep -E 'event="(accept|disconnect)"' ~/Library/Logs/macrdp.log | tail -5
+
+# Rebuild + install in one step. With the macrdp-dev cert, TCC grants survive.
+packaging/make-app.sh
+
+# Confirm the INSTALLED binary contains the change (pick a log string the change adds).
+strings /Applications/macrdp.app/Contents/MacOS/macrdp | grep -c '<new log string>'
+
+launchctl kickstart -k gui/$(id -u)/com.clintcan.macrdp
+tail -f ~/Library/Logs/macrdp.log   # watch the new behaviour actually fire
+```
+To compare the installed binary with a build, use the staged signed copy at
+`target/macrdp.app/Contents/MacOS/macrdp`. The installed binary is signed and
+`target/release/macrdp` isn't, so their hashes never match.
+
+To see what a `config.env` actually resolves to, add a throwaway `#[cfg(test)]` test
+that calls `args_from_config(&path)` and prints the fields. One `cargo test` run
+settles it, which is faster than reading logs. `EXTRA_FLAGS` is appended after every
+dedicated key: an on/off flag there silently overrides its key, a duplicated valued flag
+stops startup, and `BITRATE` always wins (see packaging/README.md).

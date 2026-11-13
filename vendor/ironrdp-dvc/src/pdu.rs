@@ -1,5 +1,5 @@
+use alloc::collections::BTreeSet;
 use alloc::format;
-use alloc::vec;
 use core::fmt;
 
 use ironrdp_core::{
@@ -14,6 +14,7 @@ use ironrdp_svc::SvcEncode;
 use crate::{DynamicChannelId, String, Vec};
 
 /// Dynamic Virtual Channel PDU's that are sent by both client and server.
+#[non_exhaustive]
 #[derive(Debug, PartialEq)]
 pub enum DrdynvcDataPdu {
     DataFirst(DataFirstPdu),
@@ -56,15 +57,13 @@ impl Encode for DrdynvcDataPdu {
 }
 
 /// Dynamic Virtual Channel PDU's that are sent by the client.
+#[non_exhaustive]
 #[derive(Debug, PartialEq)]
 pub enum DrdynvcClientPdu {
     Capabilities(CapabilitiesResponsePdu),
     Create(CreateResponsePdu),
     Close(ClosePdu),
     Data(DrdynvcDataPdu),
-    /// (macrdp divergence) Soft-Sync Response — the client's reply to a
-    /// Soft-Sync Request. Upstream errored on this (Cmd 0x09 hit the catch-all),
-    /// which tore down the connection; decoding it lets the server proceed.
     SoftSyncResponse(SoftSyncResponsePdu),
 }
 
@@ -112,19 +111,19 @@ impl Decode<'_> for DrdynvcClientPdu {
             Cmd::Close => Ok(Self::Close(ClosePdu::decode(header, src)?)),
             Cmd::Capability => Ok(Self::Capabilities(CapabilitiesResponsePdu::decode(header, src)?)),
             Cmd::SoftSyncResponse => Ok(Self::SoftSyncResponse(SoftSyncResponsePdu::decode(header, src)?)),
-            _ => Err(unsupported_value_err!("Cmd", header.cmd.into())),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
 
 /// Dynamic Virtual Channel PDU's that are sent by the server.
+#[non_exhaustive]
 #[derive(Debug, PartialEq)]
 pub enum DrdynvcServerPdu {
     Capabilities(CapabilitiesRequestPdu),
     Create(CreateRequestPdu),
     Close(ClosePdu),
     Data(DrdynvcDataPdu),
-    /// (macrdp divergence) Soft-Sync Request — moves DVCs onto a UDP tunnel.
     SoftSyncRequest(SoftSyncRequestPdu),
 }
 
@@ -171,7 +170,8 @@ impl Decode<'_> for DrdynvcServerPdu {
             Cmd::Data => Ok(Self::Data(DrdynvcDataPdu::Data(DataPdu::decode(header, src)?))),
             Cmd::Close => Ok(Self::Close(ClosePdu::decode(header, src)?)),
             Cmd::Capability => Ok(Self::Capabilities(CapabilitiesRequestPdu::decode(header, src)?)),
-            _ => Err(unsupported_value_err!("Cmd", header.cmd.into())),
+            Cmd::SoftSyncRequest => Ok(Self::SoftSyncRequest(SoftSyncRequestPdu::decode(header, src)?)),
+            _ => Err(unsupported_value_err!("Cmd", header.cmd.into(), in: src)),
         }
     }
 }
@@ -180,6 +180,353 @@ impl Decode<'_> for DrdynvcServerPdu {
 impl SvcEncode for DrdynvcDataPdu {}
 impl SvcEncode for DrdynvcClientPdu {}
 impl SvcEncode for DrdynvcServerPdu {}
+
+/// A multitransport tunnel used for Soft-Sync.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.1.1] and [\[MS-RDPEDYC\] 2.2.5.2].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/20a29627-6966-4085-b5f1-00112a6114e3
+/// [\[MS-RDPEDYC\] 2.2.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/2f9c83aa-8c82-4d85-a7fe-b4c6301a9f90
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SoftSyncTunnelType(u32);
+
+impl SoftSyncTunnelType {
+    /// Reliable RDP-UDP FEC tunnel.
+    pub const RELIABLE_UDP: Self = Self(0x0000_0001);
+    /// Lossy RDP-UDP FEC tunnel.
+    pub const LOSSY_UDP: Self = Self(0x0000_0003);
+}
+
+impl From<u32> for SoftSyncTunnelType {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SoftSyncTunnelType> for u32 {
+    fn from(value: SoftSyncTunnelType) -> Self {
+        value.0
+    }
+}
+
+/// A group of dynamic virtual channels sent over one Soft-Sync tunnel.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.1.1].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/20a29627-6966-4085-b5f1-00112a6114e3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftSyncChannelList {
+    tunnel_type: SoftSyncTunnelType,
+    channel_ids: Vec<DynamicChannelId>,
+}
+
+impl SoftSyncChannelList {
+    const FIXED_PART_SIZE: usize = 4 /* TunnelType */ + 2 /* NumberOfDVCs */;
+
+    /// Creates a channel list for a multitransport tunnel.
+    pub fn new(tunnel_type: SoftSyncTunnelType, channel_ids: Vec<DynamicChannelId>) -> Self {
+        Self {
+            tunnel_type,
+            channel_ids,
+        }
+    }
+
+    /// Returns the tunnel selected for these channels.
+    pub fn tunnel_type(&self) -> SoftSyncTunnelType {
+        self.tunnel_type
+    }
+
+    /// Returns the dynamic virtual channels assigned to this tunnel.
+    pub fn channel_ids(&self) -> &[DynamicChannelId] {
+        &self.channel_ids
+    }
+
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_u32(self.tunnel_type.into());
+        dst.write_u16(cast_length!("NumberOfDVCs", self.channel_ids.len())?);
+        for channel_id in &self.channel_ids {
+            dst.write_u32(*channel_id);
+        }
+        Ok(())
+    }
+
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE);
+
+        let tunnel_type = SoftSyncTunnelType::from(src.read_u32());
+        let number_of_dvcs = usize::from(src.read_u16());
+        ensure_size!(in: src, size: number_of_dvcs * 4 /* ListOfDVCIds */);
+
+        let mut channel_ids = Vec::with_capacity(number_of_dvcs);
+        for _ in 0..number_of_dvcs {
+            channel_ids.push(src.read_u32());
+        }
+
+        Ok(Self {
+            tunnel_type,
+            channel_ids,
+        })
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE + self.channel_ids.len() * 4 /* ListOfDVCIds */
+    }
+}
+
+/// Soft-Sync request sent by the DVC server manager.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.1].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/98c6b432-842d-4d43-b1fb-ae02f945feee
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftSyncRequestPdu {
+    channel_lists: Vec<SoftSyncChannelList>,
+}
+
+impl SoftSyncRequestPdu {
+    const TCP_FLUSHED: u16 = 0x0001;
+    const CHANNEL_LIST_PRESENT: u16 = 0x0002;
+    const LENGTH_FIXED_PART_SIZE: usize = 4 /* Length */ + 2 /* Flags */ + 2 /* NumberOfTunnels */;
+    const FIXED_PART_SIZE: usize = Header::FIXED_PART_SIZE + 1 /* Pad */ + Self::LENGTH_FIXED_PART_SIZE;
+
+    /// Creates a Soft-Sync request for the supplied tunnel/channel assignments.
+    pub fn new(channel_lists: Vec<SoftSyncChannelList>) -> Self {
+        Self { channel_lists }
+    }
+
+    /// Returns the tunnel/channel assignments announced by this request.
+    pub fn channel_lists(&self) -> &[SoftSyncChannelList] {
+        &self.channel_lists
+    }
+
+    fn flags(&self) -> u16 {
+        Self::TCP_FLUSHED
+            | if self.channel_lists.is_empty() {
+                0
+            } else {
+                Self::CHANNEL_LIST_PRESENT
+            }
+    }
+
+    fn validate(&self) -> EncodeResult<()> {
+        let _: u16 = cast_length!("NumberOfTunnels", self.channel_lists.len())?;
+        let mut tunnel_types = BTreeSet::new();
+        let mut channel_ids = BTreeSet::new();
+
+        for list in &self.channel_lists {
+            let _: u16 = cast_length!("NumberOfDVCs", list.channel_ids.len())?;
+            if !tunnel_types.insert(list.tunnel_type) {
+                return Err(invalid_field_err!(
+                    "TunnelType",
+                    "appears in more than one channel list"
+                ));
+            }
+            for channel_id in &list.channel_ids {
+                if !channel_ids.insert(*channel_id) {
+                    return Err(invalid_field_err!(
+                        "ListOfDVCIds",
+                        "channel ID appears in more than one channel list"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        if header.cb_id != FieldType::U8 || header.sp != FieldType::U8 {
+            return Err(invalid_field_err!("Header", "cbId and Sp must be zero"));
+        }
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE - Header::FIXED_PART_SIZE);
+
+        let headerless_size = src.len();
+        let pad = src.read_u8();
+        if pad != 0 {
+            return Err(invalid_field_err!("Pad", "must be zero"));
+        }
+        let length = usize::try_from(src.read_u32()).map_err(|_| invalid_field_err!("Length", "is too large"))?;
+        if length != headerless_size - 1
+        /* Pad */
+        {
+            return Err(invalid_field_err!(
+                "Length",
+                "does not match the bytes following the pad field"
+            ));
+        }
+
+        let flags = src.read_u16();
+        if flags & Self::TCP_FLUSHED == 0 {
+            return Err(invalid_field_err!("Flags", "SOFT_SYNC_TCP_FLUSHED must be set"));
+        }
+
+        let number_of_tunnels = usize::from(src.read_u16());
+        if number_of_tunnels > src.len() / SoftSyncChannelList::FIXED_PART_SIZE {
+            return Err(invalid_field_err!(
+                "NumberOfTunnels",
+                "does not fit in the remaining bytes"
+            ));
+        }
+
+        let mut channel_lists = Vec::with_capacity(number_of_tunnels);
+        let mut tunnel_types = BTreeSet::new();
+        let mut channel_ids = BTreeSet::new();
+        for _ in 0..number_of_tunnels {
+            let list = SoftSyncChannelList::decode(src)?;
+            if !tunnel_types.insert(list.tunnel_type) {
+                return Err(invalid_field_err!(
+                    "TunnelType",
+                    "appears in more than one channel list"
+                ));
+            }
+            for channel_id in &list.channel_ids {
+                if !channel_ids.insert(*channel_id) {
+                    return Err(invalid_field_err!(
+                        "ListOfDVCIds",
+                        "channel ID appears in more than one channel list"
+                    ));
+                }
+            }
+            channel_lists.push(list);
+        }
+        if !src.is_empty() {
+            return Err(invalid_field_err!("Length", "contains trailing bytes"));
+        }
+
+        Ok(Self { channel_lists })
+    }
+
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        self.validate()?;
+        ensure_size!(in: dst, size: self.size());
+
+        Header::new(0, 0, Cmd::SoftSyncRequest).encode(dst)?;
+        dst.write_u8(0);
+        dst.write_u32(cast_length!("Length", self.length())?);
+        dst.write_u16(self.flags());
+        dst.write_u16(cast_length!("NumberOfTunnels", self.channel_lists.len())?);
+        for list in &self.channel_lists {
+            list.encode(dst)?;
+        }
+
+        Ok(())
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_SOFT_SYNC_REQUEST"
+    }
+
+    fn length(&self) -> usize {
+        Self::LENGTH_FIXED_PART_SIZE + self.channel_lists.iter().map(SoftSyncChannelList::size).sum::<usize>()
+    }
+
+    fn size(&self) -> usize {
+        Header::FIXED_PART_SIZE + 1 /* Pad */ + self.length()
+    }
+}
+
+/// Soft-Sync response sent by the DVC client manager.
+///
+/// Defined in [\[MS-RDPEDYC\] 2.2.5.2].
+///
+/// [\[MS-RDPEDYC\] 2.2.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/2f9c83aa-8c82-4d85-a7fe-b4c6301a9f90
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftSyncResponsePdu {
+    tunnels_to_switch: Vec<SoftSyncTunnelType>,
+}
+
+impl SoftSyncResponsePdu {
+    const FIXED_PART_SIZE: usize = Header::FIXED_PART_SIZE + 1 /* Pad */ + 4 /* NumberOfTunnels */;
+
+    /// Creates a Soft-Sync response for the tunnels on which the client will write DVC data.
+    pub fn new(tunnels_to_switch: Vec<SoftSyncTunnelType>) -> Self {
+        Self { tunnels_to_switch }
+    }
+
+    /// Returns the tunnels on which the client will write DVC data.
+    pub fn tunnels_to_switch(&self) -> &[SoftSyncTunnelType] {
+        &self.tunnels_to_switch
+    }
+
+    fn validate(&self) -> EncodeResult<()> {
+        let _: u32 = cast_length!("NumberOfTunnels", self.tunnels_to_switch.len())?;
+        let mut tunnels = BTreeSet::new();
+        for tunnel in &self.tunnels_to_switch {
+            if !tunnels.insert(*tunnel) {
+                return Err(invalid_field_err!(
+                    "TunnelsToSwitch",
+                    "contains a duplicate tunnel type"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        if header.cb_id != FieldType::U8 || header.sp != FieldType::U8 {
+            return Err(invalid_field_err!("Header", "cbId and Sp must be zero"));
+        }
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE - Header::FIXED_PART_SIZE);
+
+        let pad = src.read_u8();
+        if pad != 0 {
+            return Err(invalid_field_err!("Pad", "must be zero"));
+        }
+        let number_of_tunnels =
+            usize::try_from(src.read_u32()).map_err(|_| invalid_field_err!("NumberOfTunnels", "is too large"))?;
+        if number_of_tunnels > src.len() / 4
+        /* TunnelsToSwitch */
+        {
+            return Err(invalid_field_err!(
+                "NumberOfTunnels",
+                "does not fit in the remaining bytes"
+            ));
+        }
+
+        let mut tunnels_to_switch = Vec::with_capacity(number_of_tunnels);
+        let mut tunnels = BTreeSet::new();
+        for _ in 0..number_of_tunnels {
+            let tunnel = SoftSyncTunnelType::from(src.read_u32());
+            if !tunnels.insert(tunnel) {
+                return Err(invalid_field_err!(
+                    "TunnelsToSwitch",
+                    "contains a duplicate tunnel type"
+                ));
+            }
+            tunnels_to_switch.push(tunnel);
+        }
+        if !src.is_empty() {
+            return Err(invalid_field_err!(
+                "NumberOfTunnels",
+                "does not match the remaining bytes"
+            ));
+        }
+
+        Ok(Self { tunnels_to_switch })
+    }
+
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        self.validate()?;
+        ensure_size!(in: dst, size: self.size());
+
+        Header::new(0, 0, Cmd::SoftSyncResponse).encode(dst)?;
+        dst.write_u8(0);
+        dst.write_u32(cast_length!("NumberOfTunnels", self.tunnels_to_switch.len())?);
+        for tunnel in &self.tunnels_to_switch {
+            dst.write_u32((*tunnel).into());
+        }
+
+        Ok(())
+    }
+
+    fn name() -> &'static str {
+        "DYNVC_SOFT_SYNC_RESPONSE"
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE + self.tunnels_to_switch.len() * 4 /* TunnelsToSwitch */
+    }
+}
 
 /// [2.2] Message Syntax
 ///
@@ -378,7 +725,7 @@ impl DataFirstPdu {
         self.header.cb_id.encode_val(self.channel_id, dst)?;
         self.header
             .sp
-            .encode_val(cast_length!("DataFirstPdu::Length", self.length)?, dst)?;
+            .encode_val(cast_length!("DataFirstPdu::Length", self.length, in: dst)?, dst)?;
         dst.write_slice(&self.data);
         Ok(())
     }
@@ -408,10 +755,10 @@ impl FieldType {
     fn encode_val(&self, value: u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size_of_val());
         match *self {
-            FieldType::U8 => dst.write_u8(cast_length!("FieldType::encode", value)?),
-            FieldType::U16 => dst.write_u16(cast_length!("FieldType::encode", value)?),
+            FieldType::U8 => dst.write_u8(cast_length!("FieldType::encode", value, in: dst)?),
+            FieldType::U16 => dst.write_u16(cast_length!("FieldType::encode", value, in: dst)?),
             FieldType::U32 => dst.write_u32(value),
-            _ => return Err(invalid_field_err!("FieldType", "invalid field type")),
+            _ => return Err(invalid_field_err!("FieldType", "invalid field type", in: dst)),
         };
         Ok(())
     }
@@ -422,7 +769,7 @@ impl FieldType {
             FieldType::U8 => Ok(u32::from(src.read_u8())),
             FieldType::U16 => Ok(u32::from(src.read_u16())),
             FieldType::U32 => Ok(src.read_u32()),
-            _ => Err(invalid_field_err!("FieldType", "invalid field type")),
+            _ => Err(invalid_field_err!("FieldType", "invalid field type", in: src)),
         }
     }
 
@@ -666,189 +1013,6 @@ impl ClosePdu {
 
     fn size(&self) -> usize {
         strict_sum(&[Header::size(), Self::headerless_size(&self.header)])
-    }
-}
-
-// ===========================================================================
-// (macrdp divergence) Server-side MS-RDPEDYC Soft-Sync — see CLAUDE.md.
-// Upstream is client-oriented and never decodes/encodes these; they're needed to
-// move dynamic virtual channels (EGFX) onto the UDP multitransport tunnel.
-// ===========================================================================
-
-/// `TUNNELTYPE_UDPFECR` — the reliable-UDP multitransport tunnel (MS-RDPEMT).
-pub const TUNNELTYPE_UDPFECR: u32 = 0x0000_0001;
-/// `TUNNELTYPE_UDPFECL` — the lossy-UDP multitransport tunnel (MS-RDPEMT).
-pub const TUNNELTYPE_UDPFECL: u32 = 0x0000_0003;
-/// `SOFT_SYNC_TCP_FLUSHED` — no more data over TCP for the listed DVCs (required).
-pub const SOFT_SYNC_TCP_FLUSHED: u16 = 0x01;
-/// `SOFT_SYNC_CHANNEL_LIST_PRESENT` — one or more channel lists follow.
-pub const SOFT_SYNC_CHANNEL_LIST_PRESENT: u16 = 0x02;
-
-/// DYNVC_SOFT_SYNC_CHANNEL_LIST (MS-RDPEDYC 3.1.5.1.1) — the DVCs the server will
-/// write on one tunnel.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SoftSyncChannelList {
-    /// `TunnelType` — e.g. [`TUNNELTYPE_UDPFECR`].
-    pub tunnel_type: u32,
-    /// `ListOfDVCIds` — the dynamic channel ids that move to this tunnel.
-    pub channel_ids: Vec<DynamicChannelId>,
-}
-
-impl SoftSyncChannelList {
-    fn size(&self) -> usize {
-        4 /* TunnelType */ + 2 /* NumberOfDVCs */ + self.channel_ids.len() * 4
-    }
-
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        dst.write_u32(self.tunnel_type);
-        let n: u16 = cast_length!("DYNVC_SOFT_SYNC_CHANNEL_LIST", "NumberOfDVCs", self.channel_ids.len())?;
-        dst.write_u16(n);
-        for id in &self.channel_ids {
-            dst.write_u32(*id);
-        }
-        Ok(())
-    }
-}
-
-/// 2.2.5.1 DVC Soft-Sync Request PDU (DYNVC_SOFT_SYNC_REQUEST) — server→client.
-///
-/// [2.2.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/f82105dd-0abd-4126-a61b-41a7909e974f
-#[derive(Debug, PartialEq)]
-pub struct SoftSyncRequestPdu {
-    header: Header,
-    /// `Flags` — `SOFT_SYNC_TCP_FLUSHED` (required) | `SOFT_SYNC_CHANNEL_LIST_PRESENT`.
-    pub flags: u16,
-    /// One channel list per tunnel.
-    pub channel_lists: Vec<SoftSyncChannelList>,
-}
-
-impl SoftSyncRequestPdu {
-    /// A request moving `channel_ids` onto the reliable-UDP tunnel.
-    ///
-    /// An **empty** `channel_ids` is a valid "flush TCP, migrate nothing" probe:
-    /// no channel list is emitted (`NumberOfTunnels` = 0, `CHANNEL_LIST_PRESENT`
-    /// unset), which is the safe spike used to confirm the send path + the
-    /// client's response decode without actually migrating any DVC.
-    pub fn switch_to_udpfecr(channel_ids: Vec<DynamicChannelId>) -> Self {
-        Self::switch_to_tunnel(TUNNELTYPE_UDPFECR, channel_ids)
-    }
-
-    /// A request moving `channel_ids` onto the **lossy**-UDP tunnel
-    /// ([`TUNNELTYPE_UDPFECL`]) — the Phase-2 audio path (`AUDIO_PLAYBACK_LOSSY_DVC`).
-    /// Same shape as [`switch_to_udpfecr`](Self::switch_to_udpfecr); only the
-    /// `TunnelType` differs. An empty `channel_ids` is the "flush TCP, migrate
-    /// nothing" probe (no list emitted).
-    pub fn switch_to_udpfecl(channel_ids: Vec<DynamicChannelId>) -> Self {
-        Self::switch_to_tunnel(TUNNELTYPE_UDPFECL, channel_ids)
-    }
-
-    /// Build a single-tunnel Soft-Sync request. An **empty** `channel_ids` is a
-    /// valid "flush TCP, migrate nothing" probe: no channel list is emitted
-    /// (`NumberOfTunnels` = 0, `CHANNEL_LIST_PRESENT` unset) — the safe spike that
-    /// confirms the send path + the client's response decode without migrating any
-    /// DVC.
-    pub fn switch_to_tunnel(tunnel_type: u32, channel_ids: Vec<DynamicChannelId>) -> Self {
-        let (flags, channel_lists) = if channel_ids.is_empty() {
-            (SOFT_SYNC_TCP_FLUSHED, vec![])
-        } else {
-            (
-                SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT,
-                vec![SoftSyncChannelList {
-                    tunnel_type,
-                    channel_ids,
-                }],
-            )
-        };
-        Self {
-            header: Header::new(0, 0, Cmd::SoftSyncRequest),
-            flags,
-            channel_lists,
-        }
-    }
-
-    fn lists_size(&self) -> usize {
-        self.channel_lists.iter().map(|l| l.size()).sum()
-    }
-
-    /// The `Length` field value: counts Length(4) + Flags(2) + NumberOfTunnels(2)
-    /// + the channel lists (per MS-RDPEDYC 2.2.5.1).
-    fn length_field(&self) -> EncodeResult<u32> {
-        Ok(cast_length!(
-            "DYNVC_SOFT_SYNC_REQUEST",
-            "Length",
-            8 + self.lists_size()
-        )?)
-    }
-
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        self.header.encode(dst)?;
-        dst.write_u8(0); // Pad
-        dst.write_u32(self.length_field()?);
-        dst.write_u16(self.flags);
-        let n: u16 = cast_length!("DYNVC_SOFT_SYNC_REQUEST", "NumberOfTunnels", self.channel_lists.len())?;
-        dst.write_u16(n);
-        for list in &self.channel_lists {
-            list.encode(dst)?;
-        }
-        Ok(())
-    }
-
-    fn name() -> &'static str {
-        "DYNVC_SOFT_SYNC_REQUEST"
-    }
-
-    fn size(&self) -> usize {
-        Header::size() + 1 /* Pad */ + 4 /* Length */ + 2 /* Flags */ + 2 /* NumberOfTunnels */ + self.lists_size()
-    }
-}
-
-/// 2.2.5.2 DVC Soft-Sync Response PDU (DYNVC_SOFT_SYNC_RESPONSE) — client→server.
-///
-/// [2.2.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpedyc/7d120558-b35d-4b78-81e8-bac2cf081bd7
-#[derive(Debug, PartialEq)]
-pub struct SoftSyncResponsePdu {
-    header: Header,
-    /// `TunnelsToSwitch` — the tunnel types the client will write DVC data on.
-    pub tunnels: Vec<u32>,
-}
-
-impl SoftSyncResponsePdu {
-    /// `NumberOfTunnels` here is a **4-byte** field (it's 2-byte in the request).
-    const HEADERLESS_FIXED_PART_SIZE: usize = 1 /* Pad */ + 4 /* NumberOfTunnels */;
-
-    fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
-        ensure_size!(in: src, size: Self::HEADERLESS_FIXED_PART_SIZE);
-        let _pad = src.read_u8();
-        let number_of_tunnels = src.read_u32();
-        let count: usize = cast_length!("DYNVC_SOFT_SYNC_RESPONSE", "NumberOfTunnels", number_of_tunnels)?;
-        ensure_size!(in: src, size: count * 4);
-        let mut tunnels = Vec::with_capacity(count);
-        for _ in 0..count {
-            tunnels.push(src.read_u32());
-        }
-        Ok(Self { header, tunnels })
-    }
-
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        self.header.encode(dst)?;
-        dst.write_u8(0); // Pad
-        let n: u32 = cast_length!("DYNVC_SOFT_SYNC_RESPONSE", "NumberOfTunnels", self.tunnels.len())?;
-        dst.write_u32(n);
-        for t in &self.tunnels {
-            dst.write_u32(*t);
-        }
-        Ok(())
-    }
-
-    fn name() -> &'static str {
-        "DYNVC_SOFT_SYNC_RESPONSE"
-    }
-
-    fn size(&self) -> usize {
-        Header::size() + Self::HEADERLESS_FIXED_PART_SIZE + self.tunnels.len() * 4
     }
 }
 

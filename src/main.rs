@@ -18,6 +18,7 @@ mod camera;
 mod capture;
 mod clipboard;
 mod clipboard_rich;
+mod conn_hooks;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
@@ -248,6 +249,14 @@ struct Args {
     /// Lets launchd start macrdp without an interactive terminal.
     #[arg(long)]
     keychain: bool,
+
+    /// Read the password from this file instead of prompting (one trailing
+    /// newline is stripped). Keeps the password out of `ps` and shell history
+    /// for headless / launchd runs where the Keychain is not an option. The
+    /// file must belong to the user running macrdp and give no access to
+    /// group or others (mode 0600 or 0400); otherwise startup fails.
+    #[arg(long, conflicts_with_all = ["password", "keychain"])]
+    password_file: Option<PathBuf>,
 
     /// Directory holding cert.pem / key.pem. Generated on first run and
     /// reused thereafter so clients see a stable fingerprint across restarts.
@@ -759,6 +768,13 @@ struct Args {
     #[arg(long = "alt-backtick-switch")]
     alt_backtick_switch: bool,
 
+    /// Also accept Option+Space (Alt+Space from the client) as the Spotlight
+    /// trigger, in addition to Cmd+Space. Off by default. For macOS clients,
+    /// whose own Spotlight takes Cmd+Space before the RDP client sees it. When
+    /// off, Option+Space types a non-breaking space. macOS-only.
+    #[arg(long = "alt-space-spotlight")]
+    alt_space_spotlight: bool,
+
     /// Show a visual app-switcher overlay (icon row) on the remote during Cmd+Tab
     /// / Option+Tab, like macOS's native switcher. Off by default. macrdp spawns a
     /// small helper process that draws a real on-screen panel; ScreenCaptureKit
@@ -785,6 +801,14 @@ struct Args {
     /// Cmd+C, the app's native macOS copy). No effect without --map-ctrl-to-cmd.
     #[arg(long = "no-remap-apps", value_delimiter = ',')]
     no_remap_apps: Vec<String>,
+
+    /// Reverse the mouse-wheel direction (vertical and horizontal) for the
+    /// remote session. For a Mac with natural scrolling on: macOS applies it to
+    /// macrdp's scroll events too, and a local tool that un-reverses the
+    /// physical wheel (LinearMouse etc.) doesn't see them. Off by default.
+    /// macOS-only.
+    #[arg(long = "reverse-scroll")]
+    reverse_scroll: bool,
 
     /// Keyboard layout to interpret the client's keystrokes as, for non-US
     /// clients. By default the layout is **auto-detected** from the client's
@@ -963,6 +987,139 @@ fn spawn_hud_helper() -> Option<std::process::Child> {
             None
         }
     }
+}
+
+/// Largest password file `--password-file` accepts.
+const MAX_PASSWORD_FILE_BYTES: usize = 4096;
+
+/// Read the password from `--password-file`. The file must belong to the
+/// user that runs macrdp and must give no access to group or others (mode
+/// 0600 or 0400), as ssh requires for private keys, and on macOS must have no
+/// access control list; otherwise it is refused.
+/// One trailing `\n` (or `\r\n`) is stripped; an empty password is an error.
+/// The bytes are read into one buffer of a fixed size that is never
+/// reallocated, so no unzeroized copy of the password is left on the heap.
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    // O_NONBLOCK: opening a FIFO without a writer would otherwise block
+    // startup with no log line; it is refused below as not a regular file.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening password file {}", path.display()))?;
+    // Check the opened file, not the path, so a swap between check and read
+    // cannot pass a different file.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("reading metadata of password file {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(anyhow!(
+            "password file {} is not a regular file",
+            path.display()
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_password_file_access(meta.mode(), meta.uid(), euid)
+        .with_context(|| format!("password file {}", path.display()))?;
+    // A macOS ACL can grant access that the mode bits do not show, for
+    // example one inherited from the parent folder.
+    #[cfg(target_os = "macos")]
+    if has_extended_acl(&file).with_context(|| format!("password file {}", path.display()))? {
+        return Err(anyhow!(
+            "password file {} has an access control list; remove it with `chmod -N {}`",
+            path.display(),
+            path.display()
+        ));
+    }
+
+    let mut buf = Zeroizing::new(vec![0u8; MAX_PASSWORD_FILE_BYTES + 1]);
+    let mut len = 0;
+    loop {
+        let n = file
+            .read(&mut buf[len..])
+            .with_context(|| format!("reading password file {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        if len == buf.len() {
+            return Err(anyhow!(
+                "password file {} is larger than {MAX_PASSWORD_FILE_BYTES} bytes",
+                path.display()
+            ));
+        }
+    }
+    buf.truncate(len); // keeps the allocation
+    let bytes = std::mem::take(&mut *buf);
+    let mut s = match String::from_utf8(bytes) {
+        Ok(s) => Zeroizing::new(s),
+        Err(e) => {
+            drop(Zeroizing::new(e.into_bytes()));
+            return Err(anyhow!(
+                "password file {} is not valid UTF-8",
+                path.display()
+            ));
+        }
+    };
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    if s.is_empty() {
+        return Err(anyhow!("password file {} is empty", path.display()));
+    }
+    Ok(s)
+}
+
+/// Whether the open file has an extended access control list (any entry).
+#[cfg(target_os = "macos")]
+fn has_extended_acl(file: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // <sys/acl.h>; the libc crate does not declare these.
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: the fd stays open while `file` is borrowed; a non-null result is
+    // freed once below.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let err = std::io::Error::last_os_error();
+        // ENOENT: no ACL. ENOTSUP: the file system has no ACLs.
+        return match err.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTSUP) => Ok(false),
+            _ => Err(err).context("reading its access control list"),
+        };
+    }
+    // SAFETY: `acl` came from acl_get_fd_np and is not used after this.
+    unsafe { acl_free(acl) };
+    Ok(true)
+}
+
+/// The access rule for `--password-file`: owned by `euid` and no permission
+/// bits for group or others.
+fn check_password_file_access(mode: u32, owner: u32, euid: u32) -> Result<()> {
+    if owner != euid {
+        return Err(anyhow!(
+            "is owned by uid {owner}, not by the user running macrdp (uid {euid})"
+        ));
+    }
+    if mode & 0o077 != 0 {
+        return Err(anyhow!(
+            "has mode {:04o}; group and others must have no access (chmod 600)",
+            mode & 0o7777
+        ));
+    }
+    Ok(())
 }
 
 /// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
@@ -1586,10 +1743,9 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // consumed waking/focusing the lock screen instead of entering text.
     // Round 1's mistake was using RETURN as that wake (it submitted an empty
     // password); a bare SHIFT tap cannot insert text and cannot submit, so
-    // it wakes the field harmlessly. Posted as FlagsChanged on BOTH event
-    // sources, the pattern `input.rs::post_flags_changed` established —
-    // `[NSEvent modifierFlags]` and the HID-level state are backed by
-    // different sources and both need to see it.
+    // it wakes the field harmlessly. Posted as FlagsChanged on both event
+    // sources, as live-tested; the lock screen ignores the doubled tap that
+    // `input.rs::post_flags_changed` now avoids for apps.
     const VK_SHIFT: u16 = 0x38;
     let post_flags = |flags: CGEventFlags| {
         for src in [&source, &source_hid] {
@@ -2297,7 +2453,22 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(username);
     }
 
-    if on("USE_KEYCHAIN", true) {
+    // PASSWORD_FILE replaces the Keychain, so USE_KEYCHAIN then defaults off.
+    let password_file = cfg.get("PASSWORD_FILE").filter(|p| !p.is_empty());
+    if let Some(p) = password_file {
+        argv.push("--password-file".into());
+        argv.push(p.clone());
+    }
+    if on("USE_KEYCHAIN", password_file.is_none()) {
+        if password_file.is_some() {
+            // Both set: say which line to change instead of clap's generic
+            // "cannot be used with" error.
+            return Err(anyhow!(
+                "{}: PASSWORD_FILE and USE_KEYCHAIN=1 are both set; set USE_KEYCHAIN=0 \
+                 (or remove that line) to read the password from the file",
+                path.display()
+            ));
+        }
         argv.push("--keychain".into());
     }
     if on("ENABLE_H264", false) {
@@ -2317,6 +2488,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("ALT_BACKTICK_SWITCH", false) {
         argv.push("--alt-backtick-switch".into());
+    }
+    if on("ALT_SPACE_SPOTLIGHT", false) {
+        argv.push("--alt-space-spotlight".into());
     }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
@@ -2338,6 +2512,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
+    }
+    if on("REVERSE_SCROLL", false) {
+        argv.push("--reverse-scroll".into());
     }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
@@ -2502,6 +2679,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
         (
             "BLANK_RECOVERY_HEAL_CONFIRM_MS",
             "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
+        ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+        ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
         ),
         ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
         ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
@@ -2895,6 +3080,8 @@ async fn async_main() -> Result<()> {
         .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
     let password: Zeroizing<String> = if args.keychain {
         read_password_from_keychain(&username)?
+    } else if let Some(path) = args.password_file.as_deref() {
+        read_password_file(path)?
     } else if let Some(p) = args.password.take() {
         warn!(
             "--password is visible to any local user via `ps` and may be saved in \
@@ -2927,7 +3114,9 @@ async fn async_main() -> Result<()> {
                 args.bind,
             ));
         }
-        warn!("--skip-auth set; using --password verbatim without PAM check (loopback only)");
+        warn!(
+            "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
+        );
     }
 
     let session_tracker = capture::SessionTracker::default();
@@ -3180,9 +3369,14 @@ async fn async_main() -> Result<()> {
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
+    crate::input::set_alt_space_spotlight(args.alt_space_spotlight);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
+    crate::input::set_reverse_scroll(args.reverse_scroll);
+    if args.reverse_scroll {
+        info!("mouse-wheel direction reversed (--reverse-scroll)");
+    }
     if args.map_ctrl_to_cmd {
         info!(
             no_remap_apps = ?args.no_remap_apps,
@@ -3381,7 +3575,7 @@ async fn async_main() -> Result<()> {
     // Mac browse/read the client's redirected drive; smart-card redirection
     // (--enable-smartcard-redirection) lets macOS apps use the client's reader.
     // Both ride the one RDPDR channel, so attach the factory if either is on.
-    let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrServerFactory>> =
+    let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrDriveServerFactory>> =
         if args.enable_drive_redirection || args.enable_smartcard_redirection {
             Some(Box::new(rdpdr::MacRdpdr::new(
                 args.enable_drive_redirection,
@@ -3421,20 +3615,85 @@ async fn async_main() -> Result<()> {
             None
         };
 
-    // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
-    // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
-    // (MACRDP_CONN_GUARD=0 disables).
-    let conn_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
-        auth_guard::AuthGuardHandler::from_env();
-    // With --lock-on-disconnect, wrap it to record reconnect activity (every
-    // hook still forwards unchanged); otherwise the handler is untouched.
-    let conn_handler = match &lock_activity {
-        Some(activity) => Some(lock_activity::ActivityHandler::wrap(
-            conn_handler,
-            Arc::clone(activity),
-        )),
-        None => conn_handler,
-    };
+    // The server's connection-lifecycle hooks, run in this order (the first
+    // rejection stops the rest seeing the connection):
+    // - auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log. On by
+    //   default (MACRDP_CONN_GUARD=0 disables);
+    // - with --lock-on-disconnect, reconnect activity, so a pending lock holds for
+    //   a client still handshaking;
+    // - the client's keyboard-layout id, for the input handler to auto-select a
+    //   matching non-US layout when --keyboard-layout is unset.
+    let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
+    hooks.extend(auth_guard::AuthGuardHandler::from_env());
+    if let Some(activity) = &lock_activity {
+        hooks.push(Box::new(lock_activity::ActivityHook(Arc::clone(activity))));
+    }
+    hooks.push(Box::new(conn_hooks::KeyboardLayoutHook(
+        keyboard_layout_klid,
+    )));
+    // With --stats-endpoint, clear the per-session stats when a connection ends.
+    if let Some(stats) = stats::global() {
+        hooks.push(Box::new(conn_hooks::StatsHook(Arc::clone(stats))));
+    }
+
+    // Client-resolution auto-adopt: the acceptor reads the desktop size the
+    // client requests in its GCC Client Core Data and negotiates the session at
+    // that size from the start (Demand Active); the CaptureDisplay's
+    // `request_initial_size` then adopts it into the shared `desktop_size` that
+    // capture, input scaling, and the H.264 pipeline all read. The value is the
+    // ceiling (--max-client-size, defense-in-depth; the clamp is per dimension),
+    // or MS-RDPBCGR's own 8192 maximum.
+    let honor_client_size = auto_size.then(|| match args.max_client_size {
+        Some((width, height)) => {
+            info!(
+                max_w = width,
+                max_h = height,
+                "client-requested session size capped at the operator maximum"
+            );
+            ironrdp_server::DesktopSize { width, height }
+        }
+        None => ironrdp_server::DesktopSize {
+            width: 8192,
+            height: 8192,
+        },
+    });
+    if args.max_client_size.is_some() && !auto_size {
+        warn!(
+            "--max-client-size has no effect: client-resolution auto-adopt is off \
+             (--no-client-resolution, or an explicit --width/--height/--hidpi \
+             without --virtual-display)"
+        );
+    }
+
+    // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
+    // (mstsc) auto-reconnects on an ungraceful drop instead of showing
+    // "disconnected". This is what makes the EGFX blank-recovery connection drop
+    // (src/h264.rs, when a reconnect lands on mstsc's stale surface and never
+    // presents) heal seamlessly — the client re-establishes on its own. Default
+    // on (standard RDP server behavior); MACRDP_AUTO_RECONNECT=0 disables. The
+    // server verifies the cookie a client returns, replaces it after every
+    // connection and hourly, and invalidates it when a session is taken over.
+    let auto_reconnect = !matches!(
+        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    );
+    let auto_reconnect_cookie = auto_reconnect.then(|| {
+        let mut random_bits = [0u8; 16];
+        match getrandom::getrandom(&mut random_bits) {
+            Ok(()) => {
+                info!("server auto-reconnect cookie provisioned (clients auto-reconnect on an ungraceful drop)");
+                // logon_id is informational for us; a stable per-process id.
+                Some(ironrdp_server::ServerAutoReconnect {
+                    logon_id: std::process::id(),
+                    random_bits,
+                })
+            }
+            Err(e) => {
+                warn!(error = %e, "could not generate auto-reconnect cookie random bits — skipping");
+                None
+            }
+        }
+    });
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -3443,20 +3702,23 @@ async fn async_main() -> Result<()> {
         .with_display_handler(display)
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
-        .with_rdpdr_factory(rdpdr_factory)
-        .with_usb_factory(usb_factory)
+        .with_rdpdr_drive_factory(rdpdr_factory)
+        .with_urbdrc_factory(usb_factory)
         .with_camera_factory(camera_factory)
         .with_audin_factory(audin_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
-        .with_connection_handler(conn_handler)
+        .with_connection_handler(Some(Box::new(conn_hooks::ConnectionHooks::new(hooks))))
+        // Share the suppress flag with the capture backend, so the server's
+        // per-connection PDU handler writes to the `AtomicBool` it reads.
+        .with_display_suppressed_handle(display_suppressed)
+        .with_honor_client_desktop_size(honor_client_size)
+        .with_auto_reconnect_cookie(auto_reconnect_cookie.flatten())
+        // macrdp is a single console session: a new authenticated client takes it
+        // over. Without this the default (Queue) leaves the second client hanging
+        // in the listen backlog until the first disconnects.
+        .with_connection_policy(ironrdp_server::ConnectionPolicy::Preempt)
         .build();
-
-    // Hand the shared suppress flag to the server so its per-connection
-    // PDU handler writes to the same `AtomicBool` the capture backend
-    // reads from. Without this, the server uses an internally-created
-    // flag the display never sees.
-    server.set_display_suppressed_handle(display_suppressed);
 
     // Per-SERVED-connection reset for the input handler's held-modifier and
     // button-down state (vendored divergence 24). The server raises this once
@@ -3467,73 +3729,10 @@ async fn async_main() -> Result<()> {
     // `on_accept` were both the wrong seam.
     server.set_input_reset_handle(input::modifier_reset_handle());
 
-    // The acceptor records the client's announced keyboard-layout id (KLID) in
-    // its Client Core Data; the server publishes it here so the input handler
-    // can auto-select a matching non-US layout (when --keyboard-layout is unset).
-    server.set_keyboard_layout_handle(keyboard_layout_klid);
-
     // The server samples the kernel's smoothed TCP RTT for each accepted
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
     server.set_link_rtt_handle(link_rtt_ms.clone());
-
-    // Client-resolution auto-adopt: the vendored acceptor reads the desktop
-    // size the client requests in its GCC Client Core Data and negotiates
-    // the session at that size from the start (Demand Active); the
-    // CaptureDisplay's `request_initial_size` then adopts it into the
-    // shared `desktop_size` that capture, input scaling, and the H.264
-    // pipeline all read.
-    server.set_honor_client_desktop_size(auto_size);
-    // Optional operator ceiling for the adopted size (--max-client-size,
-    // defense-in-depth): a request above the cap is clamped per-dimension in
-    // the acceptor. Meaningless off the auto-adopt path (nothing is adopted),
-    // so warn rather than silently ignore.
-    if let Some((max_w, max_h)) = args.max_client_size {
-        if auto_size {
-            server.set_honor_client_desktop_size_max(Some(ironrdp_server::DesktopSize {
-                width: max_w,
-                height: max_h,
-            }));
-            info!(
-                max_w,
-                max_h, "client-requested session size capped at the operator maximum"
-            );
-        } else {
-            warn!(
-                "--max-client-size has no effect: client-resolution auto-adopt is off \
-                 (--no-client-resolution, or an explicit --width/--height/--hidpi \
-                 without --virtual-display)"
-            );
-        }
-    }
-
-    // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
-    // (mstsc) auto-reconnects on an ungraceful drop instead of showing
-    // "disconnected". This is what makes the EGFX blank-recovery connection drop
-    // (src/h264.rs, when a reconnect lands on mstsc's stale surface and never
-    // presents) heal seamlessly — the client re-establishes on its own. Default
-    // on (harmless + standard RDP server behavior); MACRDP_AUTO_RECONNECT=0
-    // disables. The returning ARC_CS cookie is not validated (single console
-    // session, NLA re-auths every connection), so a fixed per-process value is
-    // fine — it only enables the client's auto-reconnect loop.
-    let auto_reconnect = !matches!(
-        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE")
-    );
-    if auto_reconnect {
-        let mut random_bits = [0u8; 16];
-        match getrandom::getrandom(&mut random_bits) {
-            Ok(()) => {
-                // logon_id is informational for us; a stable per-process id.
-                let logon_id = std::process::id();
-                server.set_auto_reconnect_cookie(logon_id, random_bits);
-                info!("server auto-reconnect cookie provisioned (clients auto-reconnect on an ungraceful drop)");
-            }
-            Err(e) => {
-                warn!(error = %e, "could not generate auto-reconnect cookie random bits — skipping")
-            }
-        }
-    }
 
     // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
     // provider so the server offers reliable UDP to clients that advertise it,
@@ -3688,7 +3887,7 @@ async fn async_main() -> Result<()> {
         args.bind.port(),
         username,
     );
-    server.run().await
+    Ok(server.run().await?)
 }
 
 /// Resolves when the process receives SIGINT (Ctrl-C) or, on Unix, SIGTERM.
@@ -3913,6 +4112,16 @@ mod config_tests {
     }
 
     #[test]
+    fn reverse_scroll_config_bridge() {
+        let p = write_temp("rs1", "REVERSE_SCROLL=1\n");
+        assert!(args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+        let p = write_temp("rs0", "REVERSE_SCROLL=0\n");
+        assert!(!args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn bitrate_config_bridge() {
         // BITRATE alone maps to --bitrate.
         let p = write_temp("br1", "BITRATE=8\n");
@@ -3936,6 +4145,166 @@ mod config_tests {
         let p = write_temp("br4", "BITRATE=\n");
         assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
         fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn password_file_config_bridge() {
+        // PASSWORD_FILE maps to --password-file and turns the Keychain default off.
+        let p = write_temp("pwf1", "PASSWORD_FILE=/tmp/x/pw\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert_eq!(a.password_file.as_deref(), Some(Path::new("/tmp/x/pw")));
+        assert!(!a.keychain);
+
+        // Both set explicitly is a conflict, not a silent pick, and the
+        // error says how to fix the config.
+        let p = write_temp("pwf2", "PASSWORD_FILE=/tmp/x/pw\nUSE_KEYCHAIN=1\n");
+        let e = args_from_config(&p).unwrap_err().to_string();
+        fs::remove_file(&p).ok();
+        assert!(e.contains("USE_KEYCHAIN=0"), "{e}");
+
+        // PASSWORD_FILE with USE_KEYCHAIN=0 (as config.env.example says).
+        let p = write_temp("pwf2b", "PASSWORD_FILE=/tmp/x/pw\nUSE_KEYCHAIN=0\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert!(a.password_file.is_some() && !a.keychain);
+
+        // Empty PASSWORD_FILE is ignored → Keychain default as before.
+        let p = write_temp("pwf3", "PASSWORD_FILE=\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert!(a.password_file.is_none());
+        assert!(a.keychain);
+    }
+
+    /// A 0600 password file for the tests.
+    fn write_pw(name: &str, body: &str) -> PathBuf {
+        let p = write_temp(name, body);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        p
+    }
+
+    #[test]
+    fn password_file_access_rule() {
+        assert!(check_password_file_access(0o100600, 501, 501).is_ok());
+        assert!(check_password_file_access(0o100400, 501, 501).is_ok());
+        // Any group/other bit is refused, not only read.
+        for mode in [0o100644, 0o100640, 0o100620, 0o100601, 0o100610] {
+            let e = check_password_file_access(mode, 501, 501)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(&format!("{:04o}", mode & 0o7777)), "{e}");
+        }
+        let e = check_password_file_access(0o100600, 0, 501)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("uid 0"), "{e}");
+    }
+
+    #[test]
+    fn password_file_refuses_open_permissions() {
+        let p = write_pw("pwf7", "s3cret\n");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("chmod 600"), "{e}");
+        assert!(!e.contains("s3cret"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn password_file_refuses_an_acl() {
+        let p = write_pw("pwf-acl", "s3cret\n");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        // Without the ACL the same file is accepted.
+        let status = std::process::Command::new("chmod")
+            .arg("-N")
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ok = read_password_file(&p);
+        fs::remove_file(&p).ok();
+        assert!(
+            e.contains("access control list") && e.contains("chmod -N"),
+            "{e}"
+        );
+        assert!(!e.contains("s3cret"));
+        assert_eq!(ok.unwrap().as_str(), "s3cret");
+    }
+
+    #[test]
+    fn password_file_must_be_a_regular_file() {
+        // A FIFO without a writer must not block startup.
+        let p = std::env::temp_dir().join(format!("macrdp-pwfifo-{}", std::process::id()));
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("not a regular file"), "{e}");
+        // A directory neither.
+        let e = format!(
+            "{:#}",
+            read_password_file(&std::env::temp_dir()).unwrap_err()
+        );
+        assert!(e.contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn password_file_size_and_encoding() {
+        let p = write_pw("pwf8", &"x".repeat(MAX_PASSWORD_FILE_BYTES));
+        assert_eq!(
+            read_password_file(&p).unwrap().len(),
+            MAX_PASSWORD_FILE_BYTES
+        );
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf9", &"x".repeat(MAX_PASSWORD_FILE_BYTES + 1));
+        assert!(read_password_file(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        let p = write_temp("pwf10", "");
+        fs::write(&p, [0x73u8, 0xff, 0x0a]).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("not valid UTF-8"), "{e}");
+    }
+
+    #[test]
+    fn password_file_reads_and_strips_one_newline() {
+        let p = write_pw("pwf4", "s3cret\r\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "s3cret");
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf5", "two\n\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "two\n");
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf6", "\n");
+        assert!(read_password_file(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        assert!(read_password_file(Path::new("/nonexistent/macrdp-pw")).is_err());
+    }
+
+    #[test]
+    fn password_file_conflicts_with_password_flag() {
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--password", "x"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--keychain"]).is_err()
+        );
+        assert!(Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw"]).is_ok());
     }
 
     #[test]

@@ -28,7 +28,7 @@ use ironrdp_cliprdr::pdu::{
 };
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Hard ceiling on the number of bytes we'll return for a single RANGE
 /// request. mstsc and Microsoft Remote Desktop both chunk at <= 1 MiB in
@@ -185,6 +185,9 @@ impl Collected {
 #[derive(Debug, Default)]
 struct RemoteFetch {
     current: Option<Want>,
+    /// When the request for `current` went out. A reply overdue by more than
+    /// `STALE_REPLY_GRACE` is presumed lost, so a new copy doesn't wait on it.
+    current_since: Option<std::time::Instant>,
     /// Whether `current` is already a retry. A failed representation is
     /// asked for once more before it's skipped: Windows apps commonly
     /// announce a copy twice in quick succession, and the second fetch can
@@ -204,10 +207,54 @@ struct RemoteFetch {
     awaiting_stale: Option<std::time::Instant>,
 }
 
-/// How long a superseded request's reply is waited for before it's presumed
-/// lost. Every FormatDataRequest is answered (data or a failure), so this only
-/// bounds a misbehaving client.
-const STALE_REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long after a request went out its reply is waited for before it's
+/// presumed lost. Every FormatDataRequest should be answered (data or a
+/// failure), so this only bounds a misbehaving client — one was seen live
+/// (Windows App for macOS never answered a connect-time request). It must be
+/// far longer than a slow-but-live reply: a reply that arrives after the
+/// grace is taken as the answer to the next copy's request, so too short a
+/// grace pastes one copy's data as another's (a 1080p CF_DIB is ~8 MB and
+/// can take well over 5 s over a VPN; `MAX_INCOMING_PAYLOAD` allows 50 MB).
+/// The cost of a long grace is bounded: after a truly lost reply, only the
+/// copies made within this window of the lost request go unfetched.
+const STALE_REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the pasteboard poller samples `changeCount`, retry waits included.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, PartialEq, Eq)]
+enum RetryWait {
+    /// The remote accepted the current wave's format list.
+    Accepted,
+    /// The pasteboard changed again; the newer copy supersedes the wave.
+    Changed,
+    /// Neither happened within the delay.
+    Elapsed,
+}
+
+/// Waits up to `delay` for the remote to accept the current advertise wave,
+/// checking every `step`. A pasteboard change wins over an acceptance.
+async fn wait_for_answer(
+    delay: Duration,
+    step: Duration,
+    accepted: impl Fn() -> bool,
+    mut changed: impl FnMut() -> bool,
+) -> RetryWait {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return RetryWait::Elapsed;
+        }
+        tokio::time::sleep(step.min(deadline - now)).await;
+        if changed() {
+            return RetryWait::Changed;
+        }
+        if accepted() {
+            return RetryWait::Accepted;
+        }
+    }
+}
 
 /// Convert PNG/TIFF bytes from NSPasteboard into a CF_DIB payload: a
 /// `BITMAPINFOHEADER` (40 bytes) followed by 32bpp BGRA pixels in
@@ -400,6 +447,12 @@ pub struct MacCliprdr {
     /// the session.
     #[cfg(target_os = "macos")]
     remote_write_cc: Arc<std::sync::atomic::AtomicI64>,
+    /// The pasteboard changeCount when the last client-served clipboard
+    /// channel closed (or at startup). A later changeCount at the next connect
+    /// means something was copied on the Mac while no client was attached —
+    /// see [`skip_connect_time_fetch`].
+    #[cfg(target_os = "macos")]
+    session_end_cc: Arc<std::sync::atomic::AtomicI64>,
     /// Coordinates the advertise retry loop with the cliprdr backend's
     /// `on_format_list_response` hook. See [`AdvertiseState`].
     advertise_state: Arc<AdvertiseState>,
@@ -442,6 +495,7 @@ impl MacCliprdr {
             paste_temp_dir,
             self_change_count,
             remote_write_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            session_end_cc: Arc::new(std::sync::atomic::AtomicI64::new(pb::change_count())),
             advertise_state: Arc::new(AdvertiseState::default()),
             active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lazy_paste,
@@ -471,10 +525,7 @@ impl ServerEventSender for MacCliprdr {
         // server to advertise the new content to the remote.
         let sender_arc = self.sender.clone();
         let paths_arc = self.file_paths.clone();
-        #[cfg(target_os = "macos")]
-        let self_cc = self.self_change_count.clone();
-        #[cfg(target_os = "macos")]
-        let remote_write_cc = self.remote_write_cc.clone();
+        let own_writes = self.own_writes();
         let advertise_state = self.advertise_state.clone();
         let active_backends = self.active_backends.clone();
         let rich = self.rich_clipboard;
@@ -496,7 +547,7 @@ impl ServerEventSender for MacCliprdr {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
                 let current = pb::change_count();
                 if current == last_seen {
                     continue;
@@ -505,58 +556,152 @@ impl ServerEventSender for MacCliprdr {
                 // If the latest bump is from OUR remote-paste publish,
                 // skip — otherwise we'd advertise the just-pasted Windows
                 // files back to Windows as a fresh Mac→Windows copy.
-                #[cfg(target_os = "macos")]
-                if current == self_cc.load(std::sync::atomic::Ordering::Relaxed)
-                    || current == remote_write_cc.load(std::sync::atomic::Ordering::Relaxed)
-                {
+                if own_writes.is_own(current) {
                     debug!(current, "skipping pasteboard tick (self-write)");
                     continue;
                 }
-                // Start a new advertise wave. `my_gen` identifies it for the
-                // retry loop and for the cliprdr backend's
-                // `on_format_list_response` hook, which stamps `locked_gen` with
-                // the current generation on `Ok` so we can stop re-advertising.
-                use std::sync::atomic::Ordering;
-                let my_gen = advertise_state.generation.fetch_add(1, Ordering::Relaxed) + 1;
-
-                if !advertise_pasteboard(&sender_arc, &paths_arc, rich) {
+                if !advertise_wave(&sender_arc, &paths_arc, rich, &advertise_state, &own_writes)
+                    .await
+                {
                     break;
-                }
-
-                // Retry on Fail, STOP on Ok. mstsc commonly rejects the first
-                // advertise right after an in-session Cmd-C (it's still
-                // processing the input) and accepts one ~0.5–1 s later. We
-                // MUST stop re-advertising the instant the remote accepts —
-                // otherwise a later re-advertise that gets rejected wipes
-                // `local_file_list` inside cliprdr and silently breaks an
-                // otherwise-working paste. The delays are sized to give each
-                // response time to arrive before the next retry decision.
-                // Supersede check handles a newer copy starting mid-wave.
-                for delay in [
-                    std::time::Duration::from_millis(1000),
-                    std::time::Duration::from_millis(2500),
-                    std::time::Duration::from_millis(5000),
-                ] {
-                    tokio::time::sleep(delay).await;
-                    if advertise_state.generation.load(Ordering::Relaxed) != my_gen {
-                        // A newer Mac-side copy started a new wave; let the
-                        // main loop handle it on its next tick.
-                        break;
-                    }
-                    if advertise_state.locked_gen.load(Ordering::Relaxed) == my_gen {
-                        // Remote acknowledged our advertise. Do NOT send
-                        // another format list — a rejection of that one would
-                        // wipe the accepted state.
-                        debug!(my_gen, "format list accepted; retry loop done");
-                        break;
-                    }
-                    if !advertise_pasteboard(&sender_arc, &paths_arc, rich) {
-                        return;
-                    }
                 }
             }
         });
     }
+}
+
+impl MacCliprdr {
+    fn own_writes(&self) -> OwnWrites {
+        OwnWrites {
+            #[cfg(target_os = "macos")]
+            self_cc: self.self_change_count.clone(),
+            #[cfg(target_os = "macos")]
+            remote_cc: self.remote_write_cc.clone(),
+        }
+    }
+}
+
+/// The changeCount markers of macrdp's own pasteboard writes (published
+/// remote files, and remote text/rich/image). A pasteboard holding one of
+/// them holds the client's own data, which must never be advertised back to
+/// it. See `MacCliprdr::self_change_count` / `MacCliprdr::remote_write_cc`.
+#[derive(Clone)]
+struct OwnWrites {
+    #[cfg(target_os = "macos")]
+    self_cc: crate::file_promise::SelfChangeCount,
+    #[cfg(target_os = "macos")]
+    remote_cc: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl OwnWrites {
+    fn is_own(&self, change_count: i64) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use std::sync::atomic::Ordering;
+            change_count == self.self_cc.load(Ordering::Relaxed)
+                || change_count == self.remote_cc.load(Ordering::Relaxed)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = change_count;
+            false
+        }
+    }
+}
+
+/// What one [`advertise_pasteboard`] call did.
+#[derive(Debug, PartialEq, Eq)]
+enum Advertised {
+    /// A format list went to the client.
+    Sent,
+    /// Nothing advertisable (empty pasteboard, an unsupported type, a
+    /// Universal Clipboard promise, or our own write of the client's data).
+    NothingToSend,
+    /// The server's event channel is gone (shutting down).
+    SenderGone,
+}
+
+/// Delays between re-advertises while the client hasn't accepted.
+const ADVERTISE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(1000),
+    Duration::from_millis(2500),
+    Duration::from_millis(5000),
+];
+
+/// Advertise the Mac pasteboard and retry until the client accepts it.
+/// Returns `false` once the sender is gone.
+///
+/// Retry on Fail, STOP on Ok. mstsc commonly rejects the first advertise
+/// right after an in-session Cmd-C (it's still processing the input), and the
+/// connect-time advertise can be rejected the same way; it accepts one
+/// ~0.5–1 s later. We MUST stop re-advertising the instant the remote accepts
+/// — otherwise a later re-advertise that gets rejected wipes
+/// `local_file_list` inside cliprdr and silently breaks an otherwise-working
+/// paste. The delays give each response time to arrive before the next retry
+/// decision. Each wait ends early on the client's acceptance or on a
+/// pasteboard change (#217: a second copy is announced at the next poll, not
+/// after the wait). A newer wave supersedes this one, and a pasteboard that
+/// now holds our own write of the client's data, or nothing advertisable,
+/// ends it.
+async fn advertise_wave(
+    sender: &Sender,
+    paths: &Paths,
+    rich: bool,
+    state: &AdvertiseState,
+    own: &OwnWrites,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    // `my_gen` identifies this wave for the retry checks and for the cliprdr
+    // backend's `on_format_list_response` hook, which stamps `locked_gen`
+    // with the current generation on `Ok`.
+    let my_gen = state.generation.fetch_add(1, Ordering::Relaxed) + 1;
+    // A pasteboard change during a retry wait ends the wave: either a newer
+    // Mac copy (the poller's next tick announces it) or our own write of the
+    // client's data, which must not be advertised back.
+    let start_cc = pb::change_count();
+    let attempt = || {
+        let current = pb::change_count();
+        if own.is_own(current) {
+            debug!(
+                current,
+                "not advertising: the pasteboard holds our own write"
+            );
+            return Advertised::NothingToSend;
+        }
+        advertise_pasteboard(sender, paths, rich)
+    };
+    match attempt() {
+        Advertised::SenderGone => return false,
+        Advertised::NothingToSend => return true,
+        Advertised::Sent => {}
+    }
+    for delay in ADVERTISE_RETRY_DELAYS {
+        let answer = wait_for_answer(
+            delay,
+            POLL_INTERVAL,
+            || state.locked_gen.load(Ordering::Relaxed) == my_gen,
+            || pb::change_count() != start_cc,
+        )
+        .await;
+        match answer {
+            RetryWait::Changed => break,
+            RetryWait::Accepted => {
+                debug!(my_gen, "format list accepted; retry loop done");
+                break;
+            }
+            RetryWait::Elapsed => {}
+        }
+        if state.generation.load(Ordering::Relaxed) != my_gen {
+            // Another wave (the connect-time one, or the poller's) took over.
+            break;
+        }
+        match attempt() {
+            Advertised::SenderGone => return false,
+            Advertised::NothingToSend => break,
+            Advertised::Sent => {}
+        }
+    }
+    true
 }
 
 impl CliprdrBackendFactory for MacCliprdr {
@@ -579,10 +724,14 @@ impl CliprdrBackendFactory for MacCliprdr {
             self_change_count: self.self_change_count.clone(),
             #[cfg(target_os = "macos")]
             remote_write_cc: self.remote_write_cc.clone(),
+            #[cfg(target_os = "macos")]
+            session_end_cc: self.session_end_cc.clone(),
             advertise_state: self.advertise_state.clone(),
             #[cfg(target_os = "macos")]
             lazy_paste: self.lazy_paste,
             initial_advertise_pending: true,
+            connect_fetch_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            initial_remote_copy_pending: true,
         })
     }
 }
@@ -619,6 +768,10 @@ struct MacCliprdrBackend {
     // See MacCliprdr::remote_write_cc — why this is NOT self_change_count.
     #[cfg(target_os = "macos")]
     remote_write_cc: Arc<std::sync::atomic::AtomicI64>,
+    // See MacCliprdr::session_end_cc. Stamped in Drop, only by a backend that
+    // handled a client's list.
+    #[cfg(target_os = "macos")]
+    session_end_cc: Arc<std::sync::atomic::AtomicI64>,
     // Lets the `on_format_list_response` hook tell the poller's retry loop
     // that the current advertise wave was accepted, so it stops re-advertising.
     advertise_state: Arc<AdvertiseState>,
@@ -648,6 +801,21 @@ struct MacCliprdrBackend {
     // silently drop Mac->client sync for that case; caught in review on
     // #173).
     initial_advertise_pending: bool,
+    // Set when the client's connect-time clipboard is being fetched (the
+    // connect-time list wasn't skipped and had something we take). The
+    // deferred connect-time advertise checks it and stands down: the client's
+    // clipboard wins at connect, and advertising the Mac's older one to the
+    // client while fetching the client's would swap the two clipboards.
+    connect_fetch_started: Arc<std::sync::atomic::AtomicBool>,
+    // True until the client's first Format List has been handled. That one
+    // is the client's connect-time announce of whatever was already on its
+    // clipboard, not a live copy — see `skip_connect_time_fetch`. It is
+    // exactly the list that initializes the channel: ironrdp-cliprdr calls
+    // `on_ready` from that list's handler, immediately before handing the
+    // same list to `on_remote_copy`, and the channel isn't usable until a
+    // client list arrives (MS-RDPECLIP 1.3.2.1), so a live copy can't be
+    // mistaken for it.
+    initial_remote_copy_pending: bool,
 }
 
 /// Drop runs when the RDP connection ends and ironrdp_server releases
@@ -657,6 +825,13 @@ struct MacCliprdrBackend {
 /// pasteboard if our URLs are still on it (otherwise NSPasteboard would
 /// be holding `file:///tmp/macrdp-lazy-paste-…/foo` URLs whose backing
 /// files we just deleted — Finder paste would error out for the user).
+///
+/// Only a backend that served a client does this. Backends are built before
+/// TLS and authentication, including for a preemption candidate while another
+/// client is being served, and the paste state is shared across backends. A
+/// failed attempt's Drop would otherwise tear down the LIVE session's paste.
+/// It has nothing of its own to clean up: pastes start from a client's Format
+/// List, and the first one fires `on_ready` before anything else handles it.
 ///
 /// Best-effort: presenter removal is async (hops to the runloop thread),
 /// and temp-dir removal is std::fs blocking — we do NOT wait on either,
@@ -668,11 +843,25 @@ impl Drop for MacCliprdrBackend {
         // clipboard channel (balances build_cliprdr_backend's increment).
         self.active_backends
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // Still pending means `on_ready` never fired: no client list was handled.
         #[cfg(target_os = "macos")]
-        crate::file_promise_lazy::cleanup_on_disconnect(
-            &self.paste_temp_dir,
-            &self.self_change_count,
-        );
+        if !self.initial_advertise_pending {
+            crate::file_promise_lazy::cleanup_on_disconnect(
+                &self.paste_temp_dir,
+                &self.self_change_count,
+            );
+        }
+        // Only a backend that served a client ends a session. Backends are
+        // built before TLS and authentication, so a failed or abandoned
+        // connection attempt, or a preemption candidate that lost, drops one
+        // here too. Letting those stamp would erase the evidence of a copy
+        // made on the Mac while disconnected, and the next real connect would
+        // fetch the client's clipboard over it.
+        #[cfg(target_os = "macos")]
+        if !self.initial_remote_copy_pending {
+            self.session_end_cc
+                .store(pb::change_count(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -686,6 +875,15 @@ impl ironrdp_core::AsAny for MacCliprdrBackend {
 }
 
 impl MacCliprdrBackend {
+    fn own_writes(&self) -> OwnWrites {
+        OwnWrites {
+            #[cfg(target_os = "macos")]
+            self_cc: self.self_change_count.clone(),
+            #[cfg(target_os = "macos")]
+            remote_cc: self.remote_write_cc.clone(),
+        }
+    }
+
     fn push(&self, msg: ClipboardMessage) {
         if let Some(s) = self.sender.lock().unwrap().as_ref() {
             let _ = s.send(ServerEvent::Clipboard(msg));
@@ -710,6 +908,7 @@ impl MacCliprdrBackend {
             Some(want) => {
                 debug!(?want, "requesting remote format data");
                 self.fetch.current = Some(want);
+                self.fetch.current_since = Some(std::time::Instant::now());
                 self.fetch.retried = false;
                 self.push(ClipboardMessage::SendInitiatePaste(want.id()));
             }
@@ -806,19 +1005,47 @@ impl MacCliprdrBackend {
     }
 }
 
+/// Whether to ignore the client's connect-time Format List instead of fetching
+/// it. The connect-time list announces what was ALREADY on the client's
+/// clipboard; fetching it copies that onto the Mac. That's wrong when the
+/// Mac's clipboard is the newer one: with Universal Clipboard (Handoff) on and
+/// a Mac client, a copy made on the server while disconnected is beaconed to
+/// the client as a promise, and asking for its data makes the client pull it
+/// back over Bluetooth ("Pasting from <server>…" on the client) only for us to
+/// write the same content back here. So skip iff the Mac holds LOCAL content
+/// (not itself a Universal Clipboard promise — then the client has the real
+/// data) that changed since the last session ended. The Mac's clipboard is
+/// advertised to the client by `on_ready` regardless, so both sides converge
+/// on it. Without Handoff the guard keeps the old behaviour unless the Mac's
+/// clipboard actually changed while disconnected — then the Mac copy wins,
+/// which is the newer one in the common case.
+#[cfg(target_os = "macos")]
+fn skip_connect_time_fetch(mac: &pb::Snapshot, session_end_cc: i64) -> bool {
+    mac.has_content && !mac.is_remote && mac.change_count != session_end_cc
+}
+
 /// Read the current Mac pasteboard and push the appropriate "we have
-/// something to copy" event into the server. Returns `false` if the sender
-/// has been dropped (i.e. the server is shutting down) so callers know to
-/// stop polling.
+/// something to copy" event into the server. Returns
+/// [`Advertised::SenderGone`] if the sender has been dropped (the server is
+/// shutting down) so callers know to stop polling.
 ///
 /// File copies and non-file copies take different code paths inside
 /// ironrdp-cliprdr: a regular format list goes via `SendInitiateCopy`, but
-/// file lists must go via `initiate_file_copy` (exposed here through the
-/// vendored `ServerEvent::ClipboardFileCopy` variant) so that the cliprdr
+/// file lists must go via `initiate_file_copy` (reached through
+/// `ClipboardMessage::SendInitiateFileCopy`) so that the cliprdr
 /// server populates its `local_file_list` and accepts subsequent
 /// FileContentsRequests instead of short-circuiting them with
 /// CB_RESPONSE_FAIL.
-fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
+fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> Advertised {
+    if pb::is_remote_clipboard() {
+        // A Universal Clipboard promise from another Apple device (the
+        // client Mac itself, when its copy comes back that way, or an
+        // iPhone). Don't advertise it: the client's eventual data request
+        // would force a Bluetooth/AWDL transfer on the server side. See the
+        // quirk note.
+        debug!("not advertising pasteboard: Universal Clipboard promise from another device");
+        return Advertised::NothingToSend;
+    }
     if pb::has_files() {
         let entries = pb::read_files();
         if !entries.is_empty() {
@@ -845,7 +1072,10 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
                 file_count = files.len(),
                 "advertising file copy to client (recursive)"
             );
-            return send(sender, ServerEvent::ClipboardFileCopy(files));
+            return send(
+                sender,
+                ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(files)),
+            );
         }
         // Files claimed but read empty (race) — fall through to format list.
     }
@@ -876,8 +1106,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
         formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
     }
     if formats.is_empty() {
-        // Nothing to advertise but the sender is presumably still alive.
-        return true;
+        return Advertised::NothingToSend;
     }
     // Clear any stale file-paths snapshot so a leftover index can't be
     // exploited by a slow follow-up FileContentsRequest.
@@ -888,11 +1117,11 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
     )
 }
 
-fn send(sender: &Sender, event: ServerEvent) -> bool {
+fn send(sender: &Sender, event: ServerEvent) -> Advertised {
     let guard = sender.lock().unwrap();
     match guard.as_ref() {
-        Some(s) => s.send(event).is_ok(),
-        None => false,
+        Some(s) if s.send(event).is_ok() => Advertised::Sent,
+        _ => Advertised::SenderGone,
     }
 }
 
@@ -957,12 +1186,26 @@ impl CliprdrBackend for MacCliprdrBackend {
                  initial FormatList ack (racing it through the shared writer would \
                  confuse the client's still-open init handshake)"
             );
+            // A full advertise-until-accepted wave, not a single send: when
+            // `on_remote_copy` skips the client's connect-time list
+            // (`skip_connect_time_fetch`), this advertise is the only thing
+            // that syncs the two clipboards, and mstsc can reject it.
             let sender = self.sender.clone();
             let file_paths = self.file_paths.clone();
             let rich = self.rich_clipboard;
+            let state = self.advertise_state.clone();
+            let own = self.own_writes();
+            let fetching_client = self.connect_fetch_started.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(CONNECT_ADVERTISE_DELAY).await;
-                advertise_pasteboard(&sender, &file_paths, rich);
+                if fetching_client.load(std::sync::atomic::Ordering::Relaxed) {
+                    debug!(
+                        "not advertising the Mac's clipboard at connect: the client's \
+                         connect-time clipboard is being fetched and wins"
+                    );
+                    return;
+                }
+                advertise_wave(&sender, &file_paths, rich, &state, &own).await;
             });
             return;
         }
@@ -1018,18 +1261,50 @@ impl CliprdrBackend for MacCliprdrBackend {
                 .collect::<Vec<_>>(),
             "remote clipboard format list received (connect-time announce or a live copy)"
         );
+        let connect_time = std::mem::take(&mut self.initial_remote_copy_pending);
+        #[cfg(target_os = "macos")]
+        if connect_time
+            && skip_connect_time_fetch(
+                &pb::Snapshot::current(self.rich_clipboard),
+                self.session_end_cc
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        {
+            info!(
+                "not fetching the client's connect-time clipboard: the Mac's own clipboard \
+                 is newer (copied here while no client was attached) and is advertised to \
+                 the client instead; fetching would make a Mac client pull the Universal \
+                 Clipboard copy of it back over Bluetooth"
+            );
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = connect_time;
         // A new remote copy supersedes whatever is still in flight for the
         // previous one. Replies name no format, so if a request is still on
         // the wire its reply must be waited for and discarded before the new
         // copy's first request goes out — see RemoteFetch::awaiting_stale.
+        //
+        // Measured from when that request went out: a reply already overdue
+        // by more than STALE_REPLY_GRACE is presumed lost and not waited for.
+        // Measuring from the new copy instead stalled the clipboard after a
+        // lost reply — the request stayed "current" forever, so every copy
+        // waited on it (seen live: a client that never answered the
+        // connect-time request left the next copies unfetched, and the Mac
+        // kept pasting old content).
         let now = std::time::Instant::now();
-        let awaiting_stale = if self.fetch.current.is_some() {
-            Some(now)
-        } else {
-            self.fetch
-                .awaiting_stale
-                .filter(|since| now.duration_since(*since) < STALE_REPLY_GRACE)
-        };
+        let awaiting_stale = match (self.fetch.current, self.fetch.current_since) {
+            (Some(_), Some(since)) => Some(since),
+            _ => self.fetch.awaiting_stale,
+        }
+        .filter(|since| now.duration_since(*since) < STALE_REPLY_GRACE);
+        if self.fetch.current.is_some() && awaiting_stale.is_none() {
+            warn!(
+                want = ?self.fetch.current,
+                "the client never answered the previous clipboard request; \
+                 presuming it lost and fetching the new copy"
+            );
+        }
         self.fetch = RemoteFetch {
             awaiting_stale,
             ..RemoteFetch::default()
@@ -1049,6 +1324,10 @@ impl CliprdrBackend for MacCliprdrBackend {
                     );
                 }
             }
+        }
+        if connect_time && !self.fetch.queue.is_empty() {
+            self.connect_fetch_started
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if self.fetch.awaiting_stale.is_some() {
             debug!("waiting for the superseded request's reply before fetching the new copy");
@@ -1120,9 +1399,24 @@ impl CliprdrBackend for MacCliprdrBackend {
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         // FileGroupDescriptorW is handled internally by upstream cliprdr
         // once we go through `initiate_file_copy` (the
-        // ServerEvent::ClipboardFileCopy path) — it answers the FormatData
+        // `SendInitiateFileCopy` path) — it answers the FormatData
         // request from its stored `local_file_list` without ever reaching
         // us. So we only deal with CF_UNICODETEXT and CF_DIB here.
+        if pb::is_remote_clipboard() {
+            // Reading the data would make macOS fetch it from the other
+            // Apple device over Bluetooth/AWDL (with the "Pasting from …"
+            // progress dialog on the Mac's screen) just to relay it to the
+            // RDP client. See the Universal Clipboard quirk note.
+            info!(
+                format = ?request.format,
+                "refusing format data request: the Mac pasteboard holds a Universal \
+                 Clipboard promise from another Apple device, not local data"
+            );
+            self.push(ClipboardMessage::SendFormatData(
+                OwnedFormatDataResponse::new_error(),
+            ));
+            return;
+        }
         let response = match request.format {
             ClipboardFormatId::CF_UNICODETEXT => match pb::read_string() {
                 Some(s) => {
@@ -1179,6 +1473,7 @@ impl CliprdrBackend for MacCliprdrBackend {
             if let (Some(w), false) = (want, self.fetch.retried) {
                 debug!(want = ?w, "remote returned error for format data; retrying once");
                 self.fetch.current = Some(w);
+                self.fetch.current_since = Some(std::time::Instant::now());
                 self.fetch.retried = true;
                 self.push(ClipboardMessage::SendInitiatePaste(w.id()));
                 return;
@@ -1304,6 +1599,21 @@ pub(crate) fn pasteboard_guard() -> std::sync::MutexGuard<'static, ()> {
     PB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Start writing new contents that must stay on THIS Mac: clears the
+/// pasteboard like `clearContents`, but with `currentHostOnly` so Universal
+/// Clipboard (Handoff) doesn't beacon it to the user's other devices. Every
+/// macrdp write is content that came from the RDP client (or temp-file URLs
+/// only valid here); beaconing it to a Mac client replaced that client's own
+/// clipboard item with a promise pointing back at this Mac, which the client
+/// then had to fetch over Bluetooth on the next connect ("Pasting from
+/// <server>…"). Caller holds [`pasteboard_guard`].
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn begin_local_write(pb: &objc2_app_kit::NSPasteboard) {
+    pb.prepareForNewContentsWithOptions(
+        objc2_app_kit::NSPasteboardContentsOptions::NSPasteboardContentsCurrentHostOnly,
+    );
+}
+
 /// The pasteboard every clipboard path reads and writes: the system's general
 /// pasteboard. Callers hold [`pasteboard_guard`] while using it.
 #[cfg(all(target_os = "macos", not(test)))]
@@ -1362,6 +1672,59 @@ mod pb {
 
     pub fn has_files() -> bool {
         unsafe { has_type(NSPasteboardTypeFileURL) }
+    }
+
+    /// True when the current pasteboard item came from ANOTHER Apple device
+    /// via Universal Clipboard (Handoff) and its data has not been fetched
+    /// yet. macOS tags such items with the undocumented type
+    /// `com.apple.is-remote-clipboard`; the marker is visible in `types()`
+    /// without triggering the transfer (reading the DATA is what starts the
+    /// Bluetooth/AWDL fetch and the "Pasting from …" progress dialog). Same
+    /// check clipboard managers use to avoid pulling every iPhone copy.
+    /// Undocumented, so if Apple ever drops the marker this simply returns
+    /// false and behaviour reverts to advertising/reading as before.
+    pub fn is_remote_clipboard() -> bool {
+        let t = NSString::from_str("com.apple.is-remote-clipboard");
+        has_type(&t)
+    }
+
+    /// The facts [`super::skip_connect_time_fetch`] decides on, read without
+    /// touching any item's data (so no Universal Clipboard transfer starts).
+    pub struct Snapshot {
+        pub change_count: i64,
+        /// Whether `advertise_pasteboard` would have something to send: the
+        /// same types it advertises, HTML/RTF only when `rich` is on.
+        pub has_content: bool,
+        pub is_remote: bool,
+    }
+
+    impl Snapshot {
+        /// One read of the change count and the type list under a single
+        /// guard, so every field describes the same pasteboard state.
+        pub fn current(rich: bool) -> Self {
+            let _pb_guard = super::pasteboard_guard();
+            autoreleasepool(|_| unsafe {
+                let pb = super::pasteboard();
+                let change_count = pb.changeCount() as i64;
+                let types = pb.types();
+                let has = |target: &NSString| {
+                    types.as_ref().is_some_and(|ts| {
+                        (0..ts.count()).any(|i| ts.objectAtIndex(i).isEqualToString(target))
+                    })
+                };
+                let remote = NSString::from_str("com.apple.is-remote-clipboard");
+                let has_content = has(NSPasteboardTypeString)
+                    || has(NSPasteboardTypePNG)
+                    || has(NSPasteboardTypeTIFF)
+                    || has(NSPasteboardTypeFileURL)
+                    || (rich && (has(NSPasteboardTypeHTML) || has(NSPasteboardTypeRTF)));
+                Snapshot {
+                    change_count,
+                    has_content,
+                    is_remote: has(&remote),
+                }
+            })
+        }
     }
 
     pub fn has_html() -> bool {
@@ -1582,9 +1945,39 @@ mod pb {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = super::pasteboard();
-            pb.clearContents();
+            super::begin_local_write(&pb);
             let ns = NSString::from_str(s);
             pb.setString_forType(&ns, NSPasteboardTypeString);
+        }
+    }
+
+    /// Test-only: put text on the pasteboard tagged as a Universal Clipboard
+    /// promise (the marker type macOS adds to items from another device).
+    #[cfg(test)]
+    pub fn write_remote_promise(s: &str) {
+        let _pb_guard = super::pasteboard_guard();
+        unsafe {
+            let pb = super::pasteboard();
+            pb.clearContents();
+            pb.setString_forType(&NSString::from_str(s), NSPasteboardTypeString);
+            pb.setData_forType(
+                Some(&NSData::with_bytes(&[])),
+                &NSString::from_str("com.apple.is-remote-clipboard"),
+            );
+        }
+    }
+
+    /// Test-only: put ONLY an HTML representation on the pasteboard.
+    #[cfg(test)]
+    pub fn write_html_only(html: &str) {
+        let _pb_guard = super::pasteboard_guard();
+        unsafe {
+            let pb = super::pasteboard();
+            pb.clearContents();
+            pb.setData_forType(
+                Some(&NSData::with_bytes(html.as_bytes())),
+                NSPasteboardTypeHTML,
+            );
         }
     }
 
@@ -1622,7 +2015,7 @@ mod pb {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = super::pasteboard();
-            pb.clearContents();
+            super::begin_local_write(&pb);
             // Richest first: the order is the owner's stated preference.
             if let Some(rtf) = rtf {
                 pb.setData_forType(Some(&NSData::with_bytes(rtf)), NSPasteboardTypeRTF);
@@ -1683,6 +2076,9 @@ mod pb {
         false
     }
     pub fn has_files() -> bool {
+        false
+    }
+    pub fn is_remote_clipboard() -> bool {
         false
     }
     pub fn read_string() -> Option<String> {
@@ -1797,6 +2193,55 @@ mod tests {
         assert!(got.iter().all(|&b| b == 0xAB));
     }
 
+    #[tokio::test]
+    async fn a_retry_wait_ends_as_soon_as_the_remote_accepts() {
+        let started = std::time::Instant::now();
+        let answer = wait_for_answer(
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            || started.elapsed() >= Duration::from_millis(20),
+            || false,
+        )
+        .await;
+        assert_eq!(answer, RetryWait::Accepted);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_new_copy_wins_over_an_acceptance() {
+        let answer = wait_for_answer(
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            || true,
+            || true,
+        )
+        .await;
+        assert_eq!(answer, RetryWait::Changed);
+    }
+
+    // On tokio's paused clock: each sleep advances exactly as long as asked,
+    // so the step count is deterministic. With real time a loaded CI runner
+    // oversleeps a 20 ms step, the 50 ms budget runs out after two checks,
+    // and the exact count fails (seen on a macOS runner 2026-11-12).
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_retry_wait_runs_out_on_time() {
+        let started = tokio::time::Instant::now();
+        let mut checks = 0;
+        let answer = wait_for_answer(
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+            || false,
+            || {
+                checks += 1;
+                false
+            },
+        )
+        .await;
+        assert_eq!(answer, RetryWait::Elapsed);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(checks, 3, "steps of 20, 20 and the 10 left");
+    }
+
     #[cfg(target_os = "macos")]
     fn test_backend() -> (MacCliprdrBackend, mpsc::UnboundedReceiver<ServerEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1810,9 +2255,14 @@ mod tests {
             paste_temp_dir: Arc::new(Mutex::new(None)),
             self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             remote_write_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            session_end_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             advertise_state: Arc::new(AdvertiseState::default()),
             lazy_paste: true,
             initial_advertise_pending: true,
+            connect_fetch_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Existing tests exercise live copies; the connect-time gate has
+            // its own tests below.
+            initial_remote_copy_pending: false,
         };
         (backend, rx)
     }
@@ -1910,6 +2360,271 @@ mod tests {
             backend.fetch.current,
             Some(Want::Text(ClipboardFormatId::CF_UNICODETEXT))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn skip_connect_time_fetch_only_when_the_mac_copy_is_local_and_newer() {
+        let snap = |change_count, has_content, is_remote| pb::Snapshot {
+            change_count,
+            has_content,
+            is_remote,
+        };
+        // Copied on the Mac while disconnected: the Mac's copy wins.
+        assert!(skip_connect_time_fetch(&snap(7, true, false), 5));
+        // Nothing changed here since the last session: the client may be newer.
+        assert!(!skip_connect_time_fetch(&snap(5, true, false), 5));
+        // The Mac holds a Universal Clipboard promise: the client has the data.
+        assert!(!skip_connect_time_fetch(&snap(7, true, true), 5));
+        // Empty Mac clipboard: nothing to prefer over the client's.
+        assert!(!skip_connect_time_fetch(&snap(7, false, false), 5));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn connect_time_list_is_skipped_when_the_mac_copy_is_newer_but_a_live_copy_is_not() {
+        let (mut backend, mut rx) = test_backend();
+        backend.initial_remote_copy_pending = true;
+        pb::write_string("copied on the Mac while disconnected");
+        let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+
+        backend.on_remote_copy(&formats);
+        assert!(
+            rx.try_recv().is_err(),
+            "connect-time list must not be fetched"
+        );
+        assert!(backend.fetch.current.is_none());
+
+        // The client's next list is a live copy and is always fetched.
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                _
+            )))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn connect_time_list_is_fetched_when_the_mac_clipboard_is_unchanged() {
+        let (mut backend, mut rx) = test_backend();
+        backend.initial_remote_copy_pending = true;
+        pb::write_string("left over from the last session");
+        backend
+            .session_end_cc
+            .store(pb::change_count(), std::sync::atomic::Ordering::Relaxed);
+        let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                _
+            )))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_universal_clipboard_promise_is_not_advertised() {
+        let (backend, mut rx) = test_backend();
+        pb::write_remote_promise("copied on another Apple device");
+
+        let outcome = advertise_pasteboard(&backend.sender, &backend.file_paths, true);
+
+        assert_eq!(outcome, Advertised::NothingToSend);
+        assert!(rx.try_recv().is_err(), "a promise must not be advertised");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_data_request_for_a_universal_clipboard_promise_is_refused() {
+        let (mut backend, mut rx) = test_backend();
+        pb::write_remote_promise("copied on another Apple device");
+
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+
+        match rx.try_recv().expect("the request must still be answered") {
+            ServerEvent::Clipboard(ClipboardMessage::SendFormatData(response)) => {
+                assert!(response.is_error(), "a promise must not be resolved");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshot_counts_rich_formats_only_when_they_would_be_advertised() {
+        pb::write_html_only("<b>rich only</b>");
+
+        assert!(!pb::Snapshot::current(false).has_content);
+        assert!(pb::Snapshot::current(true).has_content);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn connect_time_list_is_fetched_when_the_mac_copy_would_not_be_advertised() {
+        let (mut backend, mut rx) = test_backend();
+        backend.rich_clipboard = false;
+        backend.initial_remote_copy_pending = true;
+        pb::write_html_only("<b>rich only</b>");
+        let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+
+        backend.on_remote_copy(&formats);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                _
+            )))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_advertise_wave_does_not_send_the_clients_own_data_back() {
+        let (backend, mut rx) = test_backend();
+        pb::write_string("written from the client's copy");
+        backend
+            .remote_write_cc
+            .store(pb::change_count(), std::sync::atomic::Ordering::Relaxed);
+
+        let alive = advertise_wave(
+            &backend.sender,
+            &backend.file_paths,
+            true,
+            &backend.advertise_state,
+            &backend.own_writes(),
+        )
+        .await;
+
+        assert!(alive);
+        assert!(
+            rx.try_recv().is_err(),
+            "our own write must not be advertised"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_copy_does_not_wait_on_a_request_the_client_never_answered() {
+        let (mut backend, mut rx) = test_backend();
+        backend.fetch.current = Some(Want::Text(ClipboardFormatId::CF_UNICODETEXT));
+        backend.fetch.current_since =
+            Some(std::time::Instant::now() - STALE_REPLY_GRACE - std::time::Duration::from_secs(1));
+        let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+
+        backend.on_remote_copy(&formats);
+
+        assert!(backend.fetch.awaiting_stale.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                _
+            )))
+        ));
+    }
+
+    /// A slow reply must not be presumed lost and then taken as the next
+    /// copy's answer. The scenario from review on #198: a large image copied
+    /// in Windows is still being answered 6 s later when the user copies
+    /// text; the text request must wait, and the image's late reply must be
+    /// discarded, not decoded and pasted as the text.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_slow_reply_is_discarded_not_taken_as_the_next_copys_answer() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+        let _ = rx.try_recv();
+        backend.fetch.current_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        assert!(
+            rx.try_recv().is_err(),
+            "the text request must wait for the image's reply"
+        );
+
+        let dib = vec![0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x00, 0x00];
+        backend.on_format_data_response(FormatDataResponse::new_data(dib));
+        assert_ne!(pb::read_string().as_deref(), Some("ABC"));
+        // The stale reply was discarded and the text request went out.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                ClipboardFormatId::CF_UNICODETEXT
+            )))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_copy_still_waits_on_a_recent_superseded_request() {
+        let (mut backend, mut rx) = test_backend();
+        backend.fetch.current = Some(Want::Text(ClipboardFormatId::CF_UNICODETEXT));
+        backend.fetch.current_since = Some(std::time::Instant::now());
+        let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+
+        backend.on_remote_copy(&formats);
+
+        assert!(backend.fetch.awaiting_stale.is_some());
+        assert!(rx.try_recv().is_err(), "must wait for the in-flight reply");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_mac_is_not_advertised_at_connect_while_the_clients_clipboard_is_fetched() {
+        let (mut backend, mut rx) = test_backend();
+        backend.initial_remote_copy_pending = true;
+        pb::write_string("older Mac clipboard");
+        backend
+            .session_end_cc
+            .store(pb::change_count(), std::sync::atomic::Ordering::Relaxed);
+        let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+
+        // The server calls on_ready and on_remote_copy for the same first list.
+        backend.on_ready();
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                _
+            )))
+        ));
+
+        tokio::time::sleep(CONNECT_ADVERTISE_DELAY + Duration::from_millis(100)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the Mac's older clipboard must not be advertised over the client's"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_backend_that_served_a_client_stamps_the_session_end() {
+        use std::sync::atomic::Ordering;
+
+        // A failed connection attempt or a losing preemption candidate: built,
+        // then dropped without ever seeing a client's list.
+        let (mut attempt, _rx) = test_backend();
+        attempt.initial_remote_copy_pending = true;
+        let stamp = attempt.session_end_cc.clone();
+        pb::write_string("copied on the Mac while disconnected");
+        drop(attempt);
+        assert_eq!(
+            stamp.load(Ordering::Relaxed),
+            -1,
+            "an attempt that served nobody must not move the stamp"
+        );
+
+        // A backend that handled a client's list.
+        let (served, _rx) = test_backend();
+        let stamp = served.session_end_cc.clone();
+        drop(served);
+        assert_eq!(stamp.load(Ordering::Relaxed), pb::change_count());
     }
 
     fn named(id: u32, name: &'static str) -> ClipboardFormat {
@@ -2194,6 +2909,50 @@ mod tests {
             rx.try_recv(),
             Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id))) if id == ClipboardFormatId::CF_DIB
         ));
+    }
+
+    /// Backends are built before TLS and authentication, including for a
+    /// preemption candidate while another client is being served. When such an
+    /// attempt fails, its Drop must leave the paste state alone: that state
+    /// belongs to the live session, and deleting it would break a pending or
+    /// in-progress file paste. The backend that served a client still cleans up.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn only_a_backend_that_served_a_client_runs_the_disconnect_cleanup() {
+        use std::sync::atomic::Ordering;
+        let dir = tmpdir("live-session-paste");
+        let (mut live, _live_rx) = test_backend();
+        live.on_ready();
+        *live.paste_temp_dir.lock().unwrap() = Some(dir.0.clone());
+        live.active_backends.store(2, Ordering::Relaxed);
+
+        let (mut failed_attempt, _attempt_rx) = test_backend();
+        failed_attempt.paste_temp_dir = live.paste_temp_dir.clone();
+        failed_attempt.active_backends = live.active_backends.clone();
+        drop(failed_attempt);
+
+        assert!(
+            dir.0.exists(),
+            "a failed attempt deleted the live session's paste files"
+        );
+        assert_eq!(
+            live.paste_temp_dir.lock().unwrap().as_deref(),
+            Some(dir.0.as_path()),
+            "a failed attempt forgot the live session's paste dir"
+        );
+        assert_eq!(
+            live.active_backends.load(Ordering::Relaxed),
+            1,
+            "a failed attempt must still balance the poller's backend count"
+        );
+
+        let shared = live.paste_temp_dir.clone();
+        drop(live);
+        assert!(
+            !dir.0.exists(),
+            "the backend that served the client must clean up its paste files"
+        );
+        assert!(shared.lock().unwrap().is_none());
     }
 
     /// Regression pin for a bug caught in QA: publishing a remote TEXT/rich

@@ -88,6 +88,18 @@ Edit feature toggles (H.264, AAC, HiDPI, un-minimize-on-Cmd+Tab), the headless v
 an `EXTRA_FLAGS` escape hatch in `config.env`. It's outside the bundle, so edits
 never disturb the code signature or the TCC grants.
 
+> **How `EXTRA_FLAGS` interacts with the dedicated keys.** Its tokens are appended to
+> argv *after* every dedicated key, which has three outcomes:
+> - **On/off flags in `EXTRA_FLAGS` override their dedicated key silently.** For example,
+>   `ALT_TAB_SWITCH=0` plus `EXTRA_FLAGS="--alt-tab-switch"` leaves Alt+Tab **on**.
+> - **A flag that takes a value can't appear in both.** macrdp refuses to start
+>   (`the argument '--bind <BIND>' cannot be used multiple times`).
+> - **`BITRATE` always wins** over a `--bitrate` in `EXTRA_FLAGS`, which is dropped.
+>
+> Unrecognised keys are silently ignored (for forward compatibility), so a typo or an
+> older installed binary also fails quietly. If a setting seems to have no effect,
+> check `EXTRA_FLAGS` first.
+
 ## Smart-card redirection (optional)
 
 Lets the connecting client's smart-card reader be used by macOS apps. The

@@ -180,6 +180,10 @@ pub enum Decision {
 pub enum Outcome {
     Success,
     Failure,
+    /// The client authenticated and the server then failed the session: no
+    /// lockout strike, and the attempt is refunded from the rate-limit window.
+    /// Deliberately only for errored sessions: a clean disconnect keeps its attempt.
+    ServerError,
 }
 
 /// Classify a finished connection for lockout accounting.
@@ -196,9 +200,18 @@ pub enum Outcome {
 /// failure, which locked out legit clients — observed in a soak 2026-07-01).
 ///
 /// `errored` is the error signal from the connection's `on_disconnected`
-/// (`Some(err)` ⇒ the connection ended with an error).
-pub fn classify_outcome(errored: bool, duration: Duration, failfast_window: Duration) -> Outcome {
-    if errored && duration < failfast_window {
+/// (`Some(err)` ⇒ the connection ended with an error). `authenticated` is true
+/// once CredSSP accepted the client's credentials: an error after that is the
+/// server's, however fast it came, and is [`Outcome::ServerError`].
+pub fn classify_outcome(
+    errored: bool,
+    authenticated: bool,
+    duration: Duration,
+    failfast_window: Duration,
+) -> Outcome {
+    if errored && authenticated {
+        Outcome::ServerError
+    } else if errored && duration < failfast_window {
         Outcome::Failure
     } else {
         Outcome::Success
@@ -298,6 +311,12 @@ impl AuthGuardCore {
             Outcome::Success => {
                 entry.consecutive_failures = 0;
                 entry.cooldown_until = None;
+            }
+            Outcome::ServerError => {
+                entry.consecutive_failures = 0;
+                entry.cooldown_until = None;
+                // The newest attempt may be another connection's behind the same NAT; the count is what matters.
+                entry.attempts.pop_back();
             }
             Outcome::Failure => {
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
@@ -472,6 +491,7 @@ pub fn audit_disconnect(ip: IpAddr, port: u16, duration: Duration, outcome: Outc
             outcome = match outcome {
                 Outcome::Success => "success",
                 Outcome::Failure => "failure",
+                Outcome::ServerError => "server_error",
             },
         );
     }
@@ -604,7 +624,12 @@ pub struct AuthGuardHandler {
     /// because the single-process accept loop is serial — `on_accept` always runs
     /// immediately before the connection it belongs to.
     last_peer: Option<std::net::SocketAddr>,
+    /// Peers whose CredSSP exchange succeeded, until they disconnect.
+    authenticated: std::collections::HashSet<std::net::SocketAddr>,
 }
+
+/// Bounds `authenticated` against peers that never reach `on_disconnected`.
+const MAX_AUTHENTICATED_PEERS: usize = 64;
 
 impl AuthGuardHandler {
     /// Build the boxed handler, or `None` when the guard is disabled (so the
@@ -614,6 +639,7 @@ impl AuthGuardHandler {
             Box::new(Self {
                 core,
                 last_peer: None,
+                authenticated: Default::default(),
             }) as Box<dyn ironrdp_server::ConnectionHandler>
         })
     }
@@ -622,6 +648,7 @@ impl AuthGuardHandler {
 impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
     fn on_accept(&mut self, peer: std::net::SocketAddr) -> bool {
         self.last_peer = Some(peer);
+        self.authenticated.remove(&peer);
         match self.core.decide(Instant::now(), peer.ip()) {
             Decision::Accept => {
                 audit_accept(peer.ip(), peer.port());
@@ -638,6 +665,12 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         // `last_peer` is always set here in single-process operation (on_accept
         // precedes the connection); guard defensively rather than assume it.
         if let Some(peer) = self.last_peer {
+            if success {
+                if self.authenticated.len() >= MAX_AUTHENTICATED_PEERS {
+                    self.authenticated.clear();
+                }
+                self.authenticated.insert(peer);
+            }
             audit_auth(peer.ip(), peer.port(), success, reason);
         }
     }
@@ -665,9 +698,15 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         &mut self,
         peer: std::net::SocketAddr,
         duration: Duration,
-        error: Option<&anyhow::Error>,
+        error: Option<&ironrdp_server::ServerError>,
     ) -> ironrdp_server::PostConnectionAction {
-        let outcome = classify_outcome(error.is_some(), duration, self.core.failfast_window());
+        let authenticated = self.authenticated.remove(&peer);
+        let outcome = classify_outcome(
+            error.is_some(),
+            authenticated,
+            duration,
+            self.core.failfast_window(),
+        );
         self.core.record_outcome(Instant::now(), peer.ip(), outcome);
         audit_disconnect(peer.ip(), peer.port(), duration, outcome);
         // The guard must never halt the server.
@@ -696,32 +735,91 @@ mod tests {
         let w = Duration::from_secs(3);
         // Fast + errored = the brute-force/scan signature → Failure.
         assert_eq!(
-            classify_outcome(true, Duration::from_millis(1), w),
+            classify_outcome(true, false, Duration::from_millis(1), w),
             Outcome::Failure
         );
         assert_eq!(
-            classify_outcome(true, Duration::from_millis(900), w),
+            classify_outcome(true, false, Duration::from_millis(900), w),
             Outcome::Failure
         );
         // Errored but ran past the window = a client that authenticated then hit
         // session trouble (the soak false-lockout case) → Success (resets).
         assert_eq!(
-            classify_outcome(true, Duration::from_secs(7), w),
+            classify_outcome(true, false, Duration::from_secs(7), w),
             Outcome::Success
         );
         assert_eq!(
-            classify_outcome(true, Duration::from_millis(3001), w),
+            classify_outcome(true, false, Duration::from_millis(3001), w),
             Outcome::Success
         );
         // Clean disconnects never count, short or long.
         assert_eq!(
-            classify_outcome(false, Duration::from_millis(1), w),
+            classify_outcome(false, false, Duration::from_millis(1), w),
             Outcome::Success
         );
         assert_eq!(
-            classify_outcome(false, Duration::from_secs(3600), w),
+            classify_outcome(false, false, Duration::from_secs(3600), w),
             Outcome::Success
         );
+    }
+
+    #[test]
+    fn classify_outcome_blames_the_server_after_authentication() {
+        let w = Duration::from_secs(3);
+        assert_eq!(
+            classify_outcome(true, true, Duration::from_millis(400), w),
+            Outcome::ServerError
+        );
+        assert_eq!(
+            classify_outcome(true, true, Duration::from_secs(60), w),
+            Outcome::ServerError
+        );
+        assert_eq!(
+            classify_outcome(false, true, Duration::from_millis(400), w),
+            Outcome::Success
+        );
+    }
+
+    #[test]
+    fn server_errors_neither_lock_out_nor_rate_limit() {
+        let mut c = core();
+        let t0 = Instant::now();
+        let peer = ip(21);
+        for k in 0..50 {
+            let t = t0 + Duration::from_millis(k * 500);
+            assert_eq!(c.decide(t, peer), Decision::Accept, "attempt {k}");
+            c.record_outcome(t, peer, Outcome::ServerError);
+        }
+    }
+
+    #[test]
+    fn handler_counts_a_fast_failure_after_auth_as_server_error() {
+        let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+        use ironrdp_server::{ConnectionHandler, ServerError, ServerErrorExt};
+        let mut handler = AuthGuardHandler {
+            core: AuthGuardCore::with_config(test_cfg()),
+            last_peer: None,
+            authenticated: Default::default(),
+        };
+        let peer = std::net::SocketAddr::from((Ipv4Addr::new(203, 0, 113, 22), 51000));
+        let err = ServerError::reason("client loop", "failure");
+        for k in 0..30u16 {
+            let peer = std::net::SocketAddr::new(peer.ip(), 51000 + k);
+            assert!(handler.on_accept(peer), "attempt {k} rejected");
+            handler.on_authenticated(true, None);
+            handler.on_disconnected(peer, Duration::from_millis(300), Some(&err));
+        }
+        // Without authentication the same pattern still locks out.
+        let mut locked = false;
+        for k in 0..30u16 {
+            let peer = std::net::SocketAddr::new(peer.ip(), 52000 + k);
+            if !handler.on_accept(peer) {
+                locked = true;
+                break;
+            }
+            handler.on_disconnected(peer, Duration::from_millis(300), Some(&err));
+        }
+        assert!(locked);
     }
 
     #[test]
@@ -737,7 +835,7 @@ mod tests {
             c.record_outcome(
                 t0 + Duration::from_secs(k * 10),
                 peer,
-                classify_outcome(true, dur, w),
+                classify_outcome(true, false, dur, w),
             );
             assert_eq!(
                 c.decide(t0 + Duration::from_secs(k * 10 + 1), peer),
@@ -1008,6 +1106,13 @@ mod tests {
         assert!(!cleaned.chars().any(|c| c.is_control()));
     }
 
+    /// Held by the tests that capture audit events with a scoped subscriber and
+    /// by the tests that emit them without one. tracing caches each callsite's
+    /// enabled state process-wide, and an emitter registering a callsite on
+    /// another thread while a capture is running can leave it cached as disabled
+    /// for the capture (about 1 run in 40 lost the `success` event).
+    static AUDIT_EVENTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A cloneable `MakeWriter` that captures emitted log lines into a shared
     /// buffer, so we can assert the auth audit event's fields.
     #[derive(Clone, Default)]
@@ -1034,6 +1139,7 @@ mod tests {
     fn on_authenticated_emits_auth_audit_event() {
         use ironrdp_server::ConnectionHandler;
 
+        let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
         let buf = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -1045,6 +1151,7 @@ mod tests {
             let mut handler = AuthGuardHandler {
                 core: AuthGuardCore::with_config(test_cfg()),
                 last_peer: None,
+                authenticated: Default::default(),
             };
             // on_accept stashes the peer for on_authenticated to correlate.
             assert!(handler.on_accept(peer));
@@ -1067,6 +1174,7 @@ mod tests {
     fn on_client_fingerprint_emits_fingerprint_event() {
         use ironrdp_server::ConnectionHandler;
 
+        let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
         let buf = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -1078,6 +1186,7 @@ mod tests {
             let mut handler = AuthGuardHandler {
                 core: AuthGuardCore::with_config(test_cfg()),
                 last_peer: None,
+                authenticated: Default::default(),
             };
             assert!(handler.on_accept(peer));
             // A hostile client name with a control char (log-injection attempt)
@@ -1111,6 +1220,7 @@ mod tests {
         let mut handler = AuthGuardHandler {
             core: AuthGuardCore::with_config(test_cfg()),
             last_peer: None,
+            authenticated: Default::default(),
         };
         // No preceding on_accept → last_peer is None; must be a graceful no-op.
         handler.on_authenticated(true, None);

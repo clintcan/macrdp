@@ -24,14 +24,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.9.11** (input fixes from @antonmos: held modifiers on
-mouse events, Ctrl+click→Cmd+click and Ctrl+,→Cmd+, under `--map-ctrl-to-cmd`, per-connection
-input reset — #183/#184, vendored divergence (24)). Next: the IronRDP pin bump on its own branch.
+(VPN/ZeroTier). **Latest release: v0.10.3** (redirected-drive nodes are owned by the server's
+user so Finder writes, and a rename keeps the fileid and moves cached descendant paths, #253; the
+encoder schedules periodic keyframes because VideoToolbox ignores a mid-session
+MaxKeyFrameInterval change, and the IDR backoff stretch is capped at ~10 s of frames, #252).
+Next: Windows 10 mstsc fixes in review (#228, #230), and the mstsc UDP tunnel going dead.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
 previous release down as a one-line bullet in **Recent releases** — keep it a list, never a
 paragraph), and this Status line.
+
+## Before you call a change "live"
+
+- **`/Applications/macrdp.app` is not `target/release/macrdp`.** Restarting the LaunchAgent
+  re-launches the *installed* bundle; it never rebuilds. And a quiet startup proves
+  nothing, because `config.env` silently ignores unknown keys, so a stale binary just
+  drops a new setting. Rebuild, verify and watch the log using the steps in `docs/cli.md`
+  ("Deploying a change to the installed bundle").
+- **Synthetic-input bugs: ask the user what they *saw*.** The log often records only a
+  pass/fail outcome. Five different auto-unlock failures logged identically; "the field
+  shook" or "one dot short" is what found the causes.
+- **Connect-edge features need a real disconnect + reconnect to test.** Auto-unlock,
+  restore-windows and the connect-time gather run on the session watcher's 0→1 edge;
+  locking and unlocking inside a session that stays open never runs them.
 
 ## Project goal
 
