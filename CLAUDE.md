@@ -24,11 +24,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.4** (32 bpp pointers sent as BGRA bottom-up and a
-fully transparent cursor sent as the hidden pointer, #219, which needed the zero-payload
-fast-path fix harvested from upstream #2274 as divergence (31), #255; native-style Alt+Tab
-MRU and Cmd+` window cycling, #197; `--reverse-scroll`, #254; the serving path's pre-auth
-negotiation bounded at 60 s as divergence (32), #256).
+(VPN/ZeroTier). **Latest release: v0.10.5** (RDPEUDP keepalive ACKs on an idle
+tunnel so mstsc no longer closes it at 65 s, #257; the S_OK Initiate Multitransport
+Response no longer spends the one Soft-Sync when lossy audio or EGFX is set to migrate,
+which had silenced lossy audio and disabled `--udp-migrate-egfx` since v0.10.0, #258;
+lossy waves stay on TCP until the Soft-Sync is acknowledged, #259).
 Next: Windows 10 mstsc fixes awaiting rebase (#228, #230).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**

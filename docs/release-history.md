@@ -4,6 +4,33 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.5 — UDP multitransport fixes: the mstsc tunnel stays up, lossy audio plays again
+
+A bug-fix release for UDP multitransport. Nothing changes unless `--enable-udp-multitransport` is on.
+
+- **mstsc's UDP tunnel no longer dies about 90 s into every session (#257).**
+  - **The bug:** our UDP transport only sent anything to answer or acknowledge data. With nothing using the tunnel (the default), or a static screen with `--udp-migrate-egfx`, it went silent from our side. mstsc closes a silent tunnel after 65 s, and macrdp then logged `UDP tunnel DEAD` and fell back to TCP.
+  - **The fix:** an idle tunnel now gets a keepalive every 10 s (`Config::keepalive_ms`, `DEFAULT_KEEPALIVE_MS` in `vendor/macrdp-rdpeudp`), as MS-RDPEUDP requires ("If there is no data to send, each endpoint MUST periodically acknowledge the last received datagram").
+- **Lossy UDP audio (`--enable-lossy-audio`) plays again (#258).** It had been silent since v0.10.0: the tunnel came up and audio streamed into it, but mstsc played nothing. Since the IronRDP update in v0.10.0, mstsc answers the UDP offer with a success message, and macrdp used up the connection's one channel-switch request (Soft-Sync) answering it, so the audio channel was never moved onto the tunnel. `mt_on_response` now leaves the Soft-Sync to the migration gate when lossy audio or EGFX is set to migrate (`mt_has_channel_to_migrate`; vendored divergence (12)).
+- **`--udp-migrate-egfx` moves video onto UDP again (#258).** It broke the same way in v0.10.0; video quietly stayed on TCP.
+- **Lossy audio no longer drops the first half-second of each connection (#259).** Audio now stays on TCP until mstsc has confirmed the switch to UDP (`lossy_audio_soft_synced` + `DrdynvcServer::soft_sync_response_received`).
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, all 352 tests pass, and the vendored RDPEUDP crate's 57 tests pass. The new keepalive tests were mutation-checked.
+- Live on a Mac mini with Windows 11 mstsc on the LAN:
+  - **Tunnel:** an 8.6-minute session kept its tunnel the whole time; before the fix, every mstsc session lost it at about 90 s (measured 90.2 s and 90.4 s).
+  - **Lossy audio:** silent on v0.10.4 and audible with the fix. mstsc confirms the switch to the lossy tunnel, and sound starts as soon as you connect.
+  - **EGFX over UDP:** on v0.10.4 video stayed on TCP; with the fix it moved to UDP and the session ran with no fallback.
+  - **ZeroTier:** an mstsc session with lossy audio over ZeroTier ran past the ~60 s point where such sessions used to reset.
+- **Not soaked:** the mini has run this code for about an hour.
+
+**Known issues** (none are new in this release)
+
+- Lossy audio and `--udp-migrate-egfx` can't both move to UDP in the same session: a connection gets one channel-switch request, and audio takes it.
+- An mstsc window that has reconnected several times decodes video more slowly above ~2 Mbit/s, so `--adaptive-bitrate` can still briefly dip there. Closing and reopening mstsc avoids it.
+- Windows 10 mstsc shows a black screen or starts an H.264 session frozen (#226, #229). Fixes are awaiting a rebase (#228, #230).
+
 ## v0.10.4 — true-colour cursors, native-style app switching, reverse scroll
 
 Cursor, input and hardening fixes, plus one new option. By default, coloured cursors, the app switcher and the pre-login timeout behave differently; `--reverse-scroll` is off unless you turn it on.
