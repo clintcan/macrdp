@@ -16,9 +16,9 @@
 //! `MacInputHandler`), so the test is fully cross-platform — it runs on Linux CI
 //! AND locally on macOS without touching the screen-capture backend.
 //!
-//! What it asserts: with `set_honor_client_desktop_size(true)`, a client that
+//! What it asserts: with `with_honor_client_desktop_size(Some(..))`, a client that
 //! requests 1920×1080 gets a session negotiated at 1920×1080 even though the
-//! server's display starts at 1024×768 — i.e. the vendored acceptor's
+//! server's display starts at 1024×768 — i.e. the acceptor's
 //! client-resolution auto-adopt works across a real handshake. With it off, the
 //! client gets the server's own size. (Pure-fn coverage of the adopt decision
 //! lives in `capture.rs::adopt_client_size`; this proves the wire path.)
@@ -31,8 +31,9 @@ use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{ClientConnector, Config, ConnectorResult, Credentials, DesktopSize};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
 use ironrdp_server::{
-    ConnectionHandler, DesktopSize as ServerDesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent,
-    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
+    ConnectionHandler, ConnectionPolicy, DesktopSize as ServerDesktopSize, DisplayUpdate,
+    KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
+    RdpServerInputHandler, ServerAutoReconnect,
 };
 use ironrdp_tokio::TokioFramed;
 use tokio_rustls::{rustls, TlsConnector};
@@ -51,7 +52,7 @@ impl RdpServerInputHandler for TestInput {
 struct TestUpdates;
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for TestUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
         std::future::pending::<()>().await;
         Ok(None)
     }
@@ -65,7 +66,7 @@ impl RdpServerDisplay for TestDisplay {
     async fn size(&mut self) -> ServerDesktopSize {
         self.size
     }
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(TestUpdates))
     }
 }
@@ -218,7 +219,7 @@ fn client_config(width: u16, height: u16) -> Config {
         // Added to connector Config in the a5d1c682 pin bump; Lan is the canonical
         // default (client config / testsuite / web all use it).
         connection_type: ConnectionType::Lan,
-        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
@@ -244,6 +245,14 @@ fn client_config(width: u16, height: u16) -> Config {
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        // Added to connector Config by the e258f6a0 pin bump; values as upstream's
+        // own e2e tests use, except no RAIL (this client doesn't use it).
+        monitor_layout: None,
+        enable_standard_rdp_security: false,
+        enable_audio_capture: false,
+        support_dyn_vc_gfx_protocol: false,
+        remote_application_mode: false,
+        rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty(),
     }
 }
 
@@ -308,19 +317,25 @@ fn build_test_server_full(
     } else {
         None
     };
-    let mut server = RdpServer::builder()
+    RdpServer::builder()
         .with_addr((Ipv4Addr::LOCALHOST, port))
         .with_tls(server_tls_acceptor())
         .with_input_handler(TestInput)
         .with_display_handler(display)
         .with_sound_factory(sound)
         .with_bitmap_codecs(codecs)
-        .build();
-    server.set_honor_client_desktop_size(honor);
-    server.set_honor_client_desktop_size_max(
-        max.map(|(width, height)| ServerDesktopSize { width, height }),
-    );
-    server
+        .with_honor_client_desktop_size(honor_client_size(honor, max))
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build()
+}
+
+/// The honored-size setting as `main.rs` builds it: the operator ceiling, or
+/// MS-RDPBCGR's own 8192 maximum, when auto-adopt is on.
+fn honor_client_size(honor: bool, max: Option<(u16, u16)>) -> Option<ServerDesktopSize> {
+    honor.then(|| {
+        let (width, height) = max.unwrap_or((8192, 8192));
+        ServerDesktopSize { width, height }
+    })
 }
 
 /// Drive a real IronRDP client through the full connect handshake (X.224 nego →
@@ -349,11 +364,28 @@ async fn connect_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    connect_client_with_cookie(client_io, client_w, client_h, None).await
+}
+
+/// [`connect_client`], presenting `cookie` in the Client Info PDU the way a client
+/// auto-reconnecting after a dropped connection does.
+async fn connect_client_with_cookie<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+    cookie: Option<ServerAutoReconnect>,
+) -> anyhow::Result<((u16, u16), TokioFramed<tokio_rustls::client::TlsStream<S>>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
     let mut connector = ClientConnector::new(
         client_config(client_w, client_h),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
     );
+    if let Some(cookie) = cookie {
+        connector = connector.with_auto_reconnect_cookie(cookie);
+    }
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
     let initial = framed.into_inner_no_leftover();
@@ -539,6 +571,47 @@ async fn no_shared_codec_falls_back_and_connects() -> anyhow::Result<()> {
         "no-shared-codec connect should still complete (raw fallback)"
     );
     Ok(())
+}
+
+/// A client returning with an auto-reconnect cookie the server can't verify (one
+/// issued before a server restart) still gets in, through a normal logon. That is
+/// MS-RDPBCGR 3.3.5.3.11 and vendored divergence (30). Upstream denied it, and
+/// FreeRDP then retried the same cookie about three times a second, which tripped
+/// the auth lockout for its address (found live, 2026-10-28).
+#[tokio::test]
+async fn a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon() -> anyhow::Result<()> {
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // A live session (see `KeepAliveSound`), so a served connection stays up and the
+    // only way `run_connection` ends early is the cookie check denying it. The client
+    // can't tell on its own: it counts as connected before the server checks the cookie.
+    let mut server =
+        build_test_server_full(3389, 1280, 800, false, None, crate::bitmap_codecs(), true);
+    server.set_auto_reconnect_cookie(Some(ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x11; 16],
+    }));
+    let stale = ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x22; 16],
+    };
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move { server.run_connection(server_io).await });
+            let (size, _framed) = connect_client_with_cookie(client_io, 1280, 800, Some(stale)).await?;
+            assert_eq!(size, (1280, 800));
+
+            // Still serving a second later; a denied connection ends at once with an error.
+            match tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await {
+                Err(_elapsed) => Ok(()),
+                Ok(ended) => Err(anyhow::anyhow!(
+                    "the server ended the connection instead of falling back to a normal logon: {ended:?}"
+                )),
+            }
+        })
+        .await
 }
 
 /// Layer-4 reconnect lifecycle soak: one long-lived server serves many
@@ -784,8 +857,9 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
                 .with_connection_handler(Some(Box::new(RejectAfterFirst {
                     accepted_once: false,
                 })))
+                .with_honor_client_desktop_size(honor_client_size(true, None))
+                .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
-            server.set_honor_client_desktop_size(true);
 
             let server_task = tokio::task::spawn_local(async move {
                 let _ = server.run().await;
@@ -886,8 +960,9 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
                 .with_connection_handler(Some(Box::new(CountingAccepts {
                     count: Arc::clone(&accept_count),
                 })))
+                .with_honor_client_desktop_size(honor_client_size(true, None))
+                .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
-            server.set_honor_client_desktop_size(true);
 
             let server_task = tokio::task::spawn_local(async move {
                 let _ = server.run().await;
@@ -1158,24 +1233,27 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
     }
 
     /// Sends full-screen frames forever, so a client that stops reading
-    /// leaves the server's socket write blocked.
-    struct FloodUpdates;
+    /// leaves the server's socket write blocked. Each frame differs from the
+    /// last, because the bitmap encoder skips an unchanged frame.
+    struct FloodUpdates(usize);
     #[async_trait::async_trait]
     impl RdpServerDisplayUpdates for FloodUpdates {
-        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
             tokio::task::yield_now().await;
-            let (width, height) = (256_u16, 256_u16);
-            let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4)
-                .map(|i| (i * 7919 % 251) as u8)
+            const SIDE: std::num::NonZeroU16 = std::num::NonZeroU16::new(256).unwrap();
+            const STRIDE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(256 * 4).unwrap();
+            let data: Vec<u8> = (0..STRIDE.get() * usize::from(SIDE.get()))
+                .map(|i| ((i * 7919 + self.0) % 251) as u8)
                 .collect();
+            self.0 += 1;
             Ok(Some(DisplayUpdate::Bitmap(ironrdp_server::BitmapUpdate {
                 x: 0,
                 y: 0,
-                width: width.try_into()?,
-                height: height.try_into()?,
+                width: SIDE,
+                height: SIDE,
                 format: ironrdp_server::PixelFormat::BgrA32,
                 data: data.into(),
-                stride: (usize::from(width) * 4).try_into()?,
+                stride: STRIDE,
             })))
         }
     }
@@ -1189,8 +1267,10 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
                 height: 256,
             }
         }
-        async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-            Ok(Box::new(FloodUpdates))
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            Ok(Box::new(FloodUpdates(0)))
         }
     }
 
@@ -1238,6 +1318,165 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
                 matches!(received, Ok(Some(_))),
                 "a key press sent while a server write was blocked never reached the input handler"
             );
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A pointer update with no payload (hidden, default) must still reach the
+/// client. The fast-path fragmenter at our pin stopped on an empty payload
+/// and wrote nothing, so `HidePointer` and `DefaultPointer` were silently
+/// dropped (vendored server divergence 31, from upstream #2274).
+#[tokio::test]
+async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result<()> {
+    use ironrdp_core::{Decode as _, ReadCursor};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, UpdateCode};
+
+    struct PointerUpdates(Vec<DisplayUpdate>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for PointerUpdates {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
+            if let Some(update) = self.0.pop() {
+                return Ok(Some(update));
+            }
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+    }
+
+    struct PointerDisplay;
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for PointerDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 256,
+                height: 256,
+            }
+        }
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            // Popped from the back: hidden first, then default.
+            Ok(Box::new(PointerUpdates(vec![
+                DisplayUpdate::DefaultPointer,
+                DisplayUpdate::HidePointer,
+            ])))
+        }
+    }
+
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(PointerDisplay)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let (_size, mut framed) = connect_client(client_io, 256, 256).await?;
+
+            let mut codes = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while codes.len() < 2 {
+                let Ok(read) = tokio::time::timeout_at(deadline, framed.read_pdu()).await else {
+                    break;
+                };
+                let (action, bytes) = read?;
+                if action != ironrdp_pdu::Action::FastPath {
+                    continue;
+                }
+                let mut cursor = ReadCursor::new(&bytes);
+                FastPathHeader::decode(&mut cursor)?;
+                while !cursor.is_empty() {
+                    let update = FastPathUpdatePdu::decode(&mut cursor)?;
+                    if matches!(
+                        update.update_code,
+                        UpdateCode::HiddenPointer | UpdateCode::DefaultPointer
+                    ) {
+                        // A First/Next fragment would leave a real client
+                        // waiting for the rest; it has to be one Single frame.
+                        assert_eq!(
+                            update.fragmentation,
+                            ironrdp_pdu::fast_path::Fragmentation::Single
+                        );
+                        codes.push(update.update_code);
+                    }
+                }
+            }
+            server_task.abort();
+            assert_eq!(
+                codes,
+                [UpdateCode::HiddenPointer, UpdateCode::DefaultPointer],
+                "empty-payload pointer updates never reached the client"
+            );
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A peer that sends an X.224 Connection Request and then goes silent must not
+/// hold the serving connection forever (#186): the pre-finalize phase is
+/// bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s, vendored divergence 32). The
+/// clock is paused, so the wait is virtual.
+#[tokio::test(start_paused = true)]
+async fn a_silent_peer_cannot_hold_the_serving_connection() -> anyhow::Result<()> {
+    use ironrdp_pdu::nego::{ConnectionRequest, RequestFlags, SecurityProtocol};
+    use ironrdp_pdu::x224::X224;
+    use tokio::io::AsyncWriteExt as _;
+
+    init_tracing();
+    let (mut client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let request = X224(ConnectionRequest {
+                nego_data: None,
+                flags: RequestFlags::empty(),
+                protocol: SecurityProtocol::SSL | SecurityProtocol::HYBRID,
+                correlation_info: None,
+            });
+            client_io.write_all(&ironrdp_core::encode_vec(&request)?).await?;
+            client_io.flush().await?;
+
+            // Still waiting just short of the budget: a slow human typing a
+            // password inside this phase must not be cut off early.
+            tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+            assert!(
+                !server_task.is_finished(),
+                "the serving connection gave up before the 60 s budget"
+            );
+
+            let done = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
+            assert!(
+                done.is_ok(),
+                "a peer that went silent after its Connection Request still holds the serving connection"
+            );
+            drop(client_io);
             anyhow::Ok(())
         })
         .await
