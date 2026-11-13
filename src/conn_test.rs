@@ -1322,3 +1322,102 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
         })
         .await
 }
+
+/// A pointer update with no payload (hidden, default) must still reach the
+/// client. The fast-path fragmenter at our pin stopped on an empty payload
+/// and wrote nothing, so `HidePointer` and `DefaultPointer` were silently
+/// dropped (vendored server divergence 31, from upstream #2274).
+#[tokio::test]
+async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result<()> {
+    use ironrdp_core::{Decode as _, ReadCursor};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, UpdateCode};
+
+    struct PointerUpdates(Vec<DisplayUpdate>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for PointerUpdates {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
+            if let Some(update) = self.0.pop() {
+                return Ok(Some(update));
+            }
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+    }
+
+    struct PointerDisplay;
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for PointerDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 256,
+                height: 256,
+            }
+        }
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            // Popped from the back: hidden first, then default.
+            Ok(Box::new(PointerUpdates(vec![
+                DisplayUpdate::DefaultPointer,
+                DisplayUpdate::HidePointer,
+            ])))
+        }
+    }
+
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(PointerDisplay)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let (_size, mut framed) = connect_client(client_io, 256, 256).await?;
+
+            let mut codes = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while codes.len() < 2 {
+                let Ok(read) = tokio::time::timeout_at(deadline, framed.read_pdu()).await else {
+                    break;
+                };
+                let (action, bytes) = read?;
+                if action != ironrdp_pdu::Action::FastPath {
+                    continue;
+                }
+                let mut cursor = ReadCursor::new(&bytes);
+                FastPathHeader::decode(&mut cursor)?;
+                while !cursor.is_empty() {
+                    let update = FastPathUpdatePdu::decode(&mut cursor)?;
+                    if matches!(
+                        update.update_code,
+                        UpdateCode::HiddenPointer | UpdateCode::DefaultPointer
+                    ) {
+                        // A First/Next fragment would leave a real client
+                        // waiting for the rest; it has to be one Single frame.
+                        assert_eq!(
+                            update.fragmentation,
+                            ironrdp_pdu::fast_path::Fragmentation::Single
+                        );
+                        codes.push(update.update_code);
+                    }
+                }
+            }
+            server_task.abort();
+            assert_eq!(
+                codes,
+                [UpdateCode::HiddenPointer, UpdateCode::DefaultPointer],
+                "empty-payload pointer updates never reached the client"
+            );
+            anyhow::Ok(())
+        })
+        .await
+}
