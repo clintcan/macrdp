@@ -1151,7 +1151,7 @@ mod macos {
                 }
             }
             let d = match self.target_display_id {
-                Some(id) => CGDisplay::new(id),
+                Some(id) => CGDisplay::new(crate::virtual_display::current_id(id)),
                 None => CGDisplay::main(),
             };
             let b = d.bounds();
@@ -1661,6 +1661,7 @@ mod macos {
             // runs off-thread so input never stalls.
             if ctrl && opt && !cmd && vk == VK_G {
                 if let Some(id) = self.target_display_id {
+                    let id = crate::virtual_display::current_id(id);
                     std::thread::spawn(move || {
                         let moved = gather_windows_onto_display(id);
                         tracing::info!(
