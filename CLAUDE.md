@@ -24,11 +24,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.3** (redirected-drive nodes are owned by the server's
-user so Finder writes, and a rename keeps the fileid and moves cached descendant paths, #253; the
-encoder schedules periodic keyframes because VideoToolbox ignores a mid-session
-MaxKeyFrameInterval change, and the IDR backoff stretch is capped at ~10 s of frames, #252).
-Next: Windows 10 mstsc fixes in review (#228, #230), and the mstsc UDP tunnel going dead.
+(VPN/ZeroTier). **Latest release: v0.10.4** (32 bpp pointers sent as BGRA bottom-up and a
+fully transparent cursor sent as the hidden pointer, #219, which needed the zero-payload
+fast-path fix harvested from upstream #2274 as divergence (31), #255; native-style Alt+Tab
+MRU and Cmd+` window cycling, #197; `--reverse-scroll`, #254; the serving path's pre-auth
+negotiation bounded at 60 s as divergence (32), #256).
+Next: Windows 10 mstsc fixes awaiting rebase (#228, #230), and the mstsc UDP tunnel going dead.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

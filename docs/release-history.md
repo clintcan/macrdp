@@ -4,6 +4,38 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.4 — true-colour cursors, native-style app switching, reverse scroll
+
+Cursor, input and hardening fixes, plus one new option. By default, coloured cursors, the app switcher and the pre-login timeout behave differently; `--reverse-scroll` is off unless you turn it on.
+
+- **Coloured cursors show their true colours, and the pointer hides when an app hides it (#219, thanks @SferaDev).**
+  - **Colours:** the wait cursor and other coloured cursors showed red and blue swapped. They are now sent in the byte and row order RDP specifies (`xor_mask_32bpp`: B,G,R,A, bottom row first).
+  - **Hiding:** in full-screen video, the pointer now disappears on the client when the video hides it, instead of staying on screen (`fully_transparent` → `DisplayUpdate::HidePointer`). A cursor hidden with `NSCursor.hide()` (rather than replaced by a transparent one) still can't be detected.
+  - **Behind it (#255):** our copy of IronRDP never sent a "hide pointer" or "default pointer" update, because an update with no payload produced no bytes. This takes the fix IronRDP made upstream (Devolutions/IronRDP#2274) as vendored divergence (31) in `UpdateFragmenter::encode_next`, to drop at the next pin bump.
+- **Alt+Tab and Cmd+\` behave like the native macOS switchers (#197, thanks @antonmos).**
+  - A quick Alt+Tab returns to the app you were last in, even after switching by clicking a window or a Dock icon. Apps you only cycled through no longer jump ahead of it (only the landed app is promoted, in `commit_cycle_session`; switches made outside the switcher feed `SWITCHER_FRONT`).
+  - Cmd+\` cycles the right app's windows and visits every one, instead of bouncing between the top two.
+  - Every plain left click now runs one Accessibility hit-test, on its own `click-focus-hittest` thread, not only under `--map-ctrl-to-cmd`.
+- **New option: reverse the mouse-wheel direction (#254, #240).** `--reverse-scroll` (config `REVERSE_SCROLL=1`, or the toggle under Mouse in the menu-bar controller's Input tab) flips the wheel on both axes. It's for a Mac with natural scrolling on, where a tool such as LinearMouse can't see the scroll events macrdp posts. The flip is applied before the wheel accumulator (`wheel_delta`).
+- **A client that goes silent before logging in is dropped after 60 s (#256, #186).** Before, a connection that sent its first request and then nothing held the serving connection forever. The 60 s budget leaves room for a client that asks for the password during login. Vendored divergence (32), `SERVE_NEGOTIATION_TIMEOUT`; a timeout returns `TimedOut`, like upstream's `FINALIZE_TIMEOUT`.
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 352 tests pass. The new tests were mutation-checked.
+- Live on a Mac mini running this exact `main`, with Windows 11 mstsc and Windows App for macOS: connect, reconnect, Option+Tab, and a test window of custom coloured cursors (colours, orientation, and hiding).
+- Each change was also tested live on its own:
+  - **Cursors:** FreeRDP's log shows the hidden pointer arriving; on both FreeRDP and Windows App the pointer disappears in full-screen YouTube.
+  - **Switcher:** cycle order, switching by click and by Dock icon, and Cmd+\` window cycling.
+  - **Reverse scroll:** both directions.
+  - **Pre-login timeout:** a client that sends a Connection Request and then nothing is dropped at 60.1 s. Measured live, mstsc and Windows App close their own connection 8–21 s into a certificate warning and reconnect after the click, so the budget doesn't cut off a person answering one.
+- **Not soaked:** the mini has run this exact code for about half an hour.
+
+**Known issues** (none are new in this release)
+
+- An mstsc window that has reconnected several times decodes video more slowly above ~2 Mbit/s, so `--adaptive-bitrate` can still briefly dip there. Closing and reopening mstsc avoids it.
+- With mstsc, the UDP tunnel goes quiet about 90 s into a session, and the session continues over TCP.
+- Windows 10 mstsc shows a black screen or starts an H.264 session frozen (#226, #229). Fixes are in review (#228, #230).
+
 ## v0.10.3 — Finder writes to redirected drives, and the keyframe backoff works
 
 A bug-fix release. By default, only drive redirection behaves differently; the keyframe change also applies to every H.264 session, but keeps the same cadence.
