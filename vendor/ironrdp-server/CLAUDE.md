@@ -141,8 +141,12 @@ Notes on the port:
   response leaves the Soft-Sync to the migration gate; otherwise it still gets the
   empty one. Live-verified on mstsc (LAN): the Soft-Sync names the lossy audio DVC,
   mstsc answers `tunnels_to_switch: [3]`, and audio plays. No automated test (the path
-  needs a real multitransport client). Leftover: waves start ~0.5 s before the
-  Soft-Sync goes out, so the first half-second is dropped.
+  needs a real multitransport client). Follow-up the same day: waves stay on TCP
+  (`mt_route_lossy_audio` returns them to the static rdpsnd path) until the Soft-Sync
+  naming the lossy channel has been sent AND acknowledged
+  (`lossy_audio_soft_synced` + `DrdynvcServer::soft_sync_response_received`). Before,
+  they started ~0.5 s ahead of the Soft-Sync and that first half-second was dropped.
+  Live: audio from the first second, lossy streaming 4 ms after the client's response.
 - **(15)** A preemption winner's RTT is now sampled as a candidate (carried on
   `NegotiatedConnection.link_rtt_ms`); before, it inherited the previous connection's.
 - **(16)** Upstream made a completion's raw `TS_URB_RESULT` bytes private, so
