@@ -131,6 +131,18 @@ Notes on the port:
   **Behaviour change:** the rebased acceptor only offers multitransport when the client
   negotiated the MCS message channel (the old fork fell back to the I/O channel). mstsc
   sends it; a client that doesn't now silently gets no UDP offer.
+  **Regression found 2026-11-13 (silent lossy audio since v0.10.0):** on the message
+  channel, mstsc DOES answer the offer with `S_OK` (the June notes saw only tunnel
+  creation), and `mt_on_response` spent the connection's one Soft-Sync on an empty
+  request for the reliable tunnel. `mt_soft_sync_on_egfx` then found it claimed and
+  never migrated `AUDIO_PLAYBACK_LOSSY_DVC`, so mstsc dropped every wave streamed into
+  the tunnel; `--udp-migrate-egfx` went through the same one-shot. Fix: when a channel
+  is configured to migrate (`mt_has_channel_to_migrate`: lossy audio or EGFX), the
+  response leaves the Soft-Sync to the migration gate; otherwise it still gets the
+  empty one. Live-verified on mstsc (LAN): the Soft-Sync names the lossy audio DVC,
+  mstsc answers `tunnels_to_switch: [3]`, and audio plays. No automated test (the path
+  needs a real multitransport client). Leftover: waves start ~0.5 s before the
+  Soft-Sync goes out, so the first half-second is dropped.
 - **(15)** A preemption winner's RTT is now sampled as a candidate (carried on
   `NegotiatedConnection.link_rtt_ms`); before, it inherited the previous connection's.
 - **(16)** Upstream made a completion's raw `TS_URB_RESULT` bytes private, so
