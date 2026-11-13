@@ -29,7 +29,7 @@ fully transparent cursor sent as the hidden pointer, #219, which needed the zero
 fast-path fix harvested from upstream #2274 as divergence (31), #255; native-style Alt+Tab
 MRU and Cmd+` window cycling, #197; `--reverse-scroll`, #254; the serving path's pre-auth
 negotiation bounded at 60 s as divergence (32), #256).
-Next: Windows 10 mstsc fixes awaiting rebase (#228, #230), and the mstsc UDP tunnel going dead.
+Next: Windows 10 mstsc fixes awaiting rebase (#228, #230).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
