@@ -4769,7 +4769,7 @@ impl RdpServer {
                                 let offered = c.caps_data.0.0.iter().map(|caps| caps.entropy_bits);
                                 let preferred = self.opts.remotefx_entropy_coder;
                                 if let Some(entropy_bits) = pick_remotefx_entropy_coder(preferred, offered) {
-                                    update_codecs.set_remotefx(Some((entropy_bits, codec.id)));
+                                    update_codecs.set_image_remotefx(Some((entropy_bits, codec.id)));
                                     update_codecs.set_remotefx_quant(self.opts.remotefx_quant.clone());
                                 }
                             }
