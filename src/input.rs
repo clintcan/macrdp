@@ -377,6 +377,17 @@ mod coord_tests {
         let mut apps = vec!["A", "B", "C"];
         assert_eq!(remove_switcher_selection(&mut apps, 1), Some(1));
         assert_eq!(apps, ["A", "C"]);
+        // Quitting the last entry stays on the new last entry, not the first.
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(0));
+        assert_eq!(apps, ["A"]);
+        let mut apps = vec!["A", "B", "C"];
+        assert_eq!(remove_switcher_selection(&mut apps, 2), Some(1));
+        assert_eq!(apps, ["A", "B"]);
+        let mut apps = vec!["A", "B"];
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(0));
+        assert_eq!(apps, ["A"]);
+        let mut apps = vec!["A", "B", "C"];
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(1));
         assert_eq!(remove_switcher_selection(&mut apps, 1), Some(0));
         assert_eq!(apps, ["A"]);
         assert_eq!(remove_switcher_selection(&mut apps, 0), None);
@@ -605,8 +616,8 @@ fn should_alt_q_quit(on: bool, opt: bool, cmd: bool, ctrl: bool, shift: bool) ->
 
 /// Drop the switcher's selected entry at `idx` (Q pressed in the switcher) and
 /// return the index the selection moves to: the entry that slid into `idx`,
-/// wrapping to the start when the last one was removed — the native Cmd+Tab
-/// behaviour. `None` once the list is empty. Pure, so it's unit-tested on
+/// or the new last entry when the last one was removed (no wrap to the first
+/// app, like the native Cmd+Tab switcher). `None` once the list is empty. Pure, so it's unit-tested on
 /// every target.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn remove_switcher_selection<T>(items: &mut Vec<T>, idx: usize) -> Option<usize> {
@@ -614,7 +625,7 @@ fn remove_switcher_selection<T>(items: &mut Vec<T>, idx: usize) -> Option<usize>
     if items.is_empty() {
         None
     } else {
-        Some(idx % items.len())
+        Some(idx.min(items.len() - 1))
     }
 }
 
@@ -1601,9 +1612,10 @@ mod macos {
 
         /// Post a full `Cmd+<vk>` tap in place of the held `Option+<vk>`
         /// (--alt-q-quit). Same shape as `post_ctrl_as_cmd`, but the down and
-        /// up go out together: present Cmd-held (Option cleared) to both
-        /// modifier views, tap the key with those flags, then restore the real
-        /// state (Option still physically held) via `post_flags_changed`.
+        /// up go out together: present Cmd-held (Option cleared) with one
+        /// FlagsChanged from the HID source, tap the key with those flags, then
+        /// restore the real state (Option still physically held) via
+        /// `post_flags_changed`.
         fn post_alt_as_cmd_tap(&self, vk: u16) {
             let mut bits = self.mods.cg_flags().bits();
             bits &= !CGEventFlags::CGEventFlagAlternate.bits();
@@ -1612,14 +1624,12 @@ mod macos {
             bits |= NX_DEVICE_L_CMD;
             let swapped = CGEventFlags::from_bits_retain(bits);
 
-            for source in [&self.source, &self.source_hid] {
-                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), VK_LCMD, true) else {
-                    warn!("CGEvent::new_keyboard_event failed (alt→cmd flags)");
-                    continue;
-                };
+            if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true) {
                 ev.set_flags(swapped);
                 ev.set_type(CGEventType::FlagsChanged);
                 ev.post(CGEventTapLocation::HID);
+            } else {
+                warn!("CGEvent::new_keyboard_event failed (alt→cmd flags)");
             }
             for down in [true, false] {
                 if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
