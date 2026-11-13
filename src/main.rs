@@ -18,9 +18,9 @@ mod camera;
 mod capture;
 mod clipboard;
 mod clipboard_rich;
+mod conn_hooks;
 #[cfg(test)]
 mod conn_test;
-mod connection_hooks;
 mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
@@ -831,6 +831,14 @@ struct Args {
     /// Cmd+C, the app's native macOS copy). No effect without --map-ctrl-to-cmd.
     #[arg(long = "no-remap-apps", value_delimiter = ',')]
     no_remap_apps: Vec<String>,
+
+    /// Reverse the mouse-wheel direction (vertical and horizontal) for the
+    /// remote session. For a Mac with natural scrolling on: macOS applies it to
+    /// macrdp's scroll events too, and a local tool that un-reverses the
+    /// physical wheel (LinearMouse etc.) doesn't see them. Off by default.
+    /// macOS-only.
+    #[arg(long = "reverse-scroll")]
+    reverse_scroll: bool,
 
     /// Keyboard layout to interpret the client's keystrokes as, for non-US
     /// clients. By default the layout is **auto-detected** from the client's
@@ -2544,6 +2552,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
     }
+    if on("REVERSE_SCROLL", false) {
+        argv.push("--reverse-scroll".into());
+    }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
             argv.push("--no-remap-apps".into());
@@ -2716,6 +2727,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
         (
             "BLANK_RECOVERY_HEAL_CONFIRM_MS",
             "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
+        ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+        ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
         ),
         ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
         ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
@@ -3425,15 +3444,20 @@ async fn async_main() -> Result<()> {
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
+    crate::input::set_reverse_scroll(args.reverse_scroll);
+    if args.reverse_scroll {
+        info!("mouse-wheel direction reversed (--reverse-scroll)");
+    }
     if args.map_ctrl_to_cmd {
         info!(
             no_remap_apps = ?args.no_remap_apps,
             "Ctrl→Cmd Windows-shortcut remap enabled (--map-ctrl-to-cmd)"
         );
-        // Event-driven frontmost-app tracking for the terminal/app suppression
-        // (catches click-focus + Electron apps that AX polling misses).
-        crate::input::init_focus_observer();
     }
+    // Event-driven frontmost-app tracking (catches activations AX polling
+    // misses). Feeds the Ctrl→Cmd terminal suppression AND the app switcher's
+    // MRU, so it's armed regardless of --map-ctrl-to-cmd.
+    crate::input::init_focus_observer();
 
     // App-switcher HUD overlay helper (macOS-only). Tell it which display to
     // center on (the captured one) and spawn it; it idles until a Cmd+Tab. Held
@@ -3625,7 +3649,7 @@ async fn async_main() -> Result<()> {
     // Mac browse/read the client's redirected drive; smart-card redirection
     // (--enable-smartcard-redirection) lets macOS apps use the client's reader.
     // Both ride the one RDPDR channel, so attach the factory if either is on.
-    let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrServerFactory>> =
+    let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrDriveServerFactory>> =
         if args.enable_drive_redirection || args.enable_smartcard_redirection {
             Some(Box::new(rdpdr::MacRdpdr::new(
                 args.enable_drive_redirection,
@@ -3665,21 +3689,90 @@ async fn async_main() -> Result<()> {
             None
         };
 
-    // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
-    // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
-    // (MACRDP_CONN_GUARD=0 disables).
-    let conn_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
-        auth_guard::AuthGuardHandler::from_env();
-    // With --lock-on-disconnect, wrap it to record reconnect activity (every
-    // hook still forwards unchanged); otherwise the handler is untouched.
-    let conn_handler = match &lock_activity {
-        Some(activity) => Some(lock_activity::ActivityHandler::wrap(
-            conn_handler,
-            Arc::clone(activity),
-        )),
-        None => conn_handler,
-    };
-    let conn_handler = Some(connection_hooks::SessionHooks::wrap(conn_handler));
+    // The server's connection-lifecycle hooks, run in this order (the first
+    // rejection stops the rest seeing the connection):
+    // - auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log. On by
+    //   default (MACRDP_CONN_GUARD=0 disables);
+    // - with --lock-on-disconnect, reconnect activity, so a pending lock holds for
+    //   a client still handshaking;
+    // - the client's keyboard-layout id, for the input handler to auto-select a
+    //   matching non-US layout when --keyboard-layout is unset.
+    let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
+    hooks.extend(auth_guard::AuthGuardHandler::from_env());
+    if let Some(activity) = &lock_activity {
+        hooks.push(Box::new(lock_activity::ActivityHook(Arc::clone(activity))));
+    }
+    hooks.push(Box::new(conn_hooks::KeyboardLayoutHook(
+        keyboard_layout_klid,
+    )));
+    // `--virtual-display-hidpi=auto` sizes the virtual display from the
+    // desktop scale factor the connecting client announces.
+    if matches!(vd_hidpi, virtual_display::HidpiPolicy::Auto(_)) {
+        hooks.push(Box::new(conn_hooks::DesktopScaleHook(client_scale_factor)));
+    }
+    // With --stats-endpoint, clear the per-session stats when a connection ends.
+    if let Some(stats) = stats::global() {
+        hooks.push(Box::new(conn_hooks::StatsHook(Arc::clone(stats))));
+    }
+
+    // Client-resolution auto-adopt: the acceptor reads the desktop size the
+    // client requests in its GCC Client Core Data and negotiates the session at
+    // that size from the start (Demand Active); the CaptureDisplay's
+    // `request_initial_size` then adopts it into the shared `desktop_size` that
+    // capture, input scaling, and the H.264 pipeline all read. The value is the
+    // ceiling (--max-client-size, defense-in-depth; the clamp is per dimension),
+    // or MS-RDPBCGR's own 8192 maximum.
+    let honor_client_size = auto_size.then(|| match args.max_client_size {
+        Some((width, height)) => {
+            info!(
+                max_w = width,
+                max_h = height,
+                "client-requested session size capped at the operator maximum"
+            );
+            ironrdp_server::DesktopSize { width, height }
+        }
+        None => ironrdp_server::DesktopSize {
+            width: 8192,
+            height: 8192,
+        },
+    });
+    if args.max_client_size.is_some() && !auto_size {
+        warn!(
+            "--max-client-size has no effect: client-resolution auto-adopt is off \
+             (--no-client-resolution, or an explicit --width/--height/--hidpi \
+             without --virtual-display)"
+        );
+    }
+
+    // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
+    // (mstsc) auto-reconnects on an ungraceful drop instead of showing
+    // "disconnected". This is what makes the EGFX blank-recovery connection drop
+    // (src/h264.rs, when a reconnect lands on mstsc's stale surface and never
+    // presents) heal seamlessly — the client re-establishes on its own. Default
+    // on (standard RDP server behavior); MACRDP_AUTO_RECONNECT=0 disables. The
+    // server verifies the cookie a client returns, replaces it after every
+    // connection and hourly, and invalidates it when a session is taken over.
+    let auto_reconnect = !matches!(
+        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    );
+    let auto_reconnect_cookie = auto_reconnect.then(|| {
+        let mut random_bits = [0u8; 16];
+        match getrandom::getrandom(&mut random_bits) {
+            Ok(()) => {
+                info!("server auto-reconnect cookie provisioned (clients auto-reconnect on an ungraceful drop)");
+                // logon_id is informational for us; a stable per-process id.
+                Some(ironrdp_server::ServerAutoReconnect {
+                    logon_id: std::process::id(),
+                    random_bits,
+                })
+            }
+            Err(e) => {
+                warn!(error = %e, "could not generate auto-reconnect cookie random bits — skipping");
+                None
+            }
+        }
+    });
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -3688,20 +3781,23 @@ async fn async_main() -> Result<()> {
         .with_display_handler(display)
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
-        .with_rdpdr_factory(rdpdr_factory)
-        .with_usb_factory(usb_factory)
+        .with_rdpdr_drive_factory(rdpdr_factory)
+        .with_urbdrc_factory(usb_factory)
         .with_camera_factory(camera_factory)
         .with_audin_factory(audin_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
-        .with_connection_handler(conn_handler)
+        .with_connection_handler(Some(Box::new(conn_hooks::ConnectionHooks::new(hooks))))
+        // Share the suppress flag with the capture backend, so the server's
+        // per-connection PDU handler writes to the `AtomicBool` it reads.
+        .with_display_suppressed_handle(display_suppressed)
+        .with_honor_client_desktop_size(honor_client_size)
+        .with_auto_reconnect_cookie(auto_reconnect_cookie.flatten())
+        // macrdp is a single console session: a new authenticated client takes it
+        // over. Without this the default (Queue) leaves the second client hanging
+        // in the listen backlog until the first disconnects.
+        .with_connection_policy(ironrdp_server::ConnectionPolicy::Preempt)
         .build();
-
-    // Hand the shared suppress flag to the server so its per-connection
-    // PDU handler writes to the same `AtomicBool` the capture backend
-    // reads from. Without this, the server uses an internally-created
-    // flag the display never sees.
-    server.set_display_suppressed_handle(display_suppressed);
 
     // Per-SERVED-connection reset for the input handler's held-modifier and
     // button-down state (vendored divergence 24). The server raises this once
@@ -3712,76 +3808,10 @@ async fn async_main() -> Result<()> {
     // `on_accept` were both the wrong seam.
     server.set_input_reset_handle(input::modifier_reset_handle());
 
-    // The acceptor records the client's announced keyboard-layout id (KLID) in
-    // its Client Core Data; the server publishes it here so the input handler
-    // can auto-select a matching non-US layout (when --keyboard-layout is unset).
-    server.set_keyboard_layout_handle(keyboard_layout_klid);
-    if matches!(vd_hidpi, virtual_display::HidpiPolicy::Auto(_)) {
-        server.set_desktop_scale_factor_handle(client_scale_factor);
-    }
-
     // The server samples the kernel's smoothed TCP RTT for each accepted
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
     server.set_link_rtt_handle(link_rtt_ms.clone());
-
-    // Client-resolution auto-adopt: the vendored acceptor reads the desktop
-    // size the client requests in its GCC Client Core Data and negotiates
-    // the session at that size from the start (Demand Active); the
-    // CaptureDisplay's `request_initial_size` then adopts it into the
-    // shared `desktop_size` that capture, input scaling, and the H.264
-    // pipeline all read.
-    server.set_honor_client_desktop_size(auto_size);
-    // Optional operator ceiling for the adopted size (--max-client-size,
-    // defense-in-depth): a request above the cap is clamped per-dimension in
-    // the acceptor. Meaningless off the auto-adopt path (nothing is adopted),
-    // so warn rather than silently ignore.
-    if let Some((max_w, max_h)) = args.max_client_size {
-        if auto_size {
-            server.set_honor_client_desktop_size_max(Some(ironrdp_server::DesktopSize {
-                width: max_w,
-                height: max_h,
-            }));
-            info!(
-                max_w,
-                max_h, "client-requested session size capped at the operator maximum"
-            );
-        } else {
-            warn!(
-                "--max-client-size has no effect: client-resolution auto-adopt is off \
-                 (--no-client-resolution, or an explicit --width/--height/--hidpi \
-                 without --virtual-display)"
-            );
-        }
-    }
-
-    // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
-    // (mstsc) auto-reconnects on an ungraceful drop instead of showing
-    // "disconnected". This is what makes the EGFX blank-recovery connection drop
-    // (src/h264.rs, when a reconnect lands on mstsc's stale surface and never
-    // presents) heal seamlessly — the client re-establishes on its own. Default
-    // on (harmless + standard RDP server behavior); MACRDP_AUTO_RECONNECT=0
-    // disables. The returning ARC_CS cookie is not validated (single console
-    // session, NLA re-auths every connection), so a fixed per-process value is
-    // fine — it only enables the client's auto-reconnect loop.
-    let auto_reconnect = !matches!(
-        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE")
-    );
-    if auto_reconnect {
-        let mut random_bits = [0u8; 16];
-        match getrandom::getrandom(&mut random_bits) {
-            Ok(()) => {
-                // logon_id is informational for us; a stable per-process id.
-                let logon_id = std::process::id();
-                server.set_auto_reconnect_cookie(logon_id, random_bits);
-                info!("server auto-reconnect cookie provisioned (clients auto-reconnect on an ungraceful drop)");
-            }
-            Err(e) => {
-                warn!(error = %e, "could not generate auto-reconnect cookie random bits — skipping")
-            }
-        }
-    }
 
     // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
     // provider so the server offers reliable UDP to clients that advertise it,
@@ -3936,7 +3966,7 @@ async fn async_main() -> Result<()> {
         args.bind.port(),
         username,
     );
-    server.run().await
+    Ok(server.run().await?)
 }
 
 /// Resolves when the process receives SIGINT (Ctrl-C) or, on Unix, SIGTERM.
@@ -4158,6 +4188,16 @@ mod config_tests {
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
         assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn reverse_scroll_config_bridge() {
+        let p = write_temp("rs1", "REVERSE_SCROLL=1\n");
+        assert!(args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+        let p = write_temp("rs0", "REVERSE_SCROLL=0\n");
+        assert!(!args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
     }
 
     #[test]

@@ -182,6 +182,7 @@ pub enum Outcome {
     Failure,
     /// The client authenticated and the server then failed the session: no
     /// lockout strike, and the attempt is refunded from the rate-limit window.
+    /// Deliberately only for errored sessions: a clean disconnect keeps its attempt.
     ServerError,
 }
 
@@ -314,6 +315,7 @@ impl AuthGuardCore {
             Outcome::ServerError => {
                 entry.consecutive_failures = 0;
                 entry.cooldown_until = None;
+                // The newest attempt may be another connection's behind the same NAT; the count is what matters.
                 entry.attempts.pop_back();
             }
             Outcome::Failure => {
@@ -696,7 +698,7 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
         &mut self,
         peer: std::net::SocketAddr,
         duration: Duration,
-        error: Option<&anyhow::Error>,
+        error: Option<&ironrdp_server::ServerError>,
     ) -> ironrdp_server::PostConnectionAction {
         let authenticated = self.authenticated.remove(&peer);
         let outcome = classify_outcome(
@@ -793,14 +795,14 @@ mod tests {
     #[test]
     fn handler_counts_a_fast_failure_after_auth_as_server_error() {
         let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
-        use ironrdp_server::ConnectionHandler;
+        use ironrdp_server::{ConnectionHandler, ServerError, ServerErrorExt};
         let mut handler = AuthGuardHandler {
             core: AuthGuardCore::with_config(test_cfg()),
             last_peer: None,
             authenticated: Default::default(),
         };
         let peer = std::net::SocketAddr::from((Ipv4Addr::new(203, 0, 113, 22), 51000));
-        let err = anyhow::anyhow!("client loop failure");
+        let err = ServerError::reason("client loop", "failure");
         for k in 0..30u16 {
             let peer = std::net::SocketAddr::new(peer.ip(), 51000 + k);
             assert!(handler.on_accept(peer), "attempt {k} rejected");
