@@ -72,6 +72,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
+- [ ] **Controller: show something on first launch (from #236, closed 2026-11-13).** macrdpController is menu-bar-only, so opening it shows no window or Dock icon and new users think nothing happened. The README and the cask caveat now explain it; the remaining idea is a one-time first-launch window or notification pointing at the menu-bar icon and "Start (first run sets up)".
 - [ ] **Windows App (macOS) intermittently doesn't announce client copies to the server — pre-existing,
   NOT a pin-bump regression.** Found 2026-10-02 while live-testing the bump: after a copy on the MacBook,
   clicking into the Windows App session sometimes sends no CLIPRDR FormatList at all, so the mini never
