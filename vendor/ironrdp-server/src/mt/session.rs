@@ -66,6 +66,9 @@ struct MtConnection {
     egfx_on_udp: bool,
     lossy_audio_block_no: u8,
     lossy_audio_streaming: bool,
+    /// The Soft-Sync request named the lossy audio channel. Until the client has
+    /// also acknowledged it, waves stay on TCP (see [`RdpServer::mt_route_lossy_audio`]).
+    lossy_audio_soft_synced: bool,
 }
 
 /// The cookie and bound flag the RNG adapter registered, read back by the server.
@@ -491,9 +494,10 @@ impl RdpServer {
                 "UDP lossy tunnel bound — Soft-Sync migrating AUDIO_PLAYBACK_LOSSY_DVC onto the LOSSY (UdpFecL) \
                  tunnel (waves only; the format handshake runs on the reliable AUDIO_PLAYBACK_DVC over TCP)"
             );
-            return self
-                .send_soft_sync(writer, user_channel_id, SoftSyncTunnelType::LOSSY_UDP, vec![audio_id])
-                .await;
+            self.send_soft_sync(writer, user_channel_id, SoftSyncTunnelType::LOSSY_UDP, vec![audio_id])
+                .await?;
+            self.macrdp.mt.conn.lossy_audio_soft_synced = true;
+            return Ok(());
         }
 
         // EXPERIMENTAL (`--udp-migrate-egfx`, or `MACRDP_UDP_MIGRATE_EGFX`): name the
@@ -646,6 +650,17 @@ impl RdpServer {
         let Some(lossy_id) = self.open_channel_id::<AudioLossyDvc>() else {
             return Some(data);
         };
+        // The client reads the lossy channel from the tunnel only once it has
+        // processed the Soft-Sync that moves it there; a wave sent earlier is
+        // dropped (about the first half-second of every connection). Until the
+        // client acknowledges the Soft-Sync over TCP, keep the waves on TCP.
+        if !self.macrdp.mt.conn.lossy_audio_soft_synced
+            || !self
+                .get_svc_processor::<dvc::DrdynvcServer>()
+                .is_some_and(|drdynvc| drdynvc.soft_sync_response_received())
+        {
+            return Some(data);
+        }
         let conn = &mut self.macrdp.mt.conn;
         if !conn.lossy_audio_streaming {
             conn.lossy_audio_streaming = true;
