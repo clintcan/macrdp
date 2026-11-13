@@ -130,6 +130,53 @@ impl FsCache {
         }
     }
 
+    /// Move `id` to `to_path` (a child of `to_parent`), keeping its fileid.
+    ///
+    /// NFS keeps an object's identity across a rename, and macOS relies on it:
+    /// whatever already holds the object (an open file, the folder a Finder
+    /// window shows) keeps using the old fileid. Forgetting the id and
+    /// interning the new path under a fresh one, as this used to, made every
+    /// later `getattr` on the held id fail with NFS3ERR_NOENT — logged at ERROR
+    /// by nfsserve every 5 s (the attribute-cache interval) for as long as the
+    /// window stayed open. Reproduced live 2026-11-13 by creating a folder in
+    /// Finder (it makes "untitled folder" and then renames it).
+    ///
+    /// A node already at `to_path` was overwritten by the rename and is
+    /// dropped. For a folder, every cached path inside it moves too, or later
+    /// operations on its contents would use the old location.
+    fn rename(&mut self, id: fileid3, to_parent: fileid3, to_path: &str) {
+        let Some(old_path) = self.id_to_node.get(&id).map(|n| n.remote_path.clone()) else {
+            return;
+        };
+        if let Some(&replaced) = self.path_to_id.get(to_path) {
+            if replaced != id {
+                self.forget(replaced);
+            }
+        }
+        self.path_to_id.remove(&old_path);
+        if let Some(n) = self.id_to_node.get_mut(&id) {
+            n.remote_path = to_path.to_owned();
+            n.parent = to_parent;
+        }
+        self.path_to_id.insert(to_path.to_owned(), id);
+
+        let old_prefix = format!("{old_path}\\");
+        let moved: Vec<(fileid3, String)> = self
+            .id_to_node
+            .iter()
+            .filter(|(_, n)| n.remote_path.starts_with(&old_prefix))
+            .map(|(&cid, n)| (cid, n.remote_path.clone()))
+            .collect();
+        for (cid, path) in moved {
+            let new_path = join_remote(to_path, &path[old_prefix.len()..]);
+            self.path_to_id.remove(&path);
+            if let Some(n) = self.id_to_node.get_mut(&cid) {
+                n.remote_path = new_path.clone();
+            }
+            self.path_to_id.insert(new_path, cid);
+        }
+    }
+
     /// Update a node's cached size (after a write/truncate).
     fn set_size(&mut self, id: fileid3, size: u64) {
         if let Some(n) = self.id_to_node.get_mut(&id) {
@@ -188,16 +235,27 @@ impl RdpdrFs {
         }
     }
 
+    /// Attributes for a node. Files and folders are reported as owned by the
+    /// user macrdp runs as (who mounted the volume). Left at the default (uid 0,
+    /// gid 0), Finder showed them as owned by "system" with "everyone: Read
+    /// only", so New Folder silently did nothing and a rename failed with
+    /// "another operation is in progress" — Finder judges writability from
+    /// ownership and mode, even though the server's ACCESS reply allows writes
+    /// (shell commands worked). Found live 2026-11-13.
     fn attr(&self, id: fileid3, is_dir: bool, size: u64) -> fattr3 {
         let t = nfstime3 {
             seconds: self.created_secs,
             nseconds: 0,
         };
+        // SAFETY: getuid/getgid cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         if is_dir {
             fattr3 {
                 ftype: ftype3::NF3DIR,
                 mode: 0o755,
                 nlink: 2,
+                uid,
+                gid,
                 size: 4096,
                 used: 4096,
                 fileid: id,
@@ -211,6 +269,8 @@ impl RdpdrFs {
                 ftype: ftype3::NF3REG,
                 mode: 0o644,
                 nlink: 1,
+                uid,
+                gid,
                 size,
                 used: size,
                 fileid: id,
@@ -534,14 +594,15 @@ impl NFSFileSystem for RdpdrFs {
                     .and_then(|id| c.id_to_node.get(&id).map(|n| (id, n.is_dir, n.size)))
             };
         }
-        let (src_id, is_dir, size) = src.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let (src_id, _, _) = src.ok_or(nfsstat3::NFS3ERR_NOENT)?;
         self.handle
             .rename(self.device_id, &from_path, &to_path, true)
             .await
             .map_err(|e| nfs_err("rename failed", &e))?;
-        let mut c = self.cache.lock().unwrap();
-        c.forget(src_id);
-        c.intern(to_dirid, &to_path, is_dir, size);
+        self.cache
+            .lock()
+            .unwrap()
+            .rename(src_id, to_dirid, &to_path);
         Ok(())
     }
 
@@ -989,6 +1050,60 @@ fn sanitize_label(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path_of(c: &FsCache, id: fileid3) -> &str {
+        &c.id_to_node[&id].remote_path
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_its_fileid() {
+        // THE 2026-11-13 NOENT LOOP: Finder holds the object it renamed; a new
+        // id for the new name left the held one unknown.
+        let mut c = FsCache::new();
+        let f = c.intern(ROOT_ID, "\\hello.txt", false, 41);
+        c.rename(f, ROOT_ID, "\\renamed.txt");
+        assert_eq!(path_of(&c, f), "\\renamed.txt");
+        assert_eq!(c.path_to_id.get("\\renamed.txt"), Some(&f));
+        assert!(!c.path_to_id.contains_key("\\hello.txt"));
+        assert_eq!(c.id_to_node[&f].size, 41);
+    }
+
+    #[test]
+    fn a_rename_over_an_existing_file_drops_the_replaced_one() {
+        let mut c = FsCache::new();
+        let tmp = c.intern(ROOT_ID, "\\doc.tmp", false, 10);
+        let old = c.intern(ROOT_ID, "\\doc.txt", false, 5);
+        c.rename(tmp, ROOT_ID, "\\doc.txt"); // an atomic save
+        assert_eq!(c.path_to_id.get("\\doc.txt"), Some(&tmp));
+        assert!(!c.id_to_node.contains_key(&old));
+        assert!(!c.path_to_id.contains_key("\\doc.tmp"));
+    }
+
+    #[test]
+    fn a_renamed_folder_moves_everything_inside_it() {
+        let mut c = FsCache::new();
+        let dir = c.intern(ROOT_ID, "\\untitled folder", true, 0);
+        let sub = c.intern(dir, "\\untitled folder\\sub", true, 0);
+        let file = c.intern(sub, "\\untitled folder\\sub\\a.txt", false, 3);
+        // A sibling whose name merely starts the same way stays put.
+        let sibling = c.intern(ROOT_ID, "\\untitled folder 2", true, 0);
+        let other = c.intern(ROOT_ID, "\\other", true, 0);
+
+        c.rename(dir, other, "\\other\\Projects");
+
+        assert_eq!(path_of(&c, dir), "\\other\\Projects");
+        assert_eq!(c.id_to_node[&dir].parent, other);
+        assert_eq!(path_of(&c, sub), "\\other\\Projects\\sub");
+        assert_eq!(path_of(&c, file), "\\other\\Projects\\sub\\a.txt");
+        assert_eq!(
+            c.path_to_id.get("\\other\\Projects\\sub\\a.txt"),
+            Some(&file)
+        );
+        assert!(!c.path_to_id.contains_key("\\untitled folder\\sub\\a.txt"));
+        assert_eq!(path_of(&c, sibling), "\\untitled folder 2");
+        // Parents of the moved children are unchanged ids.
+        assert_eq!(c.id_to_node[&file].parent, sub);
+    }
 
     #[test]
     fn run_with_timeout_returns_output_or_kills_a_stuck_command() {
