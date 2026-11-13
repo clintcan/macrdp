@@ -238,6 +238,26 @@ fn resync_plan(reconnected: bool, buttons_down: [bool; 3], mods_held: bool) -> R
     }
 }
 
+/// When true, invert the client's wheel direction (both axes) before posting.
+/// For a Mac with natural scrolling on, where a local tool such as LinearMouse
+/// un-reverses the physical wheel but can't see macrdp's synthetic scroll
+/// events (#240). Opt-in via `--reverse-scroll`; off by default.
+static REVERSE_SCROLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_reverse_scroll(on: bool) {
+    REVERSE_SCROLL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The client's wheel delta, inverted when `reverse` is set.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn wheel_delta(raw: i32, reverse: bool) -> i32 {
+    if reverse {
+        raw.saturating_neg()
+    } else {
+        raw
+    }
+}
+
 /// Wheel units per posted scroll line; see `Inner::scroll`.
 const SCROLL_UNITS_PER_LINE: i32 = 60;
 
@@ -258,8 +278,18 @@ fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
 mod coord_tests {
     use super::{
         is_remappable_shortcut, map_client_to_display, resync_plan, scroll_lines,
-        should_remap_click, ResyncPlan,
+        should_remap_click, wheel_delta, ResyncPlan,
     };
+
+    #[test]
+    fn reverse_scroll_inverts_the_wheel_only_when_on() {
+        assert_eq!(wheel_delta(120, false), 120);
+        assert_eq!(wheel_delta(-3, false), -3);
+        assert_eq!(wheel_delta(120, true), -120);
+        assert_eq!(wheel_delta(-3, true), 3);
+        assert_eq!(wheel_delta(0, true), 0);
+        assert_eq!(wheel_delta(i32::MIN, true), i32::MAX);
+    }
 
     #[test]
     fn scroll_drops_what_the_cap_cuts_off() {
@@ -1894,6 +1924,12 @@ mod macos {
             // moves at all. Accumulate the raw delta across calls instead,
             // and only emit whole lines once the running total crosses
             // SCROLL_UNITS_PER_LINE (see `scroll_lines`).
+            //
+            // `--reverse-scroll` flips the direction first, so the
+            // accumulator only ever sees the direction actually posted.
+            let reverse = super::REVERSE_SCROLL.load(std::sync::atomic::Ordering::Relaxed);
+            let vertical = super::wheel_delta(vertical, reverse);
+            let horizontal = super::wheel_delta(horizontal, reverse);
             let (v, v_accum) = super::scroll_lines(self.scroll_v_accum, vertical);
             let (h, h_accum) = super::scroll_lines(self.scroll_h_accum, horizontal);
             self.scroll_v_accum = v_accum;

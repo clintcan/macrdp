@@ -802,6 +802,14 @@ struct Args {
     #[arg(long = "no-remap-apps", value_delimiter = ',')]
     no_remap_apps: Vec<String>,
 
+    /// Reverse the mouse-wheel direction (vertical and horizontal) for the
+    /// remote session. For a Mac with natural scrolling on: macOS applies it to
+    /// macrdp's scroll events too, and a local tool that un-reverses the
+    /// physical wheel (LinearMouse etc.) doesn't see them. Off by default.
+    /// macOS-only.
+    #[arg(long = "reverse-scroll")]
+    reverse_scroll: bool,
+
     /// Keyboard layout to interpret the client's keystrokes as, for non-US
     /// clients. By default the layout is **auto-detected** from the client's
     /// announced KLID (US/unknown keep the plain positional-keycode path, so
@@ -2505,6 +2513,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
     }
+    if on("REVERSE_SCROLL", false) {
+        argv.push("--reverse-scroll".into());
+    }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
             argv.push("--no-remap-apps".into());
@@ -3362,6 +3373,10 @@ async fn async_main() -> Result<()> {
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
+    crate::input::set_reverse_scroll(args.reverse_scroll);
+    if args.reverse_scroll {
+        info!("mouse-wheel direction reversed (--reverse-scroll)");
+    }
     if args.map_ctrl_to_cmd {
         info!(
             no_remap_apps = ?args.no_remap_apps,
@@ -4093,6 +4108,16 @@ mod config_tests {
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
         assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn reverse_scroll_config_bridge() {
+        let p = write_temp("rs1", "REVERSE_SCROLL=1\n");
+        assert!(args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+        let p = write_temp("rs0", "REVERSE_SCROLL=0\n");
+        assert!(!args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
     }
 
     #[test]

@@ -60,6 +60,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
                           #   auto-detected (e.g. com.microsoft.VSCode). macOS-only.
+--reverse-scroll          # Reverse the mouse-wheel direction (both axes) for the
+                          #   remote session. For a Mac with natural scrolling on,
+                          #   where a local tool (LinearMouse etc.) un-reverses the
+                          #   physical wheel but can't see macrdp's scroll events.
+                          #   Off by default. Config: REVERSE_SCROLL=1. macOS-only.
 MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   held modifiers are presumed stale and cleared on the
                           #   next input event (a key-up lost when the client lost
