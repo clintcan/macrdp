@@ -1155,6 +1155,122 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
         .await
 }
 
+/// A test server like [`build_test_server_full`] (keep-alive sound, so a
+/// session stays up) with macrdp's real H.264 `Gfx` as its EGFX factory.
+fn build_test_server_with_gfx(port: u16, gfx: crate::h264::Gfx) -> RdpServer {
+    let display = TestDisplay {
+        size: ServerDesktopSize {
+            width: 1024,
+            height: 768,
+        },
+    };
+    RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, port))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(display)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .with_gfx_factory(Some(Box::new(gfx)))
+        // Without this the default `Queue` policy never starts a candidate, and
+        // the bare-connect assertion below would pass without testing anything.
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build()
+}
+
+fn test_gfx() -> crate::h264::Gfx {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    crate::h264::Gfx::new(
+        crate::capture::SharedDesktopSize::new(1024, 768),
+        30,
+        5_000_000,
+        2.0,
+        2,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        true,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    )
+}
+
+/// Wait (briefly) for the H.264 pipeline's active connection to become
+/// something other than `not`.
+async fn wait_for_active_connection(
+    gfx: &crate::h264::Gfx,
+    not: Option<usize>,
+) -> anyhow::Result<usize> {
+    for _ in 0..250 {
+        match gfx.active_connection() {
+            Some(id) if Some(id) != not => return Ok(id),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    anyhow::bail!("the H.264 pipeline never switched to a new connection")
+}
+
+/// A bare TCP connect during a live session must not touch the live session's
+/// H.264 state. The accept loop starts a preemption candidate for any peer
+/// `on_accept` lets through, and building the candidate's channels used to
+/// replace the process-wide EGFX context with a fresh, not-ready one — so the
+/// live session silently fell back to legacy bitmaps under its still-mapped
+/// EGFX surface, before the peer had sent a single byte. A candidate that does
+/// win must still get a fresh context of its own.
+#[tokio::test]
+async fn a_bare_connect_does_not_replace_the_live_h264_context() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let gfx = test_gfx();
+            let mut server = build_test_server_with_gfx(addr.port(), gfx.clone());
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // A: the live session.
+            let a = connect_with_retry(addr).await?;
+            let (_size_a, _framed_a) = connect_client(a, 1280, 800).await?;
+            let live = wait_for_active_connection(&gfx, None).await?;
+
+            // `nc`: connect, send nothing. The candidate's channels are built
+            // straight away, before it negotiates anything.
+            let bare = connect_with_retry(addr).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                gfx.active_connection(),
+                Some(live),
+                "a bare TCP connect replaced the live session's H.264 context"
+            );
+
+            // The bare peer goes away; the live session is still the one served.
+            drop(bare);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(gfx.active_connection(), Some(live));
+
+            // A real client that preempts gets a fresh context of its own.
+            let b = connect_with_retry(addr).await?;
+            let (_size_b, _framed_b) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connect_client(b, 1920, 1080),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("the preempting client was never served"))??;
+            let winner = wait_for_active_connection(&gfx, Some(live)).await?;
+            assert_ne!(winner, live);
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
 /// The listener needs a moment to bind after `run()` is spawned; retry briefly
 /// so the test isn't racy on a loaded machine.
 async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
