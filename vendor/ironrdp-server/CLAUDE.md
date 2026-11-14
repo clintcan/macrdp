@@ -61,7 +61,8 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (29) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
 | (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
-| (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection | `run_connection_inner`, around `negotiate_and_authenticate` | — |
+| (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection. **Upstream as #2432 (`e482e340`); drops at the next pin bump** | `run_connection_inner`, around `negotiate_and_authenticate` | — |
+| (33) | The client's desktop and device scale factors on `ConnectionInfo`, **harvested early** from upstream #2107 (merged 2026-10-30, after this pin) | `ConnectionInfo` fields + `new()`, the `on_connection_info` call in `client_accepted`; pairs with acceptor divergence (6) | `ConnectionInfo::{desktop,device}_scale_factor` |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -103,9 +104,22 @@ Notes on the port:
   with no bound, so a peer that sent a Connection Request and went silent held the
   serving connection forever, pre-authentication. 60 s rather than 10 s because Windows
   App for macOS prompts for the password inside this phase (7-11 s measured
-  accept-to-auth) and a cellular CredSSP took 12.5 s. Upstream master has the same
-  gap. Test: `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused
-  clock; fails without the bound, and with a 30 s one). Upstream candidate.
+  accept-to-auth) and a cellular CredSSP took 12.5 s. Test:
+  `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused clock; fails
+  without the bound, and with a 30 s one). **Upstreamed** as Devolutions/IronRDP#2432,
+  merged 2026-11-14 (`e482e340`, 60 s `NEGOTIATION_TIMEOUT` around
+  `negotiate_and_authenticate`, covering every entry point). Drops at the next pin bump
+  to any rev at or after `e482e340`; keep the conn_test as the regression check.
+
+- **(33)** Added 2026-11-13 by clintcan/macrdp#201 (`--virtual-display-hidpi=auto`),
+  replacing that PR's own shared-cell divergence: upstream #2107 (by @antonmos) carries
+  the same values through `ConnectionInfo`, and macrdp's `conn_hooks::DesktopScaleHook`
+  stores them in the scale cell, as `KeyboardLayoutHook` does for the layout. Upstream
+  reports the pair only when both are valid (desktop 100..=500, device 100/140/180) and
+  only on the initial accept, so a reactivation can't overwrite a scale the client
+  announced later in a monitor layout. Copied from upstream's diff, not its file. Test:
+  `conn_hooks::tests::the_desktop_scale_factor_reaches_the_shared_cell`. **Drop it at
+  the next pin bump** (any rev at or after `335d6712`).
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play

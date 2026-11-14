@@ -56,6 +56,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.refreshGlyph()
         }
+        // After the status item is up, so the welcome's "Show Menu" can open it.
+        DispatchQueue.main.async { [weak self] in
+            self?.showFirstLaunchWelcomeIfNeeded()
+        }
     }
 
     // MARK: - Agent state

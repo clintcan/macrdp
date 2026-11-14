@@ -7,28 +7,38 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Open PRs — review state (as of 2026-10-27).** Merged since the last refresh: #181 #183 #184
-  #187 #188 #191 #192 #202 #203 #208–#210 #212 #213 #215 #216 #222 #224 #227.
-  - **#228** (@rophy, fixes #226: Win10 mstsc black screen) — reviewed as a COMMENT, static review clean.
-    **Before approving:** live-test Win11 mstsc + the macOS Windows App on the mini, since its SPS rewrite
-    (`src/h264_sps.rs`) reaches every H.264 client; also check whether it ends Win11 mstsc's 2-frame
-    presentation lag. Its new CI step is fine; the missing `--locked` is a follow-up (see the pin-bump
-    item). Its divergence (29) collides with the AND-mask backport on the bump branch, and (30) is now
-    the cookie fallback → renumber the AND mask to (31) and hand-port the encoder change at the next rebase.
-  - **#218** (@SferaDev, stats `frames_sent` + `connected:false` on disconnect) — merged 10-29 (`fde48a7`).
-    Ported onto the bump at the 10-29 rebase as `conn_hooks::StatsHook` in the hook list, added only with
-    `--stats-endpoint` (its `SessionHooks` wrapper would have swallowed `on_connection_info` and broken
-    keyboard-layout auto-detect with no build error).
-  - **#230** (@rophy, fixes #229: Win10 mstsc starts frozen, then the blank detector drops it) — not reviewed.
-  - **#197 / #198** (@antonmos) — changes requested (AX hit-test timeout; slow-reply misattribution).
-  - **Not reviewed:** @antonmos #200 #201 #204; @SferaDev #206 #217–#221 #223 #231–#234 (#233 touches
-    `auth_guard.rs`, #231 touches `private_api.rs` — review those with extra care).
-  - **#182** (@antonmos, bound `accept_finalize`) — **HELD for the pin bump, left open on purpose.** The
-    identical 30 s bound is upstream (Devolutions/IronRDP#1890), so the bump harvests it. At the bump:
-    confirm it arrives via the pin, pick up his `a_client_that_wedges_during_finalize_is_dropped` test,
-    then close.
-  - Related: issue **#186** — `run_connection`'s `accept_begin`/TLS/CredSSP are unbounded pre-auth
-    awaits, the serving-path half that #182 doesn't cover.
+- [ ] **Open PRs — review state (as of 2026-11-15).** Labels track it: `waiting on author` = the
+  contributor owes a change; everything else is ours. Merged 11-12→15: #197 #200 #201 #219 #240/#254
+  #255 #256 #257 #258 #259 #260 #263 #264.
+  - **#228** (@rophy, Win10 black screen) — rebased; changes requested to match upstream #2229: gate Stream
+    Surface Bits on the client's `STREAM_SURFACE_BITS`, prefer RemoteFX over ImageRemoteFX regardless of
+    list order. Then Win11 mstsc **bitmap-mode** live test (the SPS half already passed Win11 + Windows App).
+  - **#230** (@rophy, Win10 starts frozen) — asked to rebase keeping only `02fa269` (its other commit is
+    covered by #248). If rophy hasn't after #228 merges, rebase it ourselves (maintainer edits allowed).
+  - **#261** (@antonmos, pre-EGFX first-frame fix, split from #201) — live-tested on all three clients;
+    only a misplaced doc comment in `src/h264.rs` is left.
+  - **#231 / #232** (@SferaDev, virtual display re-registered after display sleep / wake the displays) —
+    both conflict with `main` after #201, and with each other; asked to merge #231 first and rebase #232
+    on it. #231 has one picker now and records id changes mid-session; its rebase must make `recreate()`
+    keep HiDPI, the pixel size, and clear the recorded mode. Neither has said what was tested live; #232
+    also owes answers on `--allow-sleep` and the 3 s wait in `DetachedPrimary::drop`.
+  - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in.
+  - **Not reviewed:** #204 (@antonmos, `--capture-nv12`), #262 (@antonmos, `--h264-max-unacked-frames`).
+  - **Divergence (33)** is now #201's (scale factors on `ConnectionInfo`); #228 renumbers to (34).
+  - **#225** (vendor move onto `clintcan/IronRDP`): accepted; branch `macrdp` created at `e258f6a0`; waiting
+    for rophy's PR into it.
+  - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
+    divergence (32) drops out at the next pin bump to any rev at or after it.
+  - **Next pin bump drops these vendored `ironrdp-server` divergences** (all merged upstream; keep
+    the `conn_test` regression tests for (31) and (32)): (29) pointer AND mask (≥ `fb25b47c`), (31) hidden/default
+    pointer updates (≥ `904a7da6`), (32) negotiation timeout (≥ `e482e340`).
+
+- [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
+  video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
+  `macrdp::h264=debug` so the next real occurrence shows whether a 1–2 s video backlog came with it.
+
+- [ ] **Next toolchain bump:** clippy on Rust 1.98 flags `chunks_exact_to_as_chunks` in our code (reported
+  by rophy on #228). We pin 1.95, so CI is unaffected until then.
 
 - [x] **SIEM/SOC audit forwarding — Tier 0 (structured JSON audit stream) — SHIPPED (v0.8.33);
   `event="auth"` (div18) + `event="fingerprint"` which-client (PR #163, 2026-07-18, merged, awaits
@@ -51,8 +61,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
   health-bounce / active-redirection-features / session-start onto `macrdp::audit`. Plan:
   `~/.claude/plans/tier0-siem-audit-json.md`; [[project_siem_audit_json_tier0]].
 
-- [ ] **Tier 2.4 — multi-day soak (foundation core PASSED 31 h 2026-07-03; full 48–72 h on
-  v0.8.24 still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
+- [x] **Tier 2.4 — multi-day soak — DONE: 48 h met three times (v0.9.3, v0.9.6, and the e258f6a0 pin
+  bump 11-10→12, 0 panics). The notes below are the history.** (Was: foundation core PASSED 31 h
+  2026-07-03; full 48–72 h on v0.8.24 still needed.) The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
   #105). Tooling: `scripts/soak-monitor.sh monitor` samples a resource CSV; `… analyze`
   summarizes. **2026-07-01 run (31 h / 1861 samples, pre-v0.8.22 / pre-ARC build; data recovered
   on a clean re-copy after a first transfer zero-filled):** CLEAN — **no memory leak** (RSS
@@ -72,7 +83,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
-- [ ] **Controller: show something on first launch (from #236, closed 2026-11-13).** macrdpController is menu-bar-only, so opening it shows no window or Dock icon and new users think nothing happened. The README and the cask caveat now explain it; the remaining idea is a one-time first-launch window or notification pointing at the menu-bar icon and "Start (first run sets up)".
+- [ ] **UDP: lossy audio and `--udp-migrate-egfx` can't both migrate in one session.** A connection gets one
+  Soft-Sync request, and with lossy audio on, the audio channel takes it (`mt_soft_sync_on_egfx`). Fixing it
+  means one Soft-Sync naming both channels on their tunnels. Low priority: both are opt-in.
 - [ ] **Windows App (macOS) intermittently doesn't announce client copies to the server — pre-existing,
   NOT a pin-bump regression.** Found 2026-10-02 while live-testing the bump: after a copy on the MacBook,
   clicking into the Windows App session sometimes sends no CLIPRDR FormatList at all, so the mini never
@@ -83,7 +96,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
   Cmd+V from Windows App arrives as Ctrl+V (`^V`; the Ctrl→Cmd remap is off in terminals) — paste via
   Edit → Paste, and reset the mini's pasteboard to a marker first, or a stale paste looks like success.
 
-- [ ] **Microphone / audio-input redirection (MS-RDPEAI, the `AUDIO_INPUT` DVC) — present the CLIENT's mic as a macOS input device.**
+- [ ] **Microphone / audio-input redirection (MS-RDPEAI) — SHIPPED in v0.9.10 (experimental). Still open:
+  adopt upstream `ironrdp-rdpeai` in place of our vendored `audin.rs` (divergence (25)), decided 2026-09-30
+  below; the e258f6a0 bump didn't do it.** (Was: present the CLIENT's mic as a macOS input device.)
   Scoped 2026-07-27, prompted by the A4Tech FHD webcam (`09da:2692`) having a built-in mic:
   none of the three existing channels can carry it — **USB redirection** can't (USB audio streams over
   **isochronous** endpoints; macrdp's URBDRC path is bulk+interrupt only — the isoch gap; this cam's
@@ -818,7 +833,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic; (b) past `d471bd06`
   → `main.rs` switches `set_honor_client_desktop_size(bool)` to the builder `with_honor_client_desktop_size`
   (and, once #1404 lands, re-route the shipped `--max-client-size` clamp — currently a local acceptor/server divergence extension, 2026-07-09 — through the upstream `Option<DesktopSize>` honor-size API).
-- [ ] **PIN BUMP a5d1c682 → e258f6a0 — DRY RUN DONE 2026-10-01** (branch `chore/pin-bump-e258f6a0`;
+- [x] **DONE — the e258f6a0 bump shipped in v0.10.0 (#194); history below.** **PIN BUMP a5d1c682 → e258f6a0 — DRY RUN DONE 2026-10-01** (branch `chore/pin-bump-e258f6a0`;
   391 upstream commits; **no crate version changed**, so only the git revs move).
   - **3-way merge (old base / our fork / new upstream), conflict hunks:** server **83** (`server.rs` 58,
     `builder.rs` 14, `lib.rs` 4, `Cargo.toml` 4), rdpdr **39** (`esc/mod.rs` 20 = our smart-card side,
@@ -902,7 +917,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `--locked` to both steps; refresh them whenever a vendored crate changes. Running the server tests
     from the root lockfile instead doesn't work: `cargo test -p ironrdp-server --lib --locked` fails
     with "requires dev-dependencies and is not a member of the workspace" (checked 2026-10-27).
-- [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
+- [x] **DONE — the e258f6a0 bump shipped in v0.10.0 (#194); history below.** **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
   `dvc 0.5→0.7` / `server 0.10→0.12`) and churns every vendored crate, so it runs as its OWN
