@@ -282,8 +282,8 @@ extern "C" {
     fn CFArrayGetValueAtIndex(a: CFTypeRef, i: isize) -> CFTypeRef;
 }
 
-/// `kCGConfigurePermanently`.
-const CONFIGURE_PERMANENTLY: u32 = 2;
+/// `kCGConfigureForSession`.
+const CONFIGURE_FOR_SESSION: u32 = 1;
 
 /// Put `display` on the mode of `w × h` points backed by `px_w` pixels, the
 /// way picking a resolution in System Settings does. `Ok(false)` when the
@@ -292,7 +292,8 @@ const CONFIGURE_PERMANENTLY: u32 = 2;
 /// macOS stores a preferred mode per display and, after `applySettings:`,
 /// restores it whenever the new mode list still contains it, instead of
 /// taking the mode just applied. This replaces the stored mode. The scope
-/// is permanent because the caller exits, which undoes an app-scoped change.
+/// is the login session: the caller exits, which undoes an app-scoped
+/// change, and a permanent one would also write the display preferences.
 ///
 /// Only for a process that exits right after: the caller's own view of the
 /// display (`CGDisplayBounds`, `CGDisplayCopyDisplayMode`) stops following
@@ -346,7 +347,7 @@ pub(super) fn select_mode(display: u32, w: u32, h: u32, px_w: u32) -> Result<boo
                 "CGConfigureDisplayWithDisplayMode failed (CGError {e})"
             ));
         }
-        let e = CGCompleteDisplayConfiguration(config, CONFIGURE_PERMANENTLY);
+        let e = CGCompleteDisplayConfiguration(config, CONFIGURE_FOR_SESSION);
         CFRelease(modes);
         if e != 0 {
             return Err(anyhow!(
