@@ -3235,6 +3235,20 @@ impl ServerEventSender for Gfx {
     }
 }
 
+impl Gfx {
+    /// Identity of the connection whose context is active (the address of its
+    /// `GraphicsPipelineServer`), so a test can tell one connection's context
+    /// from another's.
+    #[cfg(test)]
+    pub(crate) fn active_connection(&self) -> Option<usize> {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| Arc::as_ptr(&c.server_handle) as usize)
+    }
+}
+
 impl GfxServerFactory for Gfx {
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
         // We override build_server_with_handle, so this is only a safety stub.
