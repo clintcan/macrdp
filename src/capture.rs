@@ -413,6 +413,14 @@ pub struct CaptureDisplay {
     /// pinned off there, and `updates()` re-modes the display to match
     /// `desktop_size` before each capture stream is built.
     pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    /// When the virtual display runs HiDPI (`--virtual-display-hidpi`). With
+    /// `Auto`, decided per connection from the client's desktop scale factor
+    /// in `sync_virtual_display`.
+    pub vd_hidpi: crate::virtual_display::HidpiPolicy,
+    /// The session's UI scale for the pointer (see `pointer_scale`): set at
+    /// connect and from each monitor layout, and read live by the capture
+    /// loop so a scale change resends the pointer.
+    pub pointer_ui_scale: Arc<std::sync::atomic::AtomicU32>,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -604,6 +612,11 @@ impl RdpServerDisplay for CaptureDisplay {
             return DesktopSize { width, height };
         }
 
+        // A new connection (reactivations we trigger returned above). The
+        // server has just published the scale this client announced.
+        self.pointer_ui_scale
+            .store(self.vd_hidpi.ui_scale(), Ordering::Relaxed);
+
         let client_size = cap_client_size(client_size, self.max_client_size);
         if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
             tracing::info!(
@@ -663,6 +676,18 @@ impl RdpServerDisplay for CaptureDisplay {
             return;
         };
 
+        // Moving the client window between displays of different scale (a
+        // Retina panel and a 1x monitor) can change the scale with or without
+        // the size, so this re-modes even when the size is unchanged.
+        let scale_changed = self
+            .vd_hidpi
+            .observe_client_scale(monitor.desktop_scale_factor());
+        let layout_ui_scale = self.vd_hidpi.ui_scale();
+        // Read live by the capture loop, so a change resends the pointer even
+        // when this layout doesn't re-mode the display.
+        self.pointer_ui_scale
+            .store(layout_ui_scale, Ordering::Relaxed);
+
         let (w, h) = monitor.dimensions();
         let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
             tracing::warn!(
@@ -676,7 +701,16 @@ impl RdpServerDisplay for CaptureDisplay {
         let requested = cap_client_size(DesktopSize { width, height }, self.max_client_size);
         let (cur_w, cur_h) = self.desktop_size.get();
         let Some(adopted) = adopt_client_size(resizable, (cur_w, cur_h), requested) else {
-            return; // no-op: unchanged, or outside the protocol-legal band
+            // Size unchanged (or outside the protocol-legal band): only a
+            // scale change still needs a re-mode, at the current size.
+            if scale_changed {
+                tracing::info!(
+                    ui_scale = self.vd_hidpi.ui_scale(),
+                    "client display scale changed — re-moding at the same size (debounced)"
+                );
+                self.pending_resize.request(cur_w, cur_h);
+            }
+            return;
         };
 
         tracing::info!(
@@ -684,6 +718,8 @@ impl RdpServerDisplay for CaptureDisplay {
             client_h = adopted.height,
             prev_w = cur_w,
             prev_h = cur_h,
+            desktop_scale_factor = ?monitor.desktop_scale_factor(),
+            ui_scale = self.vd_hidpi.ui_scale(),
             "client resized its window — resizing the session (debounced)"
         );
         self.pending_resize.request(adopted.width, adopted.height);
@@ -701,6 +737,42 @@ impl RdpServerDisplay for CaptureDisplay {
 }
 
 impl CaptureDisplay {
+    /// How much to enlarge the pointer on the HiDPI virtual display, whose
+    /// cursor SkyLight returns as the 1× image (measured: a 28×40 arrow whose
+    /// NSCursor has 28×40 points, at both UI scales).
+    ///
+    /// The factor is the session's pixels per point: with "Optimize for
+    /// Retina displays" on, Windows App draws session pixels (pointer
+    /// included) 1:1, so a 2x session needs a 2x pointer and a 1x session a
+    /// 1x one. With `Auto` it comes from `pointer_ui_scale`, which follows
+    /// the client's monitor layouts; `On` uses the session width over points.
+    /// The pointer-scale cell for the capture loop to follow, with the
+    /// `--cursor-scale` multiplier it applies on top. `Some` only for `Auto`
+    /// on the HiDPI virtual display, where the pointer scale changes
+    /// mid-capture.
+    fn live_pointer_scale(&self) -> Option<(Arc<std::sync::atomic::AtomicU32>, f64)> {
+        let hidpi = self
+            .display_id
+            .is_some_and(crate::virtual_display::is_hidpi_virtual_display);
+        (hidpi && matches!(self.vd_hidpi, crate::virtual_display::HidpiPolicy::Auto(_)))
+            .then(|| (self.pointer_ui_scale.clone(), self.cursor_scale))
+    }
+
+    fn pointer_scale(&self, width: u16) -> f64 {
+        let hidpi = self
+            .display_id
+            .is_some_and(crate::virtual_display::is_hidpi_virtual_display);
+        if !hidpi {
+            return 1.0;
+        }
+        match self.vd_hidpi {
+            crate::virtual_display::HidpiPolicy::Auto(_) => {
+                f64::from(self.pointer_ui_scale.load(Ordering::Relaxed))
+            }
+            _ => f64::from(width) / self.screen_size_pts.0.max(1.0),
+        }
+    }
+
     /// Keep the virtual display's mode in sync with the session size,
     /// returning the (possibly corrected) size to serve.
     /// [`RdpServerDisplay::updates`] runs at connect AND after every
@@ -718,17 +790,20 @@ impl CaptureDisplay {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
-        let (cur_w, cur_h) = vd.size_pts();
-        if (cur_w as u16, cur_h as u16) == (width, height) {
+        let ui_scale = self.vd_hidpi.ui_scale();
+        // Compare in pixels: on a HiDPI vd the points are the session size
+        // divided by the UI scale.
+        if vd.mode_px() == (u32::from(width), u32::from(height)) && vd.ui_scale() == ui_scale {
             return (width, height);
         }
-        match vd.resize(u32::from(width), u32::from(height)) {
+        match vd.resize(u32::from(width), u32::from(height), ui_scale) {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
                     width,
                     height,
+                    ui_scale,
                     display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
                 );
@@ -864,16 +939,25 @@ impl CaptureDisplay {
                 (width, height)
             }
             Err(e) => {
-                let (w, h) = (cur_w as u16, cur_h as u16);
+                // Keep serving the size the client negotiated: by the time this
+                // runs the client has already accepted it in Demand Active, so
+                // switching to the display's old size would build the video
+                // surface at a size the client isn't showing (a client at
+                // 1728×1084 then sees the top-left quarter of a 3456×2170
+                // surface). Capture scales from whatever mode the display is
+                // in, and the next `updates()` retries the re-mode: a failed
+                // `resize` clears `mode_px`, so the retry happens even when
+                // the next client asks for the size that last succeeded.
+                // Input maps onto the display's current points.
+                self.screen_size_pts = vd.size_pts();
                 tracing::warn!(
                     error = ?e,
                     requested_w = width,
                     requested_h = height,
-                    "virtual display live resize failed — keeping the current \
-                     display mode and serving its size"
+                    "virtual display live resize failed — serving the requested size, \
+                     scaled from the display's current mode"
                 );
-                self.desktop_size.set(w, h);
-                (w, h)
+                (width, height)
             }
         }
     }
@@ -893,7 +977,7 @@ impl CaptureDisplay {
                 self.fps,
                 self.display_id,
                 self.screen_size_pts,
-                self.cursor_scale,
+                self.cursor_scale * self.pointer_scale(width),
                 self.warp_cursor_home,
                 self.gfx.clone(),
                 self.keyframe_on_change,
@@ -905,6 +989,7 @@ impl CaptureDisplay {
                 self.desktop_size.clone(),
                 self.pending_resize.clone(),
                 self.suppress_next_adopt.clone(),
+                self.live_pointer_scale(),
             )
             .await?,
         );
@@ -1213,6 +1298,10 @@ mod macos {
         /// reactivation's `request_initial_size` call doesn't re-adopt
         /// whatever size the client's Confirm Active echoes.
         suppress_next_adopt: Arc<AtomicBool>,
+        /// See `CaptureDisplay::live_pointer_scale`, plus the scale last
+        /// applied to `cursor`.
+        live_pointer_scale: Option<(Arc<std::sync::atomic::AtomicU32>, f64)>,
+        applied_pointer_scale: u32,
     }
 
     impl ScreenCaptureUpdates {
@@ -1235,6 +1324,7 @@ mod macos {
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
+            live_pointer_scale: Option<(Arc<std::sync::atomic::AtomicU32>, f64)>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -1290,15 +1380,21 @@ mod macos {
             // --width/--height that asks SCK to scale) forces full frames,
             // because then dirty-rects arrive in source coords and misalign.
             let mode = core_graphics::display::CGDisplay::new(display.display_id()).display_mode();
-            let (backing_w, backing_h) = mode
-                .as_ref()
-                .and_then(|m| {
-                    Some((
-                        u16::try_from(m.pixel_width()).ok()?,
-                        u16::try_from(m.pixel_height()).ok()?,
-                    ))
-                })
-                .unwrap_or((native_w, native_h));
+            let (backing_w, backing_h) =
+                if crate::virtual_display::is_hidpi_virtual_display(display.display_id()) {
+                    // `CGDisplayCopyDisplayMode` returns nothing for a virtual
+                    // display, so the HiDPI vd's 2× backing is derived here.
+                    (native_w.saturating_mul(2), native_h.saturating_mul(2))
+                } else {
+                    mode.as_ref()
+                        .and_then(|m| {
+                            Some((
+                                u16::try_from(m.pixel_width()).ok()?,
+                                u16::try_from(m.pixel_height()).ok()?,
+                            ))
+                        })
+                        .unwrap_or((native_w, native_h))
+                };
             // See `capture_scaling_mode`: full frames when SCK scales (configured
             // size matches neither native points nor backing pixels), and
             // letterbox vs stretch on the auto-size path.
@@ -1380,6 +1476,8 @@ mod macos {
             // native pixels while upscaling the desktop image to their window,
             // which can make a native-size pointer look small. Clamped to a
             // sane band; the hotspot stays accurate at any value.
+            // On the HiDPI virtual display the multiplier already includes
+            // the pointer enlargement (`CaptureDisplay::pointer_scale`).
             let cursor_scale = cursor_scale_multiplier.clamp(0.1, 8.0);
             tracing::debug!(
                 native_w,
@@ -1432,6 +1530,10 @@ mod macos {
                 pending_resize,
                 desktop_size,
                 suppress_next_adopt,
+                applied_pointer_scale: live_pointer_scale
+                    .as_ref()
+                    .map_or(0, |(cell, _)| cell.load(Ordering::Relaxed)),
+                live_pointer_scale,
             })
         }
 
@@ -1658,6 +1760,18 @@ mod macos {
                     .is_none_or(|t| t.elapsed() >= CURSOR_POLL_INTERVAL);
                 if poll_due {
                     self.last_cursor_poll = Some(Instant::now());
+                    if let Some((cell, multiplier)) = self.live_pointer_scale.as_ref() {
+                        let scale = cell.load(Ordering::Relaxed);
+                        if scale != self.applied_pointer_scale {
+                            self.applied_pointer_scale = scale;
+                            self.cursor
+                                .set_scale(multiplier.clamp(0.1, 8.0) * f64::from(scale));
+                            tracing::info!(
+                                pointer_ui_scale = scale,
+                                "resending the pointer at a new scale"
+                            );
+                        }
+                    }
                     let mut cursor_updates = self.cursor.poll();
                     if !cursor_updates.is_empty() {
                         let first = cursor_updates.remove(0);
@@ -1724,7 +1838,11 @@ mod macos {
                 // looping back to the top (where the flush burst re-submits the
                 // last frame, and a settled resize gets picked up promptly
                 // instead of stalling until the next real desktop change).
-                // (Neither pending — the common idle case — blocks normally.)
+                // Neither pending — the common idle case — still wakes at the
+                // cursor-poll interval, so a pointer-shape change on a static
+                // screen (the resize arrows at a window edge, which change no
+                // pixels because the captured frame excludes the cursor) gets
+                // polled and sent instead of waiting for the next redraw.
                 let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(sample) => sample,
@@ -1755,7 +1873,10 @@ mod macos {
                         }
                     }
                 } else {
-                    self.stream.next().await
+                    match tokio::time::timeout(CURSOR_POLL_INTERVAL, self.stream.next()).await {
+                        Ok(sample) => sample,
+                        Err(_) => continue,
+                    }
                 };
                 let Some(sample) = sample else {
                     self.reopen_stream().await;

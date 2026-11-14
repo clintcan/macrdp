@@ -2,8 +2,8 @@
 
 Local fork of ironrdp-acceptor 0.10.0, **re-vendored 2026-10-01 from upstream
 Devolutions/IronRDP@e258f6a0** (the pin-bump rev). `src/` is upstream verbatim except
-`connection.rs`, which carries the two divergences below (every insertion is marked
-`(macrdp divergence N)`). Earlier vendorings: @a5d1c682 (2026-08-05), @879ffed
+`connection.rs`, which carries the three divergences below (every insertion of (4) and
+(5) is marked `(macrdp divergence N)`; (6) is upstream code, unmarked). Earlier vendorings: @a5d1c682 (2026-08-05), @879ffed
 (2026-06-12). Has a standalone `[patch.crates-io]` (core/pdu/svc/connector/async →
 e258f6a0) for isolated builds, ignored in the macrdp workspace (the root `[patch]`
 wins). Keep that rev in sync. `rustfmt.toml` mirrors the IronRDP workspace config
@@ -56,6 +56,17 @@ Both divergences were mutation-checked.
     `macrdp_lossy_request_needs_the_offer_to_include_lossy`. Mutation: hard-coding the
     request back to `UdpFecR` fails the first. Upstream candidate: a natural extension
     of #1951.
+
+(6) **Client desktop and device scale factors** — **harvested early** from upstream
+    #2107 (by @antonmos, merged 2026-10-30 as `335d6712`, after this pin). `Acceptor`
+    captures `desktopScaleFactor` / `deviceScaleFactor` from the GCC Client Core Data in
+    `BasicSettingsWaitInitial` through `validate_scale_factors` (both `Some` only as a
+    valid pair, per MS-RDPBCGR 2.2.1.3.2), carries them across deactivation–reactivation,
+    and surfaces them as `Option<u32>` fields on `AcceptorResult`. Consumed by server
+    divergence (33). Copied from upstream's diff, with no `(macrdp divergence N)` markers
+    so it matches upstream exactly. Upstream's acceptor tests cover it
+    (`scale_factors_are_reported_only_as_a_valid_pair`, `scale_factors_survive_reactivation`).
+    **Drop it at the next pin bump** (any rev at or after `335d6712`).
 
 ## Retired
 

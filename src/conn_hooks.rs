@@ -1,6 +1,6 @@
 //! The server takes one [`ConnectionHandler`]; macrdp has several independent ones
 //! (the auth guard, `--lock-on-disconnect`'s activity record, the keyboard-layout
-//! publisher, and with `--stats-endpoint` the session-stats reset). [`ConnectionHooks`]
+//! and desktop-scale publishers, and with `--stats-endpoint` the session-stats reset). [`ConnectionHooks`]
 //! runs them as one.
 //!
 //! Composing beats wrapping: a wrapper must forward every hook by hand, and a hook
@@ -9,7 +9,7 @@
 //! e258f6a0 pin bump). This is the one place a new hook needs adding.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use ironrdp_server::{ConnectionHandler, ConnectionInfo, PostConnectionAction, ServerError};
@@ -91,6 +91,23 @@ impl ConnectionHandler for KeyboardLayoutHook {
     }
 }
 
+/// With `--virtual-display-hidpi=auto`, publishes the client's desktop scale
+/// factor (percent, from its GCC Client Core Data; 0 when it sent none or an
+/// invalid pair) so the virtual display can pick the UI scale for this
+/// connection. The server reports it on the initial accept only, so a
+/// reactivation never overwrites a newer scale the client announced
+/// mid-session in a monitor layout (`HidpiPolicy::observe_client_scale` writes
+/// the same cell).
+pub struct DesktopScaleHook(pub Arc<AtomicU32>);
+
+impl ConnectionHandler for DesktopScaleHook {
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        let scale = info.desktop_scale_factor.unwrap_or(0);
+        self.0.store(scale, Ordering::Relaxed);
+        tracing::debug!(scale, "client desktop scale factor announced");
+    }
+}
+
 /// With `--stats-endpoint`, clears the per-session stats when a connection ends,
 /// so the endpoint reports `connected:false` instead of the last session's numbers.
 /// Connections are served one at a time, and a preempting client is served only
@@ -112,7 +129,7 @@ impl ConnectionHandler for StatsHook {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, AtomicUsize};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
     use super::*;
@@ -240,5 +257,19 @@ mod tests {
         let mut hooks = ConnectionHooks::new(vec![Box::new(KeyboardLayoutHook(cell.clone()))]);
         hooks.on_connection_info(&info(0x040C));
         assert_eq!(cell.load(Ordering::SeqCst), 0x040C);
+    }
+
+    #[test]
+    fn the_desktop_scale_factor_reaches_the_shared_cell() {
+        let cell = Arc::new(AtomicU32::new(0));
+        let mut hooks = ConnectionHooks::new(vec![Box::new(DesktopScaleHook(cell.clone()))]);
+        let mut retina = info(0x0409);
+        retina.desktop_scale_factor = Some(200);
+        retina.device_scale_factor = Some(100);
+        hooks.on_connection_info(&retina);
+        assert_eq!(cell.load(Ordering::SeqCst), 200);
+        // A later client that sends no scale clears the previous one.
+        hooks.on_connection_info(&info(0x0409));
+        assert_eq!(cell.load(Ordering::SeqCst), 0);
     }
 }
