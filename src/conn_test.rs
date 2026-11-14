@@ -1155,6 +1155,7 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
         .await
 }
 
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
 /// A test server like [`build_test_server_full`] (keep-alive sound, so a
 /// session stays up) with macrdp's real H.264 `Gfx` as its EGFX factory.
 fn build_test_server_with_gfx(port: u16, gfx: crate::h264::Gfx) -> RdpServer {
@@ -1178,6 +1179,7 @@ fn build_test_server_with_gfx(port: u16, gfx: crate::h264::Gfx) -> RdpServer {
         .build()
 }
 
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
 fn test_gfx() -> crate::h264::Gfx {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     crate::h264::Gfx::new(
@@ -1195,6 +1197,7 @@ fn test_gfx() -> crate::h264::Gfx {
     )
 }
 
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
 /// Wait (briefly) for the H.264 pipeline's active connection to become
 /// something other than `not`.
 async fn wait_for_active_connection(
@@ -1217,6 +1220,7 @@ async fn wait_for_active_connection(
 /// live session silently fell back to legacy bitmaps under its still-mapped
 /// EGFX surface, before the peer had sent a single byte. A candidate that does
 /// win must still get a fresh context of its own.
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
 #[tokio::test]
 async fn a_bare_connect_does_not_replace_the_live_h264_context() -> anyhow::Result<()> {
     init_tracing();
