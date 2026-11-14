@@ -44,7 +44,7 @@ Cursor, input and hardening fixes, plus one new option. By default, coloured cur
   - Cmd+\` cycles the right app's windows and visits every one, instead of bouncing between the top two.
   - Every plain left click now runs one Accessibility hit-test, on its own `click-focus-hittest` thread, not only under `--map-ctrl-to-cmd`.
 - **New option: reverse the mouse-wheel direction (#254, #240).** `--reverse-scroll` (config `REVERSE_SCROLL=1`, or the toggle under Mouse in the menu-bar controller's Input tab) flips the wheel on both axes. It's for a Mac with natural scrolling on, where a tool such as LinearMouse can't see the scroll events macrdp posts. The flip is applied before the wheel accumulator (`wheel_delta`).
-- **A client that goes silent before logging in is dropped after 60 s (#256, #186).** Before, a connection that sent its first request and then nothing held the serving connection forever. The 60 s budget leaves room for a client that asks for the password during login. Vendored divergence (32), `SERVE_NEGOTIATION_TIMEOUT`; a timeout returns `TimedOut`, like upstream's `FINALIZE_TIMEOUT`.
+- **A client that goes silent before logging in is dropped after 60 s (#256, #186).** Before, a connection that sent its first request and then nothing held the serving connection forever. The 60 s budget leaves room for a client that asks for the password during login. Vendored divergence (32), `SERVE_NEGOTIATION_TIMEOUT`; a timeout returns `TimedOut`, like upstream's `FINALIZE_TIMEOUT`. Upstreamed afterwards as Devolutions/IronRDP#2432 (merged 2026-11-14, `e482e340`), so the divergence drops at the next pin bump.
 
 **Verified before release**
 

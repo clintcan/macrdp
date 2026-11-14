@@ -27,6 +27,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
     for rophy's PR into it.
   - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
     divergence (32) drops out at the next pin bump to any rev at or after it.
+  - **Next pin bump drops these vendored `ironrdp-server` divergences** (all merged upstream; keep
+    the `conn_test` regression tests for (31) and (32)): (29) pointer AND mask (≥ `fb25b47c`), (31) hidden/default
+    pointer updates (≥ `904a7da6`), (32) negotiation timeout (≥ `e482e340`).
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
