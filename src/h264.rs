@@ -2902,6 +2902,25 @@ impl Gfx {
         Ok(())
     }
 
+    /// Whether this connection's H.264 pipeline is up.
+    pub(crate) fn pipeline_ready(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_ready)
+    }
+
+    /// Whether a client is connected whose graphics pipeline is still being
+    /// negotiated: neither ready nor declined.
+    pub(crate) fn pipeline_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| !ctx.is_ready && !ctx.egfx_declined.load(Ordering::Relaxed))
+    }
+
     /// Live client-driven resize (MS-RDPEDISP monitor layout — the client
     /// resized its window) for an active EGFX/H.264 session. Called by the
     /// capture loop right before it emits the `DisplayUpdate::Resize` that
@@ -2929,25 +2948,6 @@ impl Gfx {
     /// client-requested resize/reactivation window where the client expects
     /// a graphics reset — the same position it occupies on every fresh
     /// connection.
-    /// Whether this connection's H.264 pipeline is up.
-    pub(crate) fn pipeline_ready(&self) -> bool {
-        self.ctx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|ctx| ctx.is_ready)
-    }
-
-    /// Whether a client is connected whose graphics pipeline is still being
-    /// negotiated: neither ready nor declined.
-    pub(crate) fn pipeline_pending(&self) -> bool {
-        self.ctx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|ctx| !ctx.is_ready && !ctx.egfx_declined.load(Ordering::Relaxed))
-    }
-
     pub(crate) fn reset_for_live_resize(&self) {
         let mut guard = self.ctx.lock().unwrap();
         if let Some(ctx) = guard.as_mut() {
