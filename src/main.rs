@@ -22,6 +22,7 @@ mod conn_hooks;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
+mod display_awake;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
@@ -1935,6 +1936,33 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
     }
 }
 
+/// Installs the overlay, waking the displays between attempts (CGError 1014 while asleep).
+async fn install_overlay<T>(
+    label: &'static str,
+    install: fn(u32) -> Result<T>,
+    vd_id: u32,
+) -> Result<T> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match install(vd_id) {
+            Ok(ovr) => return Ok(ovr),
+            Err(e) if attempt < ATTEMPTS => {
+                warn!(label, attempt, error = %e, "headless overlay install failed; waking the displays and retrying");
+                tokio::task::spawn_blocking(|| {
+                    virtual_display::wake_displays_and_wait(std::time::Duration::from_secs(3))
+                })
+                .await
+                .ok();
+                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                    .await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
@@ -2008,7 +2036,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         was_zero = true;
                         continue;
                     }
-                    match install(vd_id) {
+                    match install_overlay(label, install, vd_id).await {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
                             info!(
@@ -3630,12 +3658,14 @@ async fn async_main() -> Result<()> {
     // rejection stops the rest seeing the connection):
     // - auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log. On by
     //   default (MACRDP_CONN_GUARD=0 disables);
+    // - an authenticated client keeps the displays awake ahead of its session;
     // - with --lock-on-disconnect, reconnect activity, so a pending lock holds for
     //   a client still handshaking;
     // - the client's keyboard-layout id, for the input handler to auto-select a
     //   matching non-US layout when --keyboard-layout is unset.
     let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
     hooks.extend(auth_guard::AuthGuardHandler::from_env());
+    hooks.push(Box::new(display_awake::AwakeHook));
     if let Some(activity) = &lock_activity {
         hooks.push(Box::new(lock_activity::ActivityHook(Arc::clone(activity))));
     }
