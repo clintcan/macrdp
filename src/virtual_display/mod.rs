@@ -242,7 +242,8 @@ mod macos {
     }
 
     /// What a mode request actually produced.
-    enum Landed {
+    #[derive(Debug)]
+    pub(super) enum Landed {
         /// The requested point size.
         Exact,
         /// HiDPI requested, but macOS chose the 1:1 duplicate at twice the
@@ -251,6 +252,59 @@ mod macos {
         /// HiDPI requested, but macOS chose the half-size HiDPI variant
         /// (W/2 points at W pixels) — see `resize`.
         HalfVariant,
+        /// HiDPI requested, and the point size is right, but the display
+        /// is 1:1 (W points at W pixels). `CGDisplayBounds` can't tell this
+        /// from `Exact`; only the mode's pixel width can.
+        Unscaled,
+    }
+
+    /// Classify one reading after a mode request for `mode` points.
+    /// `pixel_w` is the current mode's pixel width when CoreGraphics
+    /// reports one. `moved` = the bounds differ from before the request;
+    /// `waited` = `SETTLE` has passed. A reading that matches the old mode
+    /// may just be the old mode still showing, so outcomes that can't be
+    /// told apart from it only count once the bounds moved or after a
+    /// settle.
+    pub(super) fn classify_landing(
+        hidpi: bool,
+        mode: (u32, u32),
+        bounds: (u32, u32),
+        pixel_w: Option<u32>,
+        moved: bool,
+        waited: bool,
+    ) -> Option<Landed> {
+        let settled = moved || waited;
+        let (mode_w, mode_h) = mode;
+        if !hidpi {
+            return (bounds == mode).then_some(Landed::Exact);
+        }
+        if bounds == mode {
+            return match pixel_w {
+                Some(px) if px == 2 * mode_w => Some(Landed::Exact),
+                // The point size is right but the pixels aren't 2x yet;
+                // give it the full settle before calling it 1:1.
+                Some(px) if px == mode_w && waited => Some(Landed::Unscaled),
+                Some(_) => None,
+                // No pixel reading: the 1:1 and 2x modes of this point size
+                // look the same, so don't accept the old mode as the new.
+                None => settled.then_some(Landed::Exact),
+            };
+        }
+        // With a pixel reading, each outcome also has to have its own pixel
+        // count, so a mode that simply didn't change isn't mistaken for one
+        // (1920 points at 3840 pixels, left in place, reads as twice a
+        // 960-point request).
+        if settled && bounds == (mode_w * 2, mode_h * 2) && pixel_w.is_none_or(|px| px == bounds.0)
+        {
+            return Some(Landed::OneToOne);
+        }
+        if settled
+            && bounds == (mode_w / 2, mode_h / 2)
+            && pixel_w.is_none_or(|px| px == 2 * bounds.0)
+        {
+            return Some(Landed::HalfVariant);
+        }
+        None
     }
 
     impl VirtualDisplay {
@@ -318,13 +372,26 @@ mod macos {
             Ok(vd)
         }
 
+        /// Pixel width of the display's current mode, from
+        /// `CGDisplayCopyDisplayMode`. `CGDisplayBounds` only gives points,
+        /// which read the same for the 1:1 and 2x modes of one point size.
+        fn pixel_width(&self) -> Option<u32> {
+            CGDisplay::new(self.display_id)
+                .display_mode()
+                .map(|m| m.pixel_width() as u32)
+                .filter(|&px| px > 0)
+        }
+
         /// Work out which scale macOS actually gave the display after a mode
         /// was applied, from its point width. With HiDPI requested, macOS can
         /// still choose the 1:1 duplicate (twice the point size) when the
         /// panel density is out of range; the capture path has to know, so
         /// the shared registry follows what was chosen, not what was asked.
         fn record_scale(&mut self, mode_w: u32) {
-            let scaled = self.hidpi && self.size_pts.0 as u32 == mode_w;
+            let points_w = self.size_pts.0 as u32;
+            let scaled = self.hidpi
+                && points_w == mode_w
+                && self.pixel_width().is_none_or(|px| px == 2 * points_w);
             if scaled {
                 HIDPI_DISPLAY_ID.store(self.display_id, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -384,54 +451,56 @@ mod macos {
             // below), so forget the last size. Otherwise a later request for
             // that same size would look already applied and skip the re-mode.
             self.mode_px = (0, 0);
-            let mut landed = self.apply_and_wait(mode_w, mode_h)?;
             // For a HiDPI mode of W points macOS has two variants — W points at
             // 2W pixels, and W/2 points at W pixels — and can keep whichever
-            // matches the current framebuffer's pixel count (a 1728-point
-            // request after a 1728-pixel framebuffer came out as 864 points on
-            // an idle test display). Going through a slightly different HiDPI
-            // size first leaves neither variant matching, after which the
-            // request lands correctly. Only done when the bad variant actually
-            // shows up — the live agent display didn't do this when tested —
-            // and always staying in HiDPI, never through 1:1.
-            if matches!(landed, Landed::HalfVariant) {
+            // matches the current framebuffer's pixel count (on an M1 Mac
+            // mini a 1x 1920x1080 client stayed at 960x540 points).
+            //
+            // Selecting the mode from `CGDisplayCopyAllDisplayModes` with
+            // `CGConfigureDisplayWithDisplayMode`, the way System Settings
+            // does, was tried and rejected: it fixes that one request, but
+            // afterwards `applySettings:` no longer moves the display at all
+            // for the life of the process (tested with both app and session
+            // scope), so every later re-mode fails.
+            let mut applied_w = mode_w;
+            let mut taken = self.take_mode(mode_w, mode_h);
+            if !taken {
+                // Going through a slightly different HiDPI size first leaves
+                // neither variant matching the framebuffer, after which the
+                // request often lands. Always staying in HiDPI.
                 tracing::info!(
                     expected = ?(mode_w, mode_h),
-                    "virtual display landed on the half-size HiDPI variant — stepping through \
+                    "virtual display didn't land on the HiDPI mode — stepping through \
                      another HiDPI size"
                 );
-                self.apply_and_wait(mode_w + 16, mode_h + 16)
-                    .context("stepping through another HiDPI size")?;
-                landed = self.apply_and_wait(mode_w, mode_h)?;
+                let _ = self.take_mode(mode_w + 16, mode_h + 16);
+                taken = self.take_mode(mode_w, mode_h);
             }
-            let mut applied_w = mode_w;
-            if matches!(landed, Landed::HalfVariant) {
-                // Still on the variant: seen live for a 1x mstsc at 1920x1080
-                // (3840-px backing) on an M1 Mac mini, though not reproducible
-                // on another M1. Rather than serve a desktop at twice the
-                // size, take the largest smaller HiDPI size macOS does honour:
-                // the UI comes out slightly larger than asked, and capture
-                // scales it to the session.
-                let mut fallback = None;
-                for (w, h) in fallback_points(mode_w, mode_h) {
-                    if matches!(self.apply_and_wait(w, h)?, Landed::Exact) {
-                        fallback = Some(w);
-                        break;
-                    }
-                }
-                let Some(w) = fallback else {
+            if !taken {
+                // Rather than serve a desktop at twice the size, take the
+                // largest smaller HiDPI size macOS does honour: the UI comes
+                // out slightly larger than asked, and capture scales it to
+                // the session.
+                let Some((w, _)) =
+                    fallback_points(mode_w, mode_h).find(|&(w, h)| self.take_mode(w, h))
+                else {
+                    // The caller keeps serving from the display's current
+                    // mode, so report where it really is, not the last
+                    // reading a step happened to land on.
+                    let b = CGDisplay::new(self.display_id).bounds();
+                    self.origin_pts = (b.origin.x, b.origin.y);
+                    self.size_pts = (b.size.width, b.size.height);
                     return Err(anyhow!(
-                        "virtual display still on the half-size HiDPI variant for \
-                         {mode_w}x{mode_h} points after stepping through another size, \
-                         and no smaller HiDPI size took"
+                        "virtual display didn't take the HiDPI mode for {mode_w}x{mode_h} \
+                         points, or any smaller HiDPI size"
                     ));
                 };
                 tracing::warn!(
                     requested_points = ?(mode_w, mode_h),
                     points = ?self.size_pts,
                     session_px = ?(width, height),
-                    "virtual display kept landing on the half-size HiDPI variant — serving \
-                     the largest smaller HiDPI size that took (UI slightly larger than asked)"
+                    "virtual display kept missing the HiDPI mode — serving the largest smaller \
+                     HiDPI size that took (UI slightly larger than asked)"
                 );
                 applied_w = w;
             }
@@ -439,6 +508,25 @@ mod macos {
             self.ui_scale = ui_scale;
             self.record_scale(applied_w);
             Ok(())
+        }
+
+        /// Try to put the display on `mode_w × mode_h` points (2x-backed on a
+        /// HiDPI display). Also true when macOS chose the 1:1 duplicate for
+        /// pixel density, which `record_scale` reports, as before. Never
+        /// fails outright: a request that errors or times out just didn't
+        /// take. Refreshes the cached bounds.
+        fn take_mode(&mut self, mode_w: u32, mode_h: u32) -> bool {
+            match self.apply_and_wait(mode_w, mode_h) {
+                Ok(landed) => matches!(landed, Landed::Exact | Landed::OneToOne),
+                Err(e) => {
+                    tracing::info!(
+                        points = ?(mode_w, mode_h),
+                        error = %format!("{e:#}"),
+                        "virtual display: mode didn't take"
+                    );
+                    false
+                }
+            }
         }
 
         /// Apply one mode and wait (up to 3 s) for the WindowServer to show
@@ -449,25 +537,26 @@ mod macos {
             self._handle
                 .apply_mode(mode_w, mode_h, 60, self.hidpi)
                 .context("re-applying virtual display mode")?;
+            self.wait_landed(before, mode_w, mode_h)
+        }
 
+        /// Wait (up to 3 s) for the WindowServer to show a just-applied
+        /// `mode_w × mode_h`-point mode, reporting what it landed on.
+        /// Refreshes the cached bounds.
+        fn wait_landed(&mut self, before: (u32, u32), mode_w: u32, mode_h: u32) -> Result<Landed> {
             let start = std::time::Instant::now();
             let deadline = start + Duration::from_secs(3);
             loop {
                 let bounds = CGDisplay::new(self.display_id).bounds();
                 let (bw, bh) = (bounds.size.width as u32, bounds.size.height as u32);
-                // A reading equal to the pre-apply bounds may just be the old
-                // mode still showing, so the two "wrong mode" outcomes only
-                // count once it differs from before, or after a settle.
-                let settled = (bw, bh) != before || start.elapsed() >= SETTLE;
-                let landed = if (bw, bh) == (mode_w, mode_h) {
-                    Some(Landed::Exact)
-                } else if self.hidpi && settled && (bw, bh) == (mode_w * 2, mode_h * 2) {
-                    Some(Landed::OneToOne)
-                } else if self.hidpi && settled && (bw, bh) == (mode_w / 2, mode_h / 2) {
-                    Some(Landed::HalfVariant)
-                } else {
-                    None
-                };
+                let landed = classify_landing(
+                    self.hidpi,
+                    (mode_w, mode_h),
+                    (bw, bh),
+                    self.pixel_width(),
+                    (bw, bh) != before,
+                    start.elapsed() >= SETTLE,
+                );
                 if let Some(landed) = landed {
                     self.origin_pts = (bounds.origin.x, bounds.origin.y);
                     self.size_pts = (bounds.size.width, bounds.size.height);
@@ -2071,6 +2160,110 @@ mod tests {
         // A 1x client at another size.
         vd.resize(1440, 900, 1).unwrap();
         assert_eq!(state(&vd), ((1440.0, 900.0), true), "1x client at 1440x900");
+    }
+
+    /// clintcan's case from the mini: a display created at 960x540 points
+    /// (1920x1080 pixels) re-moded for a 1x client at 1920x1080. Checks the
+    /// real backing size, which `CGDisplayBounds` can't show. Creates a
+    /// display, so run it only on a Mac nobody is connected to:
+    /// `cargo test --release one_x_1080p_live -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn one_x_1080p_live() {
+        use core_graphics::display::CGDisplay;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_test_writer()
+            .try_init();
+        let mut vd = VirtualDisplay::new(1920, 1080, 60, true, 2).unwrap();
+        let id = vd.display_id();
+        let mode = |id| {
+            CGDisplay::new(id)
+                .display_mode()
+                .map(|m| (m.width(), m.height(), m.pixel_width(), m.pixel_height()))
+        };
+        println!(
+            "created: {:?} hidpi={}",
+            mode(id),
+            is_hidpi_virtual_display(id)
+        );
+        vd.resize(1920, 1080, 1).unwrap();
+        println!(
+            "1x 1920x1080: {:?} hidpi={}",
+            mode(id),
+            is_hidpi_virtual_display(id)
+        );
+        assert_eq!(vd.size_pts(), (1920.0, 1080.0));
+        // Whatever route took, the registry must match the real pixels.
+        let px = mode(id).map(|m| m.2);
+        assert_eq!(is_hidpi_virtual_display(id), px == Some(3840));
+        vd.resize(1920, 1080, 2).unwrap();
+        println!(
+            "2x 1920x1080: {:?} hidpi={}",
+            mode(id),
+            is_hidpi_virtual_display(id)
+        );
+        println!("points {:?}", vd.size_pts());
+        assert_eq!(vd.size_pts(), (960.0, 540.0));
+        assert_eq!(
+            is_hidpi_virtual_display(id),
+            mode(id).map(|m| m.2) == Some(1920)
+        );
+        // Re-modes after that: a Retina client, then 1x at another size.
+        for (w, h, scale) in [(3456, 2168, 2), (1440, 900, 1), (1920, 1080, 1)] {
+            vd.resize(w, h, scale).unwrap();
+            println!(
+                "{w}x{h}@{scale}: {:?} points {:?} hidpi={}",
+                mode(id),
+                vd.size_pts(),
+                is_hidpi_virtual_display(id)
+            );
+            assert_eq!(vd.size_pts().0 as u32, w / scale);
+            let px = mode(id).map(|m| m.2);
+            assert_eq!(
+                is_hidpi_virtual_display(id),
+                px == Some(u64::from(2 * (w / scale)))
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn landing_uses_the_pixel_width_when_there_is_one() {
+        use macos::{classify_landing as c, Landed as L};
+        let m = (1920, 1080);
+        // Right points at 2x pixels: taken at once.
+        assert!(matches!(
+            c(true, m, m, Some(3840), false, false),
+            Some(L::Exact)
+        ));
+        // Right points at 1:1: only after the settle, never as Exact.
+        assert!(c(true, m, m, Some(1920), true, false).is_none());
+        assert!(matches!(
+            c(true, m, m, Some(1920), true, true),
+            Some(L::Unscaled)
+        ));
+        // No pixel reading: the old mode can't count as the new one.
+        assert!(c(true, m, m, None, false, false).is_none());
+        assert!(matches!(c(true, m, m, None, false, true), Some(L::Exact)));
+        // The variants, once the bounds moved or after the settle.
+        assert!(c(true, m, (960, 540), Some(1920), false, false).is_none());
+        assert!(matches!(
+            c(true, m, (960, 540), Some(1920), true, false),
+            Some(L::HalfVariant)
+        ));
+        assert!(matches!(
+            c(true, m, (3840, 2160), None, false, true),
+            Some(L::OneToOne)
+        ));
+        // A size that is none of these keeps waiting.
+        assert!(c(true, (1728, 972), (960, 540), Some(1920), true, true).is_none());
+        // Not HiDPI: points are pixels.
+        assert!(matches!(
+            c(false, m, m, Some(1920), false, false),
+            Some(L::Exact)
+        ));
     }
 
     #[cfg(target_os = "macos")]
