@@ -2387,6 +2387,16 @@ fn boost_thread_qos() {
 }
 
 fn main() -> Result<()> {
+    // One-shot helper mode for the virtual display (see
+    // `virtual_display::SELECT_MODE_ARG`); never reaches the server.
+    #[cfg(target_os = "macos")]
+    {
+        let mut argv = std::env::args().skip(1);
+        if argv.next().as_deref() == Some(virtual_display::SELECT_MODE_ARG) {
+            let spec = argv.next().unwrap_or_default();
+            std::process::exit(virtual_display::run_select_mode_helper(&spec));
+        }
+    }
     // Build the tokio runtime explicitly so every worker thread starts
     // at boosted QoS (see `boost_thread_qos`). `#[tokio::main]`'s
     // generated runtime gives us no hook for this. Crucially: the main

@@ -14,9 +14,9 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    is_hidpi_virtual_display, screen_is_locked, shield_keeps_physical_main,
+    is_hidpi_virtual_display, run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
     take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -155,6 +155,67 @@ mod macos {
         display_id != 0 && HIDPI_DISPLAY_ID.load(std::sync::atomic::Ordering::Relaxed) == display_id
     }
 
+    /// First argument that turns the binary into a one-shot helper: select
+    /// the display mode given by the next argument (`id,width,height,pixel
+    /// width`, sizes in points) and exit. See `select_mode_out_of_process`.
+    pub const SELECT_MODE_ARG: &str = "--select-display-mode";
+
+    /// Carries the same spec to a test binary acting as the helper.
+    #[cfg(test)]
+    pub(super) const TEST_SELECT_MODE_ENV: &str = "MACRDP_TEST_SELECT_MODE";
+
+    const HELPER_SELECTED: i32 = 0;
+    const HELPER_NOT_LISTED: i32 = 3;
+
+    /// Body of the helper process. Returns its exit code.
+    pub fn run_select_mode_helper(spec: &str) -> i32 {
+        let v: Vec<u32> = spec.split(',').filter_map(|x| x.parse().ok()).collect();
+        let &[display, w, h, px_w] = v.as_slice() else {
+            eprintln!("{SELECT_MODE_ARG}: expected id,width,height,pixel-width, got {spec:?}");
+            return 2;
+        };
+        match private_api::select_mode(display, w, h, px_w) {
+            Ok(true) => HELPER_SELECTED,
+            Ok(false) => HELPER_NOT_LISTED,
+            Err(e) => {
+                eprintln!("{SELECT_MODE_ARG}: {e:#}");
+                1
+            }
+        }
+    }
+
+    /// Select a mode from the display's own list, in a short-lived helper
+    /// process. `Ok(false)` when the display doesn't list it.
+    ///
+    /// It has to be another process: once a process has configured a display
+    /// this way, its own `CGDisplayBounds` / `CGDisplayCopyDisplayMode` stay
+    /// on that mode for good while the display goes on changing (observed on
+    /// macOS 26.6.2), and capture and input read those.
+    fn select_mode_out_of_process(display: u32, w: u32, h: u32, px_w: u32) -> Result<bool> {
+        let spec = format!("{display},{w},{h},{px_w}");
+        let exe = std::env::current_exe().context("locating the macrdp binary")?;
+        let mut cmd = std::process::Command::new(exe);
+        #[cfg(not(test))]
+        cmd.arg(SELECT_MODE_ARG).arg(&spec);
+        #[cfg(test)]
+        cmd.args([
+            "--exact",
+            "virtual_display::tests::select_mode_helper",
+            "--ignored",
+        ])
+        .env(TEST_SELECT_MODE_ENV, &spec);
+        let out = cmd.output().context("starting the display-mode helper")?;
+        match out.status.code() {
+            Some(HELPER_SELECTED) => Ok(true),
+            Some(HELPER_NOT_LISTED) => Ok(false),
+            _ => Err(anyhow!(
+                "display-mode helper failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        }
+    }
+
     /// Read-and-clear the "detach left the physical panel stuck-disabled" flag
     /// (see [`DETACH_REENABLE_FAILED`]). Returns true at most once per failure.
     pub fn take_detach_reenable_failed() -> bool {
@@ -231,14 +292,6 @@ mod macos {
     /// Point size of the mode for a `px`-pixel session at `ui_scale`.
     fn mode_points(px: u32, ui_scale: u32) -> u32 {
         (px / ui_scale.max(1)).max(1)
-    }
-
-    /// Smaller HiDPI point sizes to try when macOS won't give `w × h`
-    /// points: 90%, 80% and 70% of it, aspect kept.
-    pub(super) fn fallback_points(w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
-        [9u32, 8, 7]
-            .into_iter()
-            .map(move |tenths| ((w * tenths / 10).max(1), (h * tenths / 10).max(1)))
     }
 
     /// What a mode request actually produced.
@@ -451,62 +504,31 @@ mod macos {
             // below), so forget the last size. Otherwise a later request for
             // that same size would look already applied and skip the re-mode.
             self.mode_px = (0, 0);
-            // For a HiDPI mode of W points macOS has two variants — W points at
-            // 2W pixels, and W/2 points at W pixels — and can keep whichever
-            // matches the current framebuffer's pixel count (on an M1 Mac
-            // mini a 1x 1920x1080 client stayed at 960x540 points).
-            //
-            // Selecting the mode from `CGDisplayCopyAllDisplayModes` with
-            // `CGConfigureDisplayWithDisplayMode`, the way System Settings
-            // does, was tried and rejected: it fixes that one request, but
-            // afterwards `applySettings:` no longer moves the display at all
-            // for the life of the process (tested with both app and session
-            // scope), so every later re-mode fails.
-            let mut applied_w = mode_w;
+            // After `applySettings:` macOS can keep the display on another
+            // mode instead of the one applied: it stores a preferred mode per
+            // display and restores it whenever the new mode list still has
+            // it. That list holds more than the mode asked for (for 1920x1080
+            // points it also has 960x540 points at 1920x1080 pixels), so a
+            // display created at 960x540 points stayed there for a 1x
+            // 1920x1080 client. Selecting the mode explicitly replaces the
+            // stored one.
             let mut taken = self.take_mode(mode_w, mode_h);
-            if !taken {
-                // Going through a slightly different HiDPI size first leaves
-                // neither variant matching the framebuffer, after which the
-                // request often lands. Always staying in HiDPI.
-                tracing::info!(
-                    expected = ?(mode_w, mode_h),
-                    "virtual display didn't land on the HiDPI mode — stepping through \
-                     another HiDPI size"
-                );
-                let _ = self.take_mode(mode_w + 16, mode_h + 16);
-                taken = self.take_mode(mode_w, mode_h);
+            if !taken && self.hidpi {
+                taken = self.select_mode(mode_w, mode_h);
             }
             if !taken {
-                // Rather than serve a desktop at twice the size, take the
-                // largest smaller HiDPI size macOS does honour: the UI comes
-                // out slightly larger than asked, and capture scales it to
-                // the session.
-                let Some((w, _)) =
-                    fallback_points(mode_w, mode_h).find(|&(w, h)| self.take_mode(w, h))
-                else {
-                    // The caller keeps serving from the display's current
-                    // mode, so report where it really is, not the last
-                    // reading a step happened to land on.
-                    let b = CGDisplay::new(self.display_id).bounds();
-                    self.origin_pts = (b.origin.x, b.origin.y);
-                    self.size_pts = (b.size.width, b.size.height);
-                    return Err(anyhow!(
-                        "virtual display didn't take the HiDPI mode for {mode_w}x{mode_h} \
-                         points, or any smaller HiDPI size"
-                    ));
-                };
-                tracing::warn!(
-                    requested_points = ?(mode_w, mode_h),
-                    points = ?self.size_pts,
-                    session_px = ?(width, height),
-                    "virtual display kept missing the HiDPI mode — serving the largest smaller \
-                     HiDPI size that took (UI slightly larger than asked)"
-                );
-                applied_w = w;
+                // The caller keeps serving from the display's current mode,
+                // so report where it really is.
+                let b = CGDisplay::new(self.display_id).bounds();
+                self.origin_pts = (b.origin.x, b.origin.y);
+                self.size_pts = (b.size.width, b.size.height);
+                return Err(anyhow!(
+                    "virtual display didn't take the mode for {mode_w}x{mode_h} points"
+                ));
             }
             self.mode_px = (width, height);
             self.ui_scale = ui_scale;
-            self.record_scale(applied_w);
+            self.record_scale(mode_w);
             Ok(())
         }
 
@@ -523,6 +545,39 @@ mod macos {
                         points = ?(mode_w, mode_h),
                         error = %format!("{e:#}"),
                         "virtual display: mode didn't take"
+                    );
+                    false
+                }
+            }
+        }
+
+        /// After `mode_w × mode_h` points was applied but macOS kept another
+        /// mode, select the 2x-backed one from the display's mode list.
+        /// False when it isn't listed or didn't land.
+        fn select_mode(&mut self, mode_w: u32, mode_h: u32) -> bool {
+            let before = CGDisplay::new(self.display_id).bounds().size;
+            let before = (before.width as u32, before.height as u32);
+            let landed = select_mode_out_of_process(self.display_id, mode_w, mode_h, 2 * mode_w)
+                .and_then(|listed| {
+                    if !listed {
+                        return Err(anyhow!("the display doesn't list that mode"));
+                    }
+                    self.wait_landed(before, mode_w, mode_h)
+                });
+            match landed {
+                Ok(landed) => {
+                    tracing::info!(
+                        points = ?(mode_w, mode_h),
+                        ?landed,
+                        "virtual display kept its previous mode — selected the HiDPI mode"
+                    );
+                    matches!(landed, Landed::Exact)
+                }
+                Err(e) => {
+                    tracing::info!(
+                        points = ?(mode_w, mode_h),
+                        error = %format!("{e:#}"),
+                        "virtual display: selecting the HiDPI mode didn't work"
                     );
                     false
                 }
@@ -2228,6 +2283,17 @@ mod tests {
         }
     }
 
+    /// Not a test: the helper process `select_mode_out_of_process` starts
+    /// when the caller is a test binary. Does nothing unless asked to.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn select_mode_helper() {
+        if let Ok(spec) = std::env::var(macos::TEST_SELECT_MODE_ENV) {
+            std::process::exit(run_select_mode_helper(&spec));
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn landing_uses_the_pixel_width_when_there_is_one() {
@@ -2264,13 +2330,6 @@ mod tests {
             c(false, m, m, Some(1920), false, false),
             Some(L::Exact)
         ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn half_variant_fallback_steps_down_keeping_the_aspect() {
-        let sizes: Vec<_> = macos::fallback_points(1920, 1080).collect();
-        assert_eq!(sizes, [(1728, 972), (1536, 864), (1344, 756)]);
     }
 
     #[test]

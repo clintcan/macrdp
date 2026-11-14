@@ -247,6 +247,116 @@ impl Drop for Handle {
     }
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    static kCGDisplayShowDuplicateLowResolutionModes: CFTypeRef;
+    fn CGDisplayCopyAllDisplayModes(display: u32, options: CFTypeRef) -> CFTypeRef;
+    fn CGDisplayModeGetWidth(mode: CFTypeRef) -> usize;
+    fn CGDisplayModeGetHeight(mode: CFTypeRef) -> usize;
+    fn CGDisplayModeGetPixelWidth(mode: CFTypeRef) -> usize;
+    fn CGBeginDisplayConfiguration(config: *mut *mut c_void) -> i32;
+    fn CGConfigureDisplayWithDisplayMode(
+        config: *mut c_void,
+        display: u32,
+        mode: CFTypeRef,
+        options: CFTypeRef,
+    ) -> i32;
+    fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> i32;
+    fn CGCancelDisplayConfiguration(config: *mut c_void) -> i32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFBooleanTrue: CFTypeRef;
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
+    fn CFDictionaryCreate(
+        alloc: CFTypeRef,
+        keys: *const CFTypeRef,
+        values: *const CFTypeRef,
+        n: isize,
+        kcb: *const c_void,
+        vcb: *const c_void,
+    ) -> CFTypeRef;
+    fn CFArrayGetCount(a: CFTypeRef) -> isize;
+    fn CFArrayGetValueAtIndex(a: CFTypeRef, i: isize) -> CFTypeRef;
+}
+
+/// `kCGConfigurePermanently`.
+const CONFIGURE_PERMANENTLY: u32 = 2;
+
+/// Put `display` on the mode of `w × h` points backed by `px_w` pixels, the
+/// way picking a resolution in System Settings does. `Ok(false)` when the
+/// display doesn't list such a mode.
+///
+/// macOS stores a preferred mode per display and, after `applySettings:`,
+/// restores it whenever the new mode list still contains it, instead of
+/// taking the mode just applied. This replaces the stored mode. The scope
+/// is permanent because the caller exits, which undoes an app-scoped change.
+///
+/// Only for a process that exits right after: the caller's own view of the
+/// display (`CGDisplayBounds`, `CGDisplayCopyDisplayMode`) stops following
+/// later mode changes once it has done this.
+///
+/// Reads the modes through the C API: `core-graphics` 0.24's
+/// `CGDisplayMode::all_display_modes` over-releases them.
+pub(super) fn select_mode(display: u32, w: u32, h: u32, px_w: u32) -> Result<bool> {
+    unsafe {
+        let keys = [kCGDisplayShowDuplicateLowResolutionModes];
+        let vals = [kCFBooleanTrue];
+        let opts = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            vals.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        let modes = CGDisplayCopyAllDisplayModes(display, opts);
+        CFRelease(opts);
+        if modes.is_null() {
+            return Ok(false);
+        }
+        let mut found: CFTypeRef = std::ptr::null();
+        for i in 0..CFArrayGetCount(modes) {
+            let m = CFArrayGetValueAtIndex(modes, i);
+            if CGDisplayModeGetWidth(m) == w as usize
+                && CGDisplayModeGetHeight(m) == h as usize
+                && CGDisplayModeGetPixelWidth(m) == px_w as usize
+            {
+                found = m;
+                break;
+            }
+        }
+        if found.is_null() {
+            CFRelease(modes);
+            return Ok(false);
+        }
+        let mut config: *mut c_void = std::ptr::null_mut();
+        let e = CGBeginDisplayConfiguration(&mut config);
+        if e != 0 {
+            CFRelease(modes);
+            return Err(anyhow!("CGBeginDisplayConfiguration failed (CGError {e})"));
+        }
+        let e = CGConfigureDisplayWithDisplayMode(config, display, found, std::ptr::null());
+        if e != 0 {
+            CGCancelDisplayConfiguration(config);
+            CFRelease(modes);
+            return Err(anyhow!(
+                "CGConfigureDisplayWithDisplayMode failed (CGError {e})"
+            ));
+        }
+        let e = CGCompleteDisplayConfiguration(config, CONFIGURE_PERMANENTLY);
+        CFRelease(modes);
+        if e != 0 {
+            return Err(anyhow!(
+                "CGCompleteDisplayConfiguration failed (CGError {e})"
+            ));
+        }
+        Ok(true)
+    }
+}
+
 /// Allocate a virtual display at the requested pixel size, apply a
 /// single-mode settings object, and return the owning handle.
 ///
