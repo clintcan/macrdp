@@ -229,6 +229,13 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   lock-state check. See the auto-unlock note in
                           #   known-quirks.md. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
+--h264-max-unacked-frames N # cap how many shipped frames may be awaiting the
+                          #   client's FrameAcknowledge on the TCP path; past it,
+                          #   captures drop (10 fps trickle) until the client
+                          #   catches up. Bounds lag when the client decodes at
+                          #   about the rate we send (otherwise every burst
+                          #   leaves a backlog that drains for seconds). 0 = off
+                          #   (default). Try 3-4. Config: H264_MAX_UNACKED_FRAMES.
 --bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
                           #   --enable-h264). With --adaptive-bitrate it's the
                           #   ceiling the encoder backs off from under congestion;

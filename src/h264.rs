@@ -1522,6 +1522,9 @@ pub struct Gfx {
     /// that a healthy high-RTT link never trips it; low enough to cap the decode
     /// backlog so video degrades to choppy-but-live instead of freezing.
     max_frame_lag: u64,
+    /// The same ack-lag cap on the TCP path (`--h264-max-unacked-frames`);
+    /// 0 = off, leaving TCP paced by socket backpressure alone.
+    tcp_max_frame_lag: u64,
     /// EGFX-over-UDP → TCP watchdog. On by default (disable with
     /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
     /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
@@ -1656,6 +1659,7 @@ impl Gfx {
         bitrate_bps: u32,
         keyframe_secs: f32,
         max_in_flight: u32,
+        tcp_max_unacked_frames: u32,
         egfx_on_lossy: Arc<AtomicBool>,
         egfx_on_udp: Arc<AtomicBool>,
         demigrate_request: Arc<AtomicBool>,
@@ -1888,6 +1892,7 @@ impl Gfx {
             egfx_on_lossy,
             egfx_on_udp,
             max_frame_lag,
+            tcp_max_frame_lag: u64::from(tcp_max_unacked_frames),
             watchdog_enabled,
             watchdog_wedge_timeout,
             watchdog_active_window,
@@ -2324,18 +2329,28 @@ impl Gfx {
             // → frozen video while audio (on TCP) keeps playing. When the client's
             // decode backlog (shipped − decoded, from FrameAcknowledge) exceeds the
             // threshold, drop this capture so the client catches up — video degrades
-            // to choppy-but-live instead of freezing. Gated to the UDP tunnel
-            // (TCP push path stays byte-identical), to acks actually flowing (a
-            // suspended-ack client falls back to the submitted−shipped throttle
-            // above), and to having seen ≥1 ack (no cold-start false drop). Dropping
-            // before encode keeps the H.264 reference chain valid.
-            if self.egfx_on_udp.load(Ordering::Relaxed) && ctx.egfx_acks_seen && !ctx.acks_suspended
-            {
+            // to choppy-but-live instead of freezing. Always on for the UDP tunnel;
+            // on TCP only with --h264-max-unacked-frames (default off, so the TCP
+            // push path stays byte-identical). TCP's socket backpressure doesn't
+            // help when the network is fine but the client's own decode/present
+            // loop runs at about the rate we send: every burst then leaves a
+            // backlog that drains at the small rate difference, which measured as
+            // 200–600 ms of lag for 10–20 s at a time (Windows App, 3456×2168).
+            // Gated to acks actually flowing (a suspended-ack client falls back to
+            // the submitted−shipped throttle above), and to having seen ≥1 ack (no
+            // cold-start false drop). Dropping before encode keeps the H.264
+            // reference chain valid.
+            let lag_limit = if self.egfx_on_udp.load(Ordering::Relaxed) {
+                self.max_frame_lag
+            } else {
+                self.tcp_max_frame_lag
+            };
+            if lag_limit > 0 && ctx.egfx_acks_seen && !ctx.acks_suspended {
                 let lag = ctx
                     .last_shipped_frame_id
                     .load(Ordering::Relaxed)
                     .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
-                if lag > self.max_frame_lag {
+                if lag > lag_limit {
                     // Client is behind. Drop MOST captures so it catches up — but
                     // keep a low-rate trickle, never zero: mstsc only presents (and
                     // thus frame-acks) an H.264 frame once a couple more arrive
@@ -2351,14 +2366,14 @@ impl Gfx {
                     if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
                         trace!(
                             lag,
-                            "EGFX-on-UDP lag high; dropping capture (trickle floor)"
+                            "EGFX client ack lag high; dropping capture (trickle floor)"
                         );
                         return Ok(true);
                     }
                     ctx.last_throttle_ship = now;
                     trace!(
                         lag,
-                        "EGFX-on-UDP lag high; letting a trickle frame through to drain client buffer"
+                        "EGFX client ack lag high; letting a trickle frame through to drain client buffer"
                     );
                     // fall through: ship this one to keep the client presenting/acking
                 }
@@ -6263,6 +6278,7 @@ mod tests {
             5_000_000,
             2.0,
             2,
+            0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),

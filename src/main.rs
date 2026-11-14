@@ -500,6 +500,19 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     h264_frames_in_flight: u32,
 
+    /// Cap how far the server may run ahead of the client's frame
+    /// acknowledgements on the TCP path (only with --enable-h264): once more
+    /// than N shipped frames are unacknowledged, captures are dropped (with a
+    /// 10 fps trickle so the client keeps presenting) until it catches up.
+    /// Without it, a client that decodes at roughly the rate we send builds a
+    /// backlog on every burst that can take seconds to drain — felt as
+    /// hundreds of ms of input lag. 0 (default) = off, the TCP path relies on
+    /// socket backpressure alone. Try 3–4. The EGFX-over-UDP path has its own
+    /// always-on version (MACRDP_UDP_EGFX_MAX_FRAME_LAG). Config:
+    /// H264_MAX_UNACKED_FRAMES.
+    #[arg(long, default_value_t = 0)]
+    h264_max_unacked_frames: u32,
+
     /// Number of trailing "flush" frames re-sent after the last on-screen change
     /// (only with --enable-h264). ScreenCaptureKit stops delivering frames on a
     /// static screen, so the last change before a pause (e.g. the final
@@ -2607,6 +2620,10 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(path.clone());
         }
     }
+    if let Some(n) = cfg.get("H264_MAX_UNACKED_FRAMES").filter(|n| !n.is_empty()) {
+        argv.push("--h264-max-unacked-frames".into());
+        argv.push(n.clone());
+    }
     if let Some(sz) = cfg.get("MAX_CLIENT_SIZE") {
         if !sz.is_empty() {
             argv.push("--max-client-size".into());
@@ -3459,6 +3476,7 @@ async fn async_main() -> Result<()> {
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,
             args.h264_frames_in_flight.max(1),
+            args.h264_max_unacked_frames,
             egfx_on_lossy_flag.clone(),
             egfx_on_udp_flag.clone(),
             egfx_demigrate_flag.clone(),
