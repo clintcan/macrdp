@@ -347,6 +347,7 @@ async fn capture_loop(
     // killed the stream's content source — audio cut out, or the restart loop
     // thrashed it in and out. The virtual display survives both, so follow it.
     // Falls back to the first display if the id isn't enumerated (transient).
+    let target_display_id = target_display_id.map(crate::virtual_display::current_id);
     let display = match target_display_id {
         Some(id) => displays
             .iter()

@@ -413,6 +413,8 @@ pub struct CaptureDisplay {
     /// pinned off there, and `updates()` re-modes the display to match
     /// `desktop_size` before each capture stream is built.
     pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    /// Set when SCK couldn't find the virtual display, so the next start recreates it.
+    pub recreate_virtual_display: Arc<AtomicBool>,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -458,39 +460,34 @@ fn mirror_display_index(display_ids: &[u32], main_id: u32) -> Option<usize> {
     )
 }
 
-/// Vendor id on every macrdp virtual display descriptor ("macr").
+/// Backoff while SCK trails a display (re-)registration; `None` gives up after ~3.5 s.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const VIRTUAL_DISPLAY_VENDOR: u32 = 0x6D616372;
+fn sck_retry_delay(attempt: u32) -> Option<Duration> {
+    const DELAYS_MS: [u64; 6] = [100, 200, 400, 800, 1000, 1000];
+    DELAYS_MS
+        .get(attempt as usize)
+        .map(|&ms| Duration::from_millis(ms))
+}
 
-/// One display SCK lists, as the capture reopen sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-struct OnlineDisplay {
+/// SCK listed no display with the wanted id, even after retrying.
+#[derive(Debug)]
+struct DisplayMissing {
     id: u32,
-    vendor: u32,
-    builtin: bool,
-    size_px: (u32, u32),
+    seen: String,
 }
 
-/// The id a lost virtual display came back under: the same id, else the only
-/// display with our vendor id, else the only external display of the session's
-/// size. `None` while it is not back. Waking can make WindowServer re-register
-/// the virtual display under a new id, and the old one never returns.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn pick_reopened_display(old: u32, online: &[OnlineDisplay], size_px: (u32, u32)) -> Option<u32> {
-    if online.iter().any(|d| d.id == old) {
-        return Some(old);
+impl std::fmt::Display for DisplayMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SCK enumeration has no display with id={} — the virtual display didn't \
+             register, or the WindowServer hasn't picked it up yet. SCK sees: [{}]",
+            self.id, self.seen
+        )
     }
-    let unique = |f: &dyn Fn(&OnlineDisplay) -> bool| {
-        let mut it = online.iter().filter(|d| f(d));
-        match (it.next(), it.next()) {
-            (Some(d), None) => Some(d.id),
-            _ => None,
-        }
-    };
-    unique(&|d| d.vendor == VIRTUAL_DISPLAY_VENDOR)
-        .or_else(|| unique(&|d| !d.builtin && d.size_px == size_px))
 }
+
+impl std::error::Error for DisplayMissing {}
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
 ///
@@ -694,13 +691,56 @@ impl RdpServerDisplay for CaptureDisplay {
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
         let (width, height) = self.sync_virtual_display();
-        self.build_updates(width, height)
-            .await
-            .map_err(display_error)
+        let result = self.build_updates(width, height).await;
+        if let Err(e) = &result {
+            if self.virtual_display.is_some() && e.downcast_ref::<DisplayMissing>().is_some() {
+                self.recreate_virtual_display.store(true, Ordering::Relaxed);
+            }
+        }
+        result.map_err(display_error)
     }
 }
 
 impl CaptureDisplay {
+    /// Captures the virtual display's current id, recreating the display if it is gone.
+    fn resolve_virtual_display(&mut self, vd: &mut crate::virtual_display::VirtualDisplay) {
+        let before = vd.display_id();
+        let result = if self.recreate_virtual_display.swap(false, Ordering::Relaxed) {
+            tracing::warn!(
+                display_id = before,
+                "recreating the virtual display the last capture couldn't find"
+            );
+            vd.recreate().map(|()| true)
+        } else {
+            vd.ensure_live()
+        };
+        match result {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::info!(
+                    old = before,
+                    new = vd.display_id(),
+                    "virtual display id changed; capturing the new one"
+                );
+                self.screen_size_pts = vd.size_pts();
+                // A re-registered display lands where WindowServer puts it; keep it main.
+                #[cfg(target_os = "macos")]
+                if self.session_tracker.is_some()
+                    && !(self.shielded_primary.is_some()
+                        && crate::virtual_display::shield_keeps_physical_main())
+                {
+                    if let Err(e) = vd.reanchor_as_main() {
+                        tracing::warn!(error = ?e, "re-anchoring the re-registered vd as main failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, display_id = before, "re-resolving the virtual display failed")
+            }
+        }
+        self.display_id = Some(vd.display_id());
+    }
+
     /// Keep the virtual display's mode in sync with the session size,
     /// returning the (possibly corrected) size to serve.
     /// [`RdpServerDisplay::updates`] runs at connect AND after every
@@ -718,6 +758,7 @@ impl CaptureDisplay {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
+        self.resolve_virtual_display(&mut vd);
         let (cur_w, cur_h) = vd.size_pts();
         if (cur_w as u16, cur_h as u16) == (width, height) {
             return (width, height);
@@ -1215,6 +1256,46 @@ mod macos {
         suppress_next_adopt: Arc<AtomicBool>,
     }
 
+    /// Finds `target` in SCK's list, retrying while SCK trails WindowServer.
+    async fn find_sck_display(
+        target: u32,
+    ) -> Result<screencapturekit::shareable_content::SCDisplay> {
+        let mut attempt = 0;
+        loop {
+            let content = AsyncSCShareableContent::get()
+                .await
+                .map_err(|e| anyhow!("AsyncSCShareableContent::get failed (likely Screen Recording permission denied): {e:?}"))?;
+            let displays = content.displays();
+            let id = crate::virtual_display::current_id(target);
+            if let Some(d) = displays.iter().find(|d| d.display_id() == id) {
+                if attempt > 0 {
+                    tracing::info!(
+                        display_id = id,
+                        attempt,
+                        "SCK listed the display after retrying"
+                    );
+                }
+                return Ok(d.clone());
+            }
+            let seen = displays
+                .iter()
+                .map(|d| format!("id={} {}x{}", d.display_id(), d.width(), d.height()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let Some(delay) = sck_retry_delay(attempt) else {
+                return Err(DisplayMissing { id, seen }.into());
+            };
+            tracing::debug!(
+                display_id = id,
+                attempt,
+                seen,
+                "SCK doesn't list the display yet; retrying"
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
     impl ScreenCaptureUpdates {
         #[allow(clippy::too_many_arguments)]
         pub async fn start(
@@ -1236,33 +1317,13 @@ mod macos {
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
         ) -> Result<Self> {
-            let content = AsyncSCShareableContent::get()
-                .await
-                .map_err(|e| anyhow!("AsyncSCShareableContent::get failed (likely Screen Recording permission denied): {e:?}"))?;
-
-            let displays = content.displays();
             let display = match target_display_id {
-                Some(id) => displays
-                    .iter()
-                    .find(|d| d.display_id() == id)
-                    .with_context(|| {
-                        format!(
-                            "SCK enumeration has no display with id={id} — the \
-                             virtual display didn't register, or the WindowServer \
-                             hasn't picked it up yet. SCK sees: [{}]",
-                            displays
-                                .iter()
-                                .map(|d| format!(
-                                    "id={} {}x{}",
-                                    d.display_id(),
-                                    d.width(),
-                                    d.height()
-                                ))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })?,
+                Some(id) => find_sck_display(id).await?,
                 None => {
+                    let content = AsyncSCShareableContent::get()
+                        .await
+                        .map_err(|e| anyhow!("AsyncSCShareableContent::get failed (likely Screen Recording permission denied): {e:?}"))?;
+                    let displays = content.displays();
                     // Mirror mode: follow the main display, as input does.
                     let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
                     let main_id = core_graphics::display::CGDisplay::main().id;
@@ -1276,9 +1337,10 @@ mod macos {
                             "multiple displays: mirroring the main display"
                         );
                     }
-                    &displays[index]
+                    displays[index].clone()
                 }
             };
+            let display = &display;
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
             let native_h = u16::try_from(display.height()).context("display height > u16")?;
@@ -1448,9 +1510,15 @@ mod macos {
                 let id = if self.follows_virtual_display {
                     let online: Vec<_> = displays
                         .iter()
-                        .map(|d| online_display(d.display_id()))
+                        .map(|d| crate::virtual_display::online_display(d.display_id()))
                         .collect();
-                    match super::pick_reopened_display(self.display_id, &online, self.size_px) {
+                    match crate::virtual_display::pick_display_id(
+                        self.display_id,
+                        0,
+                        &online,
+                        crate::virtual_display::DisplayIdentity::ours(),
+                        self.size_px,
+                    ) {
                         Some(id) => id,
                         None => continue,
                     }
@@ -1461,11 +1529,8 @@ mod macos {
                     continue;
                 };
                 if id != self.display_id {
-                    tracing::warn!(
-                        old = self.display_id,
-                        new = id,
-                        "virtual display came back under a new id"
-                    );
+                    // Input, audio, the HUD and the overlays follow it through `current_id`.
+                    crate::virtual_display::record_id_change(self.display_id, id);
                     self.display_id = id;
                 }
                 match DisplayStream::start(display, &self.stream_config) {
@@ -1483,22 +1548,6 @@ mod macos {
                     Err(e) => tracing::debug!(error = ?e, "reopening the SCK capture failed"),
                 }
             }
-        }
-    }
-
-    fn online_display(id: u32) -> super::OnlineDisplay {
-        extern "C" {
-            fn CGDisplayVendorNumber(display: u32) -> u32;
-        }
-        let d = core_graphics::display::CGDisplay::new(id);
-        let size_px = d.display_mode().map_or((0, 0), |m| {
-            (m.pixel_width() as u32, m.pixel_height() as u32)
-        });
-        super::OnlineDisplay {
-            id,
-            vendor: unsafe { CGDisplayVendorNumber(id) },
-            builtin: d.is_builtin(),
-            size_px,
         }
     }
 
@@ -2040,40 +2089,26 @@ mod stub {
 mod tests {
     use super::*;
 
-    fn online(id: u32, vendor: u32, builtin: bool, size_px: (u32, u32)) -> OnlineDisplay {
-        OnlineDisplay {
-            id,
-            vendor,
-            builtin,
-            size_px,
-        }
+    #[test]
+    fn sck_retry_backs_off_and_gives_up_within_seconds() {
+        let delays: Vec<_> = (0..).map_while(sck_retry_delay).collect();
+        assert!(delays.len() >= 3);
+        assert!(delays.windows(2).all(|w| w[0] <= w[1]));
+        let total: Duration = delays.iter().sum();
+        assert!(total >= Duration::from_secs(2) && total <= Duration::from_secs(5));
+        assert_eq!(sck_retry_delay(delays.len() as u32), None);
     }
 
     #[test]
-    fn a_reregistered_virtual_display_is_found_by_vendor_then_by_size() {
-        const PANEL: u32 = 0x610;
-        const ODD: u32 = 1;
-        let ours = VIRTUAL_DISPLAY_VENDOR;
-        let session = (3024, 1898);
-        let same = [online(22, ours, false, session)];
-        assert_eq!(pick_reopened_display(22, &same, session), Some(22));
-        let by_vendor = [
-            online(1, PANEL, true, (3024, 1964)),
-            online(23, ours, false, session),
-        ];
-        assert_eq!(pick_reopened_display(22, &by_vendor, session), Some(23));
-        let by_size = [
-            online(1, PANEL, true, session),
-            online(23, ODD, false, session),
-        ];
-        assert_eq!(pick_reopened_display(22, &by_size, session), Some(23));
-        let ambiguous = [
-            online(23, ODD, false, session),
-            online(24, ODD, false, session),
-        ];
-        assert_eq!(pick_reopened_display(22, &ambiguous, session), None);
-        let gone = [online(1, PANEL, true, (3024, 1964))];
-        assert_eq!(pick_reopened_display(22, &gone, session), None);
+    fn display_missing_survives_anyhow_for_the_recreate_decision() {
+        let e: anyhow::Error = DisplayMissing {
+            id: 17,
+            seen: "id=21 3024x1898".into(),
+        }
+        .into();
+        let e = e.context("starting captures");
+        assert!(e.downcast_ref::<DisplayMissing>().is_some());
+        assert!(format!("{:#}", e).contains("id=17"));
     }
 
     /// #205: mirror the main display even when SCK lists another first.
