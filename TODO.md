@@ -25,8 +25,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
   - **Divergence (33)** is claimed by both #201 and #228 — whichever merges second renumbers.
   - **#225** (vendor move onto `clintcan/IronRDP`): accepted; branch `macrdp` created at `e258f6a0`; waiting
     for rophy's PR into it.
-  - **#186 upstream:** opened as Devolutions/IronRDP#2432 (2026-11-14); when it merges, vendored
-    divergence (32) drops out at the next pin bump.
+  - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
+    divergence (32) drops out at the next pin bump to any rev at or after it.
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs

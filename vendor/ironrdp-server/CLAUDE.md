@@ -103,9 +103,12 @@ Notes on the port:
   with no bound, so a peer that sent a Connection Request and went silent held the
   serving connection forever, pre-authentication. 60 s rather than 10 s because Windows
   App for macOS prompts for the password inside this phase (7-11 s measured
-  accept-to-auth) and a cellular CredSSP took 12.5 s. Upstream master has the same
-  gap. Test: `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused
-  clock; fails without the bound, and with a 30 s one). Upstream candidate.
+  accept-to-auth) and a cellular CredSSP took 12.5 s. Test:
+  `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused clock; fails
+  without the bound, and with a 30 s one). **Upstreamed** as Devolutions/IronRDP#2432,
+  merged 2026-11-14 (`e482e340`, 60 s `NEGOTIATION_TIMEOUT` around
+  `negotiate_and_authenticate`, covering every entry point). Drops at the next pin bump
+  to any rev at or after `e482e340`; keep the conn_test as the regression check.
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
