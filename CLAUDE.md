@@ -29,7 +29,7 @@ tunnel so mstsc no longer closes it at 65 s, #257; the S_OK Initiate Multitransp
 Response no longer spends the one Soft-Sync when lossy audio or EGFX is set to migrate,
 which had silenced lossy audio and disabled `--udp-migrate-egfx` since v0.10.0, #258;
 lossy waves stay on TCP until the Soft-Sync is acknowledged, #259).
-Next: Windows 10 mstsc fixes awaiting rebase (#228, #230).
+Next: #230 (Windows 10 frozen start), ported and waiting on rophy's OK; #228 merged.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

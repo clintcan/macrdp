@@ -7,31 +7,31 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Open PRs — review state (as of 2026-11-15).** Labels track it: `waiting on author` = the
-  contributor owes a change; everything else is ours. Merged 11-12→15: #197 #200 #201 #219 #240/#254
-  #255 #256 #257 #258 #259 #260 #263 #264.
-  - **#228** (@rophy, Win10 black screen) — rebased; changes requested to match upstream #2229: gate Stream
-    Surface Bits on the client's `STREAM_SURFACE_BITS`, prefer RemoteFX over ImageRemoteFX regardless of
-    list order. Then Win11 mstsc **bitmap-mode** live test (the SPS half already passed Win11 + Windows App).
-  - **#230** (@rophy, Win10 starts frozen) — asked to rebase keeping only `02fa269` (its other commit is
-    covered by #248). If rophy hasn't after #228 merges, rebase it ourselves (maintainer edits allowed).
-  - **#261** (@antonmos, pre-EGFX first-frame fix, split from #201) — live-tested on all three clients;
-    only a misplaced doc comment in `src/h264.rs` is left.
+- [ ] **Open PRs — review state (as of 2026-11-16).** Labels track it: `waiting on author` = the
+  contributor owes a change; everything else is ours. Merged 11-12→16: #197 #200 #201 #219 #228
+  #240/#254 #255 #256 #257 #258 #259 #260 #263 #264 #265.
+  - **#230** (@rophy, Win10 starts frozen) — ported by us onto #265 (local branch `pr230-port`, worktree
+    `../macrdp-pr230`, author rophy): the hold runs first and shares #265's start clock. QA done, live on
+    Win11 mstsc. Asked rophy (11-15) whether we may force-push it to their branch; waiting.
+  - **#262** (@antonmos, `--h264-max-unacked-frames`) — changes requested: exempt the trailing flush
+    frames from the cap (mstsc can strand the last keystroke), add a test for the limit choice.
   - **#231 / #232** (@SferaDev, virtual display re-registered after display sleep / wake the displays) —
     both conflict with `main` after #201, and with each other; asked to merge #231 first and rebase #232
     on it. #231 has one picker now and records id changes mid-session; its rebase must make `recreate()`
     keep HiDPI, the pixel size, and clear the recorded mode. Neither has said what was tested live; #232
     also owes answers on `--allow-sleep` and the 3 s wait in `DetachedPrimary::drop`.
   - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in.
-  - **Not reviewed:** #204 (@antonmos, `--capture-nv12`), #262 (@antonmos, `--h264-max-unacked-frames`).
-  - **Divergence (33)** is now #201's (scale factors on `ConnectionInfo`); #228 renumbers to (34).
+  - **Not reviewed:** #204 (@antonmos, `--capture-nv12`).
+  - **Divergences (33)/(34)** are #201's (scale factors on `ConnectionInfo`) and #228's (RemoteFX surface
+    command, = upstream #2229 `e20a2147`, so (34) also drops at a pin bump past it).
   - **#225** (vendor move onto `clintcan/IronRDP`): accepted; branch `macrdp` created at `e258f6a0`; waiting
     for rophy's PR into it.
   - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
     divergence (32) drops out at the next pin bump to any rev at or after it.
   - **Next pin bump drops these vendored `ironrdp-server` divergences** (all merged upstream; keep
     the `conn_test` regression tests for (31) and (32)): (29) pointer AND mask (≥ `fb25b47c`), (31) hidden/default
-    pointer updates (≥ `904a7da6`), (32) negotiation timeout (≥ `e482e340`).
+    pointer updates (≥ `904a7da6`), (32) negotiation timeout (≥ `e482e340`), (34) RemoteFX surface command
+    (≥ `e20a2147`).
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
