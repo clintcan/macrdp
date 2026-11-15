@@ -1648,6 +1648,14 @@ pub struct Gfx {
     reactivate_request: Arc<AtomicU32>,
 }
 
+/// One captured frame on its way to the encoder: BGRA bytes the encoder
+/// converts to NV12 itself, or an NV12 pixel buffer ScreenCaptureKit already
+/// converted on the GPU.
+enum FrameInput<'a> {
+    Bgra { bgra: &'a [u8], stride: usize },
+    Nv12(&'a screencapturekit::cv::CVPixelBuffer),
+}
+
 impl Gfx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1970,6 +1978,21 @@ impl Gfx {
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+        self.submit_frame(FrameInput::Bgra { bgra, stride }, request_keyframe)
+    }
+
+    /// [`Self::submit_bgra`] for a capture-owned full-range NV12 pixel buffer
+    /// (`--capture-nv12`): VideoToolbox encodes it as-is, with no CPU colour
+    /// conversion and no copy. Same return contract.
+    pub fn submit_nv12(
+        &self,
+        pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
+        request_keyframe: bool,
+    ) -> Result<bool> {
+        self.submit_frame(FrameInput::Nv12(pixel_buffer), request_keyframe)
+    }
+
+    fn submit_frame(&self, frame: FrameInput<'_>, request_keyframe: bool) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -2406,7 +2429,12 @@ impl Gfx {
             if let Some(frames) = adaptive.keyframe_frames {
                 encoder.set_keyframe_interval(frames);
             }
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            match frame {
+                FrameInput::Bgra { bgra, stride } => {
+                    encoder.encode_bgra(bgra, stride, force_keyframe)?
+                }
+                FrameInput::Nv12(pb) => encoder.encode_pixel_buffer(pb, force_keyframe)?,
+            }
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
