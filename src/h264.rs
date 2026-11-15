@@ -1651,6 +1651,14 @@ pub struct Gfx {
     reactivate_request: Arc<AtomicU32>,
 }
 
+/// One captured frame on its way to the encoder: BGRA bytes the encoder
+/// converts to NV12 itself, or an NV12 pixel buffer ScreenCaptureKit already
+/// converted on the GPU.
+enum FrameInput<'a> {
+    Bgra { bgra: &'a [u8], stride: usize },
+    Nv12(&'a screencapturekit::cv::CVPixelBuffer),
+}
+
 impl Gfx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1975,6 +1983,21 @@ impl Gfx {
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+        self.submit_frame(FrameInput::Bgra { bgra, stride }, request_keyframe)
+    }
+
+    /// [`Self::submit_bgra`] for a capture-owned full-range NV12 pixel buffer
+    /// (`--capture-nv12`): VideoToolbox encodes it as-is, with no CPU colour
+    /// conversion and no copy. Same return contract.
+    pub fn submit_nv12(
+        &self,
+        pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
+        request_keyframe: bool,
+    ) -> Result<bool> {
+        self.submit_frame(FrameInput::Nv12(pixel_buffer), request_keyframe)
+    }
+
+    fn submit_frame(&self, frame: FrameInput<'_>, request_keyframe: bool) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -2421,7 +2444,12 @@ impl Gfx {
             if let Some(frames) = adaptive.keyframe_frames {
                 encoder.set_keyframe_interval(frames);
             }
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            match frame {
+                FrameInput::Bgra { bgra, stride } => {
+                    encoder.encode_bgra(bgra, stride, force_keyframe)?
+                }
+                FrameInput::Nv12(pb) => encoder.encode_pixel_buffer(pb, force_keyframe)?,
+            }
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
@@ -2915,6 +2943,25 @@ impl Gfx {
             _ => warn!("EGFX blank remap finished on a stale connection — result discarded"),
         }
         Ok(())
+    }
+
+    /// Whether this connection's H.264 pipeline is up.
+    pub(crate) fn pipeline_ready(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_ready)
+    }
+
+    /// Whether a client is connected whose graphics pipeline is still being
+    /// negotiated: neither ready nor declined.
+    pub(crate) fn pipeline_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| !ctx.is_ready && !ctx.egfx_declined.load(Ordering::Relaxed))
     }
 
     /// Live client-driven resize (MS-RDPEDISP monitor layout — the client
@@ -6399,5 +6446,40 @@ mod tests {
         let ctx = guard.as_ref().unwrap();
         assert!(!ctx.is_ready);
         assert_eq!(clocks(ctx), [built; 11]);
+    }
+
+    /// The capture loop holds a pre-EGFX frame only while the pipeline is
+    /// still coming: pending until the client's graphics channel is confirmed
+    /// (ready) or declined, and never without a connection.
+    #[test]
+    fn pipeline_state_tracks_the_graphics_channel() {
+        let gfx = gfx_with_context();
+        assert!(gfx.pipeline_pending());
+        assert!(!gfx.pipeline_ready());
+
+        gfx.ctx
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .client_supports_avc = true;
+        GfxHandler {
+            ctx: gfx.ctx.clone(),
+        }
+        .on_ready(&avc_ready());
+        assert!(gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
+
+        let declined = gfx_with_context();
+        GfxHandler {
+            ctx: declined.ctx.clone(),
+        }
+        .on_ready(&avc_ready()); // no AVC
+        assert!(!declined.pipeline_ready());
+        assert!(!declined.pipeline_pending());
+
+        *gfx.ctx.lock().unwrap() = None;
+        assert!(!gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
     }
 }
