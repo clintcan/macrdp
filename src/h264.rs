@@ -2902,6 +2902,25 @@ impl Gfx {
         Ok(())
     }
 
+    /// Whether this connection's H.264 pipeline is up.
+    pub(crate) fn pipeline_ready(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_ready)
+    }
+
+    /// Whether a client is connected whose graphics pipeline is still being
+    /// negotiated: neither ready nor declined.
+    pub(crate) fn pipeline_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| !ctx.is_ready && !ctx.egfx_declined.load(Ordering::Relaxed))
+    }
+
     /// Live client-driven resize (MS-RDPEDISP monitor layout — the client
     /// resized its window) for an active EGFX/H.264 session. Called by the
     /// capture loop right before it emits the `DisplayUpdate::Resize` that
@@ -6383,5 +6402,40 @@ mod tests {
         let ctx = guard.as_ref().unwrap();
         assert!(!ctx.is_ready);
         assert_eq!(clocks(ctx), [built; 11]);
+    }
+
+    /// The capture loop holds a pre-EGFX frame only while the pipeline is
+    /// still coming: pending until the client's graphics channel is confirmed
+    /// (ready) or declined, and never without a connection.
+    #[test]
+    fn pipeline_state_tracks_the_graphics_channel() {
+        let gfx = gfx_with_context();
+        assert!(gfx.pipeline_pending());
+        assert!(!gfx.pipeline_ready());
+
+        gfx.ctx
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .client_supports_avc = true;
+        GfxHandler {
+            ctx: gfx.ctx.clone(),
+        }
+        .on_ready(&avc_ready());
+        assert!(gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
+
+        let declined = gfx_with_context();
+        GfxHandler {
+            ctx: declined.ctx.clone(),
+        }
+        .on_ready(&avc_ready()); // no AVC
+        assert!(!declined.pipeline_ready());
+        assert!(!declined.pipeline_pending());
+
+        *gfx.ctx.lock().unwrap() = None;
+        assert!(!gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
     }
 }
