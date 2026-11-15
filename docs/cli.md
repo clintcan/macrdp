@@ -258,7 +258,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   catches up. Bounds lag when the client decodes at
                           #   about the rate we send (otherwise every burst
                           #   leaves a backlog that drains for seconds). 0 = off
-                          #   (default). Try 3-4. Config: H264_MAX_UNACKED_FRAMES.
+                          #   (default). Try 3-4. The --flush-frames
+                          #   re-sends are exempt, so the last change still shows.
+                          #   Config: H264_MAX_UNACKED_FRAMES.
 --bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
                           #   --enable-h264). With --adaptive-bitrate it's the
                           #   ceiling the encoder backs off from under congestion;

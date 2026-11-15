@@ -1476,6 +1476,28 @@ fn recovery_config_from_env() -> (bool, RecoveryParams) {
     (enabled, params)
 }
 
+/// The client ack-lag cap (frames shipped but not yet acknowledged) for one
+/// submit; 0 = no cap.
+///
+/// - On the reliable UDP tunnel the cap is always on (`udp_limit`, ≥ 1), for
+///   every frame, flush re-submits included — unchanged from before the TCP cap.
+/// - On TCP it applies only with `--h264-max-unacked-frames` (`tcp_limit` > 0),
+///   and never to a flush re-submit. mstsc presents an AVC420 frame (and only
+///   then acknowledges it) once about two more arrive behind it, so on a still
+///   screen the flush frames are what get the last change shown. Capped, at most
+///   one of them would pass the 100 ms trickle floor, and the last keystroke
+///   could stay unshown until the next keyframe. They are bounded
+///   (`--flush-frames` per change) and are what let the client catch up.
+fn ack_lag_limit(on_udp: bool, udp_limit: u64, tcp_limit: u64, flush: bool) -> u64 {
+    if on_udp {
+        udp_limit
+    } else if flush {
+        0
+    } else {
+        tcp_limit
+    }
+}
+
 /// Cloneable factory + frame-submit handle. One clone is boxed into
 /// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
 /// side as the `submit_bgra` entry point.
@@ -1977,13 +1999,23 @@ impl Gfx {
     /// some clients (mstsc) only resolve cleanly at the next periodic IDR (the
     /// "takes a while to come to front" lag); a forced IDR lands them at once.
     ///
+    /// `flush` marks a trailing flush re-submit (`--flush-frames`): the last
+    /// frame sent again on a static screen so mstsc presents it. Those are
+    /// exempt from the TCP ack-lag cap (see [`ack_lag_limit`]).
+    ///
     /// Returns `Ok(true)` when EGFX is the active display path (so the caller
     /// should suppress legacy BitmapUpdates for this frame — even if this
     /// particular frame was skipped for backpressure or isn't encoded yet).
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
-    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
-        self.submit_frame(FrameInput::Bgra { bgra, stride }, request_keyframe)
+    pub fn submit_bgra(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+        flush: bool,
+    ) -> Result<bool> {
+        self.submit_frame(FrameInput::Bgra { bgra, stride }, request_keyframe, flush)
     }
 
     /// [`Self::submit_bgra`] for a capture-owned full-range NV12 pixel buffer
@@ -1993,11 +2025,17 @@ impl Gfx {
         &self,
         pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
         request_keyframe: bool,
+        flush: bool,
     ) -> Result<bool> {
-        self.submit_frame(FrameInput::Nv12(pixel_buffer), request_keyframe)
+        self.submit_frame(FrameInput::Nv12(pixel_buffer), request_keyframe, flush)
     }
 
-    fn submit_frame(&self, frame: FrameInput<'_>, request_keyframe: bool) -> Result<bool> {
+    fn submit_frame(
+        &self,
+        frame: FrameInput<'_>,
+        request_keyframe: bool,
+        flush: bool,
+    ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -2359,15 +2397,17 @@ impl Gfx {
             // loop runs at about the rate we send: every burst then leaves a
             // backlog that drains at the small rate difference, which measured as
             // 200–600 ms of lag for 10–20 s at a time (Windows App, 3456×2168).
+            // Flush re-submits are exempt on TCP (see `ack_lag_limit`).
             // Gated to acks actually flowing (a suspended-ack client falls back to
             // the submitted−shipped throttle above), and to having seen ≥1 ack (no
             // cold-start false drop). Dropping before encode keeps the H.264
             // reference chain valid.
-            let lag_limit = if self.egfx_on_udp.load(Ordering::Relaxed) {
-                self.max_frame_lag
-            } else {
-                self.tcp_max_frame_lag
-            };
+            let lag_limit = ack_lag_limit(
+                self.egfx_on_udp.load(Ordering::Relaxed),
+                self.max_frame_lag,
+                self.tcp_max_frame_lag,
+                flush,
+            );
             if lag_limit > 0 && ctx.egfx_acks_seen && !ctx.acks_suspended {
                 let lag = ctx
                     .last_shipped_frame_id
@@ -3785,6 +3825,31 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ack_lag_limit_tcp_is_off_unless_configured() {
+        // TCP with N = 0 never drops, flush or not.
+        assert_eq!(super::ack_lag_limit(false, 30, 0, false), 0);
+        assert_eq!(super::ack_lag_limit(false, 30, 0, true), 0);
+        // TCP with N > 0 caps captures at N.
+        assert_eq!(super::ack_lag_limit(false, 30, 4, false), 4);
+    }
+
+    #[test]
+    fn ack_lag_limit_exempts_tcp_flush_frames() {
+        assert_eq!(super::ack_lag_limit(false, 30, 4, true), 0);
+    }
+
+    #[test]
+    fn ack_lag_limit_udp_always_caps() {
+        // The UDP tunnel keeps its own limit whatever the TCP setting, and
+        // flush re-submits stay capped there as they always were.
+        for tcp in [0, 4] {
+            for flush in [false, true] {
+                assert_eq!(super::ack_lag_limit(true, 30, tcp, flush), 30);
+            }
+        }
+    }
+
     use super::*;
 
     /// #211: the iOS client sends two capsets this build can't parse. The log

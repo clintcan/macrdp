@@ -525,9 +525,10 @@ struct Args {
     /// Without it, a client that decodes at roughly the rate we send builds a
     /// backlog on every burst that can take seconds to drain — felt as
     /// hundreds of ms of input lag. 0 (default) = off, the TCP path relies on
-    /// socket backpressure alone. Try 3–4. The EGFX-over-UDP path has its own
-    /// always-on version (MACRDP_UDP_EGFX_MAX_FRAME_LAG). Config:
-    /// H264_MAX_UNACKED_FRAMES.
+    /// socket backpressure alone. Try 3–4. The --flush-frames re-sends are
+    /// exempt, so the last change before a pause still shows. The EGFX-over-UDP
+    /// path has its own always-on version (MACRDP_UDP_EGFX_MAX_FRAME_LAG).
+    /// Config: H264_MAX_UNACKED_FRAMES.
     #[arg(long, default_value_t = 0)]
     h264_max_unacked_frames: u32,
 
