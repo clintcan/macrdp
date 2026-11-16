@@ -13,6 +13,7 @@ mod audin;
 mod audio;
 mod auth;
 mod auth_guard;
+mod auth_status;
 mod avc444;
 mod camera;
 mod capture;
@@ -2845,8 +2846,40 @@ fn args_from_config(path: &Path) -> Result<Args> {
         .with_context(|| format!("config file {} produced invalid settings", path.display()))
 }
 
+/// Log a startup credential failure once and write the auth-status file the
+/// controller reads (#266). The caller then waits and re-reads the password
+/// instead of exiting into a launchd KeepAlive restart loop.
+fn report_auth_failure(
+    err: &anyhow::Error,
+    failure: auth_status::Failure,
+    username: &str,
+    status_dir: &Option<PathBuf>,
+) {
+    error!(
+        error = format!("{err:#}"),
+        reason = failure.code(),
+        user = %username,
+        "cannot start: no valid password for this Mac account. Waiting, and checking \
+         again only when the stored password changes, so the account doesn't collect \
+         failed logins. Re-enter it in the macrdp menu-bar controller, or fix the \
+         Keychain entry"
+    );
+    if let Some(dir) = status_dir.as_deref() {
+        if let Err(e) = auth_status::write(dir, failure, username) {
+            warn!(error = %e, "could not write the auth-status file for the controller");
+        }
+    }
+}
+
 async fn async_main() -> Result<()> {
     let mut args = Args::parse();
+    // Where the auth-status file goes for the controller (#266): beside the
+    // config file when there is one, else the default config directory.
+    let status_dir: Option<PathBuf> = args
+        .config
+        .as_deref()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .or_else(|| default_cert_dir().ok());
     // If launched with `--config <file>` (the LaunchAgent path), the file is the
     // sole source of truth — rebuild Args from it.
     if let Some(cfg_path) = args.config.clone() {
@@ -3090,6 +3123,116 @@ async fn async_main() -> Result<()> {
         std::process::exit(0);
     });
 
+    // Credentials first (#266): read and check the password BEFORE any setup
+    // with side effects (sleep blocker, virtual display, helper processes), so a
+    // wrong password costs nothing but the check itself. Under launchd a failure
+    // does not exit: KeepAlive would restart it every ~10 s, each restart another
+    // failed check against the Mac account. See src/auth_status.rs.
+    let username = args
+        .username
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
+    // Only the Keychain and a password file can change while we wait; the
+    // terminal prompt and --password are one-shot, so they never wait.
+    let pollable = args.keychain || args.password_file.is_some();
+    let park = pollable
+        && auth_status::should_park(
+            std::io::stdout().is_terminal(),
+            std::env::var("MACRDP_PARK_ON_AUTH_FAILURE").ok().as_deref(),
+        );
+    let mut cli_password = args.password.take();
+    // The password the account check last rejected. While parked, PAM runs
+    // again only once the stored password differs from it, so waiting adds no
+    // failed logins; a missing or unreadable password is re-read with no PAM.
+    let mut rejected: Option<Zeroizing<String>> = None;
+    let mut reported: Option<auth_status::Failure> = None;
+    let password: Zeroizing<String> = loop {
+        let read: Result<Zeroizing<String>> = if args.keychain {
+            read_password_from_keychain(&username)
+        } else if let Some(path) = args.password_file.as_deref() {
+            read_password_file(path)
+        } else if let Some(p) = cli_password.take() {
+            warn!(
+                "--password is visible to any local user via `ps` and may be saved in \
+                 shell history; prefer --keychain (headless) or the interactive prompt. \
+                 Kept only for compatibility / scripted tests."
+            );
+            Ok(Zeroizing::new(p))
+        } else {
+            rpassword::prompt_password(format!("Password for {username}: "))
+                .map(Zeroizing::new)
+                .context("read password from terminal")
+        };
+        let (failure, err) = match read {
+            Err(e) => (auth_status::Failure::NoPassword, e),
+            Ok(p) => {
+                if !auth_status::should_check(rejected.as_ref().map(|r| r.as_str()), &p) {
+                    // Same password the check already rejected: no new check,
+                    // keep waiting (the report below runs only on a change of
+                    // reason, e.g. after the entry briefly went missing).
+                    (
+                        auth_status::Failure::WrongPassword,
+                        anyhow!("the stored password is still the one the account check rejected"),
+                    )
+                } else if args.skip_auth {
+                    break p;
+                } else {
+                    if rejected.is_some() {
+                        info!(user = %username, "the stored password changed — checking it again");
+                    }
+                    match auth::authenticate(&username, p.as_str())
+                        .with_context(|| format!("PAM auth failed for {username}"))
+                    {
+                        Ok(()) => {
+                            info!(user = %username, "PAM auth ok");
+                            break p;
+                        }
+                        Err(e) => {
+                            rejected = Some(p);
+                            (auth_status::Failure::WrongPassword, e)
+                        }
+                    }
+                }
+            }
+        };
+        if !park {
+            return Err(err);
+        }
+        if reported != Some(failure) {
+            report_auth_failure(&err, failure, &username, &status_dir);
+            reported = Some(failure);
+        }
+        tokio::time::sleep(auth_status::POLL_INTERVAL).await;
+    };
+    if reported.is_some() {
+        info!(user = %username, "a valid password is available now — starting");
+    }
+    // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
+    // exact validated credential without a second Keychain read — works
+    // identically regardless of which branch above produced it.
+    let password: Arc<Zeroizing<String>> = Arc::new(password);
+    if args.skip_auth {
+        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
+        // listener is reachable beyond loopback so a fat-fingered config
+        // can't accidentally expose an unauth'd RDP server to the LAN.
+        if !args.bind.ip().is_loopback() {
+            return Err(anyhow!(
+                "--skip-auth refused on non-loopback bind {} — \
+                 remove --skip-auth or rebind to 127.0.0.1",
+                args.bind,
+            ));
+        }
+        warn!(
+            "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
+        );
+    }
+    if let Some(dir) = status_dir.as_deref() {
+        if let Err(e) = auth_status::clear(dir) {
+            warn!(error = %e, "could not remove the stale auth-status file");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         if !args.allow_sleep {
@@ -3179,51 +3322,6 @@ async fn async_main() -> Result<()> {
     // guard on 0→≥1 client transitions and drops it on ≥1→0. Both
     // flags subsume --make-primary (each puts the virtual display
     // at (0,0)), so if both are set, only the lazy path runs.
-    let username = args
-        .username
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
-    let password: Zeroizing<String> = if args.keychain {
-        read_password_from_keychain(&username)?
-    } else if let Some(path) = args.password_file.as_deref() {
-        read_password_file(path)?
-    } else if let Some(p) = args.password.take() {
-        warn!(
-            "--password is visible to any local user via `ps` and may be saved in \
-             shell history; prefer --keychain (headless) or the interactive prompt. \
-             Kept only for compatibility / scripted tests."
-        );
-        Zeroizing::new(p)
-    } else {
-        Zeroizing::new(
-            rpassword::prompt_password(format!("Password for {username}: "))
-                .context("read password from terminal")?,
-        )
-    };
-    // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
-    // exact validated credential without a second Keychain read — works
-    // identically regardless of which branch above produced it.
-    let password: Arc<Zeroizing<String>> = Arc::new(password);
-    if !args.skip_auth {
-        auth::authenticate(&username, password.as_str())
-            .with_context(|| format!("PAM auth failed for {username}"))?;
-        info!(user = %username, "PAM auth ok");
-    } else {
-        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
-        // listener is reachable beyond loopback so a fat-fingered config
-        // can't accidentally expose an unauth'd RDP server to the LAN.
-        if !args.bind.ip().is_loopback() {
-            return Err(anyhow!(
-                "--skip-auth refused on non-loopback bind {} — \
-                 remove --skip-auth or rebind to 127.0.0.1",
-                args.bind,
-            ));
-        }
-        warn!(
-            "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
-        );
-    }
 
     let session_tracker = capture::SessionTracker::default();
     // (--lock-on-disconnect) Connection activity the pending lock consults so

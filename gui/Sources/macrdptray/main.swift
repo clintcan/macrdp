@@ -1,4 +1,5 @@
 import AppKit
+import OpenDirectory
 import UniformTypeIdentifiers
 
 // macrdp Controller: a menu-bar app that controls the macrdp LaunchAgent
@@ -30,6 +31,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var home: URL { FileManager.default.homeDirectoryForCurrentUser }
     var configURL: URL { home.appendingPathComponent("Library/Application Support/macrdp/config.env") }
+    /// Written by the server when it can't start for want of a valid password
+    /// (#266): line 1 is "wrong-password" or "no-password". The server waits
+    /// instead of exiting, so this, not the log, is how the menu knows.
+    var authStatusURL: URL { home.appendingPathComponent("Library/Application Support/macrdp/auth-status") }
     var logURL: URL { home.appendingPathComponent("Library/Logs/macrdp.log") }
     // The server owns + rotates macrdp.log itself; stderr (panics, pre-logging
     // startup errors) goes to a small separate file.
@@ -82,8 +87,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let running = st.pid != nil
         // Dim the menu-bar icon when the server isn't running so state is
         // glanceable without opening the menu.
-        statusItem.button?.alphaValue = running ? 1.0 : 0.4
-        statusItem.button?.toolTip = running
+        let blocked = running && authStatus() != nil
+        statusItem.button?.alphaValue = running && !blocked ? 1.0 : 0.4
+        statusItem.button?.toolTip = blocked
+            ? "macrdp: waiting for a valid password"
+            : running
             ? "macrdp: running (pid \(st.pid!))"
             : (st.loaded ? "macrdp: stopped" : "macrdp: not installed")
     }
@@ -117,6 +125,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (screen, ax)
     }
 
+    /// Why the server is waiting for a password, from its auth-status file
+    /// (nil when it isn't). Only meaningful while the server is running.
+    func authStatus() -> String? {
+        guard let text = try? String(contentsOf: authStatusURL, encoding: .utf8) else { return nil }
+        switch text.split(separator: "\n").first.map(String.init) {
+        case "wrong-password": return "The password in the Keychain is wrong"
+        case "no-password": return "No password in the Keychain"
+        default: return nil
+        }
+    }
+
     /// Most recent error worth surfacing (auth failure / port in use / panic).
     func lastServerError() -> String? {
         for raw in logTail().reversed() {
@@ -140,6 +159,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let st = agentState()
         let header: String
         if !st.loaded { header = "macrdp — not installed" }
+        else if st.pid != nil, authStatus() != nil { header = "macrdp — waiting for a valid password" }
         else if let pid = st.pid { header = "macrdp — running (pid \(pid))" }
         else { header = "macrdp — stopped" }
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
@@ -151,6 +171,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let e = NSMenuItem(title: "⚠️ \(err)", action: nil, keyEquivalent: "")
             e.isEnabled = false
             menu.addItem(e)
+        }
+        if st.pid != nil, let why = authStatus() {
+            let e = NSMenuItem(title: "⚠️ \(why)", action: nil, keyEquivalent: "")
+            e.isEnabled = false
+            menu.addItem(e)
+            menu.addItem(item("Re-enter Password…", #selector(fixPassword)))
         }
         menu.addItem(.separator())
 
@@ -323,6 +349,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.window.initialFirstResponder = field
         NSApp.activate(ignoringOtherApps: true)
         guard a.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return false }
+        // Check it before saving (#266): a mistyped password stored here used to
+        // send the server into a restart loop of failed logins.
+        if verifyAccountPassword(field.stringValue) == false {
+            alert(style: .warning, "That password isn't right",
+                  "It doesn't match the macOS account \(NSUserName()). Nothing was saved; try again.")
+            return promptAndStorePassword()
+        }
         let r = run("/usr/bin/security",
                     ["add-generic-password", "-U", "-s", "macrdp", "-a", NSUserName(),
                      "-w", field.stringValue])
@@ -334,6 +367,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func setPassword() { promptAndStorePassword() }
+
+    /// The server is waiting for a valid password: take a checked one, then
+    /// restart the server once so it picks it up.
+    @objc func fixPassword() {
+        guard promptAndStorePassword() else { return }
+        _ = run("/bin/launchctl", ["kickstart", "-k", service])
+        refreshGlyph()
+    }
+
+    /// Check `password` against this Mac account through OpenDirectory (no
+    /// command line, so it never shows in `ps`). true / false when the account
+    /// answered; nil when it couldn't be checked, in which case the caller saves
+    /// it anyway and the server's own check decides.
+    func verifyAccountPassword(_ password: String) -> Bool? {
+        do {
+            let node = try ODNode(session: ODSession.default(), type: ODNodeType(kODNodeTypeAuthentication))
+            let record = try node.record(withRecordType: kODRecordTypeUsers, name: NSUserName(), attributes: nil)
+            try record.verifyPassword(password)
+            return true
+        } catch let e as NSError where e.domain == ODFrameworkErrorDomain && e.code == Int(kODErrorCredentialsInvalid.rawValue) {
+            return false
+        } catch {
+            return nil
+        }
+    }
 
     func remindPermissions() {
         let a = NSAlert()
