@@ -1405,7 +1405,7 @@ mod macos {
             };
             // `submit_to_gfx` hands the buffer over as NV12 or locks it as BGRA,
             // matching the capture format (`--capture-nv12`).
-            match submit_to_gfx(gfx, pb, self.nv12, true) {
+            match submit_to_gfx(gfx, pb, self.nv12, true, false) {
                 Ok(true) => {
                     self.held_frame = false;
                     self.seeded = true;
