@@ -212,6 +212,14 @@ src/reaper.rs     Startup reaper — on launch, sweeps leftovers from a PRIOR ma
                   DEAD-pid, non-self dirs are reaped, so it's safe with another
                   instance live. Called once from async_main on a detached thread
                   (a stale umount can't block startup).
+src/auth_status.rs What a startup credential failure does (#266): headless, the
+                  server waits instead of exiting (no KeepAlive restart loop of
+                  failed logins), writes `auth-status` beside config.env for
+                  the controller, and re-reads the password every 30 s,
+                  re-checking only a changed one; interactive, it exits. Pure,
+                  unit-tested should_park / should_check + the status-file
+                  contract (no-password / wrong-password).
+                  MACRDP_PARK_ON_AUTH_FAILURE=0/1 overrides.
 src/health.rs     Health-check watchdog (Tier 2.5) — turns a hung-but-alive
                   process into a clean exit so launchd KeepAlive restarts a fresh
                   one (KeepAlive only

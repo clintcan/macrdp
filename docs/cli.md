@@ -596,6 +596,23 @@ each interval and waits `TIMEOUT_SECS` for it to run; a deadlocked runtime never
 runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
 exiting.
 
+Startup password failures (#266). The server reads and checks the account
+password before any other setup (sleep blocker, virtual display, helpers). If
+there is no usable password, or the check rejects it, a **headless** server
+(launchd) does not exit, since `KeepAlive` would restart it about every 10 s and
+each restart would be another failed login against the Mac account. Instead it
+logs `cannot start: no valid password for this Mac account …` once, writes
+`auth-status` next to `config.env` (line 1 `no-password` or `wrong-password`,
+line 2 the account), and waits. Every 30 s it re-reads the Keychain or password
+file without an account check, and checks again only when the stored password
+has changed, so a Keychain that unlocks later or an entry fixed in Keychain
+Access recovers on its own (log: `the stored password changed — checking it
+again`). The menu-bar controller shows "waiting for a valid password" with
+**Re-enter Password…**, which checks the new password before saving it and
+restarts the server. An **interactive** run (stdout a TTY)
+exits with the error as before. Override with
+`MACRDP_PARK_ON_AUTH_FAILURE=1` (always wait) or `0` (always exit).
+
 Blank recovery + auto-reconnect (env-tunable, **settable through `config.env`**
 — the matching keys are the same names minus the `MACRDP_` prefix, e.g.
 `BLANK_RECOVERY=0`; on by default with `--enable-h264`).
