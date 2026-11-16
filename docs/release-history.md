@@ -4,6 +4,34 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.6 — no restart loop on a wrong password, a HiDPI virtual display, Windows 10 mstsc pictures
+
+A wrong password at setup no longer sends the server into a restart loop, a virtual display can now be a Retina-style 2× display, and Windows 10 mstsc shows a picture. New options are off unless you turn them on.
+
+- **A wrong or missing password no longer starts a restart loop (#267, fixes #266).**
+  - **The bug:** the controller saved whatever password you typed. With a typo, the server exited at startup and the login item restarted it about every 10 s, forever. Each restart set up the virtual display and the helpers before checking the password, then failed the check against the Mac account again, which slowed the Mac down and risked locking the account.
+  - **The fix:** the controller checks the password (through OpenDirectory) before saving it. The server checks it before any other setup, and under launchd a failure no longer exits: it waits, re-reads the Keychain every 30 s without a login check, and checks again only when the stored password has changed. While it waits, the controller's menu shows "waiting for a valid password" with **Re-enter Password…**. `MACRDP_PARK_ON_AUTH_FAILURE=1/0` overrides; a run from a terminal still exits.
+- **HiDPI virtual display (#201, thanks @antonmos).** `--virtual-display-hidpi` (config `VD_HIDPI=1`) makes the virtual display a Retina-style 2× display: the session size is its pixel count and the UI is laid out at half that, so a Retina client gets a sharp desktop instead of tiny UI. `VD_HIDPI=auto` picks the scale per connection from the client's announced scale (Windows App sends 200 with "Optimize for Retina displays" on, 100 with it off), and the pointer is scaled to match. When macOS keeps the display on its half-size variant, the mode is selected the way System Settings does it, in a short-lived helper process. Off by default.
+- **Windows 10 mstsc shows a picture (#228, fixes #226, thanks @rophy).** H.264 sessions were black because Windows 10 mstsc needs the `bitstream_restriction` VUI field in the SPS, which VideoToolbox leaves out; the SPS is now rewritten to include it. Bitmap mode was black too: RemoteFX now goes in a Stream Surface Bits command when the client supports it, as upstream IronRDP #2229 does.
+- **A frame captured before H.264 is ready no longer delays it on slow links (#265, thanks @antonmos).** The first frame used to go out as up to eight legacy bitmap strips, which took 38–68 s over a WAN while H.264 waited behind them. That frame is now kept and sent again over H.264 once it's ready, and the strips still queued are dropped.
+- **Experimental: `--capture-nv12` (#204, thanks @antonmos).** ScreenCaptureKit delivers NV12 straight to VideoToolbox instead of BGRA that macrdp converts on the CPU (measured at 3456×2168: 14.3 → 3.3 ms of CPU per frame). Needs `--enable-h264`; off by default.
+- **`--alt-q-quit` (#200, thanks @antonmos).** Option+Q (Alt+Q from Windows) reaches the focused app as Cmd+Q. Off by default; there's a toggle in the controller.
+- **The controller welcomes you on first launch (#263).** It has no window or Dock icon, so a first launch now explains where its menu-bar icon is and offers to start the server.
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, and all 380 tests pass.
+- **#267:** under the real login item on a Mac mini (with a test account), a missing password left the process running with no restart for over a minute and no display or helper setup; a password that appeared later was picked up within 30 s. The controller's menu and wrong-password dialog were checked on a MacBook.
+- **#201:** Windows App (Retina on and off) and Windows 11 mstsc at 1× 1920×1080 on the Mac mini, including the half-size variant case.
+- **#228:** Windows 11 mstsc in H.264 and bitmap mode; Windows 10 by the contributor.
+- **#265:** mstsc, FreeRDP and Windows App.
+- **Not tested live by us:** `--capture-nv12` (experimental, soaked by its author).
+
+**Known issues**
+
+- Windows 10 mstsc can still start an H.264 session frozen (#229); the fix (#230) is waiting on its author.
+- Lossy audio and `--udp-migrate-egfx` can't both move to UDP in the same session.
+
 ## v0.10.5 — UDP multitransport fixes: the mstsc tunnel stays up, lossy audio plays again
 
 A bug-fix release for UDP multitransport. Nothing changes unless `--enable-udp-multitransport` is on.

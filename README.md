@@ -18,10 +18,11 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.10.5](https://github.com/clintcan/macrdp/releases/latest)** — UDP multitransport fixes: mstsc's UDP tunnel no longer dies 90 s in, lossy UDP audio plays again (silent since v0.10.0), and `--udp-migrate-egfx` moves video onto UDP again.
+**Latest: [v0.10.6](https://github.com/clintcan/macrdp/releases/latest)** — a wrong password at setup no longer causes a restart loop, a HiDPI (Retina-style) virtual display, and Windows 10 mstsc shows a picture.
 
 **Recent releases**
 
+- **v0.10.5** (2026-11-13) — UDP multitransport fixes: mstsc's tunnel stays up, lossy audio plays again
 - **v0.10.4** (2026-11-13) — true-colour cursors, native-style app switching, `--reverse-scroll`, pre-login timeout
 - **v0.10.3** (2026-11-13) — Finder writes to redirected drives; the keyframe backoff works
 - **v0.10.2** (2026-11-13) — no session freezes from Universal Clipboard items; no stuck drive mount after a restart

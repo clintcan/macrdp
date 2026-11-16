@@ -24,12 +24,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.5** (RDPEUDP keepalive ACKs on an idle
-tunnel so mstsc no longer closes it at 65 s, #257; the S_OK Initiate Multitransport
-Response no longer spends the one Soft-Sync when lossy audio or EGFX is set to migrate,
-which had silenced lossy audio and disabled `--udp-migrate-egfx` since v0.10.0, #258;
-lossy waves stay on TCP until the Soft-Sync is acknowledged, #259).
-Next: #230 (Windows 10 frozen start), ported and waiting on rophy's OK; #228 merged.
+(VPN/ZeroTier). **Latest release: v0.10.6** (a wrong or missing startup password
+no longer restarts the server in a loop: it waits and re-reads the Keychain, #267;
+HiDPI virtual display, #201; Windows 10 mstsc pictures, #228; pre-EGFX frame, #265;
+experimental `--capture-nv12`, #204; `--alt-q-quit`, #200).
+Next: #230 (Windows 10 frozen start), ported and waiting on rophy's OK.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
