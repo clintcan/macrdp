@@ -1373,7 +1373,7 @@ mod macos {
                 self.egfx_pending_frame = false;
                 return;
             };
-            match submit_to_gfx(gfx, pb, self.nv12, true) {
+            match submit_to_gfx(gfx, pb, self.nv12, true, false) {
                 Ok(true) => {
                     self.egfx_pending_frame = false;
                     self.seeded = true;
@@ -1405,7 +1405,7 @@ mod macos {
             };
             // `submit_to_gfx` hands the buffer over as NV12 or locks it as BGRA,
             // matching the capture format (`--capture-nv12`).
-            match submit_to_gfx(gfx, pb, self.nv12, true) {
+            match submit_to_gfx(gfx, pb, self.nv12, true, false) {
                 Ok(true) => {
                     self.held_frame = false;
                     self.seeded = true;
@@ -1850,14 +1850,20 @@ mod macos {
         pixel_buffer: &CVPixelBuffer,
         nv12: bool,
         request_keyframe: bool,
+        flush: bool,
     ) -> Result<bool> {
         if nv12 {
-            return gfx.submit_nv12(pixel_buffer, request_keyframe);
+            return gfx.submit_nv12(pixel_buffer, request_keyframe, flush);
         }
         let guard = pixel_buffer
             .lock(CVPixelBufferLockFlags::READ_ONLY)
             .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
-        gfx.submit_bgra(guard.as_slice(), guard.bytes_per_row(), request_keyframe)
+        gfx.submit_bgra(
+            guard.as_slice(),
+            guard.bytes_per_row(),
+            request_keyframe,
+            flush,
+        )
     }
 
     /// Convert a locked NV12 capture frame to tightly packed BGRA in `out`.
@@ -2163,7 +2169,9 @@ mod macos {
                                 self.flush_remaining -= 1;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if let Some(pb) = self.last_frame.as_ref() {
-                                        if let Err(e) = submit_to_gfx(gfx, pb, self.nv12, false) {
+                                        if let Err(e) =
+                                            submit_to_gfx(gfx, pb, self.nv12, false, true)
+                                        {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
                                     }
@@ -2308,6 +2316,7 @@ mod macos {
                         &pixel_buffer,
                         self.nv12,
                         big_change || resume_keyframe,
+                        false,
                     ) {
                         Ok(true) => {
                             self.held_frame = false;
