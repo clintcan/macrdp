@@ -90,8 +90,12 @@ jobs:
           test -n "$rev"
           dir="$RUNNER_TEMP/ironrdp"
           git init -q "$dir"
-          git -C "$dir" fetch -q --depth 1 https://github.com/clintcan/IronRDP.git "$rev"
-          git -C "$dir" checkout -q FETCH_HEAD
+          # GitHub serves any commit of the fork network through this URL, so
+          # check that the rev is on a macrdp* branch (protected against
+          # force-push and deletion; macrdp-<upstream-rev> after a rebase).
+          git -C "$dir" fetch -q --filter=blob:none https://github.com/clintcan/IronRDP.git '+refs/heads/macrdp*:refs/remotes/fork/macrdp*'
+          git -C "$dir" branch -r --contains "$rev" 2>/dev/null | grep -q . || { echo "pinned rev $rev is on no macrdp* branch of clintcan/IronRDP"; exit 1; }
+          git -C "$dir" checkout -q "$rev"
           cargo test --locked --manifest-path "$dir/crates/ironrdp-server/Cargo.toml" --lib --features egfx
 
   test-macos:
