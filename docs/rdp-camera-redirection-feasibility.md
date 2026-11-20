@@ -222,7 +222,7 @@ staged:
    its webcam. This proves the client speaks MS-RDPECAM to macrdp before any
    decode/presentation work. **No entitled build, no macOS camera code** — pure
    protocol, like the URBDRC Phase-3.0 observe slice.
-   *Implemented:* `vendor/ironrdp-server/src/rdcamera.rs` (`RdCameraServer`
+   *Implemented:* `crates/ironrdp-server/src/rdcamera.rs` (clintcan/IronRDP) (`RdCameraServer`
    `DvcProcessor` — SHARED_MSG_HEADER parse, SelectVersion negotiation, and the
    `DEVICE_ADDED_NOTIFICATION` log = the GREEN signal), the `camera_factory` DVC seam
    (divergence 19: field + `new()` param + `attach_channels` advertise +

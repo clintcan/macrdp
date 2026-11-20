@@ -307,8 +307,8 @@ audioplugin/      "macrdp Microphone" — a CoreAudio AudioServerPlugIn (C, no X
                   docs/macos-gotchas.md (5).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
-(vendor/ironrdp-server/, vendor/ironrdp-acceptor/, vendor/ironrdp-rdpdr/,
- vendor/ironrdp-dvc/)    DE-VENDORED 2026-11-20 (#225). The four forks are now
+(vendor/ironrdp-{server,acceptor,rdpdr,dvc}/
+                          DE-VENDORED 2026-11-20 (#225). The four forks are now
                           clintcan/IronRDP, branch `macrdp`: upstream e258f6a0
                           plus one commit per divergence. Cargo.toml takes every
                           ironrdp-* crate from that branch at one rev. The

@@ -141,7 +141,7 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
     PDU and the server `process()` loop can decode the client's response without
     erroring. M5b-2 vendored `ironrdp-dvc` and added `SoftSyncRequestPdu` /
     `SoftSyncResponsePdu` there; this module was deleted. See
-    `vendor/ironrdp-dvc/CLAUDE.md`.
+    the `ironrdp-dvc` log in `docs/ironrdp-divergences.md`.
   Integration (send the request over drdynvc, the Initiate-Response gate, the
   server→listener handoff + recv-loop bidi refactor, route EGFX) is the next,
   bigger step — see ironrdp-server CLAUDE.md (12) M5 plan.
@@ -200,7 +200,7 @@ root `cargo test`/`fmt --all` don't reach a non-member crate). `target/` and
      server's TLS ServerHello (M4b). 34 crate tests still green (the symmetric
      `+1` keeps the two-instance test self-consistent).
 - **M3b (done — UDP listener, in `ironrdp-server`):** this crate became a real
-  dependency of `vendor/ironrdp-server` for the first time (path dep, gated by its
+  dependency of `ironrdp-server` for the first time (path dep, gated by its
   `multitransport` feature; revs already aligned so `ironrdp-core` unifies). The
   listener (`src/multitransport/listener.rs` over there) drives a per-peer
   `RdpeudpState` through the SYN→SYN+ACK handshake on a real socket. New here:

@@ -734,7 +734,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - **▶ UPDATE 2026-09-16 — supersedes the "ZERO open clintcan PRs" note below.** clintcan has 0 open
   upstream PRs and 2 open issues (#1484, #1969). Detail: the `project_upstream_ironrdp_open_prs` memory
-  and the divergence notes in `vendor/ironrdp-server/CLAUDE.md`.
+  and the divergence notes in `docs/ironrdp-divergences.md`.
   - **Divergence (23), second-client preemption, is upstream — with traps.** #1476 MERGED 2026-09-08;
     #1913 MERGED 2026-09-11 replaced its bool with `ConnectionPolicy { Queue (default), Reject, Preempt }`
     via `with_connection_policy`. The bump must add `.with_connection_policy(ConnectionPolicy::Preempt)`
@@ -860,7 +860,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   - **Structural:** upstream added `server/src/multitransport.rs` (clashes with our
     `src/multitransport/` dir — rename ours); upstream now has its OWN `ironrdp-rdpeudp` crate (name
     clash with `vendor/ironrdp-rdpeudp` — rename via `package =` or drop ours); stray committed
-    `vendor/ironrdp-server/Cargo.toml.orig` to delete.
+    `Cargo.toml.orig` in the vendored server to delete.
   - **Triage correction:** acceptor (3) is only half group-1 — the client MT flags are upstream, but our
     acceptor-side MT *offer* (`MultitransportOffer`, `multitransport_offered`) isn't (upstream offers via
     #1951) → goes with the UDP work.
@@ -869,7 +869,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
     tests → live mstsc/FreeRDP → 48–72 h soak incl. a headless mode → v0.10.0.
   - **▶ PROGRESS 2026-10-01: code steps DONE** (commits `accaf99`..`134d2e5`): dvc fork shrunk to one
     addition, acceptor/rdpdr/server re-vendored as upstream-verbatim + our files + marked hooks
-    (`vendor/ironrdp-server/CLAUDE.md`; old log frozen in `DIVERGENCE-HISTORY.md`), `vendor/ironrdp-rdpeudp`
+    (`docs/ironrdp-divergences.md`; old log frozen in `docs/ironrdp-divergence-history.md`), `vendor/ironrdp-rdpeudp`
     → `vendor/macrdp-rdpeudp`, `src/` on the new API (`ConnectionHooks`, builder chain incl.
     `ConnectionPolicy::Preempt`). 266 tests pass; fmt/clippy/deny clean on macOS; Linux = CI.
     **NEXT — live tests:** ARC after a process RESTART (upstream HMAC now denies it), Preempt takeover,
@@ -909,7 +909,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `+auto-reconnect` connected, `launchctl kickstart -k` the agent. The client auto-reconnects
     presenting its old cookie; CredSSP succeeds (`auth outcome=success`), then
     `verify_auto_reconnect_cookie` fails → `send_access_denied` + `ServerError("cookie rejected")`
-    (`vendor/ironrdp-server/src/server.rs` ~4577). FreeRDP keeps the cookie and retries ~3/s with its
+    (`crates/ironrdp-server/src/server.rs` ~4577, (clintcan/IronRDP)). FreeRDP keeps the cookie and retries ~3/s with its
     counter stuck at 0, and each try ends errored in < 1 s, so `auth_guard::classify_outcome` counts
     it as a Failure → `reject reason=lockout` after 5 (30 s, then 59 s), blocking every client from
     that IP. Preempt runs before the cookie check, so each try also EVICTS whoever is connected. `main`
@@ -917,8 +917,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
     fall back to a normal logon (`is_auto_reconnect = false`, so the credential path still runs)
     instead of denying — check MS-RDPBCGR's ARC rules first, and raise it upstream. mstsc likely hits
     it too (it presents the cookie on auto-reconnect) — verify when at the Windows machine.
-  - [ ] **After the bump lands: lock the vendor-crate CI steps (supply chain).** The rdpeudp step, and
-    the `vendor/ironrdp-server` unit-test step from #228, run `cargo test --manifest-path vendor/…`
+  - [ ] **After the bump lands: lock the vendor-crate CI steps (supply chain).** *(2026-11-20, #225:
+    the server step now runs `--locked` on a checkout of clintcan/IronRDP; the rdpeudp step is left.)*
+    The rdpeudp step, and
+    the `ironrdp-server` unit-test step from #228, ran `cargo test --manifest-path vendor/…`
     with no `--locked` and no committed lockfile (`.gitignore` has `vendor/*/Cargo.lock`), so every CI
     run resolves crates.io fresh ("Locking 377 packages to latest…") and would execute a newly
     published malicious release. Contained (no secrets, `contents: read`, harden-runner audit-only,
@@ -961,7 +963,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (do NOT file a competing PR): (a) the ironrdp-server seam = uchouT's OPEN PR #1417 (adds
   ServerBuilder::with_usb_factory + src/urbdrc.rs + UsbDeviceHandle + per-device backend — near-exact
   match to div 16; blocked by #1416, stale 07-15); (b) when #1417+#1394 merge + pin bump, macrdp adopts
-  upstream's with_usb_factory/UsbDeviceHandle/backend and DELETES vendor/ironrdp-server/src/rdpeusb.rs.
+  upstream's with_usb_factory/UsbDeviceHandle/backend and DELETES crates/ironrdp-server/src/rdpeusb.rs (clintcan/IronRDP).
   Only constructive move for us: VALIDATE #1417 from macrdp's real-URBDRC-server perspective (like the
   #1509 validation) once it's unblocked. Track it, don't file. Pin-bump-era adoption. -->
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
