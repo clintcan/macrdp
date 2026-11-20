@@ -7,36 +7,36 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Open PRs — review state (as of 2026-11-17).** Labels track it: `waiting on author` = the
-  contributor owes a change; everything else is ours. Merged 11-12→17: #197 #200 #201 #204 #219 #228
-  #230 #240/#254 #255 #256 #257 #258 #259 #260 #263 #264 #265 #267 #268.
-  - **#262** (@antonmos, `--h264-max-unacked-frames`) — flush frames now exempt; their live data shows
-    the worst write stall 774 ms → <140 ms (uncontrolled). **Doesn't compile on `main` since #230**:
-    `send_held_frame`'s `submit_to_gfx` needs `flush = false`; asked them to merge `main` and add it
-    (11-16). Then our mstsc test on the mini, then merge.
+- [ ] **Open PRs — review state (as of 2026-11-21).** Labels track it: `waiting on author` = the
+  contributor owes a change; everything else is ours. Merged 11-12→21: #197 #200 #201 #204 #219 #228
+  #230 #240/#254 #255 #256 #257 #258 #259 #260 #262 #263 #264 #265 #267 #268 #270 #271 #272 #273.
   - **#231 / #232** (@SferaDev, virtual display re-registered after display sleep / wake the displays) —
     both conflict with `main` after #201, and with each other; asked to merge #231 first and rebase #232
     on it. #231 has one picker now and records id changes mid-session; its rebase must make `recreate()`
     keep HiDPI, the pixel size, and clear the recorded mode. Neither has said what was tested live; #232
     also owes answers on `--allow-sleep` and the 3 s wait in `DetachedPrimary::drop`.
-  - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in.
+  - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in
+    (11-13), then (11-16) to keep `FINALIZE_TIMEOUT` around its replacement login loop and to skip,
+    not fail on, unexpected frames during the measurement. No commits since 10-27.
   - **Divergences (33)/(34)** are #201's (scale factors on `ConnectionInfo`) and #228's (RemoteFX surface
-    command, = upstream #2229 `e20a2147`, so (34) also drops at a pin bump past it).
-  - **#225** (vendor move onto `clintcan/IronRDP`): **done** — #271 (rophy) merged 2026-11-21; every
-    `ironrdp-*` crate now comes from the fork's `macrdp` branch at `6d90c7e8`. Hardening on top: the fork's
-    Actions are off, `macrdp*` branches can only be updated by an admin, and `scripts/check-ironrdp-pin.sh`
-    runs in CI, the daily security workflow and before release builds (see `docs/ironrdp-divergences.md`,
-    "Keeping the fork safe"). Close #225 once that hardening PR merges.
-  - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
-    divergence (32) drops out at the next pin bump to any rev at or after it.
-  - **Next pin bump drops these vendored `ironrdp-server` divergences** (all merged upstream; keep
-    the `conn_test` regression tests for (31) and (32)): (29) pointer AND mask (≥ `fb25b47c`), (31) hidden/default
-    pointer updates (≥ `904a7da6`), (32) negotiation timeout (≥ `e482e340`), (34) RemoteFX surface command
-    (≥ `e20a2147`).
+    command, = upstream #2229 `e20a2147`, so (34) also drops at a rebase past it).
+  - **#225** (IronRDP changes on clintcan/IronRDP instead of `vendor/`): **done, closed 2026-11-21.**
+    #271 (rophy) moved every `ironrdp-*` crate to the fork's `macrdp` branch at `6d90c7e8`; #272 added
+    `scripts/check-ironrdp-pin.sh` (CI, the daily security workflow, before release builds). The fork's
+    Actions are off and only an admin can update `macrdp*`. See `docs/ironrdp-divergences.md`, "Keeping the
+    fork safe". A divergence change is now a PR into the fork's `macrdp`, then a rev bump on all pins here.
+  - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Divergence (32)
+    drops out at the next rebase of the fork's `macrdp` branch onto any upstream rev at or after it.
+  - **Next rebase of the fork's `macrdp` branch onto newer upstream drops these `ironrdp-server`
+    divergences** (all merged upstream; keep the `conn_test` regression tests for (31) and (32)): (29)
+    pointer AND mask (≥ `fb25b47c`), (31) hidden/default pointer updates (≥ `904a7da6`), (32) negotiation
+    timeout (≥ `e482e340`), (34) RemoteFX surface command (≥ `e20a2147`). Also (30), once upstream
+    Devolutions/IronRDP#2465 (glamberson's fix for our #2280) merges. The rebase goes on a new branch,
+    `macrdp-<upstream-rev>`; the old one stays so older releases still build.
 
-- [ ] **Before the next release: smoke-test #230 on Windows 11 mstsc and Windows App.** The legacy hold
-  is on by default (3 s) for every H.264 connection; only Windows 10 was tested live. Add the hold to the
-  Windows 10 note in `docs/known-quirks.md`.
+- [ ] **v0.10.8:** #271, #272 and #273 are on `main`, unreleased. #271 swapped every IronRDP crate (live
+  checks clean: mstsc ×3, FreeRDP, wrong password refused), so consider a short soak with UDP and lossy
+  audio on before cutting it.
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
