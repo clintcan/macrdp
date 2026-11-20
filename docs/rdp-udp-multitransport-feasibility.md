@@ -632,7 +632,7 @@ come with M3c"*, and M3c's GC half was never built. So a client whose RDP/TCP se
 went away kept its peer entry forever, and `pump_peers_on_timer` kept RTO-retransmitting
 unacked EGFX to it; over a long-running server dead peers also accumulate unbounded.
 
-Fix (`vendor/ironrdp-server/src/multitransport/listener.rs`, idle-timeout GC):
+Fix (`crates/ironrdp-server/src/multitransport/listener.rs` (clintcan/IronRDP), idle-timeout GC):
 `Peer` gained `last_seen_ms`, bumped on **every inbound datagram** (only inbound — a
 dead peer still *sends* outbound retransmits but receives nothing, so its clock
 stops); `gc_idle_peers` runs on the existing `retransmit_tick` (right after
@@ -1115,7 +1115,7 @@ Each milestone is its own gated PR, real-client-verified, feature-flagged
   (`SslMethod::dtls()` + `Ssl::setup_accept()` over a memory BIO; no DTLS 1.3 via the
   safe API, which is fine). The one reason to have considered `openssl` (explicit
   DTLS-1.0 version pinning) is moot now that the client is 1.2. Quarantine **all** of it behind one
-  maintenance-boundary file `vendor/ironrdp-server/src/multitransport/dtls.rs`, the same
+  maintenance-boundary file `crates/ironrdp-server/src/multitransport/dtls.rs` (clintcan/IronRDP), the same
   way Phase 1's rustls layer is isolated. **Wire layering (researched):** the DTLS record
   sits *inside* the cleartext RDPUDP framing, not around it —
   `UDP datagram → RDPUDP header (cleartext seq/ACK/FEC) → DTLS record → RDP_TUNNEL_* (EMT)
@@ -1388,7 +1388,7 @@ On an independent-loss link of rate `p`, a payload is then lost only at `p²` (5
   is exactly that layer.)
 - **Implementation.** `ironrdp-rdpeudp` `Config` gained `duplicate_lossy_sends: bool` (default false); when
   set and `mode == Lossy`, `pump()` emits each new source datagram twice. The listener
-  (`vendor/ironrdp-server/src/multitransport/listener.rs`) sets it on a lossy peer behind the experimental
+  (`crates/ironrdp-server/src/multitransport/listener.rs` (clintcan/IronRDP)) sets it on a lossy peer behind the experimental
   env **`MACRDP_UDP_LOSSY_AUDIO_DUP`** (default OFF; needs `MACRDP_UDP_LOSSY_DELIVERY` so the flow is on the
   lossy SM). Reliable flow + default build are byte-unchanged. Unit-tested in `ironrdp-rdpeudp` (duplicate
   emitted byte-identical; controls for flag-off and reliable-mode; a test documenting that the receiver
@@ -1514,14 +1514,14 @@ spec, the h264 token map, `MACRDP_UDP_EGFX_LTR*`) was reverted with PR #76's rev
   `src/audio.rs` + `src/aac.rs` are unchanged; only the channel *envelope* changes (DVC
   instead of SVC). Windows **gates** this channel on **AAC + protocol v8 + a UDP transport
   being present**, so `--enable-aac` becomes a prerequisite for lossy audio. Reuse the
-  Phase-1 Soft-Sync codec (`vendor/ironrdp-dvc`) to migrate the new DVC onto the lossy
+  Phase-1 Soft-Sync codec (`ironrdp-dvc`) to migrate the new DVC onto the lossy
   tunnel. This is the **substantial, genuinely-new** piece of Phase 2 — a new audio
   channel, not a wiring change.
 
   **P2.4b-1 spike result (2026-06-27): the DVC audio handshake works — but the EGFX
   "negotiate-on-TCP-then-migrate" pattern does NOT carry over to a *lossy*-named channel.**
   Verified on real mstsc. Built a `DvcProcessor` for the audio DVC
-  (`vendor/ironrdp-server/src/multitransport/audio_dvc.rs`, gated behind the experimental
+  (`crates/ironrdp-server/src/multitransport/audio_dvc.rs` (clintcan/IronRDP), gated behind the experimental
   `MACRDP_UDP_LOSSY_AUDIO` env, default off) that, on channel open, sends Server Audio
   Formats (v8) and runs the MS-RDPEA handshake, reusing `ironrdp-rdpsnd`'s
   `ServerAudioOutputPdu`/`ClientAudioOutputPdu` codecs verbatim (the **SNDPROLOG header is

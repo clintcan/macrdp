@@ -17,9 +17,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 >   Read before adding or changing a flag, or when a command/tunable is needed.
 > - `docs/oss-rdp-server-comparison.md` — the verified evidence behind the "first OSS
 >   RDP server to…" claims (and what NOT to claim). Read before repeating any of them.
->
-> The `vendor/ironrdp-*/` forks each have their own nested `CLAUDE.md` (the
-> divergence logs) that load only when you work inside those directories.
+> - `docs/ironrdp-divergences.md` — macrdp's divergences in the `ironrdp-*` crates, which
+>   come from clintcan/IronRDP (branch `macrdp`). Read before changing an IronRDP crate.
 
 ## Status
 

@@ -5,7 +5,7 @@
 //! existing TLS) to clients that advertise support. There is no UDP listener
 //! yet, so the server's M1 path only performs the Initiate Request → Response
 //! handshake and falls back to TCP; see
-//! `vendor/ironrdp-server/src/multitransport/` and
+//! `crates/ironrdp-server/src/multitransport/` in clintcan/IronRDP and
 //! `docs/rdp-udp-multitransport-feasibility.md`. Wired in `main.rs` behind
 //! `--enable-udp-multitransport`.
 //!

@@ -63,11 +63,11 @@ wildcards = "allow"
 # remote below fails the scan.
 unknown-registry = "deny"
 unknown-git = "deny"
-# The only git remote macrdp intentionally pulls from is the pinned IronRDP fork
-# (both the root tree and the standalone vendor/macrdp-rdpeudp crate resolve
-# ironrdp-* from here via [patch.crates-io]).
+# The only git remote macrdp intentionally pulls from is the pinned IronRDP fork,
+# clintcan/IronRDP (both the root tree and the standalone vendor/macrdp-rdpeudp
+# crate resolve ironrdp-* from here via [patch.crates-io]).
 allow-git = [
-  "https://github.com/Devolutions/IronRDP.git",
+  "https://github.com/clintcan/IronRDP.git",
 ]
 
 [licenses]

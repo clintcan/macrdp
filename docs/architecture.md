@@ -307,42 +307,12 @@ audioplugin/      "macrdp Microphone" — a CoreAudio AudioServerPlugIn (C, no X
                   docs/macos-gotchas.md (5).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
-vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via
-                          [patch.crates-io] in Cargo.toml. The live
-                          divergences (audio-lag tracker, resize-stall
-                          resync, per-batch dispatch priority, SuppressOutput
-                          handling, NSCodec encoder, opt-in QOI Rgb
-                          workaround, honor-client-desktop-size plumbing)
-                          are documented in
-                          vendor/ironrdp-server/CLAUDE.md — that nested
-                          memory loads when you work in the fork. Keep the
-                          vendor dir until all of those are upstreamed AND
-                          released.
-
-vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.8.0 (added
-                          2026-06-12, same upstream rev as the git pins).
-                          Two divergences: (1) honor_client_desktop_size —
-                          adopt the client's requested desktop size from its
-                          GCC Client Core Data BEFORE Demand Active, which
-                          is what powers the default client-resolution
-                          auto-adopt (--no-client-resolution opts out); and
-                          (2) expose the client's keyboard-layout id (KLID)
-                          from the same core data on AcceptorResult, which
-                          powers default non-US keyboard auto-detect (the
-                          vendor server publishes it; input.rs auto-selects
-                          the layout). See vendor/ironrdp-acceptor/CLAUDE.md
-                          and the client-resolution / keyboard-layout quirk
-                          notes for why these can't be done from server code.
-
-vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.5.0 (added 2026-06-16,
-                          same upstream rev). Upstream is client-only
-                          (SvcClientProcessor); the fork adds the
-                          server-direction decode halves the PDUs lack
-                          (ClientName/DeviceListAnnounce/DeviceAnnounceHeader)
-                          so a server can read what the client sends. The
-                          server-side RdpdrServer processor itself lives in
-                          vendor/ironrdp-server/src/rdpdr.rs. See
-                          vendor/ironrdp-rdpdr/CLAUDE.md.
+(vendor/ironrdp-{server,acceptor,rdpdr,dvc}/
+                          DE-VENDORED 2026-11-20 (#225). The four forks are now
+                          clintcan/IronRDP, branch `macrdp`: upstream e258f6a0
+                          plus one commit per divergence. Cargo.toml takes every
+                          ironrdp-* crate from that branch at one rev. The
+                          divergence logs are in docs/ironrdp-divergences.md.
 
 (vendor/ironrdp-rdpeusb/  DE-VENDORED at the a5d1c682 pin bump (v0.9.5, 2026-08-06).
                           The lenient UsbDeviceCaps decode (USB 3.x SupportedUsbVer +
@@ -366,16 +336,6 @@ vendor/macrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
                           the e258f6a0 bump (upstream now ships its own crate of
                           that name, unused here). See
                           vendor/macrdp-rdpeudp/CLAUDE.md.
-
-vendor/ironrdp-dvc/       Local fork of ironrdp-dvc 0.5.0 (added 2026-06-26, 4th
-                          fork). Adds the server-direction MS-RDPEDYC **Soft-Sync**
-                          codec (SoftSyncRequest/Response PDUs + the client
-                          Soft-Sync-Response decode arm) so the server can move a
-                          DVC (EGFX) onto the UDP tunnel and not tear down on the
-                          client's reply. Patch wiring is TWO-SIDED (it's a path dep
-                          of the git-pinned ironrdp crates) — see its CLAUDE.md.
-                          Soft-Sync rides drdynvc on the MAIN TCP connection; only
-                          channel data after the switch rides the UDP tunnel.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298
