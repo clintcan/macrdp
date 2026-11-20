@@ -201,7 +201,13 @@ Notes on the port:
   ends the logon. The connect-time Stop needs a non-empty payload (IronRDP refuses to encode
   an empty one). Tests: `autodetect::connect_time_tests` (4, run by the CI server-test step,
   mutation-checked) and macrdp's `conn_test::network_autodetect_reports_the_connect_time_bandwidth`.
-  Upstream candidate (together with acceptor (7)).
+  Upstream candidate (together with acceptor (7)). **Revisit at the next rebase:** upstream
+  #2021 (merged 2026-10-19, after our pin) fixed the same warning differently, by bracketing a
+  single large EGFX write (at least 10 KiB) with Start/Stop, falling back to the tick window
+  only when no such write occurs. Once it is in, always preferring the connect-time figure
+  would hide those better in-session measurements: change the rule to "connect-time until a
+  bracketed measurement exists", or drop (35)'s preference if upstream takes connect-time
+  detection itself.
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
