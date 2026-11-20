@@ -1838,3 +1838,219 @@ async fn the_soft_sync_moves_lossy_audio_onto_the_lossy_tunnel() -> anyhow::Resu
         })
         .await
 }
+
+/// `--network-autodetect`: with IronRDP's auto-detect enabled and macrdp's
+/// ticker running, a client that opened the MCS message channel receives RTT
+/// Measure Requests on it. Nothing else in macrdp sends auto-detect PDUs, so
+/// without the ticker (or without `enable_autodetect`) none ever arrive.
+#[tokio::test]
+async fn network_autodetect_sends_rtt_probes_on_the_message_channel() -> anyhow::Result<()> {
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest};
+    use ironrdp_pdu::x224::X224;
+
+    init_tracing();
+    let mut server =
+        build_test_server_full(3389, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.enable_autodetect();
+    let ticker = crate::spawn_autodetect_ticker(
+        server.event_sender().clone(),
+        std::time::Duration::from_millis(100),
+    );
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let mut connector = ClientConnector::new(
+                client_config(1024, 768),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            );
+            let mut framed = TokioFramed::new(client_io);
+            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+            let initial = framed.into_inner_no_leftover();
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+                .with_no_client_auth();
+            tls_cfg.resumption = rustls::client::Resumption::disabled();
+            let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost")?.to_owned(),
+                    initial,
+                )
+                .await?;
+            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = TokioFramed::new(tls_stream);
+            let result = ironrdp_tokio::connect_finalize(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut NoNetwork,
+                "localhost".into(),
+                Vec::new(),
+                None,
+            )
+            .await?;
+            let message_channel_id = result
+                .message_channel_id
+                .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
+
+            let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id != message_channel_id {
+                        continue;
+                    }
+                    if let Ok(pdu) =
+                        ironrdp_core::decode::<AutoDetectReqPdu>(data.user_data.as_ref())
+                    {
+                        if matches!(pdu.request, AutoDetectRequest::RttRequest { .. }) {
+                            return anyhow::Ok(());
+                        }
+                    }
+                }
+            })
+            .await;
+
+            server_task.abort();
+            anyhow::Ok(probe)
+        })
+        .await;
+    ticker.abort();
+    outcome?.map_err(|_| {
+        anyhow::anyhow!("no RTT Measure Request reached the client's message channel")
+    })?
+}
+
+/// `--network-autodetect` with the connect-time measurement (#235): the
+/// bandwidth a client reports for the connect-time burst is what the server's
+/// later Network Characteristics Results carry. This client answers RTT probes
+/// after the logon but never a continuous bandwidth measurement, so a result
+/// with a bandwidth can only come from the connect-time one; IronRDP's own
+/// auto-detect alone sends no result until a continuous measurement completes.
+#[tokio::test]
+async fn network_autodetect_reports_the_connect_time_bandwidth() -> anyhow::Result<()> {
+    use ironrdp_pdu::mcs::{McsMessage, SendDataRequest};
+    use ironrdp_pdu::rdp::autodetect::{
+        AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu,
+    };
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    init_tracing();
+    let mut server =
+        build_test_server_full(3389, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.enable_autodetect();
+    let ticker = crate::spawn_autodetect_ticker(
+        server.event_sender().clone(),
+        std::time::Duration::from_millis(100),
+    );
+
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let mut connector = ClientConnector::new(
+                client_config(1024, 768),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            );
+            let mut framed = TokioFramed::new(client_io);
+            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+            let initial = framed.into_inner_no_leftover();
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+                .with_no_client_auth();
+            tls_cfg.resumption = rustls::client::Resumption::disabled();
+            let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost")?.to_owned(),
+                    initial,
+                )
+                .await?;
+            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = TokioFramed::new(tls_stream);
+            let result = ironrdp_tokio::connect_finalize(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut NoNetwork,
+                "localhost".into(),
+                Vec::new(),
+                None,
+            )
+            .await?;
+            let channel = result
+                .message_channel_id
+                .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
+            let user = result.user_channel_id;
+
+            let reported = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id != channel {
+                        continue;
+                    }
+                    let Ok(pdu) = ironrdp_core::decode::<AutoDetectReqPdu>(data.user_data.as_ref())
+                    else {
+                        continue;
+                    };
+                    match pdu.request {
+                        // Answer RTT probes, so results keep coming.
+                        AutoDetectRequest::RttRequest {
+                            sequence_number, ..
+                        } => {
+                            let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse {
+                                sequence_number,
+                            });
+                            let bytes = ironrdp_core::encode_vec(&X224(SendDataRequest {
+                                initiator_id: user,
+                                channel_id: channel,
+                                user_data: ironrdp_core::encode_vec(&response)?.into(),
+                            }))?;
+                            framed.write_all(&bytes).await?;
+                        }
+                        AutoDetectRequest::NetworkCharacteristicsResult {
+                            bandwidth_kbps, ..
+                        } => {
+                            return anyhow::Ok(bandwidth_kbps);
+                        }
+                        // A continuous bandwidth Start/Stop: deliberately never answered.
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+
+            server_task.abort();
+            anyhow::Ok(reported)
+        })
+        .await;
+    ticker.abort();
+    let bandwidth = outcome?
+        .map_err(|_| anyhow::anyhow!("no Network Characteristics Result reached the client"))??;
+    assert!(
+        bandwidth.is_some_and(|kbps| kbps > 0),
+        "the result carried no connect-time bandwidth: {bandwidth:?}"
+    );
+    Ok(())
+}

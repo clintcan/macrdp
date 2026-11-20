@@ -105,6 +105,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection. **Upstream as #2432 (`e482e340`); drops at the next pin bump** | `run_connection_inner`, around `negotiate_and_authenticate` | — |
 | (33) | The client's desktop and device scale factors on `ConnectionInfo`, **harvested early** from upstream #2107 (merged 2026-10-30, after this pin) | `ConnectionInfo` fields + `new()`, the `on_connection_info` call in `client_accepted`; pairs with acceptor divergence (6) | `ConnectionInfo::{desktop,device}_scale_factor` |
 | (34) | RemoteFX (codec GUID REMOTEFX) goes out in a Stream Surface Bits command when the client sets `STREAM_SURFACE_BITS`; ImageRemoteFX (GUID IMAGE_REMOTEFX) and every other codec keep Set Surface Bits. RemoteFX wins over ImageRemoteFX whatever the client's list order. Windows 10 mstsc shows a black session for RemoteFX in Set. **Port of upstream #2229 (`e20a2147`); drops at the next pin bump** | `encoder/mod.rs` `RemoteFxCodec`, `SurfaceBitsCommand`, `surface_bits`, `UpdateEncoderCodecs::set_remotefx_codec`, `RemoteFxHandler`; `server.rs` `pick_remotefx_codec` and the `BitmapCodecs` arm | — |
+| (35) | Optional Connect-Time Auto-Detection when auto-detect is enabled: an RTT probe, a 256 KiB bandwidth burst and a Network Characteristics Result between Client Info and licensing; later results report this connect-time bandwidth instead of the ordinary-traffic figure. Based on clintcan/macrdp#235 by @JulyStar-Lv. Pairs with acceptor divergence (7) | `server.rs` `connect_time_autodetect`, `await_autodetect_reply`, the `accept_finalize_with_hooks` call in the finalize loop; `autodetect.rs` `connect_time_*`, `PendingBandwidth::ConnectTime`, `build_netchar_result` | `--network-autodetect` (macrdp: `enable_autodetect()` + a 1 s `ServerEvent::AutoDetectRttRequest` ticker) |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -186,6 +187,21 @@ Notes on the port:
   proptest replaced by fixed codec lists), run by CI (`cargo test --manifest-path
   vendor/ironrdp-server/Cargo.toml --lib --features egfx`). **Drop it at the next pin
   bump** (any rev at or after `e20a2147`).
+
+- **(35)** Added 2026-11-21 (clintcan/IronRDP#2, from clintcan/macrdp#235). Upstream's
+  own auto-detect (enabled by macrdp's `--network-autodetect`) measures bandwidth only by
+  bracketing ordinary traffic, as MS-RDPBCGR 2.2.14.2.2 prescribes after the connection
+  sequence. On a server that sends less than the link carries, that reports the send rate:
+  live on a 1 ms LAN, mstsc showed 2.90 Mbps and Windows App 3.60 Mbps, and both warned
+  "Your network might be slow". The connect-time burst (32 × 8 KiB; 16 KiB payloads made
+  mstsc fail with 0x1304, found in #235) measured 95.42 and 91.27 Mbps, and both clients
+  then reported "good". Safety: a fresh `AutoDetectManager` per connection, each reply
+  awaited at most 2 s (`CONNECT_TIME_AUTODETECT_REPLY_TIMEOUT`), other frames skipped,
+  inside `FINALIZE_TIMEOUT`; an encoding failure skips the measurement, only a failed write
+  ends the logon. The connect-time Stop needs a non-empty payload (IronRDP refuses to encode
+  an empty one). Tests: `autodetect::connect_time_tests` (4, run by the CI server-test step,
+  mutation-checked) and macrdp's `conn_test::network_autodetect_reports_the_connect_time_bandwidth`.
+  Upstream candidate (together with acceptor (7)).
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play
@@ -288,8 +304,9 @@ Notes on the port:
 
 Local fork of ironrdp-acceptor 0.10.0, **re-vendored 2026-10-01 from upstream
 Devolutions/IronRDP@e258f6a0** (the pin-bump rev). `src/` is upstream verbatim except
-`connection.rs`, which carries the three divergences below (every insertion of (4) and
-(5) is marked `(macrdp divergence N)`; (6) is upstream code, unmarked). Earlier vendorings: @a5d1c682 (2026-08-05), @879ffed
+`connection.rs`, which carries the divergences below, and `lib.rs`, which carries (7)'s
+finalize driver (every insertion of (4), (5) and (7) is marked `(macrdp divergence N)`; (6)
+is upstream code, unmarked). Earlier vendorings: @a5d1c682 (2026-08-05), @879ffed
 (2026-06-12). Has a standalone `[patch.crates-io]` (core/pdu/svc/connector/async →
 e258f6a0) for isolated builds, ignored in the macrdp workspace (the root `[patch]`
 wins). Keep that rev in sync. `rustfmt.toml` mirrors the IronRDP workspace config
@@ -353,6 +370,16 @@ Both divergences were mutation-checked.
     so it matches upstream exactly. Upstream's acceptor tests cover it
     (`scale_factors_are_reported_only_as_a_valid_pair`, `scale_factors_survive_reactivation`).
     **Drop it at the next pin bump** (any rev at or after `335d6712`).
+
+(7) **Window for connect-time auto-detect** (NOT upstreamed; added 2026-11-21 in
+    clintcan/IronRDP#2, from clintcan/macrdp#235). `Acceptor::connect_time_autodetect_window()`
+    returns the message and user channel ids once the Client Info PDU has been received
+    and before licensing, when the client advertised `SUPPORT_NET_CHAR_AUTODETECT` and
+    joined the MCS message channel, never during a deactivation-reactivation.
+    `accept_finalize_with_hooks()` is `accept_finalize_with_multitransport()` plus a handler
+    called once at that window, inside the finalize future, so a timeout around finalize
+    bounds it; `accept_finalize_with_multitransport()` now calls it with a no-op handler.
+    Used by server divergence (35). Upstream candidate.
 
 ### Retired
 
