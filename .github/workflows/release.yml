@@ -98,6 +98,20 @@ jobs:
           set -euo pipefail
           test -f Cargo.lock || { echo "Cargo.lock missing — commit it for reproducible release builds"; exit 1; }
 
+      # Before building anything that ships: every IronRDP pin must be one commit
+      # on a protected macrdp* branch of clintcan/IronRDP (see the script). Uses
+      # the script from the tag being built. Tags from before the script (v0.10.7
+      # and older) built IronRDP from in-repo copies, so there is nothing to check.
+      - name: Check the IronRDP pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f scripts/check-ironrdp-pin.sh ]; then
+            scripts/check-ironrdp-pin.sh
+          else
+            echo "this tag predates scripts/check-ironrdp-pin.sh; nothing to check"
+          fi
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:

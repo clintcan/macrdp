@@ -22,8 +22,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
   - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in.
   - **Divergences (33)/(34)** are #201's (scale factors on `ConnectionInfo`) and #228's (RemoteFX surface
     command, = upstream #2229 `e20a2147`, so (34) also drops at a pin bump past it).
-  - **#225** (vendor move onto `clintcan/IronRDP`): accepted; branch `macrdp` created at `e258f6a0`; waiting
-    for rophy's PR into it.
+  - **#225** (vendor move onto `clintcan/IronRDP`): **done** — #271 (rophy) merged 2026-11-21; every
+    `ironrdp-*` crate now comes from the fork's `macrdp` branch at `6d90c7e8`. Hardening on top: the fork's
+    Actions are off, `macrdp*` branches can only be updated by an admin, and `scripts/check-ironrdp-pin.sh`
+    runs in CI, the daily security workflow and before release builds (see `docs/ironrdp-divergences.md`,
+    "Keeping the fork safe"). Close #225 once that hardening PR merges.
   - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
     divergence (32) drops out at the next pin bump to any rev at or after it.
   - **Next pin bump drops these vendored `ironrdp-server` divergences** (all merged upstream; keep

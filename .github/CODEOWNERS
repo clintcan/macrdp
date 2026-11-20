@@ -17,3 +17,12 @@
 #   - Fork pull requests run with a read-only token and no access to secrets.
 
 /.github/ @clintcan
+
+# Where macrdp's dependencies come from. A changed IronRDP rev or git source here
+# decides what code every build runs (see docs/ironrdp-divergences.md, "Keeping the
+# fork safe"), so it should never ride along unnoticed either.
+/Cargo.toml @clintcan
+/Cargo.lock @clintcan
+/deny.toml @clintcan
+/vendor/**/Cargo.toml @clintcan
+/scripts/check-ironrdp-pin.sh @clintcan
