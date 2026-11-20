@@ -383,7 +383,7 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   ways. A Windows->Mac copy then fetches the formatted
                           #   version too — extra traffic per copy on a thin link.
                           #   Config key: RICH_CLIPBOARD=0.
---enable-udp-multitransport # EXPERIMENTAL, opt-in (default OFF; feature-gated by
+--enable-udp-multitransport # Opt-in (default OFF; feature-gated by
                           #   the `multitransport` cargo feature). Offers RDP UDP
                           #   multitransport (MS-RDPEMT over reliable RDPEUDP) and
                           #   binds a UDP listener on the same address/port as TCP.
@@ -459,7 +459,7 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   as congestion — keeps sporadic wireless (WiFi)
                           #   retransmits from ratcheting the bitrate down (0 = any
                           #   retransmit counts, the old behaviour). macOS-only.
---enable-lossy-audio      # EXPERIMENTAL, opt-in (default OFF; ENABLE_LOSSY_AUDIO=1
+--enable-lossy-audio      # Opt-in (default OFF; ENABLE_LOSSY_AUDIO=1
                           #   in config.env). Implies --enable-udp-multitransport;
                           #   needs --enable-aac + --enable-h264. Stream RDPSND audio
                           #   over a LOSSY UDP/DTLS tunnel instead of TCP — the loss-

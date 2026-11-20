@@ -282,7 +282,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           Treat the machine as physically unsecured while a
                           session is engaged. Experimentally confirmed; see
                           known-quirks.md.
---enable-udp-multitransport  EXPERIMENTAL, opt-in. Offer RDP UDP multitransport
+--enable-udp-multitransport  Opt-in. Offer RDP UDP multitransport
                           (MS-RDPEMT over reliable RDPEUDP) and bind a UDP
                           listener on the same address/port as TCP. On its own,
                           EGFX still rides TCP (a proven safe spike) — add
@@ -307,7 +307,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           clear. So --bitrate becomes a ceiling, not a fixed
                           target: set it high (e.g. 8) and let it adapt. Off by
                           default.
---enable-lossy-audio      EXPERIMENTAL, opt-in (implies --enable-udp-multitransport;
+--enable-lossy-audio      Opt-in (implies --enable-udp-multitransport;
                           needs --enable-aac + --enable-h264). Stream RDPSND audio
                           over a LOSSY UDP/DTLS tunnel instead of TCP — the loss-
                           resilient audio path. AAC Wave2 data rides a lossy

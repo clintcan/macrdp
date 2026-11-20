@@ -517,13 +517,13 @@ private struct AdvancedTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
         Form {
-            Section("UDP multitransport (experimental)") {
+            Section("UDP multitransport") {
                 Toggle("Offer UDP multitransport", isOn: model.boolBinding("ENABLE_UDP_MULTITRANSPORT"))
-                Toggle("Move video onto UDP (clean link only)", isOn: model.boolBinding("UDP_MIGRATE_EGFX"))
+                Toggle("Move video onto UDP (experimental, clean link only)", isOn: model.boolBinding("UDP_MIGRATE_EGFX"))
                     .disabled(!model.bool("ENABLE_UDP_MULTITRANSPORT"))
-                Text("Moving video onto the reliable UDP tunnel helps on a clean, low-latency link, "
-                    + "but under packet loss the picture can freeze until reconnect (audio stays on "
-                    + "TCP). Auto-enables H.264. LAN/Wi-Fi only.")
+                Text("Moving video onto the reliable UDP tunnel helps on a clean, low-latency link. "
+                    + "Under packet loss the picture can stall for a few seconds until it moves back "
+                    + "to TCP. Auto-enables H.264. High-latency links never get UDP.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Diagnostics") {
