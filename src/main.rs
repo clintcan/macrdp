@@ -3682,9 +3682,9 @@ async fn async_main() -> Result<()> {
 
     // Shared "client minimized / SuppressOutput" flag — created here so
     // the same `Arc<AtomicBool>` can be handed to both the capture
-    // backend (which reads it to gate frame emission) and the vendor
-    // server (whose per-connection PDU handler writes it). See
-    // `vendor/ironrdp-server` `display_suppressed` plumbing.
+    // backend (which reads it to gate frame emission) and ironrdp-server
+    // (whose per-connection PDU handler writes it). See its
+    // `display_suppressed` plumbing.
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let display = CaptureDisplay {

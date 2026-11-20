@@ -786,7 +786,7 @@ struct MacCliprdrBackend {
     // same caller. If we fire our own Mac->client advertise here too, it
     // queues onto the shared ServerEvent channel that the sibling
     // dispatch_events loop drains independently, racing the ack through
-    // ironrdp-server's shared writer mutex (see vendor/ironrdp-server
+    // ironrdp-server's shared writer mutex (see ironrdp-server's
     // SharedWriter): under any write contention (e.g. the initial
     // full-frame video paint happening at the same moment), our advertise
     // or the client-clipboard fetch it can crowd out may reach the wire

@@ -71,7 +71,7 @@ pub const EAGER_PARALLEL_CHUNKS: usize = 8;
 /// Serial (1) — the lazy path runs *while the user is interacting*
 /// (paste-time). Combined with `LAZY_CHUNK_SIZE = 128 KiB`, peak
 /// inbound in-flight is 128 KiB. The `dispatch_audio` carve-out in
-/// vendor/ironrdp-server fixed the per-connection `Mutex<Self>`
+/// ironrdp-server fixed the per-connection `Mutex<Self>`
 /// contention; at 2-in-flight 256 KiB we found TCP send-buffer
 /// pressure introduces audio/video stalls. Serial fetch keeps inbound
 /// pressure low enough that the shared writer / kernel buffer isn't

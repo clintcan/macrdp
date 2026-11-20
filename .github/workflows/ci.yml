@@ -74,18 +74,24 @@ jobs:
           cargo fmt --manifest-path vendor/macrdp-rdpeudp/Cargo.toml -- --check
           cargo test --manifest-path vendor/macrdp-rdpeudp/Cargo.toml
 
-      # vendor/ironrdp-server is a [patch.crates-io] path crate, not a workspace
-      # member, and its manifest sets `[lib] test = false`, so the root
-      # `cargo test` never runs its unit tests (the divergence tests, e.g. the
-      # surface command per codec of divergence (34)). `--lib` runs them; the
-      # crate resolves its IronRDP siblings via its own [patch.crates-io].
-      # Platform-independent, so Linux is enough. `egfx` as macrdp builds it;
-      # `multitransport` (BoringSSL from source) is left out to keep the job
-      # fast. No --locked: vendor/*/Cargo.lock is not committed (as for rdpeudp).
-      - name: Test ironrdp-server (vendored crate, unit tests)
+      # ironrdp-server comes from clintcan/IronRDP (branch `macrdp`) and its
+      # manifest sets `[lib] test = false`, so the root `cargo test` never runs
+      # its unit tests (the divergence tests, e.g. the surface command per codec
+      # of divergence (34)). Check out the rev that Cargo.toml pins and run them
+      # there; `--lib` runs them. Platform-independent, so Linux is enough.
+      # `egfx` as macrdp builds it; `multitransport` (BoringSSL from source) is
+      # left out to keep the job fast.
+      - name: Test ironrdp-server (clintcan/IronRDP at the pinned rev, unit tests)
         env:
           RUSTFLAGS: ''
-        run: cargo test --manifest-path vendor/ironrdp-server/Cargo.toml --lib --features egfx
+        run: |
+          rev=$(sed -n 's|^ironrdp-server *= { git = "https://github.com/clintcan/IronRDP.git", rev = "\([0-9a-f]*\)" }$|\1|p' Cargo.toml)
+          test -n "$rev"
+          dir="$RUNNER_TEMP/ironrdp"
+          git init -q "$dir"
+          git -C "$dir" fetch -q --depth 1 https://github.com/clintcan/IronRDP.git "$rev"
+          git -C "$dir" checkout -q FETCH_HEAD
+          cargo test --manifest-path "$dir/crates/ironrdp-server/Cargo.toml" --lib --features egfx
 
   test-macos:
     name: test (macos)
