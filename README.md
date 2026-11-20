@@ -18,10 +18,11 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.10.6](https://github.com/clintcan/macrdp/releases/latest)** — a wrong password at setup no longer causes a restart loop, a HiDPI (Retina-style) virtual display, and Windows 10 mstsc shows a picture.
+**Latest: [v0.10.7](https://github.com/clintcan/macrdp/releases/latest)** — Windows 10 mstsc no longer starts H.264 sessions frozen, an opt-in cap on unacknowledged video frames, and UDP multitransport and lossy audio are out of experimental.
 
 **Recent releases**
 
+- **v0.10.6** (2026-11-16) — no restart loop on a wrong password, a HiDPI virtual display, Windows 10 mstsc pictures
 - **v0.10.5** (2026-11-13) — UDP multitransport fixes: mstsc's tunnel stays up, lossy audio plays again
 - **v0.10.4** (2026-11-13) — true-colour cursors, native-style app switching, `--reverse-scroll`, pre-login timeout
 - **v0.10.3** (2026-11-13) — Finder writes to redirected drives; the keyframe backoff works

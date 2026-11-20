@@ -24,11 +24,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.6** (a wrong or missing startup password
-no longer restarts the server in a loop: it waits and re-reads the Keychain, #267;
-HiDPI virtual display, #201; Windows 10 mstsc pictures, #228; pre-EGFX frame, #265;
-experimental `--capture-nv12`, #204; `--alt-q-quit`, #200).
-Next: #230 (Windows 10 frozen start), ported and waiting on rophy's OK.
+(VPN/ZeroTier). **Latest release: v0.10.7** (Windows 10 mstsc no longer starts
+H.264 sessions frozen: legacy updates are held until EGFX is ready, #230;
+opt-in `--h264-max-unacked-frames`, #262; `--enable-udp-multitransport` and
+`--enable-lossy-audio` out of experimental after #268's test and a 48 h soak, #270).
+Next: #225 step 4 (rophy: take the IronRDP changes from clintcan/IronRDP's `macrdp`
+branch instead of `vendor/`), to merge after this release.
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

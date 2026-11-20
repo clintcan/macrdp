@@ -4,6 +4,26 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.7 — no frozen start on Windows 10 mstsc, an ack-lag cap, UDP out of experimental
+
+Windows 10 mstsc no longer starts some H.264 sessions frozen, a new opt-in setting keeps fast clients from building a video backlog, and UDP multitransport and lossy audio are no longer experimental.
+
+- **Windows 10 mstsc no longer starts H.264 sessions frozen (#230, fixes #229, thanks @rophy).** A legacy bitmap update that reached mstsc just before H.264 started could leave the session frozen on that picture: 7 of 8 fresh connects in rophy's tests. A new connection now holds legacy updates until H.264 is ready, for at most 3 s (`MACRDP_EGFX_LEGACY_HOLD_MS`, 0 = off), and sends the held frame over H.264. A client that declines H.264 gets legacy updates at once.
+- **`--h264-max-unacked-frames N` (#262, thanks @antonmos).** Caps how many shipped H.264 frames may await the client's acknowledgement on the TCP path; past it, frames are dropped until the client catches up. On Windows App for macOS at 3456×2168, `H264_MAX_UNACKED_FRAMES=3` cut ship-to-acknowledge latency from 236 to 57 ms (median) and from 2282 to 178 ms (99th percentile). Off by default; try 3–4 for large sessions.
+- **UDP multitransport and lossy audio are no longer experimental (#270).** `--enable-udp-multitransport` and `--enable-lossy-audio` are supported, still opt-in. Behind the change: a regression test for lossy audio's channel switch (#268), the path that silently broke in v0.10.0–v0.10.4, and a 48 h soak on mstsc with both on. `--udp-migrate-egfx` stays experimental.
+- **Security: `libz-sys` 1.1.33.** It fixes RUSTSEC-2026-0544, a heap overflow in zlib's gzip-file writer (`gz_vacate()`). macrdp reaches zlib only through `flate2` (PNG, and IronRDP's smart-card dependencies), which as far as we can tell doesn't use those gzip-file functions, but the update closes it either way.
+
+**Verified before release**
+
+- CI green on Linux and macOS. `cargo fmt --check` passes on stable and nightly, `cargo clippy --all-targets -- -D warnings` passes, all 385 tests pass, and `cargo deny` is clean.
+- **#230:** Windows 10 mstsc by rophy: 10 of 10 runs showed the picture with default capture and 10 of 10 with `CAPTURE_NV12=1`; with the hold off, 3 of 6 started frozen. On the Mac mini, Windows 11 mstsc, Windows App for macOS and FreeRDP 3.26 all connected with the desktop shown at once (hold under 1 ms to 0.5 s).
+- **#262:** mstsc on the Mac mini with `H264_MAX_UNACKED_FRAMES=3` at 3024×1898: no write stalls, the last keystroke shown promptly after fast typing, and a clean reconnect.
+- **UDP soak:** 48 h on the Mac mini (v0.10.6, 2026-11-17 to 11-19): no panics or restarts, memory back to its starting 22 MB, and a 27-hour mstsc session with lossy audio on UDP throughout. A ZeroTier connection correctly got no UDP offer.
+
+**Known issues**
+
+- Lossy audio and `--udp-migrate-egfx` can't both move to UDP in the same session.
+
 ## v0.10.6 — no restart loop on a wrong password, a HiDPI virtual display, Windows 10 mstsc pictures
 
 A wrong password at setup no longer sends the server into a restart loop, a virtual display can now be a Retina-style 2× display, and Windows 10 mstsc shows a picture. New options are off unless you turn them on.
