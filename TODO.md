@@ -35,14 +35,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
   is on by default (3 s) for every H.264 connection; only Windows 10 was tested live. Add the hold to the
   Windows 10 note in `docs/known-quirks.md`.
 
-- [ ] **Graduate `--enable-udp-multitransport` and `--enable-lossy-audio` from experimental (still
-  opt-in; `--udp-migrate-egfx` stays experimental).** Regression test landed (#268). 48 h soak with both
-  on is running on the mini (v0.10.6, sampler `~/macrdp-soak-sampler-udp.sh`, started 2026-11-16 18:48
-  UTC). If clean: drop "EXPERIMENTAL" from those two flags in `docs/cli.md` / `docs/features.md`.
-  Later: lossy audio + `--udp-migrate-egfx` together needs two tunnels and one Soft-Sync with two lists;
-  the 11-16 spike showed mstsc opens both (stash `spike: second reliable UDP offer`). Disconnect must
-  retire both tunnels' bound flags, or the listener reads the idle one as dead.
-
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
   `macrdp::h264=debug` so the next real occurrence shows whether a 1–2 s video backlog came with it.
@@ -635,6 +627,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
   ceiling (NO-GO): multi-user concurrent GUI sessions (macOS limit).
 
 ## Parked — scoped, low priority
+
+- [ ] **Lossy audio + `--udp-migrate-egfx` on UDP together.** Today a connection gets one Soft-Sync, and
+  lossy audio takes it, so video stays on TCP. Fix: offer a reliable and a lossy tunnel, then one Soft-Sync
+  with two channel lists. The 2026-11-16 spike showed mstsc opens both tunnels (local stash `spike: second
+  reliable UDP offer`). The listener already keys peers by address; the work is per-tunnel state in
+  `mt/session.rs`, a list-taking `request_soft_sync` in the dvc fork, and per-tunnel recovery. Disconnect must
+  retire both tunnels' bound flags, or the listener reads the idle one as dead. Low value on a LAN, where
+  video over UDP gains little over TCP.
 
 - [x] **Headless-lock arc — LANDED on `main` 2026-07-23 (pending a release tag).** Merged this
   session: **`--shield-primary`** opt-in lockable headless blanking (#170; single-panel engage
