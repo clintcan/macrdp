@@ -77,25 +77,18 @@ jobs:
       # ironrdp-server comes from clintcan/IronRDP (branch `macrdp`) and its
       # manifest sets `[lib] test = false`, so the root `cargo test` never runs
       # its unit tests (the divergence tests, e.g. the surface command per codec
-      # of divergence (34)). Check out the rev that Cargo.toml pins and run them
-      # there; `--lib` runs them. Platform-independent, so Linux is enough.
-      # `egfx` as macrdp builds it; `multitransport` (BoringSSL from source) is
-      # left out to keep the job fast. `--locked` uses the fork's committed
-      # Cargo.lock.
+      # of divergence (34)). scripts/check-ironrdp-pin.sh first checks that
+      # every IronRDP pin is one commit on a protected macrdp* branch of
+      # clintcan/IronRDP, then leaves that commit checked out; `--lib` runs the
+      # tests there. Platform-independent, so Linux is enough. `egfx` as macrdp
+      # builds it; `multitransport` (BoringSSL from source) is left out to keep
+      # the job fast. `--locked` uses the fork's committed Cargo.lock.
       - name: Test ironrdp-server (clintcan/IronRDP at the pinned rev, unit tests)
         env:
           RUSTFLAGS: ''
         run: |
-          rev=$(sed -n 's|^ironrdp-server *= { git = "https://github.com/clintcan/IronRDP.git", rev = "\([0-9a-f]*\)" }$|\1|p' Cargo.toml)
-          test -n "$rev"
           dir="$RUNNER_TEMP/ironrdp"
-          git init -q "$dir"
-          # GitHub serves any commit of the fork network through this URL, so
-          # check that the rev is on a macrdp* branch (protected against
-          # force-push and deletion; macrdp-<upstream-rev> after a rebase).
-          git -C "$dir" fetch -q --filter=blob:none https://github.com/clintcan/IronRDP.git '+refs/heads/macrdp*:refs/remotes/fork/macrdp*'
-          git -C "$dir" branch -r --contains "$rev" 2>/dev/null | grep -q . || { echo "pinned rev $rev is on no macrdp* branch of clintcan/IronRDP"; exit 1; }
-          git -C "$dir" checkout -q "$rev"
+          scripts/check-ironrdp-pin.sh --checkout "$dir"
           cargo test --locked --manifest-path "$dir/crates/ironrdp-server/Cargo.toml" --lib --features egfx
 
   test-macos:

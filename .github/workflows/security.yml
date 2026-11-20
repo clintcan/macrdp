@@ -24,6 +24,7 @@ on:
       - 'vendor/**/Cargo.toml'
       - 'vendor/**/Cargo.lock'
       - 'deny.toml'
+      - 'scripts/check-ironrdp-pin.sh'
       - '.github/workflows/security.yml'
   pull_request:
     paths:
@@ -32,6 +33,7 @@ on:
       - 'vendor/**/Cargo.toml'
       - 'vendor/**/Cargo.lock'
       - 'deny.toml'
+      - 'scripts/check-ironrdp-pin.sh'
       - '.github/workflows/security.yml'
   schedule:
     # 07:12 UTC daily. Off the hour so it isn't in the top-of-hour runner surge.
@@ -102,6 +104,15 @@ jobs:
       # swap to a SHA-pinned install-action if you want that). Built from source
       # via the already-SHA-pinned toolchain to keep the repo's no-unpinned-actions
       # convention.
+      # Every IronRDP pin must be one commit on a protected macrdp* branch of
+      # clintcan/IronRDP: cargo-deny's `sources` check only sees the URL, and
+      # GitHub serves any commit of the IronRDP fork network through that URL.
+      # The daily run uses main's copy of this workflow and script, so a bad pin
+      # that got past review is still caught. Needs only github.com, which the
+      # egress policy above allows.
+      - name: Check the IronRDP pin
+        run: scripts/check-ironrdp-pin.sh
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --version '=0.19.9' --locked
 

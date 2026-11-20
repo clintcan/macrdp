@@ -7,7 +7,31 @@ Devolutions/IronRDP@e258f6a0 plus macrdp's divergences in `ironrdp-server`, `iro
 number, for example `server: (34) send RemoteFX in a Stream Surface Bits command`.
 
 To change a divergence: make the commit on that branch, then bump the rev in `Cargo.toml` (every
-`ironrdp-*` entry, so that all crates come from one source), and update the log below.
+`ironrdp-*` entry, so that all crates come from one source), and update the log below. The same rev
+goes in `vendor/macrdp-rdpeudp/Cargo.toml` and `vendor/macrdp-rdpeudp/fuzz/Cargo.toml`, which pull
+`ironrdp-core` when built on their own.
+
+## Keeping the fork safe
+
+macrdp builds whatever the pinned rev contains, so the fork is part of the supply chain:
+
+- **Never delete, rename or make private clintcan/IronRDP.** Every release from v0.10.8 on is
+  built from it, so a release tag stops building the day the repo goes.
+- **The `macrdp` and `macrdp-*` branches are protected by two repository rulesets:** nobody can
+  force-push or delete them (no bypass, not even the owner), and only an admin can create or update
+  them. A contributor's change arrives as a pull request into the branch, which the owner merges.
+  After a rebase onto a newer upstream, the new branch is named `macrdp-<upstream-rev>` and the old
+  one stays, so older releases still build.
+- **GitHub Actions are disabled on the fork.** It would otherwise run IronRDP's own workflows,
+  including PR automation that holds a write token. macrdp's CI tests the fork's server crate.
+- **`scripts/check-ironrdp-pin.sh`** checks that every IronRDP git dependency in a tracked
+  `Cargo.toml` names clintcan/IronRDP with a full 40-hex rev, that all of them are the same commit,
+  that `Cargo.lock` agrees, and that the commit is on a `macrdp*` branch. The branch check matters
+  because GitHub serves any commit of the IronRDP fork network through clintcan/IronRDP's URL, and
+  cargo-deny checks only the URL. It runs in CI, in the daily security workflow (from `main`'s
+  copy, so a bad pin that got past review is still caught) and before every release build. A rev
+  that is on a branch but isn't its tip passes with a warning: older tags must stay buildable, but
+  in review an older commit may mean a missing fix.
 
 The logs below were written when the four crates were vendored in this repo, at `vendor/ironrdp-*`.
 Read `vendor/ironrdp-<crate>/` as `crates/ironrdp-<crate>/` in clintcan/IronRDP. Notes about the
