@@ -309,8 +309,10 @@ build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 (vendor/ironrdp-{server,acceptor,rdpdr,dvc}/
                           DE-VENDORED 2026-11-20 (#225). The four forks are now
-                          clintcan/IronRDP, branch `macrdp`: upstream e258f6a0
-                          plus one commit per divergence. Cargo.toml takes every
+                          clintcan/IronRDP, branch `macrdp-79e763a0`: upstream
+                          79e763a0 plus one commit per divergence (until the
+                          79e763a0 pin: branch `macrdp`, on upstream e258f6a0).
+                          Cargo.toml takes every
                           ironrdp-* crate from that branch at one rev. The
                           divergence logs are in docs/ironrdp-divergences.md.
 
