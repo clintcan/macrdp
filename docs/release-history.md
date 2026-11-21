@@ -4,14 +4,16 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
-## v0.10.8 — Windows App on Windows connects first time, connection-quality reporting, IronRDP from a fork
+## v0.10.9 — Windows App on Windows connects first time, connection-quality reporting, IronRDP from a fork
+
+The `v0.10.8` tag was never released: its release build stopped in the new IronRDP pin check (below), whose cleanup failed on GitHub's macOS runner after the check itself had passed. v0.10.9 is v0.10.8 plus that fix.
 
 Windows App on Windows no longer disconnects and reconnects three times after connecting, a new opt-in setting reports connection quality to the client, and macrdp now takes its IronRDP changes from a fork instead of copies in this repo.
 
 - **Windows App on Windows connects first time (#273, fixes #269).** It connected and showed the desktop, then was dropped and reconnected three times before it stayed up. Blank-screen recovery mistook it for a black screen: this client reports a render time only for its first frame and zero afterwards, even while it's working. Recovery is now off for clients that advertise its newer graphics capability versions (Windows App on Windows and iOS). mstsc and Windows App for macOS keep it.
 - **`--network-autodetect` (#274, from #235, thanks @JulyStar-Lv).** Reports round-trip time and bandwidth to the client, which Windows shows in its connection-quality view. At connect time macrdp sends a 256 KiB burst to measure the real bandwidth: without it, the measurement only saw macrdp's own video rate and mstsc and Windows App warned "Your network might be slow" on a fast LAN. Off by default (`NETWORK_AUTODETECT=1`).
 - **IronRDP changes now live on a fork (#271, thanks @rophy).** Every `ironrdp-*` crate comes from clintcan/IronRDP (branch `macrdp`) instead of copies under `vendor/`, one commit per change, so `git log` and `git blame` show each one's history. The move itself changed no source; #274's connect-time measurement was then added on the fork.
-- **Supply-chain guard (#272).** `scripts/check-ironrdp-pin.sh` checks that every IronRDP pin is one commit on a protected branch of the fork. It runs in CI, in the daily security scan and before every release build. On the fork, GitHub Actions are off and only the owner can update the `macrdp` branches.
+- **Supply-chain guard (#272).** `scripts/check-ironrdp-pin.sh` checks that every IronRDP pin is one commit on a protected branch of the fork. It runs in CI, in the daily security scan and before every release build. On the fork, GitHub Actions are off and only the owner can update the `macrdp` branches. Its cleanup is best effort, so a leftover temporary directory can't fail a check that passed.
 
 **Verified before release**
 

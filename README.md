@@ -18,7 +18,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.10.8](https://github.com/clintcan/macrdp/releases/latest)** — Windows App on Windows connects first time, opt-in connection-quality reporting for the Windows connection dialog, and IronRDP changes now come from a fork.
+**Latest: [v0.10.9](https://github.com/clintcan/macrdp/releases/latest)** — Windows App on Windows connects first time, opt-in connection-quality reporting for the Windows connection dialog, and IronRDP changes now come from a fork.
 
 **Recent releases**
 

@@ -23,7 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.8** (Windows App on Windows no longer loops
+(VPN/ZeroTier). **Latest release: v0.10.9** (v0.10.8 was tagged but never released; Windows App on Windows no longer loops
 through blank recovery, #273/#269; opt-in `--network-autodetect` with a connect-time
 bandwidth burst, #274/#235; every `ironrdp-*` crate from clintcan/IronRDP's `macrdp`
 branch, #271; the IronRDP pin guard, #272).
