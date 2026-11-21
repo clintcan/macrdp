@@ -7,6 +7,24 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **Live-test checklist for the macrdp PR that moves the pins to `macrdp-79e763a0` (rophy, #275).**
+  Before merging: `cargo tree` and `cargo-deny` before and after (upstream's lockfile trips zstd-safe,
+  hickory-proto and libz-sys advisories; zstd-safe 7.4.1 is fine), and the pin guard on the new branch.
+  Live, on the mini, with UDP and lossy audio on:
+  - Clients: mstsc (Windows 11, and Windows 10 if available), Windows App on Windows (stays connected
+    first time: #273 reads the EGFX capability list) and on macOS (blank recovery still armed), FreeRDP.
+  - Picture, sound, clipboard both ways (text, rich text, files), drive redirection read and write,
+    microphone, camera, USB (drive and gamepad), smart card.
+  - Resize (live and maximize), minimize and restore, takeover by a second client, wrong password refused,
+    auto-reconnect after a network drop, blank recovery.
+  - Audio latency vs v0.10.9 (waves now queue behind a batch): mstsc resize and a drive copy while audio
+    plays.
+  - Stuck-modifier reset, now raised from `on_connection_info`: hold Ctrl (or start a drag), drop the
+    connection, reconnect, check clicks are normal; and check a takeover attempt doesn't clear the live
+    session's held keys.
+  - Connect-time auto-detect (`NETWORK_AUTODETECT=1`): "good" quality, no slow-network warning.
+  - Then a 48 h soak before any release.
+
 - [ ] **Open PRs — review state (as of 2026-11-21).** Labels track it: `waiting on author` = the
   contributor owes a change; everything else is ours. Merged 11-12→21: #197 #200 #201 #204 #219 #228
   #230 #240/#254 #255 #256 #257 #258 #259 #260 #262 #263 #264 #265 #267 #268 #270 #271 #272 #273.
@@ -84,6 +102,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
   "GREEN" status lines are demoted WARN→DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.
 
 ## Deferred — scoped, not started
+
+- [ ] **Pre-existing gaps found reviewing the 79e763a0 rebase (clintcan/IronRDP#3, 2026-11-21).** Not
+  regressions; present on `macrdp` too. (a) After an in-place Deactivation-Reactivation (blank recovery), the
+  UDP tunnel's inbound receiver isn't re-taken (`TunnelInbound::take` runs once per client loop), so data the
+  client sends over the tunnel (EGFX acks once migrated) is dropped. (b) A connection that dies between cookie
+  registration and `mt_on_finalized` leaves its tunnel-bound flag raised (cookie still evicted). (c) The camera
+  enumerator has no per-connection cap on DEVICE_ADDED (URBDRC has `MAX_DEVICE_CHANNELS`). (d) The
+  client-supplied hostname is logged with `%` (log injection).
 
 - [ ] **UDP: lossy audio and `--udp-migrate-egfx` can't both migrate in one session.** A connection gets one
   Soft-Sync request, and with lossy audio on, the audio channel takes it (`mt_soft_sync_on_egfx`). Fixing it
@@ -628,7 +654,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Parked — scoped, low priority
 
-- [ ] **Lossy audio + `--udp-migrate-egfx` on UDP together.** Today a connection gets one Soft-Sync, and
+- [ ] **Lossy audio + `--udp-migrate-egfx` on UDP together.** **Design written: `docs/udp-two-tunnels-design.md`** (2026-11-22); build it on `macrdp-79e763a0` after the pin move. Today a connection gets one Soft-Sync, and
   lossy audio takes it, so video stays on TCP. Fix: offer a reliable and a lossy tunnel, then one Soft-Sync
   with two channel lists. The 2026-11-16 spike showed mstsc opens both tunnels (local stash `spike: second
   reliable UDP offer`). The listener already keys peers by address; the work is per-tunnel state in
