@@ -447,6 +447,16 @@ struct Args {
     #[arg(long)]
     stats_endpoint: bool,
 
+    /// Report network characteristics to the client (MS-RDPBCGR 2.2.14
+    /// auto-detect): RTT probes and bandwidth measurements on the MCS message
+    /// channel, and Network Characteristics Result PDUs the client can show, for
+    /// example in the Windows connection-quality dialog. IronRDP's own
+    /// auto-detect does the work; macrdp ticks it once a second. Only for
+    /// clients that open the message channel. Opt-in (default off). Config:
+    /// NETWORK_AUTODETECT=1.
+    #[arg(long)]
+    network_autodetect: bool,
+
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
     /// Hardware-encoded via VideoToolbox. Falls back to the legacy path
@@ -2582,6 +2592,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
+    if on("NETWORK_AUTODETECT", false) {
+        argv.push("--network-autodetect".into());
+    }
     if on("CAPTURE_NV12", false) {
         argv.push("--capture-nv12".into());
     }
@@ -2869,6 +2882,34 @@ fn report_auth_failure(
             warn!(error = %e, "could not write the auth-status file for the controller");
         }
     }
+}
+
+/// How often `--network-autodetect` ticks IronRDP's auto-detect. Each tick
+/// sends one RTT probe; every 8th starts a bandwidth measurement over the next
+/// 4 ticks; a Network Characteristics Result goes out at most once a second.
+const AUTODETECT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Send `ServerEvent::AutoDetectRttRequest` every `period` until the server's
+/// event channel closes. A tick sent while no session is served is discarded by
+/// the server's accept loop (and by the drain before a takeover), so ticks
+/// can't pile up and reach the next client as a burst of probes.
+fn spawn_autodetect_ticker(
+    events: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if events
+                .send(ironrdp_server::ServerEvent::AutoDetectRttRequest)
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
 }
 
 async fn async_main() -> Result<()> {
@@ -4087,6 +4128,19 @@ async fn async_main() -> Result<()> {
     } else {
         None
     };
+
+    // Network auto-detect (--network-autodetect). IronRDP's AutoDetectManager
+    // sends the RTT probes, brackets ordinary traffic for the bandwidth
+    // measurement and reports the results; it only needs a periodic tick.
+    if args.network_autodetect {
+        server.enable_autodetect();
+        spawn_autodetect_ticker(server.event_sender().clone(), AUTODETECT_TICK);
+        info!(
+            tick_ms = AUTODETECT_TICK.as_millis() as u64,
+            "network auto-detect enabled (--network-autodetect): RTT and bandwidth are measured and \
+             reported to clients that open the message channel"
+        );
+    }
 
     // ironrdp_server::Credentials holds a plain String, so this copy is
     // outside our control and won't be zeroed when the server shuts down.

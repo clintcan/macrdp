@@ -535,6 +535,15 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   when off. Loopback-only, carries no client IP/hostname.
                           #   Port MACRDP_STATS_PORT (default 40245). Config keys:
                           #   STATS_ENDPOINT, STATS_PORT. macOS-built; cross-platform.
+--network-autodetect      # Opt-in (default OFF; NETWORK_AUTODETECT=1 in config.env).
+                          #   Report network characteristics to the client (MS-RDPBCGR
+                          #   2.2.14 auto-detect) using IronRDP's own AutoDetectManager:
+                          #   an RTT probe each second, a bandwidth measurement every
+                          #   8 s that brackets ordinary traffic (no extra payload),
+                          #   and a Network Characteristics Result at most once a
+                          #   second, e.g. for the Windows connection-quality dialog.
+                          #   Only clients that open the MCS message channel take
+                          #   part (mstsc does). Idea from #235.
 ```
 
 Auth hardening (env-only, **on by default**). macrdp rate-limits and briefly
