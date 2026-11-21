@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
+    BitmapUpdate, DesktopSize, DisplayContext, DisplayUpdate, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates, ServerError, ServerErrorExt as _, ServerResult,
 };
 
@@ -307,6 +307,30 @@ impl RdpServerDisplayUpdates for CountedUpdates {
     }
 }
 
+/// The current connection's "client minimized" flag.
+///
+/// ironrdp-server makes a new flag for each connection and hands it to
+/// [`CaptureDisplay::updates`] in its `DisplayContext`. `updates` puts it here, so
+/// readers that live for the whole server (the audio capture) see the current
+/// connection's flag.
+#[derive(Clone, Debug, Default)]
+pub struct SuppressedFlag(Arc<std::sync::Mutex<Arc<AtomicBool>>>);
+
+impl SuppressedFlag {
+    /// Makes `flag` the current connection's flag.
+    pub fn set(&self, flag: Arc<AtomicBool>) {
+        *self.0.lock().unwrap() = flag;
+    }
+
+    pub fn load(&self) -> bool {
+        self.0.lock().unwrap().load(Ordering::Relaxed)
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().unwrap().store(false, Ordering::Relaxed);
+    }
+}
+
 pub struct CaptureDisplay {
     /// Session desktop size — shared with the input handler and the H.264
     /// pipeline so all three stay in sync when `auto_size` adopts the
@@ -391,7 +415,7 @@ pub struct CaptureDisplay {
     /// frame. `None` disables the gate entirely (single-binary builds
     /// where the server doesn't expose the handle — e.g., the non-macOS
     /// stub).
-    pub display_suppressed: Option<Arc<AtomicBool>>,
+    pub display_suppressed: Option<SuppressedFlag>,
     /// Client-driven live-resize request in flight (MS-RDPEDISP monitor
     /// layout — the client resized its window mid-session). `request_layout`
     /// writes to it; the capture loop polls + debounces it into an actual
@@ -729,7 +753,13 @@ impl RdpServerDisplay for CaptureDisplay {
         self.pending_resize.request(adopted.width, adopted.height);
     }
 
-    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(
+        &mut self,
+        ctx: DisplayContext,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        if let Some(slot) = self.display_suppressed.as_ref() {
+            slot.set(ctx.display_suppressed);
+        }
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
@@ -1271,7 +1301,7 @@ mod macos {
         nv12_bgra: Vec<u8>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
-        display_suppressed: Option<Arc<AtomicBool>>,
+        display_suppressed: Option<SuppressedFlag>,
         /// Last observed value of `display_suppressed`, used to detect the
         /// false→true→false transition. On the un-suppress edge we force an
         /// IDR keyframe so the client resumes from a fresh reference frame
@@ -1475,7 +1505,7 @@ mod macos {
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
             capture_nv12: bool,
-            display_suppressed: Option<Arc<AtomicBool>>,
+            display_suppressed: Option<SuppressedFlag>,
             auto_size: bool,
             stretch: bool,
             desktop_size: SharedDesktopSize,
@@ -1678,7 +1708,7 @@ mod macos {
             // default; the gate then trips correctly when the new client's
             // own SuppressOutput PDU lands.
             if let Some(flag) = display_suppressed.as_ref() {
-                flag.store(false, Ordering::Relaxed);
+                flag.clear();
             }
 
             Ok(Self {
@@ -2126,7 +2156,7 @@ mod macos {
                 // normally.
                 if self.first_egfx_frame_sent {
                     if let Some(flag) = self.display_suppressed.as_ref() {
-                        if flag.load(Ordering::Relaxed) {
+                        if flag.load() {
                             let started = *self.suppressed_since.get_or_insert_with(Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;

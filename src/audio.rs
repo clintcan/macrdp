@@ -7,7 +7,7 @@
 //! ship via `RdpsndServerMessage::Wave`.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -41,11 +41,10 @@ pub struct MacRdpsnd {
     /// Dedicated bounded channel for Wave PDUs. Set by ironrdp-server
     /// via `set_audio_sender`. When present, the capture loop sends
     /// every Wave directly here, bypassing the unified `ServerEvent`
-    /// stream. The server's `dispatch_audio` task is the sole consumer,
-    /// independent of the inbound-PDU and outbound-event dispatch
-    /// branches that share `Mutex<Self>` — so a sustained inbound
-    /// cliprdr stream (e.g., large `--lazy-paste` Windows→Mac transfer)
-    /// no longer starves audio output.
+    /// stream. The server reads it in its own arm of the connection's
+    /// select loop, so a sustained inbound cliprdr stream (e.g., large
+    /// `--lazy-paste` Windows→Mac transfer) or a backlog of other server
+    /// events does not starve audio output.
     audio_sender: AudioSender,
     // Monotonic capture-loop generation, shared with every backend this
     // factory builds. mstsc's cert-prompt reconnect makes ironrdp build a
@@ -57,7 +56,7 @@ pub struct MacRdpsnd {
     /// Shared "client minimized / SuppressOutput" flag, same Arc the
     /// vendor server flips and capture.rs reads. `None` disables the
     /// audio mute (e.g., test/Linux-stub builds without server plumbing).
-    display_suppressed: Option<Arc<AtomicBool>>,
+    display_suppressed: Option<crate::capture::SuppressedFlag>,
     /// When true (default) and `display_suppressed` is set, the capture
     /// loop stops emitting Wave PDUs while the client is minimized so
     /// the client's audio renderer drains naturally. Pass
@@ -82,7 +81,7 @@ pub struct MacRdpsnd {
 
 impl MacRdpsnd {
     pub fn new(
-        display_suppressed: Option<Arc<AtomicBool>>,
+        display_suppressed: Option<crate::capture::SuppressedFlag>,
         mute_on_minimize: bool,
         enable_aac: bool,
         aac_bitrate: u32,
@@ -186,7 +185,7 @@ struct MacRdpsndBackend {
     formats: Vec<AudioFormat>,
     /// Shared with the vendor server's SuppressOutput handler — see
     /// [`MacRdpsnd::display_suppressed`].
-    display_suppressed: Option<Arc<AtomicBool>>,
+    display_suppressed: Option<crate::capture::SuppressedFlag>,
     /// Default-on opt-out via `--no-mute-on-minimize`.
     mute_on_minimize: bool,
     /// Target AAC bitrate (bits/sec); only consulted when the negotiated
@@ -326,7 +325,7 @@ async fn capture_loop(
     audio_sender: AudioSender,
     generation: Arc<AtomicU64>,
     my_gen: u64,
-    display_suppressed: Option<Arc<AtomicBool>>,
+    display_suppressed: Option<crate::capture::SuppressedFlag>,
     mute_on_minimize: bool,
     use_aac: bool,
     aac_bitrate: u32,
@@ -667,7 +666,7 @@ async fn capture_loop(
                 // steady-`true` for >= 1 s.
                 if mute_on_minimize {
                     if let Some(flag) = display_suppressed.as_ref() {
-                        if flag.load(Ordering::Relaxed) {
+                        if flag.load() {
                             let started =
                                 *suppressed_since.get_or_insert_with(std::time::Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
@@ -732,7 +731,7 @@ async fn capture_loop(
                     }
                     if let Some(audio_ref) = audio_s.as_ref() {
                         // Bounded channel: send().await applies backpressure if
-                        // the dispatch_audio task is behind, but if we're at
+                        // the server's audio arm is behind, but if we're at
                         // capacity we'd rather drop this wave at the SCK level
                         // than block the capture loop (which would back up the
                         // SCK ring buffer and lose newer audio anyway). Use
@@ -740,7 +739,9 @@ async fn capture_loop(
                         match audio_ref.try_send((data, ts_ms, duration_ms)) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                debug!("audio channel full; dropping wave (dispatch_audio behind)");
+                                debug!(
+                                    "audio channel full; dropping wave (server audio arm behind)"
+                                );
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                         }
@@ -777,7 +778,7 @@ async fn capture_loop(
     _audio_sender: AudioSender,
     _generation: Arc<AtomicU64>,
     _my_gen: u64,
-    _display_suppressed: Option<Arc<AtomicBool>>,
+    _display_suppressed: Option<crate::capture::SuppressedFlag>,
     _mute_on_minimize: bool,
     _use_aac: bool,
     _aac_bitrate: u32,
