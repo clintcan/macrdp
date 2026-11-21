@@ -63,7 +63,7 @@ use ironrdp_egfx::pdu::{
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
-    EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
+    EgfxServerMessage, GfxContext, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
     ServerEventSender,
 };
 use ironrdp_svc::ChannelFlags;
@@ -3473,26 +3473,10 @@ impl ServerEventSender for Gfx {
 }
 
 impl Gfx {
-    /// Identity of the connection whose context is active (the address of its
-    /// `GraphicsPipelineServer`), so a test can tell one connection's context
-    /// from another's.
-    #[cfg(test)]
-    pub(crate) fn active_connection(&self) -> Option<usize> {
-        self.ctx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|c| Arc::as_ptr(&c.server_handle) as usize)
-    }
-}
-
-impl GfxServerFactory for Gfx {
-    fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
-        // We override build_server_with_handle, so this is only a safety stub.
-        Box::new(StubHandler)
-    }
-
-    fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+    /// Builds the connection's EGFX server and its context (see
+    /// [`GfxServerFactory::build_server_with_handle`]). Separate from the trait
+    /// method so tests can call it: they cannot build a `GfxContext`.
+    pub(crate) fn build_connection_server(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
         let handler = Box::new(GfxHandler {
             ctx: self.ctx.clone(),
         });
@@ -3592,6 +3576,32 @@ impl GfxServerFactory for Gfx {
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
             handle,
         ))
+    }
+
+    /// Identity of the connection whose context is active (the address of its
+    /// `GraphicsPipelineServer`), so a test can tell one connection's context
+    /// from another's.
+    #[cfg(test)]
+    pub(crate) fn active_connection(&self) -> Option<usize> {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| Arc::as_ptr(&c.server_handle) as usize)
+    }
+}
+
+impl GfxServerFactory for Gfx {
+    fn build_gfx_handler(&self, _ctx: GfxContext) -> Box<dyn GraphicsPipelineHandler> {
+        // We override build_server_with_handle, so this is only a safety stub.
+        Box::new(StubHandler)
+    }
+
+    fn build_server_with_handle(
+        &self,
+        _ctx: GfxContext,
+    ) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        self.build_connection_server()
     }
 }
 
@@ -6636,7 +6646,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
         );
-        assert!(gfx.build_server_with_handle().is_some());
+        assert!(gfx.build_connection_server().is_some());
         gfx
     }
 

@@ -3721,12 +3721,11 @@ async fn async_main() -> Result<()> {
     let click_signal =
         (args.enable_h264 && keyframe_on_change.enabled).then(crate::capture::ClickSignal::new);
 
-    // Shared "client minimized / SuppressOutput" flag — created here so
-    // the same `Arc<AtomicBool>` can be handed to both the capture
-    // backend (which reads it to gate frame emission) and ironrdp-server
-    // (whose per-connection PDU handler writes it). See its
-    // `display_suppressed` plumbing.
-    let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Shared "client minimized / SuppressOutput" flag, read by the capture
+    // backend (to gate frame emission) and the audio capture (to mute). The
+    // server writes a new flag for each connection; `CaptureDisplay::updates`
+    // puts that connection's flag into this slot.
+    let display_suppressed = capture::SuppressedFlag::default();
 
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
@@ -3876,6 +3875,8 @@ async fn async_main() -> Result<()> {
     //   a client still handshaking;
     // - the client's keyboard-layout id, for the input handler to auto-select a
     //   matching non-US layout when --keyboard-layout is unset.
+    // - the input-reset flag, so the input handler clears held modifiers and
+    //   buttons once per served connection.
     let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
     hooks.extend(auth_guard::AuthGuardHandler::from_env());
     if let Some(activity) = &lock_activity {
@@ -3883,6 +3884,9 @@ async fn async_main() -> Result<()> {
     }
     hooks.push(Box::new(conn_hooks::KeyboardLayoutHook(
         keyboard_layout_klid,
+    )));
+    hooks.push(Box::new(conn_hooks::InputResetHook(
+        input::modifier_reset_handle(),
     )));
     // `--virtual-display-hidpi=auto` sizes the virtual display from the
     // desktop scale factor the connecting client announces.
@@ -3967,9 +3971,6 @@ async fn async_main() -> Result<()> {
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
         .with_connection_handler(Some(Box::new(conn_hooks::ConnectionHooks::new(hooks))))
-        // Share the suppress flag with the capture backend, so the server's
-        // per-connection PDU handler writes to the `AtomicBool` it reads.
-        .with_display_suppressed_handle(display_suppressed)
         .with_honor_client_desktop_size(honor_client_size)
         .with_auto_reconnect_cookie(auto_reconnect_cookie.flatten())
         // macrdp is a single console session: a new authenticated client takes it
@@ -3977,15 +3978,6 @@ async fn async_main() -> Result<()> {
         // in the listen backlog until the first disconnects.
         .with_connection_policy(ironrdp_server::ConnectionPolicy::Preempt)
         .build();
-
-    // Per-SERVED-connection reset for the input handler's held-modifier and
-    // button-down state (vendored divergence 24). The server raises this once
-    // at the top of `run_connection`/`serve_negotiated` — not on a live-resize
-    // or blank-recovery reactivation, and not for a preemption candidate — and
-    // the input handler drains it on its next event. See
-    // `input::modifier_reset_handle` for why the display `updates()` path and
-    // `on_accept` were both the wrong seam.
-    server.set_input_reset_handle(input::modifier_reset_handle());
 
     // The server samples the kernel's smoothed TCP RTT for each accepted
     // connection (divergence 15) into this cell; the H.264 pipeline reads it

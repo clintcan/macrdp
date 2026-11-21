@@ -66,17 +66,19 @@ impl RdpServerDisplay for TestDisplay {
     async fn size(&mut self) -> ServerDesktopSize {
         self.size
     }
-    async fn updates(&mut self) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(
+        &mut self,
+        _ctx: ironrdp_server::DisplayContext,
+    ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(TestUpdates))
     }
 }
 
-/// A do-nothing sound factory whose only job is to KEEP THE SESSION ALIVE in
-/// the preemption test. With no sound factory the server drops the audio
-/// sender, so `dispatch_audio`'s channel closes and the client loop ends
-/// immediately with `Disconnect` — a client would never actually stay
-/// connected. Holding the `audio_sender` here (and never sending) makes the
-/// audio arm park forever, so the session lives until it's torn down for real.
+/// A do-nothing sound factory for the tests that need a live session, as in
+/// production (which always has a sound factory). It holds the `audio_sender`
+/// and never sends. Before the 79e763a0 pin a closed audio channel ended the
+/// client loop, so this was what kept those sessions up; the server now keeps a
+/// session whose audio channel is closed or absent.
 struct KeepAliveSound {
     audio_sender: Option<tokio::sync::mpsc::Sender<ironrdp_server::AudioWave>>,
 }
@@ -253,6 +255,35 @@ fn client_config(width: u16, height: u16) -> Config {
         support_dyn_vc_gfx_protocol: false,
         remote_application_mode: false,
         rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty(),
+        // Added to connector Config by the 79e763a0 pin bump. V5_PLUS is what the
+        // connector sent before it let the client choose.
+        desktop_physical_size: None,
+        desktop_orientation: None,
+        device_scale_factor: None,
+        monitor_extended_layout: None,
+        relative_mouse_input: false,
+        rdp_version: ironrdp_pdu::gcc::RdpVersion::V5_PLUS,
+    }
+}
+
+/// Reads from `framed` for `window` and returns `Ok(())` when the connection
+/// stays open, or the read result that ended it. The server may still send
+/// PDUs (for example the logon notification at activation), so a PDU does not
+/// count as the end of the session; only an error or EOF does.
+async fn stays_open<S>(
+    framed: &mut TokioFramed<S>,
+    window: std::time::Duration,
+) -> std::result::Result<(), std::io::Error>
+where
+    S: tokio::io::AsyncRead + Unpin + Send + Sync,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        match tokio::time::timeout_at(deadline, framed.read_pdu()).await {
+            Err(_elapsed) => return Ok(()),
+            Ok(Ok(_pdu)) => continue,
+            Ok(Err(e)) => return Err(e),
+        }
     }
 }
 
@@ -294,9 +325,9 @@ fn build_test_server_on(
 }
 
 /// As above, with `keep_alive` opting into a `KeepAliveSound` factory so a
-/// served connection stays up (the preemption test needs a live session to
-/// take over). Without it the client loop ends immediately (closed audio
-/// channel), which is fine for the negotiate-and-drop tests.
+/// served connection has a sound factory, as in production (the preemption
+/// test needs a live session to take over). The negotiate-and-drop tests
+/// do not need one.
 fn build_test_server_full(
     port: u16,
     server_w: u16,
@@ -415,7 +446,8 @@ where
         Vec::new(),
         None,
     )
-    .await?;
+    .await?
+    .into_connected()?;
     Ok((
         (result.desktop_size.width, result.desktop_size.height),
         tls_framed,
@@ -692,8 +724,7 @@ async fn second_client_preempts_the_live_session() -> anyhow::Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            // A live session (see `KeepAliveSound`) — otherwise the client loop
-            // ends the moment it starts and there's nothing to preempt.
+            // A live session (see `KeepAliveSound`) to preempt.
             let mut server = build_test_server_full(
                 addr.port(),
                 1024,
@@ -891,13 +922,13 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
                 "the rejected candidate's connection should be closed by the server, got {client_b_read:?}"
             );
 
-            // Client A must still be alive: reading a PDU TIMES OUT (no
+            // Client A must still be alive: reads see no EOF or error (no
             // disconnect) rather than observing the server having dropped it
             // to serve the (rejected) client B.
             let client_a_still_alive =
-                tokio::time::timeout(std::time::Duration::from_millis(500), framed_a.read_pdu()).await;
+                stays_open(&mut framed_a, std::time::Duration::from_millis(500)).await;
             assert!(
-                client_a_still_alive.is_err(),
+                client_a_still_alive.is_ok(),
                 "the live session must survive a preemption attempt the handler rejected, got {client_a_still_alive:?}"
             );
 
@@ -1064,13 +1095,12 @@ async fn a_just_evicted_peer_cannot_immediately_preempt_back() -> anyhow::Result
                  successful connect back"
             );
 
-            // ...and B is still alive: reading times out (nothing to say)
+            // ...and B is still alive: reads see no EOF or error
             // rather than reporting the session was torn down under it.
             let b_still_alive =
-                tokio::time::timeout(std::time::Duration::from_millis(500), framed_b.read_pdu())
-                    .await;
+                stays_open(&mut framed_b, std::time::Duration::from_millis(500)).await;
             assert!(
-                b_still_alive.is_err(),
+                b_still_alive.is_ok(),
                 "B's session must survive the evicted peer's reconnect, got {b_still_alive:?}"
             );
 
@@ -1390,6 +1420,7 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
         }
         async fn updates(
             &mut self,
+            _ctx: ironrdp_server::DisplayContext,
         ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
             Ok(Box::new(FloodUpdates(0)))
         }
@@ -1476,6 +1507,7 @@ async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result
         }
         async fn updates(
             &mut self,
+            _ctx: ironrdp_server::DisplayContext,
         ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
             // Popped from the back: hidden first, then default.
             Ok(Box::new(PointerUpdates(vec![
@@ -1762,7 +1794,8 @@ async fn the_soft_sync_moves_lossy_audio_onto_the_lossy_tunnel() -> anyhow::Resu
                     Ok(ironrdp_connector::MultitransportResult::Success)
                 },
             )
-            .await?;
+            .await?
+            .into_connected()?;
             let request_id = offered
                 .get()
                 .ok_or_else(|| anyhow::anyhow!("the server never offered the lossy tunnel"))?;
@@ -1895,7 +1928,8 @@ async fn network_autodetect_sends_rtt_probes_on_the_message_channel() -> anyhow:
                 Vec::new(),
                 None,
             )
-            .await?;
+            .await?
+            .into_connected()?;
             let message_channel_id = result
                 .message_channel_id
                 .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
@@ -1993,7 +2027,8 @@ async fn network_autodetect_reports_the_connect_time_bandwidth() -> anyhow::Resu
                 Vec::new(),
                 None,
             )
-            .await?;
+            .await?
+            .into_connected()?;
             let channel = result
                 .message_channel_id
                 .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
