@@ -80,24 +80,33 @@ bad=$(printf '%s\n' "$lock" | grep -vxF "source = \"git+$FORK?rev=$rev#$rev\"" |
 dir="$checkout"
 if [ -z "$dir" ]; then
     dir=$(mktemp -d)
-    trap 'rm -rf "$dir"' EXIT
+    # Best effort: a leftover temporary directory must never fail a check that
+    # passed. (On GitHub's macOS runners git's background maintenance was still
+    # writing commit-graph files when the cleanup ran, "Directory not empty",
+    # and the failed cleanup became this script's exit status.)
+    trap 'rm -rf "$dir" 2>/dev/null || true' EXIT
 fi
+# No background maintenance, so nothing keeps writing into $dir after a command
+# returns (see the trap above).
+g() {
+    git -c gc.auto=0 -c maintenance.auto=false -c fetch.writeCommitGraph=false -C "$dir" "$@"
+}
 git init -q "$dir"
-git -C "$dir" fetch -q --filter=blob:none "$FORK" '+refs/heads/macrdp*:refs/remotes/fork/macrdp*'
-git -C "$dir" for-each-ref --format='%(refname)' refs/remotes/fork | grep -q . \
+g fetch -q --filter=blob:none "$FORK" '+refs/heads/macrdp*:refs/remotes/fork/macrdp*'
+g for-each-ref --format='%(refname)' refs/remotes/fork | grep -q . \
     || fail "no macrdp* branch found on $FORK"
-git -C "$dir" branch -r --contains "$rev" 2>/dev/null | grep -q . \
+g branch -r --contains "$rev" 2>/dev/null | grep -q . \
     || fail "pinned rev $rev is on no macrdp* branch of $FORK"
 
 # Not the tip of any branch: allowed (old tags must stay buildable), but worth a
 # look in review, since an older commit may lack a later fix.
-if ! git -C "$dir" for-each-ref --format='%(objectname)' refs/remotes/fork | grep -qx "$rev"; then
+if ! g for-each-ref --format='%(objectname)' refs/remotes/fork | grep -qx "$rev"; then
     msg="pinned rev $rev is not the tip of any macrdp* branch; check that an older commit is intended"
     if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::warning::$msg"; else echo "note: $msg" >&2; fi
 fi
 
 if [ -n "$checkout" ]; then
-    git -C "$dir" checkout -q "$rev"
+    g checkout -q "$rev"
 fi
 
 echo "ok: $count IronRDP pins, all $rev, on a macrdp* branch of $FORK"
