@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - `docs/oss-rdp-server-comparison.md` — the verified evidence behind the "first OSS
 >   RDP server to…" claims (and what NOT to claim). Read before repeating any of them.
 > - `docs/ironrdp-divergences.md` — macrdp's divergences in the `ironrdp-*` crates, which
->   come from clintcan/IronRDP (branch `macrdp`). Read before changing an IronRDP crate.
+>   come from clintcan/IronRDP (branch `macrdp-79e763a0`). Read before changing an IronRDP crate.
 
 ## Status
 

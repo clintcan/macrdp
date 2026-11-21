@@ -1476,9 +1476,10 @@ async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
 }
 
 /// A pointer update with no payload (hidden, default) must still reach the
-/// client. The fast-path fragmenter at our pin stopped on an empty payload
-/// and wrote nothing, so `HidePointer` and `DefaultPointer` were silently
-/// dropped (vendored server divergence 31, from upstream #2274).
+/// client. Upstream's fast-path fragmenter before #2274 stopped on an empty
+/// payload and wrote nothing, so `HidePointer` and `DefaultPointer` were
+/// silently dropped (server divergence (31) until the 79e763a0 pin, which has
+/// upstream's fix).
 #[tokio::test]
 async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result<()> {
     use ironrdp_core::{Decode as _, ReadCursor};
@@ -1577,8 +1578,8 @@ async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result
 
 /// A peer that sends an X.224 Connection Request and then goes silent must not
 /// hold the serving connection forever (#186): the pre-finalize phase is
-/// bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s, vendored divergence 32). The
-/// clock is paused, so the wait is virtual.
+/// bounded by upstream's `NEGOTIATION_TIMEOUT` (60 s, #2432; server divergence
+/// (32) until the 79e763a0 pin). The clock is paused, so the wait is virtual.
 #[tokio::test(start_paused = true)]
 async fn a_silent_peer_cannot_hold_the_serving_connection() -> anyhow::Result<()> {
     use ironrdp_pdu::nego::{ConnectionRequest, RequestFlags, SecurityProtocol};
