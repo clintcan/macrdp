@@ -18,10 +18,11 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.10.7](https://github.com/clintcan/macrdp/releases/latest)** — Windows 10 mstsc no longer starts H.264 sessions frozen, an opt-in cap on unacknowledged video frames, and UDP multitransport and lossy audio are out of experimental.
+**Latest: [v0.10.8](https://github.com/clintcan/macrdp/releases/latest)** — Windows App on Windows connects first time, opt-in connection-quality reporting for the Windows connection dialog, and IronRDP changes now come from a fork.
 
 **Recent releases**
 
+- **v0.10.7** (2026-11-20) — no frozen start on Windows 10 mstsc, an ack-lag cap, UDP out of experimental
 - **v0.10.6** (2026-11-16) — no restart loop on a wrong password, a HiDPI virtual display, Windows 10 mstsc pictures
 - **v0.10.5** (2026-11-13) — UDP multitransport fixes: mstsc's tunnel stays up, lossy audio plays again
 - **v0.10.4** (2026-11-13) — true-colour cursors, native-style app switching, `--reverse-scroll`, pre-login timeout

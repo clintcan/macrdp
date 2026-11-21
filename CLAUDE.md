@@ -23,14 +23,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.7** (Windows 10 mstsc no longer starts
-H.264 sessions frozen: legacy updates are held until EGFX is ready, #230;
-opt-in `--h264-max-unacked-frames`, #262; `--enable-udp-multitransport` and
-`--enable-lossy-audio` out of experimental after #268's test and a 48 h soak, #270).
-Unreleased on `main` (v0.10.8 candidates): #271 (every `ironrdp-*` crate now comes from
-clintcan/IronRDP's `macrdp` branch; `vendor/ironrdp-*` is gone), #272 (the IronRDP pin guard,
-`scripts/check-ironrdp-pin.sh`), #273 (no blank-recovery loop for Windows App on Windows, #269).
-#271 swapped every IronRDP crate: consider a short soak before releasing it.
+(VPN/ZeroTier). **Latest release: v0.10.8** (Windows App on Windows no longer loops
+through blank recovery, #273/#269; opt-in `--network-autodetect` with a connect-time
+bandwidth burst, #274/#235; every `ironrdp-*` crate from clintcan/IronRDP's `macrdp`
+branch, #271; the IronRDP pin guard, #272).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

@@ -34,9 +34,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
     Devolutions/IronRDP#2465 (glamberson's fix for our #2280) merges. The rebase goes on a new branch,
     `macrdp-<upstream-rev>`; the old one stays so older releases still build.
 
-- [ ] **v0.10.8:** #271, #272 and #273 are on `main`, unreleased. #271 swapped every IronRDP crate (live
-  checks clean: mstsc ×3, FreeRDP, wrong password refused), so consider a short soak with UDP and lossy
-  audio on before cutting it.
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
