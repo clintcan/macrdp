@@ -56,6 +56,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
   `macrdp::h264=debug` so the next real occurrence shows whether a 1–2 s video backlog came with it.
+  **2026-11-22:** seen on Windows App on Windows (TCP only), on both v0.10.9 and #276's build: a small
+  offset at connect, which the user judged to be audio late rather than video. The A/V resync hotkey fixed it
+  every time and reported 0 unacked frames each time, so there was no video backlog on the server side. Not a
+  regression; next step is the audio side (client playback buffer start, or the first waves' timing).
 
 - [ ] **Next toolchain bump:** clippy on Rust 1.98 flags `chunks_exact_to_as_chunks` in our code (reported
   by rophy on #228). We pin 1.95, so CI is unaffected until then.
