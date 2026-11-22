@@ -3368,17 +3368,8 @@ impl Gfx {
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
             for f in frames {
-                // Region = full actual frame, inclusive bounds. QP 22 /
-                // quality 100 are first-light defaults; tuned in M3. Rebuilt
-                // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1),
-                    bottom: height.saturating_sub(1),
-                    quantization_parameter: 22,
-                    quality: 100,
-                };
+                // Rebuilt per frame because `Avc420Region` isn't `Copy`.
+                let region = frame_region(width, height);
                 let payload = self.frame_payload(f);
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
@@ -4001,6 +3992,15 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
     out
 }
 
+/// The AVC420 region of a whole `width` x `height` frame. Its right and bottom
+/// edges are exclusive (`Avc420Region`, MS-RDPEGFX `RDPGFX_RECT16`),
+/// so they are the frame size: with `width - 1` / `height - 1` the client never
+/// paints the last pixel column and row. QP 22 / quality 100 are first-light
+/// defaults.
+fn frame_region(width: u16, height: u16) -> Avc420Region {
+    Avc420Region::full_frame(width, height, 22)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4029,6 +4029,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_frame_region_covers_the_last_column_and_row() {
+        let region = frame_region(1280, 720);
+        assert_eq!((region.left, region.top), (0, 0));
+        // Exclusive edges: the region includes column 1279 and row 719.
+        assert_eq!((region.right, region.bottom), (1280, 720));
+        let rect = region.to_rectangle();
+        assert_eq!((rect.right, rect.bottom), (1280, 720));
+    }
 
     /// #211: the iOS client sends two capsets this build can't parse. The log
     /// line must say which versions they are, and the flags, without dumping
