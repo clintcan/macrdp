@@ -27,6 +27,9 @@ Functional v0 — daily-driver usable on a trusted LAN and over the internet
 through blank recovery, #273/#269; opt-in `--network-autodetect` with a connect-time
 bandwidth burst, #274/#235; every `ironrdp-*` crate from clintcan/IronRDP's `macrdp`
 branch, #271; the IronRDP pin guard, #272).
+**On `main`, unreleased:** IronRDP rebased onto upstream 79e763a0 (fork branch `macrdp-79e763a0`,
+#275/#276; 48 h soak from 2026-11-22 09:52 UTC), `url` 2.5.9 (#278), the Screen Recording error
+reaches the client (#277).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
