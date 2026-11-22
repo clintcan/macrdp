@@ -709,6 +709,8 @@ pub fn init_focus_observer() {}
 
 #[cfg(target_os = "macos")]
 mod scancodes;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod unicode_keys;
 
 // Re-export the gather-windows sweep so the capture path can trigger it
 // automatically after a live virtual-display re-mode (see
@@ -725,6 +727,7 @@ mod macos {
 
     use super::is_remappable_shortcut;
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode, to_iso_key_order};
+    use super::unicode_keys::{UnicodeAction, UnicodeKeys};
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -1019,6 +1022,8 @@ mod macos {
         // key-up gets swallowed too so the focused app doesn't see a bare
         // release with no preceding press.
         consumed_keys: HashSet<u16>,
+        // RDP Unicode key events: surrogate pairs joined into one character.
+        unicode: UnicodeKeys,
         // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
         // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
         // Cmd swap + restores the real (Ctrl) modifier state.
@@ -1119,6 +1124,7 @@ mod macos {
                 scroll_v_accum: 0,
                 scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
+                unicode: UnicodeKeys::default(),
                 remapped_keys: HashSet::new(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
@@ -1836,17 +1842,21 @@ mod macos {
             }
         }
 
-        fn unicode(&self, c: u16, down: bool) {
-            // For unicode, send a "null" keycode and set the string. Only fire
-            // on key-down — Mac doesn't have a release-side for typed text.
-            if !down {
-                return;
-            }
-            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, true) else {
+        /// An RDP Unicode key event (one UTF-16 unit): a key down or up with
+        /// the "null" keycode, carrying the character. A surrogate pair (emoji)
+        /// is joined into one character (see `unicode_keys`). The key up is
+        /// posted too, as for a real key, so keycode 0 does not stay down.
+        fn unicode(&mut self, c: u16, down: bool) {
+            let (down, text) = match self.unicode.feed(c, down) {
+                UnicodeAction::Down(text) => (true, text),
+                UnicodeAction::Up(text) => (false, text),
+                UnicodeAction::None => return,
+            };
+            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, down) else {
                 warn!("unicode CGEvent create failed");
                 return;
             };
-            ev.set_string_from_utf16_unchecked(&[c]);
+            ev.set_string_from_utf16_unchecked(&text);
             ev.post(CGEventTapLocation::HID);
         }
 
