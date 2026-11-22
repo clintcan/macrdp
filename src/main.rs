@@ -787,8 +787,8 @@ struct Args {
     /// Cap the resolution a client can request on the auto-adopt path
     /// (defense-in-depth resource bound; e.g. 2560x1440). A request above the
     /// cap is clamped per-dimension and the session is served at the clamped
-    /// size. Without it, an authenticated client can request up to the
-    /// protocol maximum 8192x8192 — a ~256 MB BGRA framebuffer per frame.
+    /// size. Default 3840x2160: a larger H.264 frame is above level 5.2,
+    /// which decoders take (and 8192x8192 is a ~256 MB BGRA framebuffer).
     /// Each dimension must be in the RDP band [200, 8192]. No effect with
     /// --no-client-resolution, or with an explicit --width/--height/--hidpi
     /// on the mirror-primary path (those pin the size; --virtual-display
@@ -2463,6 +2463,12 @@ fn main() -> Result<()> {
 /// identity to approve once — instead of going through an unsigned wrapper
 /// script that BTM re-flags on every rebuild. Mirrors the old
 /// `packaging/macrdp-launch` translation exactly (same keys, same defaults).
+/// Largest client-requested session without `--max-client-size`: 4K UHD.
+/// A larger H.264 frame is above the level 5.2 frame size (36 864 macroblocks,
+/// 4096x2304 at 16:9) that decoders take: FreeRDP at 5120x2880 failed to decode
+/// it and showed a black screen. Clamped per dimension, as the option.
+const DEFAULT_MAX_CLIENT_SIZE: (u16, u16) = (3840, 2160);
+
 /// Parse a `--max-client-size` spec ("WxH", e.g. "2560x1440") into a
 /// per-dimension cap, validating each dimension against the RDP desktop band
 /// [200, 8192] (MS-RDPBCGR) — the same band the acceptor's sanity check uses,
@@ -3754,9 +3760,10 @@ async fn async_main() -> Result<()> {
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
         // connect-time auto-adopt above. See `CaptureDisplay::request_layout`.
         pending_resize: capture::PendingResize::new(),
-        max_client_size: args
-            .max_client_size
-            .map(|(width, height)| ironrdp_server::DesktopSize { width, height }),
+        max_client_size: {
+            let (width, height) = args.max_client_size.unwrap_or(DEFAULT_MAX_CLIENT_SIZE);
+            Some(ironrdp_server::DesktopSize { width, height })
+        },
         suppress_next_adopt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Shared so a live client resize can re-mode the display; None on
         // the mirror-primary path (no virtual display to re-mode).
@@ -3903,21 +3910,16 @@ async fn async_main() -> Result<()> {
     // that size from the start (Demand Active); the CaptureDisplay's
     // `request_initial_size` then adopts it into the shared `desktop_size` that
     // capture, input scaling, and the H.264 pipeline all read. The value is the
-    // ceiling (--max-client-size, defense-in-depth; the clamp is per dimension),
-    // or MS-RDPBCGR's own 8192 maximum.
-    let honor_client_size = auto_size.then(|| match args.max_client_size {
-        Some((width, height)) => {
-            info!(
-                max_w = width,
-                max_h = height,
-                "client-requested session size capped at the operator maximum"
-            );
-            ironrdp_server::DesktopSize { width, height }
-        }
-        None => ironrdp_server::DesktopSize {
-            width: 8192,
-            height: 8192,
-        },
+    // ceiling (--max-client-size, or DEFAULT_MAX_CLIENT_SIZE; the clamp is per
+    // dimension).
+    let honor_client_size = auto_size.then(|| {
+        let (width, height) = args.max_client_size.unwrap_or(DEFAULT_MAX_CLIENT_SIZE);
+        info!(
+            max_w = width,
+            max_h = height,
+            "client-requested session size capped"
+        );
+        ironrdp_server::DesktopSize { width, height }
     });
     if args.max_client_size.is_some() && !auto_size {
         warn!(
@@ -4290,7 +4292,17 @@ mod auto_unlock_submission_budget_tests {
 
 #[cfg(test)]
 mod max_client_size_tests {
-    use super::parse_max_client_size;
+    use super::{parse_max_client_size, DEFAULT_MAX_CLIENT_SIZE};
+
+    #[test]
+    fn the_default_cap_fits_h264_level_5_2() {
+        // Level 5.2 MaxFS: 36 864 macroblocks of 16x16.
+        let (w, h) = DEFAULT_MAX_CLIENT_SIZE;
+        let mbs = u32::from(w).div_ceil(16) * u32::from(h).div_ceil(16);
+        assert!(mbs <= 36_864, "{w}x{h} = {mbs} macroblocks");
+        // A 5K client (the broken case) is clamped to it.
+        assert_eq!((5120u16.min(w), 2880u16.min(h)), (3840, 2160));
+    }
 
     #[test]
     fn parses_wxh() {
