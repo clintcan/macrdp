@@ -17,8 +17,67 @@ use ironrdp_server::{
 
 /// The server's display traits use its own error type; capture code uses anyhow.
 /// Keeps the whole context chain in the message (the server logs it with `{:#}`).
+///
+/// A capture that did not start for lack of Screen Recording permission
+/// becomes a `ServerErrorKind::ErrorInfo` error: the server then sends
+/// ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES, so the client shows why the
+/// connection ended.
 fn display_error(error: anyhow::Error) -> ServerError {
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    if error.downcast_ref::<ScreenRecordingDenied>().is_some() {
+        return ServerError::new(
+            "display capture",
+            ironrdp_server::ServerErrorKind::ErrorInfo(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::ServerInsufficientPrivileges,
+            )),
+        )
+        .with_source(std::io::Error::other(format!("{error:#}")));
+    }
     ServerError::reason("display capture", format!("{error:#}"))
+}
+
+/// Context on a capture start error when the Mac has no Screen Recording
+/// permission for macrdp (see `display_error`).
+///
+/// Ported from macrdp-v1 d42dbd0, relicensed to MIT OR Apache-2.0 by the
+/// author.
+#[derive(Debug)]
+struct ScreenRecordingDenied;
+
+impl std::fmt::Display for ScreenRecordingDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Screen Recording permission is not granted")
+    }
+}
+
+/// Whether a capture start error comes from a missing Screen Recording
+/// permission. `preflight()` alone is not enough: after the permission is
+/// removed from a running macrdp it still returns true (seen on macOS 15.7),
+/// while ScreenCaptureKit fails with "The user declined TCCs for application,
+/// window, display capture". screencapturekit gives only that text, no code.
+#[cfg(target_os = "macos")]
+fn screen_recording_denied(error: anyhow::Error) -> anyhow::Error {
+    use core_graphics::access::ScreenCaptureAccess;
+    let granted = ScreenCaptureAccess.preflight() && !declined_tcc(&error);
+    with_start_reason(error, granted)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn declined_tcc(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("declined TCC")
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_start_reason(error: anyhow::Error, screen_recording_granted: bool) -> anyhow::Error {
+    if screen_recording_granted {
+        return error;
+    }
+    tracing::warn!(
+        "Screen Recording permission is not granted: the client is told \
+         (insufficient privileges). Enable macrdp in System Settings → \
+         Privacy & Security → Screen Recording, then restart macrdp."
+    );
+    error.context(ScreenRecordingDenied)
 }
 use tokio::sync::Notify;
 
@@ -1026,7 +1085,8 @@ impl CaptureDisplay {
                 self.suppress_next_adopt.clone(),
                 self.live_pointer_scale(),
             )
-            .await?,
+            .await
+            .map_err(screen_recording_denied)?,
         );
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
@@ -2540,6 +2600,43 @@ mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without Screen Recording the capture error tells the client why; with
+    /// it, the error stays a plain reason.
+    #[test]
+    fn a_capture_error_without_screen_recording_carries_the_reason() {
+        use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        use ironrdp_server::ServerErrorKind;
+        let denied = display_error(with_start_reason(
+            anyhow::anyhow!("SCStream::start_capture failed"),
+            false,
+        ));
+        assert!(matches!(
+            denied.kind(),
+            ServerErrorKind::ErrorInfo(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::ServerInsufficientPrivileges
+            ))
+        ));
+        let source = core::error::Error::source(&denied).map(ToString::to_string);
+        assert!(source.is_some_and(|s| s.contains("SCStream::start_capture failed")));
+        let granted = display_error(with_start_reason(anyhow::anyhow!("other failure"), true));
+        assert!(
+            matches!(granted.kind(), ServerErrorKind::Reason(r) if r.contains("other failure"))
+        );
+    }
+
+    #[test]
+    fn a_declined_tcc_error_is_a_missing_permission() {
+        let sck = anyhow::anyhow!(
+            "AsyncSCShareableContent::get failed (likely Screen Recording permission denied): \
+             NoShareableContent(\"Content unavailable: The user declined TCCs for application, \
+             window, display capture\")"
+        );
+        assert!(declined_tcc(&sck));
+        assert!(!declined_tcc(&anyhow::anyhow!(
+            "SCStream::start_capture failed"
+        )));
+    }
 
     fn online(id: u32, vendor: u32, builtin: bool, size_px: (u32, u32)) -> OnlineDisplay {
         OnlineDisplay {
