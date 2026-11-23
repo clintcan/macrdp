@@ -2452,7 +2452,13 @@ fn main() -> Result<()> {
             boost_thread_qos();
         })
         .build()?;
-    rt.block_on(async_main())
+    let result = rt.block_on(async_main());
+    if let Err(e) = &result {
+        // In macrdp.log too, not only on stderr (under launchd a separate
+        // file). Before the log is set up, this does nothing.
+        tracing::error!(error = format!("{e:#}"), "macrdp server stopped");
+    }
+    result
 }
 
 /// Translate a `config.env` (plain `key=value`, the format the menu-bar
