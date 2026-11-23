@@ -18,9 +18,10 @@
 //! an animated cursor's frame strip, or a future macOS without the SLS
 //! symbols.
 //!
-//! Position is read via CGEvent.location() on a fresh no-op event and sent
-//! as a Pointer Position Update only when the Mac cursor moved by itself
-//! (not by the client's input, see `moves`).
+//! With `--enable-mac-pointer-moves`, the position is read via
+//! CGEvent.location() on a fresh no-op event and sent as a Pointer Position
+//! Update only when the Mac cursor moved by itself (not by the client's
+//! input, see `moves`).
 
 pub mod moves;
 #[cfg(target_os = "macos")]
@@ -109,8 +110,7 @@ mod macos {
     pub struct Inner {
         source: CGEventSource,
         last_hash: u64,
-        /// Last Mac cursor position seen (global points).
-        last_pos: Option<(f64, f64)>,
+        position: moves::PositionPoll,
         desktop_size: crate::capture::SharedDesktopSize,
         display_id: u32,
         /// session-framebuffer-px ÷ display-backing-px; see `CursorState::new`.
@@ -141,7 +141,7 @@ mod macos {
             Ok(Self {
                 source,
                 last_hash: 0,
-                last_pos: None,
+                position: moves::PositionPoll::default(),
                 desktop_size,
                 display_id,
                 cursor_scale,
@@ -159,7 +159,9 @@ mod macos {
         pub fn poll(&mut self) -> Vec<DisplayUpdate> {
             let mut updates = Vec::new();
             self.poll_shape(&mut updates);
-            self.poll_position(&mut updates);
+            if moves::enabled() {
+                self.poll_position(&mut updates);
+            }
             updates
         }
 
@@ -168,44 +170,33 @@ mod macos {
         /// other clients) move their cursor locally from the user's input,
         /// ahead of the server, and snap to any Pointer Position Update: a
         /// position that the client's input caused would make the cursor jump
-        /// back, so those are not sent (`moves`). The first position of a
-        /// stream is not sent either: the client shows its cursor where its
-        /// user left it.
+        /// back, so those are not sent (`moves::PositionPoll::decide`).
         fn poll_position(&mut self, out: &mut Vec<DisplayUpdate>) {
             let Ok(ev) = CGEvent::new(self.source.clone()) else {
                 return;
             };
             let pt = ev.location();
-            let pos = (pt.x, pt.y);
-            let first = self.last_pos.is_none();
-            if self.last_pos == Some(pos) {
-                return;
-            }
-            self.last_pos = Some(pos);
-            if first || moves::is_client_move(pos) {
-                return;
-            }
+            let display_id = self.display_id;
             // CGEvent::location is in global display points, top-left
             // origin; the captured display's bounds place it.
-            let b = core_graphics::display::CGDisplay::new(self.display_id).bounds();
-            let (mx, my) = (pos.0 - b.origin.x, pos.1 - b.origin.y);
-            if mx < 0.0 || my < 0.0 || mx >= b.size.width || my >= b.size.height {
-                // On another display: the client cannot show it.
-                return;
-            }
-            let (dw, dh) = self.desktop_size.get();
-            let (x, y) = crate::input::map_display_to_client(
-                mx,
-                my,
-                dw,
-                dh,
-                b.size.width,
-                b.size.height,
+            let display = || {
+                let b = core_graphics::display::CGDisplay::new(display_id).bounds();
+                moves::DisplayRect {
+                    x: b.origin.x,
+                    y: b.origin.y,
+                    w: b.size.width,
+                    h: b.size.height,
+                }
+            };
+            let Some((x, y)) = moves::decide_position(
+                &mut self.position,
+                (pt.x, pt.y),
+                display,
+                self.desktop_size.get(),
                 self.desktop_size.letterbox(),
-            );
-            // The client cursor moves to this position: older client
-            // positions no longer describe where the client shows it.
-            moves::forget();
+            ) else {
+                return;
+            };
             trace!(x, y, "Mac cursor moved by itself: pointer position sent");
             out.push(DisplayUpdate::PointerPosition(PointerPositionAttribute {
                 x,

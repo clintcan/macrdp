@@ -19,17 +19,19 @@
 //! and match within [`SAME_POINT`] (macrdp posts fractional points).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// How many recent client-caused cursor positions are kept to recognise an
-/// echo. The cursor poll reads the position after some of the client's moves
-/// were posted, so it can see any of the last few, not only the newest one.
-const RECENT_CLIENT_MOVES: usize = 32;
-
-/// An older client move counts as the cause of the cursor position only this
-/// long. Later, the same position comes from a local move and must be sent.
+/// A client move counts as the cause of the cursor position this long (the
+/// newest one always counts). All client moves in this window are kept: the
+/// cursor poll (every ~66 ms) can see any of them, and a fast mouse posts
+/// many per poll.
 const CLIENT_MOVE_WINDOW: Duration = Duration::from_millis(250);
+
+/// At most this many client moves are kept (a 1000 Hz mouse posts 250 in
+/// [`CLIENT_MOVE_WINDOW`]).
+const MAX_CLIENT_MOVES: usize = 1024;
 
 /// Two positions this close (points, each axis) are the same: the
 /// WindowServer may round a posted fractional point.
@@ -52,15 +54,23 @@ impl ClientMoves {
         }
     }
 
-    /// Remember that client input moved the Mac cursor to `mac`.
+    /// Remember that client input moved the Mac cursor to `mac`. Moves older
+    /// than [`CLIENT_MOVE_WINDOW`] are dropped.
     pub fn note_at(&mut self, mac: (f64, f64), now: Instant) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) > CLIENT_MOVE_WINDOW)
+        {
+            self.recent.pop_front();
+        }
         if let Some(last) = self.recent.back_mut() {
             if last.0 == mac {
                 last.1 = now;
                 return;
             }
         }
-        if self.recent.len() == RECENT_CLIENT_MOVES {
+        if self.recent.len() == MAX_CLIENT_MOVES {
             self.recent.pop_front();
         }
         self.recent.push_back((mac, now));
@@ -86,6 +96,71 @@ impl ClientMoves {
     }
 }
 
+/// The captured display in global points (CGEvent coordinates).
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// The Mac cursor position of one display stream, and when it goes to the client.
+#[derive(Debug, Default)]
+pub struct PositionPoll {
+    /// Last Mac cursor position seen (global points).
+    last: Option<(f64, f64)>,
+}
+
+impl PositionPoll {
+    /// The session position (pixels) to send in a Pointer Position Update for
+    /// the Mac cursor at `pos`, or `None`. Sent only when the position changed
+    /// and the client's input did not cause it (`moves`). Not sent: the first
+    /// position of the stream (the client shows its cursor where its user left
+    /// it), and a position outside `display()` (the client cannot show it).
+    /// After a send, `moves` is cleared: the client cursor is now at the
+    /// server's position.
+    pub fn decide(
+        &mut self,
+        pos: (f64, f64),
+        moves: &mut ClientMoves,
+        now: Instant,
+        display: impl FnOnce() -> DisplayRect,
+        desktop: (u16, u16),
+        letterbox: bool,
+    ) -> Option<(u16, u16)> {
+        let first = self.last.is_none();
+        if self.last == Some(pos) {
+            return None;
+        }
+        self.last = Some(pos);
+        if first || moves.is_client_move_at(pos, now) {
+            return None;
+        }
+        let d = display();
+        let (mx, my) = (pos.0 - d.x, pos.1 - d.y);
+        if mx < 0.0 || my < 0.0 || mx >= d.w || my >= d.h {
+            return None;
+        }
+        let (x, y) =
+            crate::input::map_display_to_client(mx, my, desktop.0, desktop.1, d.w, d.h, letterbox);
+        moves.forget();
+        Some((x, y))
+    }
+}
+
+/// `--enable-mac-pointer-moves`. Off: no client move is recorded and no
+/// Pointer Position Update is sent.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 static CLIENT_MOVES: Mutex<ClientMoves> = Mutex::new(ClientMoves::new());
 
 fn moves() -> std::sync::MutexGuard<'static, ClientMoves> {
@@ -95,13 +170,28 @@ fn moves() -> std::sync::MutexGuard<'static, ClientMoves> {
 /// The input handler moved the Mac cursor to `mac` (global points) for the client.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn note_client_move(mac: (f64, f64)) {
-    moves().note_at(mac, Instant::now());
+    if enabled() {
+        moves().note_at(mac, Instant::now());
+    }
 }
 
-/// See [`ClientMoves::is_client_move_at`].
+/// [`PositionPoll::decide`] with the process-wide client moves.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn is_client_move(mac: (f64, f64)) -> bool {
-    moves().is_client_move_at(mac, Instant::now())
+pub fn decide_position(
+    poll: &mut PositionPoll,
+    pos: (f64, f64),
+    display: impl FnOnce() -> DisplayRect,
+    desktop: (u16, u16),
+    letterbox: bool,
+) -> Option<(u16, u16)> {
+    poll.decide(
+        pos,
+        &mut moves(),
+        Instant::now(),
+        display,
+        desktop,
+        letterbox,
+    )
 }
 
 /// See [`ClientMoves::forget`].
@@ -156,14 +246,88 @@ mod tests {
     }
 
     #[test]
-    fn only_recent_client_moves_are_kept() {
+    fn all_client_moves_in_the_window_are_kept() {
+        // A fast mouse: many moves between two cursor polls.
         let mut m = ClientMoves::new();
         let t0 = Instant::now();
-        for i in 0..=RECENT_CLIENT_MOVES {
+        for i in 0..200 {
+            m.note_at((i as f64 * 10.0, 0.0), t0 + Duration::from_millis(i / 2));
+        }
+        let poll = t0 + Duration::from_millis(150);
+        assert!(m.is_client_move_at((0.0, 0.0), poll));
+        assert!(m.is_client_move_at((990.0, 0.0), poll));
+        // Older than the window: dropped at the next move.
+        m.note_at((5000.0, 0.0), t0 + Duration::from_millis(400));
+        assert_eq!(m.recent.len(), 1);
+    }
+
+    #[test]
+    fn at_most_max_client_moves_are_kept() {
+        let mut m = ClientMoves::new();
+        let t0 = Instant::now();
+        for i in 0..=MAX_CLIENT_MOVES {
             m.note_at((i as f64 * 10.0, 0.0), t0);
         }
+        assert_eq!(m.recent.len(), MAX_CLIENT_MOVES);
         assert!(!m.is_client_move_at((0.0, 0.0), t0));
         assert!(m.is_client_move_at((10.0, 0.0), t0));
-        assert!(m.is_client_move_at((RECENT_CLIENT_MOVES as f64 * 10.0, 0.0), t0));
+    }
+
+    const DISPLAY: DisplayRect = DisplayRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1280.0,
+        h: 720.0,
+    };
+
+    fn decide(
+        p: &mut PositionPoll,
+        m: &mut ClientMoves,
+        pos: (f64, f64),
+        now: Instant,
+    ) -> Option<(u16, u16)> {
+        p.decide(pos, m, now, || DISPLAY, (960, 540), true)
+    }
+
+    #[test]
+    fn the_first_position_is_not_sent() {
+        let (mut p, mut m, t0) = (PositionPoll::default(), ClientMoves::new(), Instant::now());
+        assert_eq!(decide(&mut p, &mut m, (100.0, 100.0), t0), None);
+        assert_eq!(decide(&mut p, &mut m, (100.0, 100.0), t0), None);
+        assert_eq!(
+            decide(&mut p, &mut m, (1100.0, 600.0), t0),
+            Some((825, 450))
+        );
+    }
+
+    #[test]
+    fn a_client_move_is_not_sent() {
+        let (mut p, mut m, t0) = (PositionPoll::default(), ClientMoves::new(), Instant::now());
+        decide(&mut p, &mut m, (640.0, 360.0), t0);
+        m.note_at((700.0, 400.0), t0);
+        assert_eq!(decide(&mut p, &mut m, (700.0, 400.0), t0), None);
+    }
+
+    #[test]
+    fn a_position_on_another_display_is_not_sent() {
+        let (mut p, mut m, t0) = (PositionPoll::default(), ClientMoves::new(), Instant::now());
+        decide(&mut p, &mut m, (640.0, 360.0), t0);
+        assert_eq!(decide(&mut p, &mut m, (1280.0, 360.0), t0), None);
+        assert_eq!(decide(&mut p, &mut m, (-1.0, 360.0), t0), None);
+        assert_eq!(decide(&mut p, &mut m, (640.0, 720.0), t0), None);
+        // Back on the display: sent.
+        assert_eq!(decide(&mut p, &mut m, (0.0, 0.0), t0), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_send_forgets_the_client_moves() {
+        let (mut p, mut m, t0) = (PositionPoll::default(), ClientMoves::new(), Instant::now());
+        decide(&mut p, &mut m, (640.0, 360.0), t0);
+        m.note_at((640.0, 360.0), t0);
+        assert_eq!(decide(&mut p, &mut m, (100.0, 100.0), t0), Some((75, 75)));
+        assert!(m.recent.is_empty());
+        // The Mac cursor goes back where the client left it: the client shows
+        // its cursor at (75, 75) now, so this is sent too.
+        assert_eq!(decide(&mut p, &mut m, (640.0, 360.0), t0), Some((480, 270)));
     }
 }

@@ -94,6 +94,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   where a local tool (LinearMouse etc.) un-reverses the
                           #   physical wheel but can't see macrdp's scroll events.
                           #   Off by default. Config: REVERSE_SCROLL=1. macOS-only.
+--enable-mac-pointer-moves # Send the Mac pointer position to the client when the
+                          #   pointer moves on the Mac (local mouse or trackpad,
+                          #   an app that warps it), not by the client's input.
+                          #   Off by default: tested with mstsc only.
+                          #   Config: ENABLE_MAC_POINTER_MOVES=1. macOS-only.
 MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   held modifiers are presumed stale and cleared on the
                           #   next input event (a key-up lost when the client lost
