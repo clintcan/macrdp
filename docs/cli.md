@@ -117,8 +117,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   No effect with --width/--height or matching aspect.
 --max-client-size WxH     # Cap the resolution a client can request on the
                           #   auto-adopt path (e.g. 2560x1440). Default
-                          #   3840x2160: a larger H.264 frame is above level
-                          #   5.2, which decoders take. Requests above the cap are clamped
+                          #   4096x2304: a larger H.264 frame is above level
+                          #   5.2, or wider/taller than mstsc shows (4096).
+                          #   Requests above the cap are clamped
                           #   per-dimension. Each dimension must be in [200,
                           #   8192]. No effect off the auto-adopt path. Config:
                           #   MAX_CLIENT_SIZE. Mirrors upstream IronRDP #1404.

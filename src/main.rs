@@ -787,8 +787,9 @@ struct Args {
     /// Cap the resolution a client can request on the auto-adopt path
     /// (defense-in-depth resource bound; e.g. 2560x1440). A request above the
     /// cap is clamped per-dimension and the session is served at the clamped
-    /// size. Default 3840x2160: a larger H.264 frame is above level 5.2,
-    /// which decoders take (and 8192x8192 is a ~256 MB BGRA framebuffer).
+    /// size. Default 4096x2304: a larger H.264 frame is above level 5.2 or
+    /// wider/taller than mstsc shows (and 8192x8192 is a ~256 MB BGRA
+    /// framebuffer).
     /// Each dimension must be in the RDP band [200, 8192]. No effect with
     /// --no-client-resolution, or with an explicit --width/--height/--hidpi
     /// on the mirror-primary path (those pin the size; --virtual-display
@@ -2455,19 +2456,16 @@ fn main() -> Result<()> {
     rt.block_on(async_main())
 }
 
-/// Translate a `config.env` (plain `key=value`, the format the menu-bar
-/// controller writes and `packaging/config.env.example` documents) into the
-/// equivalent CLI argv and parse it back into `Args`. This lets the LaunchAgent
-/// launch the *signed* `macrdp` binary directly with a single `--config <file>`
-/// argument — giving macOS Background Task Management a stable Developer-ID
-/// identity to approve once — instead of going through an unsigned wrapper
-/// script that BTM re-flags on every rebuild. Mirrors the old
-/// `packaging/macrdp-launch` translation exactly (same keys, same defaults).
-/// Largest client-requested session without `--max-client-size`: 4K UHD.
-/// A larger H.264 frame is above the level 5.2 frame size (36 864 macroblocks,
-/// 4096x2304 at 16:9) that decoders take: FreeRDP at 5120x2880 failed to decode
-/// it and showed a black screen. Clamped per dimension, as the option.
-const DEFAULT_MAX_CLIENT_SIZE: (u16, u16) = (3840, 2160);
+/// Largest client-requested session without `--max-client-size`, clamped per
+/// dimension like the option. Both limits are measured:
+/// - 36 864 macroblocks (H.264 level 5.2 MaxFS): FreeRDP failed to decode
+///   5120x2880 and showed a black screen; 4096x2304 is exactly the limit.
+/// - 4096 per side: mstsc (Windows 10 19041) showed a black screen at 4112x720
+///   and 1440x4112, and the desktop at 4096x1440 and 1440x4096.
+///
+/// So 3456x2168 (Windows App, Retina, 16-inch MacBook Pro) is kept, and
+/// 5120x2880 becomes 4096x2304.
+const DEFAULT_MAX_CLIENT_SIZE: (u16, u16) = (4096, 2304);
 
 /// Parse a `--max-client-size` spec ("WxH", e.g. "2560x1440") into a
 /// per-dimension cap, validating each dimension against the RDP desktop band
@@ -2493,6 +2491,14 @@ fn parse_max_client_size(spec: &str) -> Result<(u16, u16), String> {
     Ok((parse_dim(w, "width")?, parse_dim(h, "height")?))
 }
 
+/// Translate a `config.env` (plain `key=value`, the format the menu-bar
+/// controller writes and `packaging/config.env.example` documents) into the
+/// equivalent CLI argv and parse it back into `Args`. This lets the LaunchAgent
+/// launch the *signed* `macrdp` binary directly with a single `--config <file>`
+/// argument — giving macOS Background Task Management a stable Developer-ID
+/// identity to approve once — instead of going through an unsigned wrapper
+/// script that BTM re-flags on every rebuild. Mirrors the old
+/// `packaging/macrdp-launch` translation exactly (same keys, same defaults).
 fn args_from_config(path: &Path) -> Result<Args> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
@@ -4300,8 +4306,12 @@ mod max_client_size_tests {
         let (w, h) = DEFAULT_MAX_CLIENT_SIZE;
         let mbs = u32::from(w).div_ceil(16) * u32::from(h).div_ceil(16);
         assert!(mbs <= 36_864, "{w}x{h} = {mbs} macroblocks");
-        // A 5K client (the broken case) is clamped to it.
-        assert_eq!((5120u16.min(w), 2880u16.min(h)), (3840, 2160));
+        // mstsc (Windows 10) shows no frame wider or taller than 4096.
+        assert!(w <= 4096 && h <= 4096);
+        // A 5K client (the broken case) is clamped to it; a Retina 16-inch
+        // MacBook Pro request is kept.
+        assert_eq!((5120u16.min(w), 2880u16.min(h)), (4096, 2304));
+        assert_eq!((3456u16.min(w), 2168u16.min(h)), (3456, 2168));
     }
 
     #[test]
