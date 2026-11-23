@@ -1174,8 +1174,8 @@ mod macos {
     use screencapturekit::cm::CMSampleBuffer;
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     use screencapturekit::prelude::{
-        CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCDisplay, SCError, SCStream,
-        SCStreamConfiguration, SCStreamOutputType,
+        CGRect, CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCDisplay, SCError,
+        SCStream, SCStreamConfiguration, SCStreamOutputType,
     };
     use screencapturekit::stream::delegate_trait::ErrorHandler;
 
@@ -1207,7 +1207,72 @@ mod macos {
     #[derive(Default)]
     struct SampleQueue {
         samples: std::collections::VecDeque<CMSampleBuffer>,
+        /// What changed in samples dropped because the consumer fell behind.
+        lost: LostDamage,
         stopped: bool,
+    }
+
+    /// Past this many lost rects, the next legacy frame goes out whole.
+    const MAX_LOST_RECTS: usize = 64;
+
+    /// The changed areas of samples dropped before the consumer saw them.
+    /// SCK's dirty rects only describe the change from the frame before, so
+    /// a dropped sample's areas must be sent with the next one, or the
+    /// legacy (bitmap) path leaves those areas stale on the client until
+    /// something else changes there. (EGFX sends whole frames and doesn't
+    /// need this.)
+    #[derive(Debug, Default, PartialEq)]
+    enum LostDamage {
+        #[default]
+        Nothing,
+        Rects(Vec<CGRect>),
+        /// A dropped sample had no dirty rects: send the whole frame.
+        Full,
+    }
+
+    impl LostDamage {
+        /// Record the dirty rects of a dropped sample (`None`: unknown).
+        fn add(&mut self, rects: Option<Vec<CGRect>>) {
+            *self = match (std::mem::take(self), rects) {
+                (Self::Full, _) | (_, None) => Self::Full,
+                (Self::Nothing, Some(all)) => Self::capped(all),
+                (Self::Rects(mut all), Some(r)) => {
+                    all.extend(r);
+                    Self::capped(all)
+                }
+            };
+        }
+
+        fn capped(all: Vec<CGRect>) -> Self {
+            if all.len() > MAX_LOST_RECTS {
+                Self::Full
+            } else {
+                Self::Rects(all)
+            }
+        }
+
+        /// Fold in damage lost earlier.
+        fn absorb(&mut self, other: LostDamage) {
+            match other {
+                Self::Nothing => {}
+                Self::Full => self.add(None),
+                Self::Rects(r) => self.add(Some(r)),
+            }
+        }
+
+        /// The rects to send for a sample whose own dirty rects are
+        /// `current`, adding what was lost before it. `None` means the
+        /// whole frame.
+        fn merge(self, current: Option<Vec<CGRect>>) -> Option<Vec<CGRect>> {
+            match (self, current) {
+                (Self::Full, _) | (_, None) => None,
+                (Self::Nothing, current) => current,
+                (Self::Rects(mut lost), Some(current)) => {
+                    lost.extend(current);
+                    Some(lost)
+                }
+            }
+        }
     }
 
     #[derive(Default)]
@@ -1246,7 +1311,13 @@ mod macos {
                 move |sample, _| {
                     let mut q = on_sample.queue.lock().unwrap();
                     if q.samples.len() >= SAMPLE_BUFFER {
-                        q.samples.pop_front();
+                        if let Some(dropped) = q.samples.pop_front() {
+                            // An idle sample changed nothing.
+                            let changed = dropped.frame_status().is_none_or(|s| s.has_content());
+                            if changed {
+                                q.lost.add(dropped.dirty_rects());
+                            }
+                        }
                     }
                     q.samples.push_back(sample);
                     drop(q);
@@ -1258,12 +1329,13 @@ mod macos {
             Ok(Self { stream, samples })
         }
 
-        async fn next(&self) -> Option<CMSampleBuffer> {
+        /// The next sample, with what changed in samples dropped before it.
+        async fn next(&self) -> Option<(CMSampleBuffer, LostDamage)> {
             loop {
                 {
                     let mut q = self.samples.queue.lock().unwrap();
                     if let Some(sample) = q.samples.pop_front() {
-                        return Some(sample);
+                        return Some((sample, std::mem::take(&mut q.lost)));
                     }
                     if q.stopped {
                         return None;
@@ -1271,6 +1343,69 @@ mod macos {
                 }
                 self.samples.ready.notified().await;
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod lost_damage_tests {
+        use super::*;
+
+        fn r(x: f64) -> CGRect {
+            CGRect {
+                x,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            }
+        }
+
+        #[test]
+        fn a_dropped_samples_rects_go_out_with_the_next_frame() {
+            let mut lost = LostDamage::default();
+            lost.add(Some(vec![r(1.0)]));
+            lost.add(Some(vec![r(2.0)]));
+            assert_eq!(
+                lost.merge(Some(vec![r(3.0)])),
+                Some(vec![r(1.0), r(2.0), r(3.0)])
+            );
+        }
+
+        #[test]
+        fn nothing_lost_keeps_the_frames_own_rects() {
+            assert_eq!(
+                LostDamage::Nothing.merge(Some(vec![r(3.0)])),
+                Some(vec![r(3.0)])
+            );
+            assert_eq!(LostDamage::Nothing.merge(None), None);
+        }
+
+        #[test]
+        fn unknown_or_too_much_lost_damage_sends_the_whole_frame() {
+            let mut lost = LostDamage::default();
+            lost.add(Some(vec![r(1.0)]));
+            lost.add(None);
+            assert_eq!(lost, LostDamage::Full);
+            lost.add(Some(vec![r(2.0)]));
+            assert_eq!(lost.merge(Some(vec![r(3.0)])), None);
+
+            let mut many = LostDamage::default();
+            many.add(Some(vec![r(1.0); MAX_LOST_RECTS + 1]));
+            assert_eq!(many, LostDamage::Full);
+
+            let mut lost = LostDamage::default();
+            lost.add(Some(vec![r(1.0)]));
+            assert_eq!(lost.merge(None), None);
+        }
+
+        #[test]
+        fn absorb_accumulates_across_consumer_skips() {
+            let mut acc = LostDamage::default();
+            acc.absorb(LostDamage::Rects(vec![r(1.0)]));
+            acc.absorb(LostDamage::Nothing);
+            acc.absorb(LostDamage::Rects(vec![r(2.0)]));
+            assert_eq!(acc, LostDamage::Rects(vec![r(1.0), r(2.0)]));
+            acc.absorb(LostDamage::Full);
+            assert_eq!(acc, LostDamage::Full);
         }
     }
 
@@ -1398,6 +1533,9 @@ mod macos {
         /// EGFX once it is ready, or sends it as a legacy update when the hold
         /// ends without EGFX.
         held_frame: bool,
+        /// Changes from samples whose areas weren't sent yet (dropped by the
+        /// sample buffer or skipped here); added to the next legacy frame.
+        lost_damage: LostDamage,
         /// When capturing a virtual display, the RDP session drives the cursor
         /// into that display's slot of the global coordinate space (to the
         /// right of / beyond the physical panels). On disconnect the cursor is
@@ -1799,6 +1937,7 @@ mod macos {
                 suppressed_since: None,
                 first_egfx_frame_sent: false,
                 held_frame: false,
+                lost_damage: LostDamage::Nothing,
                 warp_cursor_home,
                 pending_resize,
                 desktop_size,
@@ -2276,10 +2415,11 @@ mod macos {
                         Err(_) => continue,
                     }
                 };
-                let Some(sample) = sample else {
+                let Some((sample, lost)) = sample else {
                     self.reopen_stream().await;
                     continue;
                 };
+                self.lost_damage.absorb(lost);
 
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
                 if let Some(status) = sample.frame_status() {
@@ -2289,6 +2429,8 @@ mod macos {
                 }
 
                 let Some(pixel_buffer) = sample.image_buffer() else {
+                    // Its changes would be lost: send the next frame whole.
+                    self.lost_damage.add(None);
                     continue;
                 };
 
@@ -2472,10 +2614,11 @@ mod macos {
                 // After that, SCK's dirty_rects tells us what changed; if the
                 // attachment is missing (older macOS, no key), fall back to
                 // the full frame.
+                let lost = std::mem::take(&mut self.lost_damage);
                 let dirty = if !self.seeded || self.force_full_frame {
                     None
                 } else {
-                    sample.dirty_rects()
+                    lost.merge(sample.dirty_rects())
                 };
 
                 let rects: Vec<(u16, u16, u16, u16)> = match dirty {
