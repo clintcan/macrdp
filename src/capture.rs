@@ -2825,6 +2825,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_flag_armed_before_a_disconnect_does_not_reach_the_next_connection() {
+        // The capture loop armed `suppress_next_adopt` for a resize
+        // reactivation, and the client disconnected before Confirm Active.
+        // The connection hook clears it, so the next client still gets the
+        // leftover resize dropped and its own size adopted.
+        use ironrdp_server::ConnectionHandler as _;
+        let mut display = test_display(3440, 1440);
+        display.suppress_next_adopt.store(true, Ordering::Relaxed);
+        display.pending_resize.request(1920, 1080);
+
+        crate::conn_hooks::AdoptResetHook(display.suppress_next_adopt.clone()).on_connection_info(
+            &ironrdp_server::ConnectionInfo::new(
+                0x0409,
+                ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED,
+                String::new(),
+            ),
+        );
+        let size = display
+            .request_initial_size(DesktopSize {
+                width: 3456,
+                height: 2168,
+            })
+            .await;
+
+        assert_eq!((size.width, size.height), (3456, 2168));
+        assert_eq!(display.pending_resize.take_settled(Duration::ZERO), None);
+    }
+
+    #[tokio::test]
     async fn a_reactivation_we_triggered_keeps_the_pending_resize() {
         // Our own reactivations (blank recovery, an applied live resize) must
         // not eat a resize the live client queued meanwhile.
