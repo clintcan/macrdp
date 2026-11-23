@@ -425,7 +425,7 @@ pub struct CaptureDisplay {
     /// virtual-display path.
     pub pending_resize: PendingResize,
     /// Ceiling for a live client-requested resize (`--max-client-size`, default
-    /// 3840x2160), mirroring the connect-time cap the vendored acceptor applies.
+    /// 4096x2304), mirroring the connect-time cap the vendored acceptor applies.
     /// `None` = no cap beyond the protocol max (still enforced by
     /// `adopt_client_size`).
     pub max_client_size: Option<DesktopSize>,
