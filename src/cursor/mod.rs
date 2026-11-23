@@ -12,9 +12,11 @@
 //! pointer instead of a transparent bitmap.
 //!
 //! Fallback path: `NSCursor.currentSystemCursor` rendered via
-//! `NSBitmapImageRep` — process-local cursor stack, only sees cursors
-//! set in macrdp's own process. Kept as a last resort in case a future
-//! macOS removes/renames the SLS symbols.
+//! `NSBitmapImageRep`. It also returns cursors set by other processes
+//! (measured on macOS 15.7.9 with Chrome's `progress` cursor). Used when
+//! SkyLight returns nothing: a cursor too large for the RDP pointer, such as
+//! an animated cursor's frame strip, or a future macOS without the SLS
+//! symbols.
 //!
 //! Position is read via CGEvent.location() on a fresh no-op event but
 //! intentionally not forwarded — see `poll` for the reasoning.
@@ -300,9 +302,10 @@ mod macos {
     ///   1. SkyLight `SLSGetGlobalCursorData` → the actually-rendered
     ///      system cursor (any process's I-beam, crosshair, hand, etc.).
     ///      Returns bitmap + hotspot directly.
-    ///   2. Fallback to `NSCursor.currentSystemCursor` for the (rare)
-    ///      case where SkyLight refuses the call or the symbols vanish
-    ///      in a future macOS.
+    ///   2. Fallback to `NSCursor.currentSystemCursor` when SkyLight gives
+    ///      no cursor: an image too large for the RDP pointer (an animated
+    ///      cursor's frames in one image), a refused call, or symbols that
+    ///      vanish in a future macOS.
     unsafe fn read_cursor_bitmap() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
         // Try SkyLight first — this sees cursors set by other processes
         // (Safari's I-beam, `screencapture -i`'s crosshair, web link hand
@@ -311,9 +314,10 @@ mod macos {
             return Some(t);
         }
 
-        // Fallback: NSCursor only sees cursors set in macrdp's process,
-        // but works as a last resort if the private SkyLight symbols are
-        // ever removed.
+        // Fallback: NSCursor's current system cursor, which also sees cursors
+        // set by other processes. Used when SkyLight returns nothing, e.g. for
+        // an animated cursor (Chrome's `progress`) whose frame strip is taller
+        // than the RDP pointer limit, or if the private symbols are removed.
         let cursor: Retained<NSCursor> = match NSCursor::currentSystemCursor() {
             Some(c) => c,
             None => NSCursor::currentCursor(),
@@ -328,8 +332,10 @@ mod macos {
             return None;
         }
 
-        // Allocate a 32-bit RGBA, non-premultiplied, top-down bitmap rep.
-        // bytesPerRow=0 makes AppKit pick an aligned stride; we read it back.
+        // Allocate a 32-bit RGBA, premultiplied, top-down bitmap rep: AppKit
+        // gives no graphics context for a non-premultiplied one. The pixels
+        // are un-premultiplied after drawing. bytesPerRow=0 makes AppKit pick
+        // an aligned stride; we read it back.
         let rep: Retained<NSBitmapImageRep> = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
             NSBitmapImageRep::alloc(),
             std::ptr::null_mut(),
@@ -340,7 +346,7 @@ mod macos {
             true,
             false,
             NSDeviceRGBColorSpace,
-            NSBitmapFormat::AlphaNonpremultiplied,
+            NSBitmapFormat::empty(),
             0,
             32,
         )?;
@@ -365,12 +371,9 @@ mod macos {
             return None;
         }
         let stride = rep.bytesPerRow() as usize;
-        let row_bytes = (w as usize) * 4;
-        let mut data = Vec::with_capacity((w as usize) * (h as usize) * 4);
-        for row in 0..(h as usize) {
-            let src = std::slice::from_raw_parts(ptr.add(row * stride), row_bytes);
-            data.extend_from_slice(src);
-        }
+        let (w_px, h_px) = (w as usize, h as usize);
+        let buf = std::slice::from_raw_parts(ptr, stride * (h_px - 1) + w_px * 4);
+        let data = private_api::rgba_premultiplied_to_rgba(buf, stride, w_px, h_px)?;
 
         Some((
             data,

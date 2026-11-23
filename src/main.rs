@@ -787,8 +787,9 @@ struct Args {
     /// Cap the resolution a client can request on the auto-adopt path
     /// (defense-in-depth resource bound; e.g. 2560x1440). A request above the
     /// cap is clamped per-dimension and the session is served at the clamped
-    /// size. Without it, an authenticated client can request up to the
-    /// protocol maximum 8192x8192 — a ~256 MB BGRA framebuffer per frame.
+    /// size. Default 4096x2304: a larger H.264 frame is above level 5.2 or
+    /// wider/taller than mstsc shows (and 8192x8192 is a ~256 MB BGRA
+    /// framebuffer).
     /// Each dimension must be in the RDP band [200, 8192]. No effect with
     /// --no-client-resolution, or with an explicit --width/--height/--hidpi
     /// on the mirror-primary path (those pin the size; --virtual-display
@@ -2455,14 +2456,17 @@ fn main() -> Result<()> {
     rt.block_on(async_main())
 }
 
-/// Translate a `config.env` (plain `key=value`, the format the menu-bar
-/// controller writes and `packaging/config.env.example` documents) into the
-/// equivalent CLI argv and parse it back into `Args`. This lets the LaunchAgent
-/// launch the *signed* `macrdp` binary directly with a single `--config <file>`
-/// argument — giving macOS Background Task Management a stable Developer-ID
-/// identity to approve once — instead of going through an unsigned wrapper
-/// script that BTM re-flags on every rebuild. Mirrors the old
-/// `packaging/macrdp-launch` translation exactly (same keys, same defaults).
+/// Largest client-requested session without `--max-client-size`, clamped per
+/// dimension like the option. Both limits are measured:
+/// - 36 864 macroblocks (H.264 level 5.2 MaxFS): FreeRDP failed to decode
+///   5120x2880 and showed a black screen; 4096x2304 is exactly the limit.
+/// - 4096 per side: mstsc (Windows 10 19041) showed a black screen at 4112x720
+///   and 1440x4112, and the desktop at 4096x1440 and 1440x4096.
+///
+/// So 3456x2168 (Windows App, Retina, 16-inch MacBook Pro) is kept, and
+/// 5120x2880 becomes 4096x2304.
+const DEFAULT_MAX_CLIENT_SIZE: (u16, u16) = (4096, 2304);
+
 /// Parse a `--max-client-size` spec ("WxH", e.g. "2560x1440") into a
 /// per-dimension cap, validating each dimension against the RDP desktop band
 /// [200, 8192] (MS-RDPBCGR) — the same band the acceptor's sanity check uses,
@@ -2487,6 +2491,14 @@ fn parse_max_client_size(spec: &str) -> Result<(u16, u16), String> {
     Ok((parse_dim(w, "width")?, parse_dim(h, "height")?))
 }
 
+/// Translate a `config.env` (plain `key=value`, the format the menu-bar
+/// controller writes and `packaging/config.env.example` documents) into the
+/// equivalent CLI argv and parse it back into `Args`. This lets the LaunchAgent
+/// launch the *signed* `macrdp` binary directly with a single `--config <file>`
+/// argument — giving macOS Background Task Management a stable Developer-ID
+/// identity to approve once — instead of going through an unsigned wrapper
+/// script that BTM re-flags on every rebuild. Mirrors the old
+/// `packaging/macrdp-launch` translation exactly (same keys, same defaults).
 fn args_from_config(path: &Path) -> Result<Args> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
@@ -3759,9 +3771,10 @@ async fn async_main() -> Result<()> {
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
         // connect-time auto-adopt above. See `CaptureDisplay::request_layout`.
         pending_resize: capture::PendingResize::new(),
-        max_client_size: args
-            .max_client_size
-            .map(|(width, height)| ironrdp_server::DesktopSize { width, height }),
+        max_client_size: {
+            let (width, height) = args.max_client_size.unwrap_or(DEFAULT_MAX_CLIENT_SIZE);
+            Some(ironrdp_server::DesktopSize { width, height })
+        },
         suppress_next_adopt: Arc::clone(&suppress_next_adopt),
         // Shared so a live client resize can re-mode the display; None on
         // the mirror-primary path (no virtual display to re-mode).
@@ -3909,21 +3922,16 @@ async fn async_main() -> Result<()> {
     // that size from the start (Demand Active); the CaptureDisplay's
     // `request_initial_size` then adopts it into the shared `desktop_size` that
     // capture, input scaling, and the H.264 pipeline all read. The value is the
-    // ceiling (--max-client-size, defense-in-depth; the clamp is per dimension),
-    // or MS-RDPBCGR's own 8192 maximum.
-    let honor_client_size = auto_size.then(|| match args.max_client_size {
-        Some((width, height)) => {
-            info!(
-                max_w = width,
-                max_h = height,
-                "client-requested session size capped at the operator maximum"
-            );
-            ironrdp_server::DesktopSize { width, height }
-        }
-        None => ironrdp_server::DesktopSize {
-            width: 8192,
-            height: 8192,
-        },
+    // ceiling (--max-client-size, or DEFAULT_MAX_CLIENT_SIZE; the clamp is per
+    // dimension).
+    let honor_client_size = auto_size.then(|| {
+        let (width, height) = args.max_client_size.unwrap_or(DEFAULT_MAX_CLIENT_SIZE);
+        info!(
+            max_w = width,
+            max_h = height,
+            "client-requested session size capped"
+        );
+        ironrdp_server::DesktopSize { width, height }
     });
     if args.max_client_size.is_some() && !auto_size {
         warn!(
@@ -4296,7 +4304,21 @@ mod auto_unlock_submission_budget_tests {
 
 #[cfg(test)]
 mod max_client_size_tests {
-    use super::parse_max_client_size;
+    use super::{parse_max_client_size, DEFAULT_MAX_CLIENT_SIZE};
+
+    #[test]
+    fn the_default_cap_fits_h264_level_5_2() {
+        // Level 5.2 MaxFS: 36 864 macroblocks of 16x16.
+        let (w, h) = DEFAULT_MAX_CLIENT_SIZE;
+        let mbs = u32::from(w).div_ceil(16) * u32::from(h).div_ceil(16);
+        assert!(mbs <= 36_864, "{w}x{h} = {mbs} macroblocks");
+        // mstsc (Windows 10) shows no frame wider or taller than 4096.
+        assert!(w <= 4096 && h <= 4096);
+        // A 5K client (the broken case) is clamped to it; a Retina 16-inch
+        // MacBook Pro request is kept.
+        assert_eq!((5120u16.min(w), 2880u16.min(h)), (4096, 2304));
+        assert_eq!((3456u16.min(w), 2168u16.min(h)), (3456, 2168));
+    }
 
     #[test]
     fn parses_wxh() {

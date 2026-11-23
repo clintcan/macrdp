@@ -45,10 +45,10 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 --max-client-size WxH     Cap the resolution a client can request on the
                           auto-adopt path (e.g. 2560x1440). A request above the
                           cap is clamped per-dimension and the session is served
-                          at the clamped size. Defense-in-depth resource bound:
-                          without it an authenticated client can request up to
-                          the protocol maximum 8192x8192 — a ~256 MB framebuffer
-                          per frame. Each dimension must be in [200, 8192]. No
+                          at the clamped size. Default 4096x2304: a larger
+                          H.264 frame is above level 5.2, or wider/taller than
+                          mstsc shows (4096).
+                          Each dimension must be in [200, 8192]. No
                           effect with --no-client-resolution or an explicit
                           --width/--height/--hidpi/--virtual-display (those pin
                           the size). Config key: MAX_CLIENT_SIZE.
