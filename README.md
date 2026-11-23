@@ -73,12 +73,12 @@ Then open **macrdpController** from /Applications. It's a menu-bar app, so nothi
 
 ```bash
 cargo build --release
-codesign -s - --force target/release/macrdp   # ad-hoc sign so TCC grants persist
+codesign -s - --force target/release/macrdp   # ad-hoc sign: TCC grants hold for this build (re-grant after a rebuild)
 ./target/release/macrdp
 ```
 
 First run will prompt for:
-1. **Screen Recording permission** (System Settings → Privacy & Security → Screen Recording → enable `macrdp` → restart it).
+1. **Screen Recording permission** (System Settings → Privacy & Security → Screen Recording → enable `macrdp` → restart it). If the permission is removed while macrdp runs, the client is told why it can't connect; mstsc words this as "the user account is not authorized for remote login", so check Screen Recording first.
 2. **Accessibility permission** (same path, "Accessibility" — required to forward keyboard and mouse).
 3. Your Mac password at the terminal — validated against your local account via PAM `checkpw`, then used as the RDP credential.
 

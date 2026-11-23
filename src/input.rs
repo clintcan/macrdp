@@ -666,10 +666,9 @@ pub fn set_map_ctrl_to_cmd(on: bool) {
 /// `LeftMouseDragged`.
 ///
 /// **Who raises it matters.** `RdpServerInputHandler` has only
-/// `keyboard`/`mouse`, so the connection edge has to come from the server, and
-/// it is raised (vendored `ironrdp-server` divergence 24) once at the top of
-/// `run_connection` / `serve_negotiated` — the two places that each call
-/// `accept_finalize` exactly once, with reactivations looping *inside* it. Two
+/// `keyboard`/`mouse`, so the connection edge has to come from the server:
+/// `conn_hooks::InputResetHook` raises it in `on_connection_info`, which the
+/// server calls once per served connection and not on a reactivation. Two
 /// tempting seams were rejected: the display `updates()` path (re-runs on every
 /// live resize and blank-recovery reactivation, so it would clear a held
 /// modifier — and, once button state is included, break a drag — with no user
@@ -679,8 +678,7 @@ pub fn set_map_ctrl_to_cmd(on: bool) {
 static MODS_RESET_REQUEST: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
-/// The shared reset flag. Hand a clone to the server via
-/// `RdpServer::set_input_reset_handle`; the input handler drains it on its next
+/// The shared reset flag. `conn_hooks::InputResetHook` raises it; the input handler drains it on its next
 /// event. Idempotent — every call returns the same `Arc`.
 pub fn modifier_reset_handle() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     MODS_RESET_REQUEST

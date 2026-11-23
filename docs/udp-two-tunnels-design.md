@@ -1,8 +1,8 @@
 # Two UDP tunnels: lossy audio and EGFX on UDP in one session
 
-Status: **design, not started.** Build it on the `macrdp-79e763a0` fork branch once the macrdp PR
-that moves the pins there has merged; the code it changes (`crates/ironrdp-server/src/mt/session.rs`)
-was restructured by that rebase.
+Status: **built, not yet live-tested** (2026-11-24): clintcan/IronRDP#4 on `macrdp-79e763a0`, points 1–7
+below. Point 8 (the tunnel's inbound data after an in-place reactivation) is left for a follow-up: when it
+bites, the EGFX watchdog moves video back to TCP. The bind timeout is 5 s.
 
 ## The gap
 

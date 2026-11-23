@@ -11,14 +11,73 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
+    BitmapUpdate, DesktopSize, DisplayContext, DisplayUpdate, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates, ServerError, ServerErrorExt as _, ServerResult,
 };
 
 /// The server's display traits use its own error type; capture code uses anyhow.
 /// Keeps the whole context chain in the message (the server logs it with `{:#}`).
+///
+/// A capture that did not start for lack of Screen Recording permission
+/// becomes a `ServerErrorKind::ErrorInfo` error: the server then sends
+/// ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES, so the client shows why the
+/// connection ended.
 fn display_error(error: anyhow::Error) -> ServerError {
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    if error.downcast_ref::<ScreenRecordingDenied>().is_some() {
+        return ServerError::new(
+            "display capture",
+            ironrdp_server::ServerErrorKind::ErrorInfo(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::ServerInsufficientPrivileges,
+            )),
+        )
+        .with_source(std::io::Error::other(format!("{error:#}")));
+    }
     ServerError::reason("display capture", format!("{error:#}"))
+}
+
+/// Context on a capture start error when the Mac has no Screen Recording
+/// permission for macrdp (see `display_error`).
+///
+/// Ported from macrdp-v1 d42dbd0, relicensed to MIT OR Apache-2.0 by the
+/// author.
+#[derive(Debug)]
+struct ScreenRecordingDenied;
+
+impl std::fmt::Display for ScreenRecordingDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Screen Recording permission is not granted")
+    }
+}
+
+/// Whether a capture start error comes from a missing Screen Recording
+/// permission. `preflight()` alone is not enough: after the permission is
+/// removed from a running macrdp it still returns true (seen on macOS 15.7),
+/// while ScreenCaptureKit fails with "The user declined TCCs for application,
+/// window, display capture". screencapturekit gives only that text, no code.
+#[cfg(target_os = "macos")]
+fn screen_recording_denied(error: anyhow::Error) -> anyhow::Error {
+    use core_graphics::access::ScreenCaptureAccess;
+    let granted = ScreenCaptureAccess.preflight() && !declined_tcc(&error);
+    with_start_reason(error, granted)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn declined_tcc(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("declined TCC")
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_start_reason(error: anyhow::Error, screen_recording_granted: bool) -> anyhow::Error {
+    if screen_recording_granted {
+        return error;
+    }
+    tracing::warn!(
+        "Screen Recording permission is not granted: the client is told \
+         (insufficient privileges). Enable macrdp in System Settings → \
+         Privacy & Security → Screen Recording, then restart macrdp."
+    );
+    error.context(ScreenRecordingDenied)
 }
 use tokio::sync::Notify;
 
@@ -319,6 +378,30 @@ impl RdpServerDisplayUpdates for CountedUpdates {
     }
 }
 
+/// The current connection's "client minimized" flag.
+///
+/// ironrdp-server makes a new flag for each connection and hands it to
+/// [`CaptureDisplay::updates`] in its `DisplayContext`. `updates` puts it here, so
+/// readers that live for the whole server (the audio capture) see the current
+/// connection's flag.
+#[derive(Clone, Debug, Default)]
+pub struct SuppressedFlag(Arc<std::sync::Mutex<Arc<AtomicBool>>>);
+
+impl SuppressedFlag {
+    /// Makes `flag` the current connection's flag.
+    pub fn set(&self, flag: Arc<AtomicBool>) {
+        *self.0.lock().unwrap() = flag;
+    }
+
+    pub fn load(&self) -> bool {
+        self.0.lock().unwrap().load(Ordering::Relaxed)
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().unwrap().store(false, Ordering::Relaxed);
+    }
+}
+
 pub struct CaptureDisplay {
     /// Session desktop size — shared with the input handler and the H.264
     /// pipeline so all three stay in sync when `auto_size` adopts the
@@ -403,7 +486,7 @@ pub struct CaptureDisplay {
     /// frame. `None` disables the gate entirely (single-binary builds
     /// where the server doesn't expose the handle — e.g., the non-macOS
     /// stub).
-    pub display_suppressed: Option<Arc<AtomicBool>>,
+    pub display_suppressed: Option<SuppressedFlag>,
     /// Client-driven live-resize request in flight (MS-RDPEDISP monitor
     /// layout — the client resized its window mid-session). `request_layout`
     /// writes to it; the capture loop polls + debounces it into an actual
@@ -755,7 +838,13 @@ impl RdpServerDisplay for CaptureDisplay {
         self.pending_resize.request(adopted.width, adopted.height);
     }
 
-    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(
+        &mut self,
+        ctx: DisplayContext,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        if let Some(slot) = self.display_suppressed.as_ref() {
+            slot.set(ctx.display_suppressed);
+        }
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
@@ -1022,7 +1111,8 @@ impl CaptureDisplay {
                 self.suppress_next_adopt.clone(),
                 self.live_pointer_scale(),
             )
-            .await?,
+            .await
+            .map_err(screen_recording_denied)?,
         );
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
@@ -1297,7 +1387,7 @@ mod macos {
         nv12_bgra: Vec<u8>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
-        display_suppressed: Option<Arc<AtomicBool>>,
+        display_suppressed: Option<SuppressedFlag>,
         /// Last observed value of `display_suppressed`, used to detect the
         /// false→true→false transition. On the un-suppress edge we force an
         /// IDR keyframe so the client resumes from a fresh reference frame
@@ -1501,7 +1591,7 @@ mod macos {
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
             capture_nv12: bool,
-            display_suppressed: Option<Arc<AtomicBool>>,
+            display_suppressed: Option<SuppressedFlag>,
             auto_size: bool,
             stretch: bool,
             desktop_size: SharedDesktopSize,
@@ -1704,7 +1794,7 @@ mod macos {
             // default; the gate then trips correctly when the new client's
             // own SuppressOutput PDU lands.
             if let Some(flag) = display_suppressed.as_ref() {
-                flag.store(false, Ordering::Relaxed);
+                flag.clear();
             }
 
             Ok(Self {
@@ -2152,7 +2242,7 @@ mod macos {
                 // normally.
                 if self.first_egfx_frame_sent {
                     if let Some(flag) = self.display_suppressed.as_ref() {
-                        if flag.load(Ordering::Relaxed) {
+                        if flag.load() {
                             let started = *self.suppressed_since.get_or_insert_with(Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;
@@ -2536,6 +2626,43 @@ mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without Screen Recording the capture error tells the client why; with
+    /// it, the error stays a plain reason.
+    #[test]
+    fn a_capture_error_without_screen_recording_carries_the_reason() {
+        use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        use ironrdp_server::ServerErrorKind;
+        let denied = display_error(with_start_reason(
+            anyhow::anyhow!("SCStream::start_capture failed"),
+            false,
+        ));
+        assert!(matches!(
+            denied.kind(),
+            ServerErrorKind::ErrorInfo(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::ServerInsufficientPrivileges
+            ))
+        ));
+        let source = core::error::Error::source(&denied).map(ToString::to_string);
+        assert!(source.is_some_and(|s| s.contains("SCStream::start_capture failed")));
+        let granted = display_error(with_start_reason(anyhow::anyhow!("other failure"), true));
+        assert!(
+            matches!(granted.kind(), ServerErrorKind::Reason(r) if r.contains("other failure"))
+        );
+    }
+
+    #[test]
+    fn a_declined_tcc_error_is_a_missing_permission() {
+        let sck = anyhow::anyhow!(
+            "AsyncSCShareableContent::get failed (likely Screen Recording permission denied): \
+             NoShareableContent(\"Content unavailable: The user declined TCCs for application, \
+             window, display capture\")"
+        );
+        assert!(declined_tcc(&sck));
+        assert!(!declined_tcc(&anyhow::anyhow!(
+            "SCStream::start_capture failed"
+        )));
+    }
 
     fn online(id: u32, vendor: u32, builtin: bool, size_px: (u32, u32)) -> OnlineDisplay {
         OnlineDisplay {

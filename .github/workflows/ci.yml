@@ -74,10 +74,10 @@ jobs:
           cargo fmt --manifest-path vendor/macrdp-rdpeudp/Cargo.toml -- --check
           cargo test --manifest-path vendor/macrdp-rdpeudp/Cargo.toml
 
-      # ironrdp-server comes from clintcan/IronRDP (branch `macrdp`) and its
-      # manifest sets `[lib] test = false`, so the root `cargo test` never runs
-      # its unit tests (the divergence tests, e.g. the surface command per codec
-      # of divergence (34)). scripts/check-ironrdp-pin.sh first checks that
+      # ironrdp-server comes from clintcan/IronRDP (branch `macrdp-79e763a0`) and
+      # its manifest sets `[lib] test = false`, so the root `cargo test` never runs
+      # its unit tests (the divergence tests, e.g. the audio arm and batch priority
+      # in `server::macrdp::tests`). scripts/check-ironrdp-pin.sh first checks that
       # every IronRDP pin is one commit on a protected macrdp* branch of
       # clintcan/IronRDP, then leaves that commit checked out; `--lib` runs the
       # tests there. Platform-independent, so Linux is enough. `egfx` as macrdp

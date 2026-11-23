@@ -9,7 +9,7 @@
 //! e258f6a0 pin bump). This is the one place a new hook needs adding.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use ironrdp_server::{ConnectionHandler, ConnectionInfo, PostConnectionAction, ServerError};
@@ -73,6 +73,20 @@ impl ConnectionHandler for ConnectionHooks {
         for h in &mut self.0 {
             h.on_client_fingerprint(client_name, rdp_version, client_build, platform);
         }
+    }
+}
+
+/// Asks the input handler to reset its per-connection state (held modifiers and
+/// buttons) once per served connection. The server calls `on_connection_info`
+/// once per connection, after validation and before the session loop, and not
+/// on a Deactivation-Reactivation or for a preemption candidate that loses. See
+/// `input::modifier_reset_handle` for why the display `updates()` path and
+/// `on_accept` are the wrong places.
+pub struct InputResetHook(pub Arc<AtomicBool>);
+
+impl ConnectionHandler for InputResetHook {
+    fn on_connection_info(&mut self, _info: &ConnectionInfo) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 

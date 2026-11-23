@@ -11,13 +11,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 macrdp-rdpeudp = { path = ".." }
 # For the free `decode::<T>` helper + ReadCursor in the EMT target.
-ironrdp-core = { version = "0.2", features = ["alloc"] }
+ironrdp-core = { version = "0.3", features = ["alloc"] }
 
 # This fuzz crate is its own workspace root (see [workspace] below), so the
 # parent's [patch.crates-io] does NOT apply — replicate it. Keep the rev in sync
 # with the root macrdp Cargo.toml and vendor/macrdp-rdpeudp/Cargo.toml.
 [patch.crates-io]
-ironrdp-core = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
+ironrdp-core = { git = "https://github.com/clintcan/IronRDP.git", rev = "0087f037ebbb569570c7a01c06c05cc40b835fba" }
 
 [[bin]]
 name = "datagram_decode"

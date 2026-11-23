@@ -1,12 +1,16 @@
 # IronRDP divergences
 
 macrdp takes every `ironrdp-*` crate from [clintcan/IronRDP](https://github.com/clintcan/IronRDP),
-branch `macrdp`, at the rev in the root `Cargo.toml` `[patch.crates-io]`. That branch is upstream
-Devolutions/IronRDP@e258f6a0 plus macrdp's divergences in `ironrdp-server`, `ironrdp-acceptor`,
-`ironrdp-rdpdr` and `ironrdp-dvc`, one commit per divergence. The subject has the crate and the
-number, for example `server: (34) send RemoteFX in a Stream Surface Bits command`.
+branch `macrdp-79e763a0`, at the rev in the root `Cargo.toml` `[patch.crates-io]`. That branch is
+upstream Devolutions/IronRDP@79e763a0 plus macrdp's divergences in `ironrdp-server`,
+`ironrdp-acceptor`, `ironrdp-rdpdr` and `ironrdp-dvc`, one commit per divergence, and one commit that
+drops the workspace lints from two crates (see "Lints" below). The subject has the crate and the
+number, for example `server: (35) measure bandwidth at connect time and report it`.
 
-To change a divergence: make the commit on that branch, then bump the rev in `Cargo.toml` (every
+The old branch `macrdp` (upstream e258f6a0 plus the divergences, last commit fd3798d3) stays. Releases
+before this pin build from it. Its log is in this file's git history.
+
+To change a divergence: make the commit on the branch, then bump the rev in `Cargo.toml` (every
 `ironrdp-*` entry, so that all crates come from one source), and update the log below. The same rev
 goes in `vendor/macrdp-rdpeudp/Cargo.toml` and `vendor/macrdp-rdpeudp/fuzz/Cargo.toml`, which pull
 `ironrdp-core` when built on their own.
@@ -33,240 +37,236 @@ macrdp builds whatever the pinned rev contains, so the fork is part of the suppl
   that is on a branch but isn't its tip passes with a warning: older tags must stay buildable, but
   in review an older commit may mean a missing fix.
 
-The logs below were written when the four crates were vendored in this repo, at `vendor/ironrdp-*`.
-Read `vendor/ironrdp-<crate>/` as `crates/ironrdp-<crate>/` in clintcan/IronRDP. Notes about the
-vendored copy's own `[patch.crates-io]`, `rustfmt.toml` and `[lib] test = false` describe the
-vendored copy, not the branch. The reasoning behind the server divergences is in
-[`ironrdp-divergence-history.md`](ironrdp-divergence-history.md).
+Paths below are in clintcan/IronRDP (`crates/ironrdp-<crate>/src/...`) unless they name macrdp's
+`src/`. The reasoning behind the server divergences (live-debugging notes, dead ends, what NOT to
+do) is in [`ironrdp-divergence-history.md`](ironrdp-divergence-history.md), frozen at the old
+vendored fork. The numbers are shared, so (N) here is (N) there. Read the history entry before you
+change a divergence.
+
+Gaps found in the review of this rebase that were already on the old branch (they are not
+regressions) are listed in `TODO.md`, "Pre-existing gaps found reviewing the 79e763a0 rebase".
+
+### Lints
+
+The last commit on the branch removes `[lints] workspace = true` from `ironrdp-server` and
+`ironrdp-rdpdr`. Under IronRDP's workspace lints, macrdp's code in them warns (server: mostly
+`mt/listener.rs`, `mt/audio_dvc.rs`, `rdpdr_drive.rs`; rdpdr: `multiple_inherent_impl` from the
+`server_direction.rs` shape). `ironrdp-acceptor` and `ironrdp-dvc` have no such warnings and keep the
+lints. Upstream's own manifests set `[lib] test = false` for `ironrdp-server`, `ironrdp-acceptor` and
+`ironrdp-dvc`; the fork does not change that. `cargo test -p <crate> --lib` still runs the lib tests.
 
 ## ironrdp-server
 
-Local fork of ironrdp-server 0.13.0, **re-vendored 2026-10-01 from upstream
-Devolutions/IronRDP@e258f6a0** (the pin-bump rev), replacing the a5d1c682 fork. The
-reasoning behind each divergence (live-debugging notes, dead ends, what NOT to do)
-is in **[`ironrdp-divergence-history.md`](ironrdp-divergence-history.md)**, frozen at the old fork; numbers are shared, so (N)
-here is (N) there. Read the history entry before changing a divergence.
-
-Pulled in via `[patch.crates-io]` in the root `Cargo.toml`; has a standalone
-`[patch.crates-io]` (vendored siblings by path, the rest git-pinned to e258f6a0) for
-isolated builds, ignored in the macrdp workspace. Keep that rev in sync. The lib is
-`test = false`, and macrdp is a single package, so the root `cargo fmt`/`clippy`/`test`
-never reach this crate: check it with `--manifest-path vendor/ironrdp-server/Cargo.toml`
-(`rustfmt.toml` matches upstream's 120 columns, and upstream's files are clean under it).
-
 ### Shape
 
-Upstream's files verbatim, plus macrdp's own files, wired in by hook edits marked
-`(macrdp ...)`:
+Upstream's files, plus macrdp's own files, wired in by hook edits marked `(macrdp N)`:
 
-- **Our files:** `audin.rs` (25), `rdcamera.rs` (19), `rdpdr_drive.rs` (11),
-  `rdpeusb.rs` (16), and `mt/` (12): `mod.rs`, `listener.rs`, `dtls.rs`,
-  `audio_dvc.rs`, and `session.rs`, which `server.rs` declares as its child module
-  (`#[path]`) so all of the multitransport logic lives outside upstream's file.
-- **Hook edits in upstream files:** `server.rs` (fields grouped in one
-  `macrdp: MacrdpServerState`; one-line calls at each hook point), `builder.rs`
-  (one `macrdp_channels` field, four `with_*` methods, one post-build
-  `install_macrdp_channels` call), `lib.rs` (module declarations and exports),
-  `gfx.rs` (14), `sound.rs` (2/8).
-- **Cargo deviations:** the `multitransport` feature + `macrdp-rdpeudp`/`getrandom`/
-  `boring`; `anyhow` (our modules' error type); macOS `libc` (15); and `usb` drops
-  `dep:ironrdp-rdpeusb`, which is a regular dependency here because `rdpeusb.rs` uses it.
+- **Our files:** `macrdp.rs`, which `server.rs` declares as its child module (`#[path]`), so it can
+  use `RdpServer` and `ConnectionState` private fields. It holds `MacrdpServerState`,
+  `MacrdpChannelFactories`, `install_macrdp_channels`, the dispatch helpers, and the code of (2)(3)(8),
+  (4), (15), (18), (20), (30) and (35). Also `audin.rs` (25), `rdcamera.rs` (19), `rdpdr_drive.rs`
+  (11), `rdpeusb.rs` (16), and `mt/` (12): `mod.rs`, `listener.rs`, `dtls.rs`, `audio_dvc.rs`, and
+  `session.rs`, which `macrdp.rs` declares as its child module.
+- **Hook edits in upstream files:** `server.rs` (one `macrdp` field on `RdpServer`, one on
+  `ConnectionState` with `multitransport`, short calls at each hook point, the `ServerEvent::RdpdrDrive`
+  and `ServerEvent::Urbdrc` variants, the `on_authenticated` and `on_client_fingerprint` trait methods),
+  `builder.rs` (one `macrdp_channels` field, the `with_*` methods, one `install_macrdp_channels` call
+  in `build()`), `lib.rs` (module declarations and exports), `gfx.rs` (14), `sound.rs` (2/8),
+  `autodetect.rs` (35).
+- **Channels attach through upstream's factories.** `install_macrdp_channels` pushes (11)'s RDPDR
+  processor as an upstream `StaticChannelFactory`, and the audio DVCs (12), URBDRC (16), camera (19)
+  and microphone (25) as upstream `DynamicChannelFactory`s, in that DVC order (as before). Per-device
+  channels (16)(19) open with upstream's `ServerEvent::CreateDynamicChannel`. `attach_channels` has no
+  macrdp edit.
+- **Cargo deviations:** the `multitransport` feature + `macrdp-rdpeudp` (git, clintcan/macrdp; macrdp
+  patches it to `vendor/macrdp-rdpeudp`) / `getrandom` / `boring`; `anyhow` (our modules' error type);
+  macOS `libc` (15); `usb` drops `dep:ironrdp-rdpeusb`, which is a regular dependency here because
+  `rdpeusb.rs` uses it; no `[lints]` (see "Lints").
 
-**Coexistence rule.** Upstream now has its own RDPDR server (`with_rdpdr_factory`),
-microphone (`with_rdpeai_factory`), USB (`usb` feature, `with_usb_factory`) and UDP
-multitransport (`with_udp_transport`). They stay inert because macrdp never sets them.
-Never set one together with macrdp's counterpart: both register the same channel
-(`RDPDR`, `AUDIO_INPUT`, `URBDRC`) or offer, and the client would see it twice. Our
-clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
-`RdpdrDriveMessage`, `RdpdrDriveServer`, `ServerEvent::RdpdrDrive`,
-`with_rdpdr_drive_factory`; USB's builder method is `with_urbdrc_factory`.
+**Coexistence rule.** Upstream has its own RDPDR server (`with_rdpdr_factory`), microphone
+(`with_rdpeai_factory`), USB (`usb` feature, `with_usb_factory`) and UDP multitransport
+(`with_udp_transport`). They stay inert because macrdp never sets them. Never set one together with
+macrdp's counterpart. For URBDRC and AUDIO_INPUT, both register the same DVC and the client sees it
+twice. For RDPDR, upstream's processor is attached first and the acceptor refuses ours ("Static channel
+name is already registered"), so macrdp's drive and smart card stop working. `install_macrdp_channels`
+logs a warning at build time for each such pair (RDPDR, AUDIO_INPUT, and URBDRC with `usb`), and
+`set_multitransport_provider` warns when `with_udp_transport` is also set. Our clashing names were
+renamed for this (11): `RdpdrDriveServerFactory`, `RdpdrDriveMessage`, `RdpdrDriveServer`,
+`ServerEvent::RdpdrDrive`, `with_rdpdr_drive_factory`; USB's builder method is `with_urbdrc_factory`.
 
 ### Kept divergences
 
 | # | What | Where | macrdp's API |
 |---|---|---|---|
-| (2)(3)(8) | Audio on its own bounded channel + task; drop-stale lag model with resync after a writer stall; per-wave duration for AAC | `client_loop`'s `dispatch_audio`; `AudioLagModel`; `sound.rs` `AudioWave`, `set_audio_sender` | `SoundServerFactory::set_audio_sender` |
-| (4) | Batch priority: CLIPRDR, then EGFX + rest, then RDPDR | `prioritize_batch` | — |
-| (11) | Our RDPDR drive + smart card processor | `rdpdr_drive.rs` | `with_rdpdr_drive_factory`, `RdpdrHandle` |
-| (12) | Our UDP multitransport (RDPEUDP + DTLS lossy audio + Soft-Sync + watchdog de-migration) | `mt/` (`session.rs` holds the server side) | `set_multitransport_*`, `set_egfx_on_*_handle`, `set_demigrate_request_handle`, `set_migrate_egfx` |
-| (14) | EGFX decline flag (no CapabilitiesConfirm for a no-AVC client) | `gfx.rs` | `GfxDvcBridge::with_decline_flag` |
-| (15) | Kernel TCP RTT at accept | `tcp_srtt_ms`, `store_link_rtt` | `set_link_rtt_handle` |
-| (16) | Our URBDRC USB processor | `rdpeusb.rs` | `with_urbdrc_factory`, `UsbHandle` |
-| (18) | `ConnectionHandler::on_authenticated` | `complete_security_upgrade`, via `PendingConnection::observe_authentication` | trait method |
-| (19) | MS-RDPECAM camera | `rdcamera.rs` | `with_camera_factory` |
-| (20) | Client-fingerprint log + `on_client_fingerprint` | top of `client_accepted` | trait method |
-| (24) | Per-served-connection input-reset flag | `raise_input_reset` in `run_connection_inner` and `serve_negotiated` | `set_input_reset_handle` |
-| (25) | Our MS-RDPEAI microphone | `audin.rs` | `with_audin_factory` |
-| (26) | Client input read off the `Self` lock: fast-path input straight to the handler, X224 through a bounded queue; queued X224 replayed across a reactivation | `client_loop`'s `read_pdus` arm; `MacrdpServerState::read_ahead`, drained into the backlog in `client_accepted` | — |
-| (28) | `zstd-safe` 8.2 instead of upstream's 7.2 (RustSec advisories in 7.x; QOIZ only compresses, so unreachable) | `Cargo.toml` only | — |
-| (29) | AND mask for 32 bpp pointers, **harvested early** from upstream #2108 (merged 2026-10-19, after this pin) | `encoder/pointer_mask.rs` (upstream's file, verbatim) + the two `and_mask_from_alpha` call sites in `encoder/mod.rs` and a doc line in `display.rs` | — |
-| (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
-| (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
-| (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection. **Upstream as #2432 (`e482e340`); drops at the next pin bump** | `run_connection_inner`, around `negotiate_and_authenticate` | — |
-| (33) | The client's desktop and device scale factors on `ConnectionInfo`, **harvested early** from upstream #2107 (merged 2026-10-30, after this pin) | `ConnectionInfo` fields + `new()`, the `on_connection_info` call in `client_accepted`; pairs with acceptor divergence (6) | `ConnectionInfo::{desktop,device}_scale_factor` |
-| (34) | RemoteFX (codec GUID REMOTEFX) goes out in a Stream Surface Bits command when the client sets `STREAM_SURFACE_BITS`; ImageRemoteFX (GUID IMAGE_REMOTEFX) and every other codec keep Set Surface Bits. RemoteFX wins over ImageRemoteFX whatever the client's list order. Windows 10 mstsc shows a black session for RemoteFX in Set. **Port of upstream #2229 (`e20a2147`); drops at the next pin bump** | `encoder/mod.rs` `RemoteFxCodec`, `SurfaceBitsCommand`, `surface_bits`, `UpdateEncoderCodecs::set_remotefx_codec`, `RemoteFxHandler`; `server.rs` `pick_remotefx_codec` and the `BitmapCodecs` arm | — |
-| (35) | Optional Connect-Time Auto-Detection when auto-detect is enabled: an RTT probe, a 256 KiB bandwidth burst and a Network Characteristics Result between Client Info and licensing; later results report this connect-time bandwidth instead of the ordinary-traffic figure. Based on clintcan/macrdp#235 by @JulyStar-Lv. Pairs with acceptor divergence (7) | `server.rs` `connect_time_autodetect`, `await_autodetect_reply`, the `accept_finalize_with_hooks` call in the finalize loop; `autodetect.rs` `connect_time_*`, `PendingBandwidth::ConnectTime`, `build_netchar_result` | `--network-autodetect` (macrdp: `enable_autodetect()` + a 1 s `ServerEvent::AutoDetectRttRequest` ticker) |
+| (2)(3)(8) | Audio on its own bounded channel (50); drop-stale lag model with resync after a writer stall; per-wave duration for AAC | `macrdp.rs` `AudioDispatch` (one more arm in `server.rs` `client_loop_queued`), `AudioLagModel`, `discard_stale_macrdp_audio` (called from `discard_stale_session_events`); `sound.rs` `AudioWave`, `set_audio_sender` | `SoundServerFactory::set_audio_sender` |
+| (4) | Batch priority: CLIPRDR, then EGFX + rest, then RDPDR | `macrdp.rs` `prioritize_batch`, called in `dispatch_server_events` before upstream's deferral loop | — |
+| (11) | Our RDPDR drive + smart card processor | `rdpdr_drive.rs` (`RdpdrDriveChannelFactory`); the `ServerEvent::RdpdrDrive` arm → `macrdp::dispatch_rdpdr_drive` | `with_rdpdr_drive_factory`, `RdpdrHandle` |
+| (12) | Our UDP multitransport (RDPEUDP + DTLS lossy audio + Soft-Sync + watchdog de-migration) | `mt/` (`session.rs` holds the server side); hooks in `prepare_pending_connection`, `accept_finalize`, `handle_message_channel_data`, `process_x224`, the `Egfx` arm of `dispatch_server_events`, a tunnel arm in `client_loop_queued` | `set_multitransport_*`, `set_egfx_on_*_handle`, `set_demigrate_request_handle`, `set_migrate_egfx` |
+| (14) | EGFX decline flag (no CapabilitiesConfirm for a no-AVC client) | `gfx.rs` `GfxDvcBridge::with_decline_flag`, `process` | `GfxDvcBridge::with_decline_flag`, called in macrdp's `GfxServerFactory::build_server_with_handle(GfxContext)` |
+| (15) | Kernel TCP RTT at accept | `macrdp.rs` `tcp_srtt_ms`, `store_link_rtt`; `TcpConnectionSource::accept` → `IncomingConnection.link_rtt_ms`; stored in `serve_connection` (fresh) and `finalize_negotiated` (preemption winner) | `set_link_rtt_handle` |
+| (16) | Our URBDRC USB processor | `rdpeusb.rs` (`UrbdrcChannelFactory`); the `ServerEvent::Urbdrc` arm → `macrdp::dispatch_urbdrc` | `with_urbdrc_factory`, `UsbHandle` |
+| (18) | `ConnectionHandler::on_authenticated` | `complete_security_upgrade`, through `ServerCredentialsHandler.auth_observer` and `macrdp::report_authentication`; candidates through `NegotiationContext.connection_handler` | trait method |
+| (19) | MS-RDPECAM camera | `rdcamera.rs` (`RdCameraChannelFactory`) | `with_camera_factory` |
+| (20) | Client-fingerprint log + `on_client_fingerprint` | top of `client_accepted` (not on reactivation), `macrdp::report_client_fingerprint` | trait method |
+| (25) | Our MS-RDPEAI microphone | `audin.rs` (`AudinChannelFactory`) | `with_audin_factory` |
+| (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the auto-reconnect check; `macrdp.rs` `is_stale_reconnect_cookie` | — |
+| (35) | Optional Connect-Time Auto-Detection when auto-detect is enabled: an RTT probe, a 256 KiB bandwidth burst and a Network Characteristics Result between Client Info and licensing; later results report this connect-time bandwidth instead of the continuous figure. Based on clintcan/macrdp#235 by @JulyStar-Lv. Pairs with acceptor divergence (7) | `macrdp.rs` `connect_time_autodetect`, `await_autodetect_reply`, `connect_time_autodetect_hook`; the `accept_finalize_with_hooks` call in `accept_finalize`; `autodetect.rs` `connect_time_*`, `PendingBandwidth::ConnectTime`, `build_netchar_result` | `--network-autodetect` (macrdp: `enable_autodetect()` + a 1 s `ServerEvent::AutoDetectRttRequest` ticker) |
 
-Notes on the port:
-- **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
-  logging stays in `dispatch_pdu`, which still takes the lock. The replay path has no
-  test: removing the `read_ahead.push` leaves every test passing.
-- **(28)** Drop it once upstream requires zstd-safe >= 8.2.
-- **(29)** Numbered (29) because main used (27) and (28) while this branch was open.
-  A byte-for-byte backport of upstream #2108 (by @antonmos): `RGBAPointer` and
-  `LargePointer` used to go out with an empty AND mask, which MS-RDPBCGR 2.2.9.1.1.4.4
-  requires and Windows App drops (macOS: stuck on the default arrow; suspected for the
-  iOS no-cursor report, clintcan/macrdp#211). Upstream's unit tests live in
-  `pointer_mask.rs` but this lib is `test = false`, so they were run once in a scratch
-  crate (2026-10-26). **Drop it at the next pin bump** (any rev at or after `fb25b47c`).
-- **(30)** Added 2026-10-28 after a live FreeRDP test: restarting macrdp with a client
-  connected made it auto-reconnect with the old process's cookie, which never verifies.
-  Upstream denied it, FreeRDP retried with the same cookie about three times a second,
-  and every try ended in under a second, so `auth_guard` counted each as a failed login
-  and locked out the client's address (30 s, then 59 s). Each try also evicted the live
-  session first, because preemption runs before this check. MS-RDPBCGR 3.3.5.3.11: "If
-  logon with the cookie fails, the credentials supplied in the Client Info PDU SHOULD
-  be used". The fallback grants nothing: CredSSP or the acceptor's credential check has
-  already authenticated the client, and the credential validator still runs. Test:
-  `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`. Upstream
-  candidate.
+Notes on the port to 79e763a0. Upstream replaced the per-connection `Rc<Mutex<Self>>` and the
+parallel dispatch futures with one `select!` loop over a FIFO outbound queue (#2349, #2431, #2312),
+and moved per-connection state into `ConnectionState` (#2059). So every hook moved, and the server
+code of (2)(3)(8) and (12) was rewritten for that shape, with the same wire behaviour unless a note
+says otherwise.
 
-- **(31)** Added 2026-11-13 while live-testing clintcan/macrdp#219 (hide the pointer
-  while an app hides it). The fragmenter's `encode_next` returned `None` for an empty
-  payload, so `DisplayUpdate::HidePointer` and `DefaultPointer` produced no bytes at
-  all: macrdp logged `cursor hidden`, yet FreeRDP's `restoreCursor` never saw a null
-  pointer and Windows App kept the arrow. Only the 3-line `fast_path.rs` part of #2274
-  is taken; its pointer-promotion and RemoteFX-buffer changes are not. Test:
-  `conn_test::hidden_and_default_pointer_updates_reach_the_client` (fails without the
-  fix; catches a dropped `index == 0` guard and a `First` fragment). **Drop it at the
-  next pin bump** (any rev at or after `904a7da6`).
+- **(2)(3)(8)** The audio arm takes the next wave only after the previous one is written (it holds
+  a permit that upstream's `WriteCompletion::Rdpsnd` releases), and it is not gated on `queue_idle`.
+  The lag model and its constants (200 ms, 300 ms resync) are unchanged. `discard_stale_session_events`
+  also drains the audio channel, so the evicted session's waves don't play into the winner's. Waves
+  are dropped quietly until RDPSND negotiates (`is_ready()`).
+  **Behaviour changes:** (a) A closed audio channel no longer ends the session: the arm switches off
+  and the connection continues. The channel exists only when a sound factory is set. macrdp's
+  `MacRdpsnd` keeps the sender for the life of the server, so production is not affected. (b) A wave
+  now waits behind every byte already in upstream's FIFO outbound queue, which can be a whole EGFX
+  batch dispatched just before it. The old per-PDU writer lock let a wave go out between two frames
+  of one batch. A wave is never queued behind frames queued after it. The latency effect has not been
+  measured live yet (see the live-test checklist in `TODO.md`).
+- **(4)** A stable `sort_by_key` by tier. Upstream's own `Rdpdr` events and our `RdpdrDrive` sort
+  last; `Urbdrc` and `CreateDynamicChannel` are in the middle tier. The sort runs before upstream's
+  deferral gate, which holds validity-guarded events and waves while bytes are queued.
+  **Behaviour change:** a `ClipboardWithValidity` sorted first holds the rest of the batch until the
+  writer drains. macrdp sends only plain `ServerEvent::Clipboard` today, so nothing sends that variant.
+  If macrdp starts to use `ClipboardWithCompletion` or `ClipboardWithValidity`, add them to the first
+  tier, or a plain `Clipboard` can overtake them on the CLIPRDR channel.
+- **(11)** `rdpdr_drive.rs` is the old file plus the factory wrapper and tests;
+  `RdpdrDriveServerFactory` now requires `Send` (upstream's `StaticChannelFactory` needs it).
+  Device I/O requests keep our own `ServerEvent::RdpdrDrive` arm, which sends them with no channel
+  flags. Do not move them to upstream's `StaticChannelWithCompletion`: it adds `SHOW_PROTOCOL` above
+  1600 bytes, and Windows drops a multi-chunk RDPDR PDU that carries it. `decode_write_response` keeps
+  `DR_WRITE_RSP`'s padding byte optional, as MS-RDPEFS 2.2.1.5.4 says; upstream's decoder requires it.
+  Upstream-issue candidate. Upstream's `RdpdrServer` has no smart card path, so it cannot replace ours.
+- **(12)** Configuration stays on `RdpServer` (`MtState`); each connection's state is an
+  `MtConnection` in `ConnectionState`, and its `Drop` retires the tunnel (lowers the handles and the
+  bound flag, evicts the cookie) on every entry point. The offer uses acceptor (5): `OfferRng`
+  (`MultitransportSecurityRng`) registers each cookie with the listener as it is generated; the offer
+  is `flag | SOFT_SYNC_TCP_TO_UDP` plus `set_multitransport_requested_protocol` for lossy;
+  `MigrationState` comes from `acceptor.multitransport_request()` after each finalize. Soft-Sync goes
+  through dvc (3)'s `request_soft_sync` (same wire bytes, `SHOW_PROTOCOL` included). Upstream's
+  message-channel handler consumes the Initiate Multitransport Response first, so ours is
+  `mt_on_response` in its arm, and the owed empty Soft-Sync is a `ConnectionOutput::ResponseFrame`
+  appended in `process_x224`. The two audio DVCs have distinct types (`AudioReliableDvc`,
+  `AudioLossyDvc`), because the DRDYNVC server's by-type lookup keys on the Rust type. Our
+  `egfx_on_udp` lives in the `mt` state; upstream has its own field of that name, which stays false.
+  Upstream's own EGFX Soft-Sync stays inert, because it needs a `udp_transport` that only
+  `with_udp_transport` creates.
+  The multitransport offer needs the MCS message channel (since e258f6a0; the older fork fell back to
+  the I/O channel). mstsc sends it; a client that doesn't gets no UDP offer.
+  **The one Soft-Sync (fix of 2026-11-13, silent lossy audio since v0.10.0):** mstsc answers the
+  offer with `S_OK` on the message channel. When a channel is configured to migrate
+  (`has_channel_to_migrate`: lossy audio or EGFX), the response leaves the connection's one Soft-Sync
+  to the migration gate; otherwise it gets the empty one. Waves stay on TCP (`mt_route_lossy_audio`
+  returns them to the static RDPSND path) until the Soft-Sync naming the lossy channel has been sent
+  AND acknowledged. Live-verified on mstsc at e258f6a0; the fork's lib tests now cover both rules
+  (`mt_session::tests`).
+  Known, not changed by the port: upstream brackets bandwidth only on its own UDP writes
+  (#2031, `cb7ca376`), so no measurement runs while EGFX rides macrdp's tunnel.
+- **(14)** Unchanged. Upstream's EGFX server still always confirms, and its handler can't veto.
+- **(15)** A fresh connection is now sampled in `TcpConnectionSource::accept`, a preemption candidate
+  at its accept too (a little earlier than before). The custom-stream entry points (`run_connection*`,
+  `run_connection_handshake`) don't touch the cell. The macOS `getsockopt` body is the old one.
+  Upstream's `AutoDetectHandles::rtt` has no value yet when the offer is decided, so it can't replace
+  this.
+- **(16)** Upstream keeps a completion's raw `TS_URB_RESULT` bytes private, so
+  `urb_completion_no_data_result` re-reads SelectConfiguration's result from the PDU, only after
+  upstream's decode has validated the layout (now a lib test against upstream's encoder). Drop it once
+  upstream exposes the bytes or a typed result.
+  **Stricter decode:** upstream decodes every `URB_COMPLETION` result as isoch (`into_isoch()`), so a
+  *non-isoch* completion carrying a non-empty result payload fails the whole PDU. Watch the USB live
+  test for decode errors. Transfers keep our own `ServerEvent::Urbdrc` arm, which drops a transfer on
+  an encode error instead of ending the session. `UrbdrcServerMessage::OpenDeviceChannel` is gone
+  (upstream's `CreateDynamicChannel` replaces it).
+- **(18)** Fires for preemption candidates too. Under HYBRID_EX, a credential-validator rejection
+  fails `accept_credssp_with`, so it is reported as `on_authenticated(false, ..)` (macrdp sets no
+  validator).
+- **(19)** Upstream's new camera server (`ironrdp-rdpecam`, #2445) is not used: it keeps one
+  SampleRequest in flight (ours keeps 4, or the stream stalls) and does not prefer H.264. Each device's
+  sample sink is built when its channel is created, as before. `CameraServerMessage` and
+  `ServerEvent::Camera` are gone.
+- **(20)** On 79e763a0 the log also runs before upstream's connection-binder and "credentials were
+  not prepared" denials, so those attempts are fingerprinted too.
+- **(25)** Protocol version 1, and it opens the mic by itself from `process()`. Upstream's
+  `RdpeaiServer` (version 2, opened by an event from the embedder) is not used.
+- **(30)** Added 2026-10-28 after a live FreeRDP test: restarting macrdp with a client connected made
+  it auto-reconnect with the old process's cookie, which never verifies. Upstream denied it, FreeRDP
+  retried about three times a second, and `auth_guard` locked out the client's address. MS-RDPBCGR
+  3.3.5.3.11: "If logon with the cookie fails, the credentials supplied in the Client Info PDU SHOULD
+  be used". On 79e763a0 the acceptor skips the credential validator for Client Info credentials when
+  the client sent a cookie. So:
+  - with a credential validator, the fallback is denied ("credentials were not prepared before
+    activation") unless CredSSP under HYBRID_EX already validated the credentials (for example
+    TLS-only security + a validator: denied);
+  - with a connection binder, the cookie is still denied, as upstream does (the binder never runs for
+    a reconnect attempt);
+  - macrdp sets neither, so for macrdp the fallback logs on normally, after CredSSP.
+  Tests: `ironrdp-testsuite-core` `tests/server/macrdp_auto_reconnect.rs` (fallback, validator,
+  binder) and macrdp's `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`.
+  Upstream candidate (Devolutions/IronRDP#2465 is a fix for our #2280).
+- **(35)** Added 2026-11-21 (clintcan/IronRDP#2, from clintcan/macrdp#235). Before upstream #2021,
+  upstream measured bandwidth only by bracketing ordinary traffic. On a server that sends less than the
+  link carries, that reports the send rate: live on a 1 ms LAN (at e258f6a0), mstsc showed 2.90 Mbps
+  and Windows App 3.60 Mbps, and both warned "Your network might be slow". The connect-time burst
+  (32 × 8 KiB; 16 KiB payloads made mstsc fail with 0x1304) measured 95.42 and 91.27 Mbps, and both
+  clients then reported "good". Safety: the connection's own `AutoDetectManager`, reset first; each
+  reply awaited at most 2 s (`CONNECT_TIME_AUTODETECT_REPLY_TIMEOUT`); other frames skipped; inside
+  `FINALIZE_TIMEOUT`; an encoding failure skips the measurement, only a failed write ends the logon.
+  The connect-time Stop needs a non-empty payload. On 79e763a0 the figure comes from upstream's
+  `measured_bandwidth_kbps`, and the connect-time measurement does not update `AutoDetectHandles`.
+  Tests: `autodetect::connect_time_tests` (run by the CI server-test step) and macrdp's
+  `conn_test::network_autodetect_reports_the_connect_time_bandwidth`. Upstream candidate (together
+  with acceptor (7)). Not live-tested on this base yet.
+  **Open follow-up:** results still always report the connect-time figure. Upstream #2021 (in
+  79e763a0) now brackets a single large EGFX write, so in-session measurements are better than before,
+  and always preferring the connect-time figure hides them. Changing the rule to "connect-time until a
+  bracketed measurement exists" is a separate change (agreed in clintcan/IronRDP#3).
 
-- **(32)** Added 2026-11-13 for clintcan/macrdp#186. The candidate path was already
-  bounded (`CANDIDATE_NEGOTIATION_TIMEOUT`, 10 s) and finalize by upstream's
-  `FINALIZE_TIMEOUT`, but `run_connection_inner` awaited `negotiate_and_authenticate`
-  with no bound, so a peer that sent a Connection Request and went silent held the
-  serving connection forever, pre-authentication. 60 s rather than 10 s because Windows
-  App for macOS prompts for the password inside this phase (7-11 s measured
-  accept-to-auth) and a cellular CredSSP took 12.5 s. Test:
-  `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused clock; fails
-  without the bound, and with a 30 s one). **Upstreamed** as Devolutions/IronRDP#2432,
-  merged 2026-11-14 (`e482e340`, 60 s `NEGOTIATION_TIMEOUT` around
-  `negotiate_and_authenticate`, covering every entry point). Drops at the next pin bump
-  to any rev at or after `e482e340`; keep the conn_test as the regression check.
+### Upstream changes at 79e763a0 that macrdp sees
 
-- **(33)** Added 2026-11-13 by clintcan/macrdp#201 (`--virtual-display-hidpi=auto`),
-  replacing that PR's own shared-cell divergence: upstream #2107 (by @antonmos) carries
-  the same values through `ConnectionInfo`, and macrdp's `conn_hooks::DesktopScaleHook`
-  stores them in the scale cell, as `KeyboardLayoutHook` does for the layout. Upstream
-  reports the pair only when both are valid (desktop 100..=500, device 100/140/180) and
-  only on the initial accept, so a reactivation can't overwrite a scale the client
-  announced later in a monitor layout. Copied from upstream's diff, not its file. Test:
-  `conn_hooks::tests::the_desktop_scale_factor_reaches_the_shared_cell`. **Drop it at
-  the next pin bump** (any rev at or after `335d6712`).
+- **Logon notification (#2478):** at its first activation, each connection now gets a Save Session
+  Info PDU (logon notification), before the auto-reconnect cookie. macrdp does not call
+  `with_logon_notification_on_request`, so it is sent at activation.
+- **`RdpServerDisplay::updates(DisplayContext)` (#2073):** the server makes a new SuppressOutput flag
+  for each connection and hands it in `DisplayContext::display_suppressed`; the builder's
+  `with_display_suppressed_handle` (retired (5) below) is gone. macrdp's `capture::SuppressedFlag`
+  holds the current connection's flag for the capture and audio readers.
+- **`GfxServerFactory` methods take a `GfxContext` (#2104).** macrdp's `h264.rs` takes it and ignores it.
 
-- **(34)** Added 2026-10-21 (clintcan/macrdp#226). Numbered (34) because main used
-  (29) to (33) while this branch was open. MS-RDPRFX 3.1.8.3.1: "The sequence of
-  encode messages is encapsulated inside an Extended Bitmap Data structure ..., which
-  is encapsulated in a Stream Surface Bits Surface Command". Windows 10 mstsc
-  (10.0.19041.4717), A/B on the wire 2026-10-21:
-  - RemoteFX, id 3 (what mstsc gets when both are offered): Set Surface Bits =
-    **black** session (no error, input still flows); Stream Surface Bits = renders
-    and moves.
-  - ImageRemoteFX, id 5 (server offering only ImageRemoteFX): Set Surface Bits =
-    renders and moves (385 commands in 12 s); Stream Surface Bits = mstsc "An
-    internal error has occurred" after 4 commands (3 of 3 runs).
+### Retired at 79e763a0 (upstream has it; what macrdp calls instead)
 
-  FreeRDP 3.30 `/rfx` offers only RemoteFX (id 3), so it cannot exercise id 5.
-  Upstream merged the same fix after our pin as Devolutions/IronRDP#2229
-  (`e20a2147`); this port uses its names and shape: `RemoteFxCodec::surface_bits_command`
-  sends Stream Surface Bits only for RemoteFX and only when the client sets
-  `STREAM_SURFACE_BITS` in its Surface Commands capability (MS-RDPBCGR 2.2.7.2.9), and
-  `pick_remotefx_codec` picks RemoteFX over ImageRemoteFX whatever the order of the
-  client's codec list (before, the last one in the list won). Tests:
-  `encoder::surface_command_tests` and `server::remotefx_codec_choice_tests` (upstream's
-  proptest replaced by fixed codec lists), run by CI (`cargo test --manifest-path
-  vendor/ironrdp-server/Cargo.toml --lib --features egfx`). **Drop it at the next pin
-  bump** (any rev at or after `e20a2147`).
-
-- **(35)** Added 2026-11-21 (clintcan/IronRDP#2, from clintcan/macrdp#235). Upstream's
-  own auto-detect (enabled by macrdp's `--network-autodetect`) measures bandwidth only by
-  bracketing ordinary traffic, as MS-RDPBCGR 2.2.14.2.2 prescribes after the connection
-  sequence. On a server that sends less than the link carries, that reports the send rate:
-  live on a 1 ms LAN, mstsc showed 2.90 Mbps and Windows App 3.60 Mbps, and both warned
-  "Your network might be slow". The connect-time burst (32 × 8 KiB; 16 KiB payloads made
-  mstsc fail with 0x1304, found in #235) measured 95.42 and 91.27 Mbps, and both clients
-  then reported "good". Safety: a fresh `AutoDetectManager` per connection, each reply
-  awaited at most 2 s (`CONNECT_TIME_AUTODETECT_REPLY_TIMEOUT`), other frames skipped,
-  inside `FINALIZE_TIMEOUT`; an encoding failure skips the measurement, only a failed write
-  ends the logon. The connect-time Stop needs a non-empty payload (IronRDP refuses to encode
-  an empty one). Tests: `autodetect::connect_time_tests` (4, run by the CI server-test step,
-  mutation-checked) and macrdp's `conn_test::network_autodetect_reports_the_connect_time_bandwidth`.
-  Upstream candidate (together with acceptor (7)). **Revisit at the next rebase:** upstream
-  #2021 (merged 2026-10-19, after our pin) fixed the same warning differently, by bracketing a
-  single large EGFX write (at least 10 KiB) with Start/Stop, falling back to the tick window
-  only when no such write occurs. Once it is in, always preferring the connect-time figure
-  would hide those better in-session measurements: change the rule to "connect-time until a
-  bracketed measurement exists", or drop (35)'s preference if upstream takes connect-time
-  detection itself.
-
-- **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
-  now also drains the audio channel, so the evicted session's queued waves don't play
-  into the winner's. `dispatch_audio` adopts upstream's `is_ready()` check (drop
-  quietly until RDPSND negotiates) instead of warning per wave.
-- **(4)** Now a stable `sort_by_key` by tier, equivalent to the old three-bucket split.
-  Upstream's own `Rdpdr` events sort with ours, last.
-- **(11)** Upstream's drive PDUs are now two-way, so the vendored ironrdp-rdpdr fork
-  shrank to the smart card side (see its CLAUDE.md). `decode_write_response` keeps
-  `DR_WRITE_RSP`'s padding byte optional, as MS-RDPEFS 2.2.1.5.4 says; upstream's
-  decoder requires it. Upstream-issue candidate.
-- **(12)** The offer now uses the rebased acceptor's API: `OfferRng`
-  (`MultitransportSecurityRng`) registers each cookie with the listener as it is
-  generated; the offer is `flag | SOFT_SYNC_TCP_TO_UDP` plus
-  `set_multitransport_requested_protocol` for lossy; `MigrationState` comes from
-  `acceptor.multitransport_request()` after each finalize. Soft-Sync goes through the
-  dvc fork's `request_soft_sync` (same wire bytes, `SHOW_PROTOCOL` included). Upstream's
-  message-channel handler consumes the Initiate Multitransport Response first, so ours
-  is `mt_on_response` inside its arm, with the owed empty Soft-Sync sent by the caller.
-  The two audio DVCs now have distinct types (`AudioReliableDvc`, `AudioLossyDvc`),
-  because the DRDYNVC server's by-type lookup keys on the Rust type. Our field
-  `egfx_on_udp` lives in `mt` state; upstream has its own field of that name.
-  **Behaviour change:** the rebased acceptor only offers multitransport when the client
-  negotiated the MCS message channel (the old fork fell back to the I/O channel). mstsc
-  sends it; a client that doesn't now silently gets no UDP offer.
-  **Regression found 2026-11-13 (silent lossy audio since v0.10.0):** on the message
-  channel, mstsc DOES answer the offer with `S_OK` (the June notes saw only tunnel
-  creation), and `mt_on_response` spent the connection's one Soft-Sync on an empty
-  request for the reliable tunnel. `mt_soft_sync_on_egfx` then found it claimed and
-  never migrated `AUDIO_PLAYBACK_LOSSY_DVC`, so mstsc dropped every wave streamed into
-  the tunnel; `--udp-migrate-egfx` went through the same one-shot. Fix: when a channel
-  is configured to migrate (`mt_has_channel_to_migrate`: lossy audio or EGFX), the
-  response leaves the Soft-Sync to the migration gate; otherwise it still gets the
-  empty one. Live-verified on mstsc (LAN): the Soft-Sync names the lossy audio DVC,
-  mstsc answers `tunnels_to_switch: [3]`, and audio plays. No automated test (the path
-  needs a real multitransport client). Follow-up the same day: waves stay on TCP
-  (`mt_route_lossy_audio` returns them to the static rdpsnd path) until the Soft-Sync
-  naming the lossy channel has been sent AND acknowledged
-  (`lossy_audio_soft_synced` + `DrdynvcServer::soft_sync_response_received`). Before,
-  they started ~0.5 s ahead of the Soft-Sync and that first half-second was dropped.
-  Live: audio from the first second, lossy streaming 4 ms after the client's response.
-- **(15)** A preemption winner's RTT is now sampled as a candidate (carried on
-  `NegotiatedConnection.link_rtt_ms`); before, it inherited the previous connection's.
-- **(16)** Upstream made a completion's raw `TS_URB_RESULT` bytes private, so
-  `urb_completion_no_data_result` re-reads SelectConfiguration's result from the PDU,
-  only after upstream's decode has validated the layout. Byte-tested against
-  upstream's encoder, with two mutations caught, 2026-10-01 (scratch crate). Drop it
-  once upstream exposes the bytes or a typed result.
-  **Stricter decode:** upstream now decodes every `URB_COMPLETION` result as isoch
-  (`into_isoch()`), so a *non-isoch* completion carrying a non-empty result payload fails
-  the whole PDU, where the old fork accepted it. Normal for bulk/control; watch the USB
-  live test for decode errors.
-- **(18)** Fires for preemption candidates too (`NegotiationContext` carries the
-  handler); #2065's shared handler makes that borrow-safe.
+- **(24) input-reset flag** → macrdp's `conn_hooks::InputResetHook`, in
+  `ConnectionHandler::on_connection_info`, which the server calls once per served connection (not on a
+  Deactivation-Reactivation, not for a losing preemption candidate). `set_input_reset_handle` is gone.
+  The flag is now raised after finalize, not at the top of the serving path. Input that arrives during
+  finalize is buffered by the acceptor and handed over after it, so no input reaches the handler first.
+- **(26) client input read off the `Self` lock** → nothing to call. Upstream's single select loop
+  reads input while the outbound queue writes (#2349, #2431, #2312), and the acceptor buffers input in
+  flight during a reactivation and replays it (#2439). Reads pause while queued replies exceed 1 MiB.
+- **(28) zstd-safe 8.2** → nothing in the fork. Upstream still requires `zstd-safe = "7.2"`; macrdp's
+  `Cargo.lock` has 7.4.1, which the RustSec advisories list as patched ("^7.4.0 OR >=8.2.0").
+- **(29) AND mask for 32 bpp pointers** → upstream #2108 (`fb25b47c`).
+- **(31) zero-payload fast-path update as one empty frame** → upstream #2274 (`904a7da6`). macrdp's
+  `conn_test::hidden_and_default_pointer_updates_reach_the_client` stays as the regression check.
+- **(32) serving-path negotiation timeout** → upstream #2432 (`e482e340`), `NEGOTIATION_TIMEOUT` (60 s)
+  around `negotiate_and_authenticate`, on every entry point. macrdp's
+  `conn_test::a_silent_peer_cannot_hold_the_serving_connection` stays as the regression check.
+- **(33) client scale factors on `ConnectionInfo`** → upstream #2107 (`335d6712`),
+  `ConnectionInfo::{desktop,device}_scale_factor`. macrdp's `conn_hooks::DesktopScaleHook` is
+  unchanged.
+- **(34) RemoteFX in a Stream Surface Bits command** → upstream #2229 (`e20a2147`). Windows 10 mstsc
+  shows a black session for RemoteFX in Set Surface Bits; the history is in `known-quirks.md`.
 
 ### Retired at e258f6a0 (upstream has it; what macrdp calls instead)
 
-- **(5) SuppressOutput** → builder `with_display_suppressed_handle`. **Behaviour
-  change:** upstream's capabilities ADVERTISE refresh-rect/suppress-output support,
+- **(5) SuppressOutput** → builder `with_display_suppressed_handle` (gone at 79e763a0, see above).
+  **Behaviour change:** upstream's capabilities ADVERTISE refresh-rect/suppress-output support,
   which our fork never did, so spec-following clients (FreeRDP, Thincast) now send
   minimize signals too, and macrdp's mute + video pause applies to them.
 - **(6) NSCodec** → upstream's `ironrdp-nscodec` behind the `nscodec` feature, which
@@ -297,43 +297,30 @@ Notes on the port:
   The `Reject` policy's accept drops the socket unserved.
 - Earlier: (1) PR #1276, (7) QOI at a5d1c682, (17) wheel decode at a5d1c682.
 
-### Known leftovers
+### Tests
 
-- `cargo clippy` flags two `collapsible_if`s in upstream's own code (`autodetect.rs`,
-  `run()`'s `on_disconnected` call) under our newer toolchain. Left as upstream wrote them.
-  With `--all-features` it also flags `urbdrc::PendingIo` as more private than
-  `UrbdrcDeviceServerMessage::IoReq::tx`, also upstream's.
-- Upstream's in-file `#[cfg(test)]` module never compiles here (`test = false`); its
-  one `NegotiationContext` literal was kept in step with our added field anyway.
+The fork's server lib tests cover most kept divergences: `server::macrdp::tests` (audio arm, batch
+priority, RDPDR drive, URBDRC, camera, mic, fingerprint, link RTT, authentication),
+`server::macrdp::mt_session::tests` (with `multitransport`), `autodetect::connect_time_tests`, and the
+tests in `gfx.rs`, `rdpdr_drive.rs`, `rdpeusb.rs`, `rdcamera.rs` and `audin.rs`. macrdp's CI runs them
+(`cargo test --lib --features egfx` on the pinned checkout; `multitransport` is left out to keep the
+job fast). (30) is tested in `ironrdp-testsuite-core`. Not covered by an automated test: a live
+multitransport client, a successful NLA for (18), and (20)'s placement in `client_accepted`.
+
+### Porting notes for the next rebase
+
+- Keep upstream code as upstream wrote it. Put macrdp code in macrdp's files (`macrdp.rs` and the
+  channel modules) and mark each hook edit in an upstream file with `(macrdp N)`.
+- Prefer upstream extension points (channel factories, `CreateDynamicChannel`, `ConnectionHandler`
+  methods) over edits to `server.rs` when they give the same wire behaviour.
+- `ServerEvent` matches: our variants `RdpdrDrive` and `Urbdrc` need an arm in each exhaustive match;
+  check new upstream variants against `prioritize_batch`'s tiers.
 
 ## ironrdp-acceptor
 
-Local fork of ironrdp-acceptor 0.10.0, **re-vendored 2026-10-01 from upstream
-Devolutions/IronRDP@e258f6a0** (the pin-bump rev). `src/` is upstream verbatim except
-`connection.rs`, which carries the divergences below, and `lib.rs`, which carries (7)'s
-finalize driver (every insertion of (4), (5) and (7) is marked `(macrdp divergence N)`; (6)
-is upstream code, unmarked). Earlier vendorings: @a5d1c682 (2026-08-05), @879ffed
-(2026-06-12). Has a standalone `[patch.crates-io]` (core/pdu/svc/connector/async →
-e258f6a0) for isolated builds, ignored in the macrdp workspace (the root `[patch]`
-wins). Keep that rev in sync. `rustfmt.toml` mirrors the IronRDP workspace config
-(added 2026-10-01 — without it rustfmt reformats upstream's 120-column code).
-
-**Known, pre-existing, not ours:** `cargo clippy -- -D warnings` on this crate alone
-flags a `collapsible_if` in upstream's credentials check (`connection.rs`, the
-`if let Some(expected) = &self.creds` block). It's a newer-clippy lint (our 1.95 vs
-upstream's 1.94); verified identical on pure upstream source. macrdp's own clippy run
-doesn't lint path dependencies. Don't "fix" upstream code here.
-
-### Testing
-
-The lib is `test = false`, and the useful harness lives upstream in
-`ironrdp-testsuite-core/tests/server/acceptor.rs`. To test a change, copy
-`connection.rs` into the IronRDP clone (`~/Documents/Projects/Misc/IronRDP`) at the
-pinned rev and run `cargo test -p ironrdp-testsuite-core server::acceptor`. The
-2026-10-01 rebase did exactly that on the local branch
-`scratch/macrdp-acceptor-divergences` (not pushed): four `macrdp_*` tests below, plus
-upstream's 13 acceptor tests and the whole suite (1731) passing against this fork.
-Both divergences were mutation-checked.
+`src/` is upstream 79e763a0 except `connection.rs`, which carries (4), (5) and (7), and `lib.rs`,
+which carries (7)'s finalize driver. Every insertion is marked `(macrdp divergence N)`. The crate keeps
+IronRDP's workspace lints and is lint-clean under them.
 
 ### Divergences
 
@@ -343,51 +330,44 @@ Both divergences were mutation-checked.
     `BasicSettingsWaitInitial`, next to upstream's own `keyboard_layout` /
     `keyboard_type` / `ime_file_name` captures, carries them across
     deactivation–reactivation, and surfaces them as `pub` fields on `AcceptorResult`.
-    Consumed by the vendored server's divergence (20) client-fingerprint log. Same
+    Consumed by server divergence (20)'s client-fingerprint log. Same
     additive shape as #1397 (keyboard layout) — cleanly upstreamable. Heuristics: mstsc
     sends the real Windows build + its hostname; FreeRDP hardcodes build 2600.
     Informational only — a client can claim anything.
-    Test: `macrdp_result_carries_the_client_fingerprint` (drives to `Connected`, reads
-    `get_result()`). Mutation: dropping the build capture fails it.
 
 (5) **`Acceptor::set_multitransport_requested_protocol(RequestedProtocol)`** (NOT
     upstreamed; added 2026-10-01). Upstream's offer (#1951) only ever requests reliable
     UDP: `MultitransportBootstrapping` gates on `TRANSPORT_TYPE_UDP_FECR` and hard-codes
-    `RequestedProtocol::UdpFecR` ("this acceptor never requests [lossy]"). macrdp's
-    `--enable-lossy-audio` needs a lossy (`UdpFecL`) request. The setter (default
-    `UdpFecR`, so upstream behaviour is unchanged when it isn't called) makes both gates
-    — our advertised offer and the client's flags — and the request use the chosen
-    protocol's transport flag. The gate's locals were renamed `offer_transport` /
-    `client_supports_transport` (upstream's `offer_udp_fecr` / `client_supports_udp_fecr`
-    would be wrong for lossy) and the "Not offering UDP multitransport" debug log gained
-    `requested_protocol`. Tests: `macrdp_lossy_multitransport_request_when_requested_and_reciprocated`,
-    `macrdp_lossy_request_needs_the_client_to_support_lossy`,
-    `macrdp_lossy_request_needs_the_offer_to_include_lossy`. Mutation: hard-coding the
-    request back to `UdpFecR` fails the first. Upstream candidate: a natural extension
-    of #1951.
-
-(6) **Client desktop and device scale factors** — **harvested early** from upstream
-    #2107 (by @antonmos, merged 2026-10-30 as `335d6712`, after this pin). `Acceptor`
-    captures `desktopScaleFactor` / `deviceScaleFactor` from the GCC Client Core Data in
-    `BasicSettingsWaitInitial` through `validate_scale_factors` (both `Some` only as a
-    valid pair, per MS-RDPBCGR 2.2.1.3.2), carries them across deactivation–reactivation,
-    and surfaces them as `Option<u32>` fields on `AcceptorResult`. Consumed by server
-    divergence (33). Copied from upstream's diff, with no `(macrdp divergence N)` markers
-    so it matches upstream exactly. Upstream's acceptor tests cover it
-    (`scale_factors_are_reported_only_as_a_valid_pair`, `scale_factors_survive_reactivation`).
-    **Drop it at the next pin bump** (any rev at or after `335d6712`).
+    `RequestedProtocol::UdpFecR`. macrdp's `--enable-lossy-audio` needs a lossy (`UdpFecL`)
+    request. The setter (default `UdpFecR`, so upstream behaviour is unchanged when it isn't
+    called) makes both gates — our advertised offer and the client's flags — and the request
+    use the chosen protocol's transport flag. Upstream candidate: a natural extension of #1951.
 
 (7) **Window for connect-time auto-detect** (NOT upstreamed; added 2026-11-21 in
     clintcan/IronRDP#2, from clintcan/macrdp#235). `Acceptor::connect_time_autodetect_window()`
     returns the message and user channel ids once the Client Info PDU has been received
     and before licensing, when the client advertised `SUPPORT_NET_CHAR_AUTODETECT` and
     joined the MCS message channel, never during a deactivation-reactivation.
-    `accept_finalize_with_hooks()` is `accept_finalize_with_multitransport()` plus a handler
-    called once at that window, inside the finalize future, so a timeout around finalize
-    bounds it; `accept_finalize_with_multitransport()` now calls it with a no-op handler.
-    Used by server divergence (35). Upstream candidate.
+    `accept_finalize_with_hooks()` is upstream's `accept_finalize_with_handlers()` plus a
+    handler called once at that window, after the Client Info and credential handlers,
+    inside the finalize future, so a timeout around finalize bounds it.
+    `accept_finalize_with_handlers()` now calls it with a no-op handler, so its behaviour is
+    unchanged. A client whose credentials are refused gets no burst. Used by server
+    divergence (35). Upstream candidate.
 
-### Retired
+### Testing
+
+(7) has three tests in `ironrdp-testsuite-core` `tests/server/acceptor.rs`
+(`connect_time_autodetect_window_*`). (4) and (5) have no test in the fork: the `macrdp_*` acceptor
+tests of the 2026-10-01 rebase lived on a local scratch branch that was never pushed. (4) is used by
+the server's fingerprint test, and (5) by `mt_session::tests` and macrdp's `conn_test` lossy offer.
+
+### Retired at 79e763a0
+
+(6) Client desktop and device scale factors → upstream #2107 (`335d6712`):
+    `AcceptorResult::{desktop,device}_scale_factor`, reported only as a valid pair.
+
+### Retired earlier
 
 (1) Honor the client's requested desktop size — upstream #1373 + #1404
     (`set_honor_client_desktop_size(Option<DesktopSize>)`), retired at a5d1c682.
@@ -395,80 +375,54 @@ Both divergences were mutation-checked.
     Client Core Data, before Demand Active) is recorded in `docs/known-quirks.md`.
 (2) Expose the client's keyboard-layout id — upstream #1397, retired at a5d1c682.
 (3) UDP multitransport — read side (client flags) upstream #1453, retired at a5d1c682;
-    **offer side retired 2026-10-01** in favour of upstream's own offer (#1951). What
-    went: our `MultitransportOffer` type and `set_multitransport_offer(Option<MultitransportOffer>)`,
-    `AcceptorResult::multitransport_offered`, our `SC_MULTITRANSPORT` advertise, the
-    request emitted in `LicensingExchange`, and the `finalization.rs` skip of
-    non-io-channel PDUs. Upstream equivalents: `set_multitransport_offer(Option<MultiTransportFlags>)`
-    advertises; `MultitransportBootstrapping` (right after licensing, the same window)
-    sends the request; `multitransport_request()` exposes what was sent;
-    `set_multitransport_security_rng()` supplies the cookie and request ID; and
-    `is_late_multitransport_response` tolerates the client's reply during
-    capabilities confirmation and finalization (stricter than our skip: only a payload
-    that decodes as the reply to the sent request is consumed — which covers the
-    E_ABORT case our skip existed for). One behaviour difference: with no MCS message
-    channel, upstream doesn't offer; ours fell back to the I/O channel. Upstream's is
-    the spec-correct one (2.2.15.1: the request travels on the message channel).
-
-### Porting notes for the server rebase (vendored ironrdp-server)
-
-- Offer: `acceptor.set_multitransport_offer(Some(flag | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP))`
-  where `flag` is `TRANSPORT_TYPE_UDP_FECR` or `_FECL`, plus
-  `set_multitransport_requested_protocol(..)` for the lossy case.
-- Cookie: implement `MultitransportSecurityRng` so `fill_security_cookie` registers the
-  cookie in the multitransport `CookieRegistry` as it is generated — the UDP listener
-  then knows it before the client's first datagram (no race), replacing `new_offer()`.
-- Replace `result.multitransport_offered` with `acceptor.multitransport_request()` (or
-  the `accept_finalize_with_multitransport` handler).
+    **offer side retired 2026-10-01** (e258f6a0) in favour of upstream's own offer (#1951):
+    `set_multitransport_offer(Option<MultiTransportFlags>)` advertises;
+    `MultitransportBootstrapping` (right after licensing) sends the request;
+    `multitransport_request()` exposes what was sent; `set_multitransport_security_rng()`
+    supplies the cookie and request ID; and `is_late_multitransport_response` tolerates the
+    client's reply during capabilities confirmation and finalization. With no MCS message
+    channel, upstream doesn't offer; that is the spec-correct behaviour (2.2.15.1: the
+    request travels on the message channel).
 
 ## ironrdp-rdpdr
 
-Local fork of ironrdp-rdpdr 0.7.0, **re-vendored 2026-10-01 from upstream
-Devolutions/IronRDP@e258f6a0** (the pin-bump rev). Earlier vendorings: @a5d1c682
-(2026-08-05), @879ffed (2026-06-16). Pulled in via `[patch.crates-io]` in the root
-`Cargo.toml`; has a standalone `[patch.crates-io]` (core/error/pdu/svc → e258f6a0) for
-isolated builds, ignored in the macrdp workspace (the root `[patch]` wins). Keep that rev in
-sync.
-
 ### Shape: upstream verbatim + two new files
 
-`src/` is upstream e258f6a0 **verbatim** except four code lines across three files, all
-marked `(macrdp divergence N)`:
+`src/` is upstream 79e763a0 **verbatim** except three lines in two files, marked
+`(macrdp divergence N)`:
 
-- `pdu/efs.rs`: `DeviceAnnounceHeader::device_type()` widened `pub(crate)` → `pub`.
 - `pdu/mod.rs`: `mod server_direction;` + `pub use self::server_direction::ScardControlRequest;`
 - `pdu/esc/mod.rs`: `mod server_direction;`
 
 Everything else lives in two new files: `pdu/server_direction.rs` and
 `pdu/esc/server_direction.rs`. As child modules they can implement traits on, and add
 methods to, their parent's types and read private fields, so no upstream line needs to
-change. **Keep it that way:** the next rebase is "copy upstream `src/`, re-apply four lines,
-fix what no longer compiles in our two files".
+change. **Keep it that way:** a rebase is "re-apply three lines, fix what no longer
+compiles in our two files".
 
-Cost of this shape: under IronRDP's own workspace lints, `clippy::multiple_inherent_impl`
-fires for every type that gains a second `impl` block here. It doesn't apply to our
-standalone build. If any of this is upstreamed, it folds into upstream's existing `impl`
-blocks.
+Cost of this shape: under IronRDP's workspace lints, `clippy::multiple_inherent_impl`
+fires for every type that gains a second `impl` block here, so the fork drops the lints
+from this crate (see "Lints"). If any of this is upstreamed, it folds into upstream's
+existing `impl` blocks.
 
 ### Why a fork at all
 
-macrdp's RDPDR server processor is its own (`vendor/ironrdp-server/src/rdpdr.rs`,
-divergence (11) there), and it needs to build requests and parse replies in the server's
-direction. Upstream has since made the EFS (drive) PDU layer two-way (#1779) and added its
-own `RdpdrServer` (#1783/#1784); its ESC (smart card) layer is still client-only. Moving
-macrdp onto upstream's `RdpdrServer` is a later, separate change (group 2 of the pin-bump
-triage). Until then this crate supplies what our processor uses.
+macrdp's RDPDR server processor is its own (`ironrdp-server`'s `rdpdr_drive.rs`, server
+divergence (11)), and it needs to build requests and parse replies in the server's
+direction. Upstream's EFS (drive) PDU layer is two-way (#1779) and it has its own
+`RdpdrServer` (#1783/#1784), but that server frames requests with a private type and has no
+smart card path; its ESC (smart card) layer is still client-only. Moving macrdp onto
+upstream's `RdpdrServer` would be a separate change.
 
 ### Divergences
 
 (1) **Drive (EFS) server direction** — nearly all retired at e258f6a0 (see below). What's left:
-    - `device_type()` made `pub` (the server reads the announced device type).
-    - `pdu/server_direction.rs`: `impl Encode + SvcEncode for ServerDriveIoRequest` —
-      `PAKID_CORE_DEVICE_IOREQUEST` header + the request's own (upstream) `encode`. Upstream's
-      equivalent (`DriveRequestBody` in `server.rs`) is private. Covers every variant except
-      `DeviceControlRequest`, which carries no input buffer (upstream's server excludes it
-      too). The `match` is exhaustive on purpose: a new upstream variant is a compile error,
-      not a silent gap.
+    `pdu/server_direction.rs`: `impl Encode + SvcEncode for ServerDriveIoRequest` —
+    `PAKID_CORE_DEVICE_IOREQUEST` header + the request's own (upstream) `encode`. Upstream's
+    equivalent (`DriveRequestBody` in `server.rs`) is private. Covers every variant except
+    `DeviceControlRequest`, which carries no input buffer (upstream's server excludes it
+    too). The `match` is exhaustive on purpose: a new upstream variant is a compile error,
+    not a silent gap.
 
 (2) **Smart card (ESC) server direction** — `pdu/esc/server_direction.rs`, for
     `--enable-smartcard-redirection`. Upstream decodes each `*Call` and encodes each
@@ -485,23 +439,28 @@ triage). Until then this crate supplies what our processor uses.
       (`write_ndr_string`/`ndr_string_size`, the mirror of `ndr::read_string_from_cursor`).
     - `TryFrom<u32>` for `ReturnCode` and `CardState`; `From<Scope> for u32`.
     - `ScardControlRequest` (in `pdu/server_direction.rs`): a `DR_CONTROL_REQ` carrying a
-      `ScardCall`. Now built from upstream's `DeviceControlRequest::encode` (new at
-      e258f6a0) plus the call; same bytes as before.
+      `ScardCall`, built from upstream's `DeviceControlRequest::encode` plus the call.
 
     **Live-Windows rules these halves must keep** (found against mstsc + a TPM virtual smart
     card, 2026-06-18; full APDU transceive verified end to end):
     - A NULL `[unique]` referent means no deferred conformant array. The decoders check the
       referent before reading `MaximumCount` for `mszReaderNames` (`StatusReturn`, Windows
       often sends an ATR-only status), `pbRecvBuffer` (`TransmitReturn`, no card data), and
-      now `msz` in `ListReadersReturn` (a length-only probe).
+      `msz` in `ListReadersReturn` (a length-only probe). Upstream's `GetStatusChangeReturn`
+      encode now writes `cReaders=0` and a NULL pointer for a non-success return (#2175); our
+      decoder reads that form.
     - **`TransmitCall` writes a NULL `pbExtraBytes` referent when there are no extra PCI
       bytes** (`encode_io_request_ptr`). This deliberately does NOT use upstream's
       `ndr::Encode for SCardIORequest`, which writes a non-NULL referent for the same
       input; real Windows rejects that `Transmit_Call` with `STATUS_UNSUCCESSFUL`. Don't
       "simplify" it back to `send_pci.encode_ptr`.
     - Pointer-sized (8-byte) contexts/handles and the connect handle's empty embedded
-      context are now upstream's own behaviour (`ScardContext`/`ScardHandle`, #1654); our
-      old `u64 value + length` fix was retired in favour of it.
+      context are upstream's own behaviour (`ScardContext`/`ScardHandle`, #1654).
+
+### Retired at 79e763a0
+
+- `DeviceAnnounceHeader::device_type()` widened to `pub` → upstream made it public in #2440
+  (`2e65d081`).
 
 ### Retired at e258f6a0 (upstream now has it)
 
@@ -518,83 +477,34 @@ triage). Until then this crate supplies what our processor uses.
 
 ### Testing
 
-The lib is `test = false`; run the tests on a scratch copy with `test = true`
-(`cargo test --lib`). 52 pass: upstream's 38 plus 14 of ours (`pdu::server_direction::tests`,
-`pdu::esc::server_direction::tests`; the round trips are table-driven, so one test covers
-many PDUs). Ours round-trip every request through upstream's own
-decode chain and every reply from upstream's own encoder, and add hand-built byte layouts
-real Windows sends (empty handle context, NULL reader names, NULL receive buffer).
+The crate's lib is testable as upstream ships it: `cargo test -p ironrdp-rdpdr --lib` runs upstream's
+tests plus our 14 (`pdu::server_direction::tests`, `pdu::esc::server_direction::tests`; the round
+trips are table-driven, so one test covers many PDUs). Ours round-trip every request through
+upstream's own decode chain and every reply from upstream's own encoder, and add hand-built byte
+layouts real Windows sends (empty handle context, NULL reader names, NULL receive buffer).
 **Mutation-checked 2026-10-01:** each of these, introduced alone, fails a test — non-NULL
 `pbExtraBytes` referent, unconditional `msz`/reader-names/receive-buffer read, a typo in
 the `ReturnCode` table, dropping the NDR string padding, skipping the connect handle's
 value.
 
-### Porting notes for the server rebase (vendored ironrdp-server)
-
-Measured against `vendor/ironrdp-server/src/rdpdr.rs`: 10 of its compile errors come from
-this crate, all mechanical.
-- `Device{Create,Read,Write}Response::decode(src)` → decode the `DeviceIoResponse` first,
-  then `::decode(io_response, src)`.
-- The inline query-directory parse used `FileDirectoryInformation::decode` (now private) →
-  use upstream's `ClientDriveQueryDirectoryResponse::decode_for_class(FILE_DIRECTORY_INFORMATION, …)`.
-- `ret.return_code` / `ret.context` → `ret.return_code()` / `ret.context()` for `LongReturn`
-  and `EstablishContextReturn`.
-- `ListReadersReturn::readers` and `TransmitReturn::recv_buffer` are now `Option` (NULL
-  referent ⇒ `None`).
-- `src/rdpdr/smartcard.rs` logs `ctx.value` → `ctx.value()` (or `as_bytes()`).
-- Later (group 2): adopt upstream's `RdpdrServer` and drop this fork's drive half.
-
 ## ironrdp-dvc
 
-Local fork of ironrdp-dvc 0.8.0, **re-vendored 2026-10-01 from upstream
-Devolutions/IronRDP@e258f6a0** (the pin-bump rev). `src/` is upstream verbatim plus
-**one** pure addition, divergence (3). Earlier vendorings: @a5d1c682 (2026-08-05),
-@879ffed (2026-06-26). Keep this vendor dir until (3) is upstreamed AND released, or
-until macrdp adopts upstream's own UDP routing (see "Retiring this fork" below).
-Has a standalone `[patch.crates-io]` (core/svc/pdu → e258f6a0) for isolated builds,
-ignored in the macrdp workspace (the root `[patch]` wins). Keep that rev in sync.
-
-**Patch wiring is two-sided.** Unlike the other vendored crates, ironrdp-dvc is a
-**path dependency of the git-pinned ironrdp crates** (egfx / displaycontrol / echo /
-rdpeusb depend on it *within the IronRDP git workspace*), so `[patch.crates-io]`
-alone leaves two versions — the git copy those crates pull and the vendored copy
-ironrdp-server pulls — which fail to unify (trait mismatch). The root Cargo.toml
-therefore patches **both** sources to the single vendored copy:
-
-```toml
-[patch.crates-io]
-ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
-[patch."https://github.com/Devolutions/IronRDP.git"]
-ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
-```
-
-That is also why the fork must track upstream closely: the two-sided patch forces
-this copy on the git crates too, so a stale fork breaks them (the e258f6a0 dry run
-showed exactly that — upstream's `ironrdp-rdpeusb` needs `DvcClientProcessor`, which
-the a5d1c682-based fork predated).
-
-### Style / cleanliness
-
-Copied verbatim from upstream and kept that way: the divergence is a **pure
-addition** — `diff` against upstream `src/` shows **zero deletions or modifications**
-of upstream lines. `rustfmt.toml` mirrors the IronRDP workspace config. Under
-`cargo +nightly fmt`, upstream's own `client.rs` differs (upstream formats with stable
-rustfmt, which skips the two nightly-only import options) — leave it, reformatting
-upstream code would break the pure-addition property. The crate is a path dep, so the
-root `cargo fmt`/`cargo test` don't reach it, and its lib is `test = false`; run its
-tests on a scratch copy with `test = true` (`cargo test --lib`).
+`src/` is upstream 79e763a0 plus **one** pure addition, divergence (3), in `server.rs`: no upstream
+line is deleted or changed. The crate keeps IronRDP's workspace lints and is lint-clean under them.
+Every `ironrdp-*` crate comes from the same fork rev, so the git crates that depend on
+`ironrdp-dvc` (egfx, displaycontrol, echo, rdpeusb) use this copy too; no second patch is needed.
 
 ### Divergence
 
 (3) **`DrdynvcServer::request_soft_sync(tunnel_type, channel_ids)`** (NOT upstreamed;
-    added 2026-10-01 at the e258f6a0 bump). Upstream's `DrdynvcServer` now owns a
+    added 2026-10-01 at the e258f6a0 bump). Upstream's `DrdynvcServer` owns a
     Soft-Sync state machine (#1584 + #1954): one request per connection, and the
     client's response is validated against the request — an unsolicited, duplicate,
     or unrequested-tunnel response is an **error** out of `process()`, i.e. it ends
     the session. Its only public request API is `request_reliable_udp(non-empty
     ids)`, which also **registers** the channels for tunnelling — after which
     `process()` rejects their data over TCP ("received TCP data for a channel
-    selected by Soft-Sync").
+    selected by Soft-Sync"). Unchanged at 79e763a0.
 
     macrdp needs three things that API can't do: Soft-Sync onto the **lossy** tunnel
     (`--enable-lossy-audio`, `AUDIO_PLAYBACK_LOSSY_DVC`); an **empty** request (the
@@ -606,35 +516,30 @@ tests on a scratch copy with `test = true` (`cargo test --lib`).
     `tunnel_type` (none if `channel_ids` is empty — only SOFT_SYNC_TCP_FLUSHED set),
     and **does not register per-channel routing** — `tunnel_for_outgoing_channel`
     stays `None` and `process()` keeps accepting the channels' data over TCP. macrdp
-    routes the data itself, as it always has. Net behaviour = the pre-bump fork's.
+    routes the data itself.
 
-    Tests: five in `src/server.rs`'s test module (lossy request + response + TCP data
-    still accepted; empty request carries no list; unrequested-tunnel response
-    rejected; one request per connection; unopened/duplicate channels rejected).
+    Tests: five `request_soft_sync_*` tests in `src/server.rs`'s test module (lossy request
+    + response + TCP data still accepted; empty request carries no list; unrequested-tunnel
+    response rejected; one request per connection; unopened/duplicate channels rejected).
     **Mutation-checked 2026-10-01:** making the method register routing like
     `request_reliable_udp` fails the first test. Wire bytes are additionally pinned by
     macrdp's `src/multitransport.rs` tests.
 
-(1) **RETIRED 2026-10-01 at the e258f6a0 bump.** Server-direction Soft-Sync PDU
-    codec (our `SoftSyncRequestPdu` / `SoftSyncResponsePdu` / `SoftSyncChannelList`,
-    the `TUNNELTYPE_UDPFEC{R,L}` / flag constants, the `switch_to_*` constructors, the
-    `process()` response arm, and `DrdynvcServer::get_channel_id_by_name`). Upstream
-    #1584 (Marc-André Moreau, merged 2026-08-11) added its own codec: the
-    `SoftSyncTunnelType` newtype (`RELIABLE_UDP` / `LOSSY_UDP`),
-    `SoftSyncRequestPdu::new(Vec<SoftSyncChannelList>)` (flags derived: TCP_FLUSHED
-    always, CHANNEL_LIST_PRESENT iff a list is present — same rule as ours), and
-    `SoftSyncResponsePdu::tunnels_to_switch()`. `get_channel_id_by_name` has no
-    upstream equivalent; callers use `get_channel_id_by_type::<T>()` (macrdp gives
-    its two audio DVCs distinct types for that).
+(1) **RETIRED 2026-10-01 at the e258f6a0 bump.** Server-direction Soft-Sync PDU codec →
+    upstream #1584 (`SoftSyncTunnelType`, `SoftSyncRequestPdu::new`,
+    `SoftSyncResponsePdu::tunnels_to_switch()`). `get_channel_id_by_name` has no upstream
+    equivalent; callers use `get_channel_id_by_type::<T>()` (macrdp gives its two audio DVCs
+    distinct types for that).
 
 (2) **RETIRED 2026-08-05 at the a5d1c682 bump.** Invoking `DvcProcessor::close` on a
     client Close — upstream #1302 does it via `impl Drop for DynamicChannel`.
 
-### Retiring this fork
+### Retiring this divergence
 
 Two routes. (a) Upstream (3): the lossy + empty generalisation is a natural
 extension of `request_reliable_udp`; the no-routing part is macrdp-specific (it
 exists for the TCP fallback), so an upstream version would more likely register
 routing and add an explicit "release this channel back to TCP" call. (b) Adopt
-upstream's own UDP routing (#1954) at the group-2 UDP swap, at which point the TCP
-fallback is re-examined anyway. Either way, verify the fallback live on mstsc.
+upstream's own UDP routing (#1954); upstream still has no way back to TCP (a lost
+tunnel with EGFX on it ends the session), so the TCP fallback must be re-examined
+first. Either way, verify the fallback live on mstsc.
