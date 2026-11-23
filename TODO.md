@@ -12,7 +12,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
   core live checks on the mini (2026-11-22, all pass): mstsc on Windows 11 (picture, sound, resize, minimize
   and restore, audio latency during resize, clipboard both ways, drive, the stuck-modifier reset, a wrong
   password refused) and Windows App on Windows (connects first time). **48 h soak running since
-  2026-11-22 09:52 UTC** (sampler `~/macrdp-soak-79e763a0-samples.log` on the mini; ends 2026-11-24 09:52).
+  2026-11-22 09:52 UTC** (sampler `~/macrdp-soak-79e763a0-samples.log` on the mini; ends 2026-11-24 09:52;
+  healthy at 33 h: no restarts or panics, memory at most 80 MB, at most 43 file handles).
   Still to do: auto-reconnect after a network drop; FreeRDP; Windows App for macOS (blank recovery armed);
   a takeover by a second client; connect-time auto-detect (`NETWORK_AUTODETECT=1`); and, with config
   changes after the soak, microphone, camera, USB and smart card.
@@ -30,8 +31,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
     session-long display-awake hold and the 3 s wait in `DetachedPrimary::drop`.
   - **Clipboard file-index fixes** (ours, local branch `fix/clipboard-file-lock-snapshots`, reported by
     Seiun Zhang in the zhangyxXyz fork): serve a locked Mac file paste from its own paths, and skip
-    descriptors ironrdp-cliprdr would drop so the file lists stay aligned. Rebase on `main`, live-test
-    (a large paste with a new Mac copy made mid-paste), open a PR.
+    descriptors ironrdp-cliprdr would drop so the file lists stay aligned. Rebased on `main` 2026-11-23 and
+    updated for ironrdp-cliprdr 0.9 (a request for an unknown lock fails, as the crate refuses it). Next:
+    live-test after the soak (a large paste with a new Mac copy made mid-paste), then open a PR.
+  - **Two UDP tunnels** (ours, clintcan/IronRDP#4, 2026-11-24): lossy audio and EGFX on UDP in one session
+    (design: `docs/udp-two-tunnels-design.md`). Merge the fork PR, then a macrdp PR moving the pins, with the
+    connection test `one_soft_sync_moves_lossy_audio_and_egfx_onto_two_tunnels` (fails on the current pins)
+    and the docs; live mstsc check after the soak.
   - **zhangyxXyz/macrdp** (Seiun Zhang's fork): worth inviting PRs for screenshots as images, clipboard
     I/O off the connection loop, `mkdtemp` staging, capture-stop recovery, `SACLockScreenImmediate` for
     `--lock-on-disconnect`, and an opt-in File Provider paste. Not its power-default flip (`caffeinate
@@ -644,7 +650,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Parked — scoped, low priority
 
-- [ ] **Lossy audio + `--udp-migrate-egfx` on UDP together.** **Design written: `docs/udp-two-tunnels-design.md`** (2026-11-22); build it on `macrdp-79e763a0` after the pin move. Today a connection gets one Soft-Sync, and
+- [ ] **Lossy audio + `--udp-migrate-egfx` on UDP together.** **Built: clintcan/IronRDP#4** (2026-11-24); see the
+  in-flight list. Left out on purpose: the tunnel's inbound data after an in-place reactivation (design point 8). Today a connection gets one Soft-Sync, and
   lossy audio takes it, so video stays on TCP. Fix: offer a reliable and a lossy tunnel, then one Soft-Sync
   with two channel lists. The 2026-11-16 spike showed mstsc opens both tunnels (local stash `spike: second
   reliable UDP offer`). The listener already keys peers by address; the work is per-tunnel state in
