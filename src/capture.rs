@@ -1204,12 +1204,61 @@ mod macos {
     /// Samples kept for a consumer that falls behind; the oldest is dropped.
     const SAMPLE_BUFFER: usize = 4;
 
-    #[derive(Default)]
-    struct SampleQueue {
-        samples: std::collections::VecDeque<CMSampleBuffer>,
+    struct SampleQueue<S = CMSampleBuffer> {
+        samples: std::collections::VecDeque<S>,
         /// What changed in samples dropped because the consumer fell behind.
         lost: LostDamage,
         stopped: bool,
+    }
+
+    impl<S> Default for SampleQueue<S> {
+        fn default() -> Self {
+            Self {
+                samples: std::collections::VecDeque::new(),
+                lost: LostDamage::Nothing,
+                stopped: false,
+            }
+        }
+    }
+
+    /// What `SampleQueue` needs from a sample when it has to drop one.
+    trait SampleDamage {
+        /// False for an idle sample, which changed nothing.
+        fn changed(&self) -> bool;
+        /// The sample's dirty rects (`None`: unknown).
+        fn damage(&self) -> Option<Vec<CGRect>>;
+    }
+
+    impl SampleDamage for CMSampleBuffer {
+        fn changed(&self) -> bool {
+            self.frame_status().is_none_or(|s| s.has_content())
+        }
+        fn damage(&self) -> Option<Vec<CGRect>> {
+            self.dirty_rects()
+        }
+    }
+
+    impl<S: SampleDamage> SampleQueue<S> {
+        /// Queue a sample from SCK, dropping the oldest when the consumer has
+        /// fallen behind and keeping what it changed.
+        fn push(&mut self, sample: S) {
+            if self.samples.len() >= SAMPLE_BUFFER {
+                if let Some(dropped) = self.samples.pop_front() {
+                    // Once the next frame goes out whole, rects add nothing.
+                    if dropped.changed() && !self.lost.is_full() {
+                        self.lost.add(dropped.damage());
+                    }
+                }
+            }
+            self.samples.push_back(sample);
+        }
+
+        /// The oldest queued sample, with what changed in samples dropped
+        /// before it.
+        fn pop(&mut self) -> Option<(S, LostDamage)> {
+            let sample = self.samples.pop_front()?;
+            Some((sample, std::mem::take(&mut self.lost)))
+        }
     }
 
     /// Past this many lost rects, the next legacy frame goes out whole.
@@ -1231,6 +1280,10 @@ mod macos {
     }
 
     impl LostDamage {
+        fn is_full(&self) -> bool {
+            matches!(self, Self::Full)
+        }
+
         /// Record the dirty rects of a dropped sample (`None`: unknown).
         fn add(&mut self, rects: Option<Vec<CGRect>>) {
             *self = match (std::mem::take(self), rects) {
@@ -1309,18 +1362,7 @@ mod macos {
             let on_sample = Arc::clone(&samples);
             stream.add_output_handler(
                 move |sample, _| {
-                    let mut q = on_sample.queue.lock().unwrap();
-                    if q.samples.len() >= SAMPLE_BUFFER {
-                        if let Some(dropped) = q.samples.pop_front() {
-                            // An idle sample changed nothing.
-                            let changed = dropped.frame_status().is_none_or(|s| s.has_content());
-                            if changed {
-                                q.lost.add(dropped.dirty_rects());
-                            }
-                        }
-                    }
-                    q.samples.push_back(sample);
-                    drop(q);
+                    on_sample.queue.lock().unwrap().push(sample);
                     on_sample.ready.notify_one();
                 },
                 SCStreamOutputType::Screen,
@@ -1334,8 +1376,8 @@ mod macos {
             loop {
                 {
                     let mut q = self.samples.queue.lock().unwrap();
-                    if let Some(sample) = q.samples.pop_front() {
-                        return Some((sample, std::mem::take(&mut q.lost)));
+                    if let Some(next) = q.pop() {
+                        return Some(next);
                     }
                     if q.stopped {
                         return None;
@@ -1357,6 +1399,83 @@ mod macos {
                 width: 10.0,
                 height: 10.0,
             }
+        }
+
+        /// A stand-in for an SCK sample: its dirty rects, or `None` for an
+        /// idle sample.
+        struct Fake(Option<Option<Vec<CGRect>>>);
+
+        impl SampleDamage for Fake {
+            fn changed(&self) -> bool {
+                self.0.is_some()
+            }
+            fn damage(&self) -> Option<Vec<CGRect>> {
+                self.0.clone().flatten()
+            }
+        }
+
+        fn fake(x: f64) -> Fake {
+            Fake(Some(Some(vec![r(x)])))
+        }
+
+        #[test]
+        fn a_sample_dropped_from_a_full_queue_reaches_the_next_frames_update() {
+            let mut q = SampleQueue::<Fake>::default();
+            for x in 1..=SAMPLE_BUFFER {
+                q.push(fake(x as f64));
+            }
+            // The consumer fell behind: the oldest (x = 1) is dropped.
+            q.push(fake(9.0));
+
+            let (sample, lost) = q.pop().unwrap();
+            assert_eq!(sample.damage(), Some(vec![r(2.0)]));
+            assert_eq!(lost.merge(sample.damage()), Some(vec![r(1.0), r(2.0)]));
+            // Taken once: the following frames carry only their own rects.
+            let (sample, lost) = q.pop().unwrap();
+            assert_eq!(lost.merge(sample.damage()), Some(vec![r(3.0)]));
+        }
+
+        /// A full queue whose oldest sample is `first`, then one more push.
+        fn overflow(first: Fake) -> SampleQueue<Fake> {
+            let mut q = SampleQueue::<Fake>::default();
+            q.push(first);
+            for x in 2..=SAMPLE_BUFFER {
+                q.push(fake(x as f64));
+            }
+            q.push(fake(9.0));
+            q
+        }
+
+        #[test]
+        fn dropping_an_idle_sample_loses_nothing() {
+            assert_eq!(overflow(Fake(None)).lost, LostDamage::Nothing);
+        }
+
+        #[test]
+        fn dropping_a_sample_with_unknown_rects_sends_the_next_frame_whole() {
+            let (sample, lost) = overflow(Fake(Some(None))).pop().unwrap();
+            assert_eq!(lost.merge(sample.damage()), None);
+        }
+
+        #[test]
+        fn once_the_next_frame_goes_whole_further_drops_are_not_inspected() {
+            struct Unread;
+            impl SampleDamage for Unread {
+                fn changed(&self) -> bool {
+                    true
+                }
+                fn damage(&self) -> Option<Vec<CGRect>> {
+                    panic!("rects read after the lost damage was already Full")
+                }
+            }
+            let mut q = SampleQueue::<Unread> {
+                lost: LostDamage::Full,
+                ..Default::default()
+            };
+            for _ in 0..=SAMPLE_BUFFER {
+                q.push(Unread);
+            }
+            assert_eq!(q.lost, LostDamage::Full);
         }
 
         #[test]
@@ -2553,6 +2672,8 @@ mod macos {
                         Ok(true) => {
                             self.held_frame = false;
                             self.seeded = true;
+                            // A whole frame went out: nothing lost is pending.
+                            self.lost_damage = LostDamage::Nothing;
                             // First-EGFX-frame milestone: arms the suppress
                             // gate (see `first_egfx_frame_sent` in the struct).
                             if !self.first_egfx_frame_sent {
