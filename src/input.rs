@@ -160,6 +160,42 @@ fn map_client_to_display(
     )
 }
 
+/// The inverse of [`map_client_to_display`]: a point offset `(mx, my)` in the
+/// `sw`x`sh` display (points) to the client frame (`dw`x`dh` pixels), for a
+/// Pointer Position Update. Rounded and clamped into the frame.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn map_display_to_client(
+    mx: f64,
+    my: f64,
+    dw: u16,
+    dh: u16,
+    sw: f64,
+    sh: f64,
+    letterbox: bool,
+) -> (u16, u16) {
+    let dwf = f64::from(dw.max(1));
+    let dhf = f64::from(dh.max(1));
+    let sw = sw.max(1.0);
+    let sh = sh.max(1.0);
+    let (x, y) = if letterbox {
+        let mac_aspect = sw / sh;
+        let (cw, ch) = if dwf / dhf > mac_aspect {
+            (dhf * mac_aspect, dhf)
+        } else {
+            (dwf, dwf / mac_aspect)
+        };
+        let off_x = (dwf - cw) / 2.0;
+        let off_y = (dhf - ch) / 2.0;
+        (mx / sw * cw + off_x, my / sh * ch + off_y)
+    } else {
+        (mx * dwf / sw, my * dhf / sh)
+    };
+    (
+        x.round().clamp(0.0, dwf - 1.0) as u16,
+        y.round().clamp(0.0, dhf - 1.0) as u16,
+    )
+}
+
 /// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
 /// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G , (copy / paste / cut /
 /// select-all / undo / save / find / new / new-tab / close / open / print /
@@ -287,8 +323,9 @@ fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        is_remappable_shortcut, map_client_to_display, remove_switcher_selection, resync_plan,
-        scroll_lines, should_alt_q_quit, should_remap_click, wheel_delta, ResyncPlan,
+        is_remappable_shortcut, map_client_to_display, map_display_to_client,
+        remove_switcher_selection, resync_plan, scroll_lines, should_alt_q_quit,
+        should_remap_click, wheel_delta, ResyncPlan,
     };
 
     #[test]
@@ -528,6 +565,44 @@ mod coord_tests {
         assert!(approx(my, 0.0));
         let (_, my) = map_client_to_display(960, 1080, 1920, 1080, sw, sh, true);
         assert!(approx(my, sh - 1.0));
+    }
+
+    /// A Mac point maps to the client frame and back to (about) the same
+    /// point; the black bands are outside the picture.
+    #[test]
+    fn display_to_client_is_the_inverse_of_client_to_display() {
+        // 1:1, stretch and letterbox (16:9 Mac in a 4:3 frame), pillarbox.
+        for (dw, dh, letterbox) in [
+            (1280u16, 720u16, false),
+            (1920, 1080, false),
+            (1024, 768, false),
+            (1024, 768, true),
+            (1440, 720, true),
+        ] {
+            for (mx, my) in [(0.0, 0.0), (640.0, 360.0), (1279.0, 719.0), (100.5, 600.25)] {
+                let (x, y) = map_display_to_client(mx, my, dw, dh, 1280.0, 720.0, letterbox);
+                let (bx, by) = map_client_to_display(x, y, dw, dh, 1280.0, 720.0, letterbox);
+                let tol = (1280.0 / f64::from(dw)).max(720.0 / f64::from(dh)).max(1.0);
+                assert!(
+                    (bx - mx).abs() <= tol && (by - my).abs() <= tol,
+                    "{dw}x{dh} lb={letterbox} ({mx},{my}) -> ({x},{y}) -> ({bx},{by})"
+                );
+            }
+        }
+        // 1:1 is exact.
+        assert_eq!(
+            map_display_to_client(500.0, 287.0, 1280, 720, 1280.0, 720.0, false),
+            (500, 287)
+        );
+        // Letterbox: a 16:9 picture in 1024x768 has bands of 96 rows.
+        assert_eq!(
+            map_display_to_client(0.0, 0.0, 1024, 768, 1280.0, 720.0, true),
+            (0, 96)
+        );
+        assert_eq!(
+            map_display_to_client(1280.0, 720.0, 1024, 768, 1280.0, 720.0, true),
+            (1023, 672)
+        );
     }
 
     #[test]
@@ -1936,6 +2011,9 @@ mod macos {
         fn post_move(&mut self, sx: f64, sy: f64) {
             self.last_x = sx;
             self.last_y = sy;
+            // A client move of the Mac cursor: never sent back as a Pointer
+            // Position Update (see `cursor::moves`).
+            crate::cursor::moves::note_client_move((sx, sy));
 
             let etype = if self.left_down {
                 CGEventType::LeftMouseDragged
