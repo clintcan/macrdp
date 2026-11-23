@@ -226,6 +226,12 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     cursor_scale: f64,
 
+    /// Send the Mac pointer position to the client when the pointer moves on
+    /// the Mac (a local mouse or trackpad, an app that warps it), not by the
+    /// client's input. Off by default: tested with mstsc only. macOS-only.
+    #[arg(long)]
+    enable_mac_pointer_moves: bool,
+
     /// Mac account the client authenticates as. Defaults to $USER. The
     /// password is validated against the local account via PAM (checkpw
     /// service) at startup, so this must be a real Mac user.
@@ -2568,6 +2574,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ALT_BACKTICK_SWITCH", false) {
         argv.push("--alt-backtick-switch".into());
     }
+    if on("ENABLE_MAC_POINTER_MOVES", false) {
+        argv.push("--enable-mac-pointer-moves".into());
+    }
     if on("ALT_SPACE_SPOTLIGHT", false) {
         argv.push("--alt-space-spotlight".into());
     }
@@ -3618,6 +3627,7 @@ async fn async_main() -> Result<()> {
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
     crate::input::set_alt_space_spotlight(args.alt_space_spotlight);
+    crate::cursor::moves::set_enabled(args.enable_mac_pointer_moves);
     crate::input::set_alt_q_quit(args.alt_q_quit);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);

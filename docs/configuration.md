@@ -103,6 +103,10 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           scroll events too, and a local tool that un-reverses
                           the physical wheel (LinearMouse etc.) doesn't see
                           them. Off by default. macOS-only.
+--enable-mac-pointer-moves  Send the Mac pointer position to the client when the
+                          pointer moves on the Mac (a local mouse or trackpad,
+                          an app that warps it), not by the client's input.
+                          Off by default: tested with mstsc only. macOS-only.
 --keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
                           auto-detecting it from the client. By default the
                           layout is auto-detected from the client's announced

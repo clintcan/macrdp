@@ -4477,6 +4477,9 @@ mod macos {
             );
             match (moved, down, up) {
                 (Ok(m), Ok(d), Ok(u)) => {
+                    // The client's Cmd+Space moves the cursor here: not a
+                    // Mac-side move to send back (`cursor::moves`).
+                    crate::cursor::moves::note_client_move((center.x, center.y));
                     m.set_flags(CGEventFlags::empty());
                     d.set_flags(CGEventFlags::empty());
                     u.set_flags(CGEventFlags::empty());
