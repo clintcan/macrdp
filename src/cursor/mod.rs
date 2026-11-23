@@ -16,9 +16,11 @@
 //! set in macrdp's own process. Kept as a last resort in case a future
 //! macOS removes/renames the SLS symbols.
 //!
-//! Position is read via CGEvent.location() on a fresh no-op event but
-//! intentionally not forwarded — see `poll` for the reasoning.
+//! Position is read via CGEvent.location() on a fresh no-op event and sent
+//! as a Pointer Position Update only when the Mac cursor moved by itself
+//! (not by the client's input, see `moves`).
 
+pub mod moves;
 #[cfg(target_os = "macos")]
 mod private_api;
 
@@ -32,9 +34,9 @@ pub struct CursorState {
 }
 
 impl CursorState {
-    /// `screen_size_pts` is the target display's logical size in
-    /// points; only consumed by the (currently-disabled) position
-    /// polling path, but parameterized for symmetry with input.rs.
+    /// `display_id` is the captured display (its bounds place the Mac
+    /// cursor position); `desktop_size` is the live session size and
+    /// letterbox mode (as input.rs maps mouse input).
     ///
     /// `cursor_scale` is the user-facing comfort multiplier (`--cursor-scale`,
     /// default `1.0`). At `1.0` the SkyLight cursor passes through at its
@@ -43,15 +45,17 @@ impl CursorState {
     /// but draw the pointer at native pixels. The hotspot scales with the
     /// bitmap, so it stays accurate at any value.
     pub fn new(
-        desktop_w: u16,
-        desktop_h: u16,
-        screen_size_pts: (f64, f64),
+        desktop_size: crate::capture::SharedDesktopSize,
+        display_id: u32,
         cursor_scale: f64,
     ) -> anyhow::Result<Self> {
+        // A new connection or a reactivation (each builds a new display
+        // stream): older client cursor positions do not apply.
+        moves::forget();
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new(desktop_w, desktop_h, screen_size_pts, cursor_scale)?;
+        let inner = macos::Inner::new(desktop_size, display_id, cursor_scale)?;
         #[cfg(not(target_os = "macos"))]
-        let _ = (desktop_w, desktop_h, screen_size_pts, cursor_scale);
+        let _ = (desktop_size, display_id, cursor_scale);
         Ok(Self {
             #[cfg(target_os = "macos")]
             inner,
@@ -98,18 +102,15 @@ mod macos {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use tracing::trace;
 
-    use super::private_api;
+    use super::{moves, private_api};
 
-    #[allow(dead_code)] // last_pos / desktop+screen fields are kept warm for
-                        // re-enabling position polling in non-RDP-driven cases
     pub struct Inner {
         source: CGEventSource,
         last_hash: u64,
-        last_pos: Option<(u16, u16)>,
-        desktop_w: u16,
-        desktop_h: u16,
-        screen_w_pts: f64,
-        screen_h_pts: f64,
+        /// Last Mac cursor position seen (global points).
+        last_pos: Option<(f64, f64)>,
+        desktop_size: crate::capture::SharedDesktopSize,
+        display_id: u32,
         /// session-framebuffer-px ÷ display-backing-px; see `CursorState::new`.
         cursor_scale: f64,
         /// one-shot guard for the cursor-size diagnostic log.
@@ -122,9 +123,8 @@ mod macos {
 
     impl Inner {
         pub fn new(
-            desktop_w: u16,
-            desktop_h: u16,
-            screen_size_pts: (f64, f64),
+            desktop_size: crate::capture::SharedDesktopSize,
+            display_id: u32,
             cursor_scale: f64,
         ) -> Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -140,10 +140,8 @@ mod macos {
                 source,
                 last_hash: 0,
                 last_pos: None,
-                desktop_w,
-                desktop_h,
-                screen_w_pts: screen_size_pts.0,
-                screen_h_pts: screen_size_pts.1,
+                desktop_size,
+                display_id,
                 cursor_scale,
                 diag_logged: false,
             })
@@ -159,39 +157,58 @@ mod macos {
         pub fn poll(&mut self) -> Vec<DisplayUpdate> {
             let mut updates = Vec::new();
             self.poll_shape(&mut updates);
-            // Intentionally NOT polling cursor position: mstsc (and other RDP
-            // clients) predict the cursor locally from the user's mouse input
-            // and snap to any PointerPositionPDU we send. Our updates lag the
-            // local prediction by the encode/network round-trip, so sending
-            // them causes the cursor to jump back to a stale position. The
-            // downside: if a Mac app programmatically moves the cursor (rare),
-            // the client won't see it until something else triggers a frame.
+            self.poll_position(&mut updates);
             updates
         }
 
-        #[allow(dead_code)]
+        /// A Pointer Position Update when the Mac cursor moved by itself (a
+        /// local mouse or trackpad, an app that warps the cursor). mstsc (and
+        /// other clients) move their cursor locally from the user's input,
+        /// ahead of the server, and snap to any Pointer Position Update: a
+        /// position that the client's input caused would make the cursor jump
+        /// back, so those are not sent (`moves`). The first position of a
+        /// stream is not sent either: the client shows its cursor where its
+        /// user left it.
         fn poll_position(&mut self, out: &mut Vec<DisplayUpdate>) {
             let Ok(ev) = CGEvent::new(self.source.clone()) else {
                 return;
             };
             let pt = ev.location();
-            // CGEvent::location is in pixels with top-left origin (display
-            // coordinates), same orientation as our captured framebuffer.
-            let x = (pt.x * f64::from(self.desktop_w) / self.screen_w_pts.max(1.0))
-                .round()
-                .clamp(0.0, f64::from(u16::MAX));
-            let y = (pt.y * f64::from(self.desktop_h) / self.screen_h_pts.max(1.0))
-                .round()
-                .clamp(0.0, f64::from(u16::MAX));
-            let x = x as u16;
-            let y = y as u16;
-            if self.last_pos != Some((x, y)) {
-                self.last_pos = Some((x, y));
-                out.push(DisplayUpdate::PointerPosition(PointerPositionAttribute {
-                    x,
-                    y,
-                }));
+            let pos = (pt.x, pt.y);
+            let first = self.last_pos.is_none();
+            if self.last_pos == Some(pos) {
+                return;
             }
+            self.last_pos = Some(pos);
+            if first || moves::is_client_move(pos) {
+                return;
+            }
+            // CGEvent::location is in global display points, top-left
+            // origin; the captured display's bounds place it.
+            let b = core_graphics::display::CGDisplay::new(self.display_id).bounds();
+            let (mx, my) = (pos.0 - b.origin.x, pos.1 - b.origin.y);
+            if mx < 0.0 || my < 0.0 || mx >= b.size.width || my >= b.size.height {
+                // On another display: the client cannot show it.
+                return;
+            }
+            let (dw, dh) = self.desktop_size.get();
+            let (x, y) = crate::input::map_display_to_client(
+                mx,
+                my,
+                dw,
+                dh,
+                b.size.width,
+                b.size.height,
+                self.desktop_size.letterbox(),
+            );
+            // The client cursor moves to this position: older client
+            // positions no longer describe where the client shows it.
+            moves::forget();
+            trace!(x, y, "Mac cursor moved by itself: pointer position sent");
+            out.push(DisplayUpdate::PointerPosition(PointerPositionAttribute {
+                x,
+                y,
+            }));
         }
 
         fn poll_shape(&mut self, out: &mut Vec<DisplayUpdate>) {
