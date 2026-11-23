@@ -4,14 +4,11 @@
 //! function, drops a parameter, returns a different type), update only this
 //! file.
 //!
-//! Why this exists: `NSCursor.currentSystemCursor` returns the calling
-//! *process's* NSCursor stack, not the cursor the WindowServer is actually
-//! compositing on screen. macrdp's process never installs an I-beam or
-//! crosshair, so NSCursor just keeps reporting the default arrow — even when
-//! the user is typing in a Safari text field and the screen shows an I-beam,
-//! or when `screencapture -i` has put a crosshair on screen. The
-//! WindowServer's connection exposes the real composited cursor via the
-//! private functions below.
+//! Why this exists: the WindowServer's connection exposes the cursor it is
+//! actually compositing on screen, as raw pixels with the hotspot, via the
+//! private functions below. `NSCursor.currentSystemCursor` (the fallback in
+//! `cursor/mod.rs`) also returns cursors set by other processes, but only as
+//! an `NSImage` that must be drawn into a bitmap first.
 //!
 //! Symbols live in `/System/Library/PrivateFrameworks/SkyLight.framework`,
 //! aren't exported in the framework's `.tbd` stub, and weren't kept under
@@ -190,6 +187,26 @@ fn bgra_premultiplied_to_rgba(buf: &[u8], row_bytes: usize, w: usize, h: usize) 
     Some(out)
 }
 
+/// Tightly-packed RGBA from premultiplied RGBA rows with stride `row_bytes`
+/// (the NSCursor fallback in `mod.rs` draws into a premultiplied bitmap).
+pub(super) fn rgba_premultiplied_to_rgba(
+    buf: &[u8],
+    row_bytes: usize,
+    w: usize,
+    h: usize,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        let start = row * row_bytes;
+        let src = buf.get(start..start + w * 4)?;
+        for &[r, g, b, a] in src.as_chunks::<4>().0 {
+            let (r, g, b) = un_premultiply(r, g, b, a);
+            out.extend_from_slice(&[r, g, b, a]);
+        }
+    }
+    Some(out)
+}
+
 fn un_premultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
     match a {
         0 => (0, 0, 0),
@@ -206,7 +223,7 @@ fn un_premultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::bgra_premultiplied_to_rgba;
+    use super::{bgra_premultiplied_to_rgba, rgba_premultiplied_to_rgba};
 
     #[test]
     fn conversion_swaps_to_rgb_unpremultiplies_and_keeps_row_order() {
@@ -219,5 +236,14 @@ mod tests {
     #[test]
     fn short_buffer_is_rejected() {
         assert_eq!(bgra_premultiplied_to_rgba(&[0; 11], 8, 1, 2), None);
+        assert_eq!(rgba_premultiplied_to_rgba(&[0; 11], 8, 1, 2), None);
+    }
+
+    #[test]
+    fn rgba_conversion_unpremultiplies_and_keeps_row_order() {
+        // 1x2 with an 8-byte stride: opaque red on top, then blue premultiplied at A=128.
+        let buf = [255, 0, 0, 255, 9, 9, 9, 9, 0, 0, 128, 128, 9, 9, 9, 9];
+        let out = rgba_premultiplied_to_rgba(&buf, 8, 1, 2).unwrap();
+        assert_eq!(out, vec![255, 0, 0, 255, 0, 0, 255, 128]);
     }
 }
