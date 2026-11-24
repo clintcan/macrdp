@@ -13,10 +13,10 @@
 //!
 //! Fallback path: `NSCursor.currentSystemCursor` rendered via
 //! `NSBitmapImageRep`. It also returns cursors set by other processes
-//! (measured on macOS 15.7.9 with Chrome's `progress` cursor). Used when
-//! SkyLight returns nothing: a cursor too large for the RDP pointer, such as
-//! an animated cursor's frame strip, or a future macOS without the SLS
-//! symbols.
+//! (measured on macOS 15.7.9 with Chrome's `progress` cursor). Used only when
+//! SkyLight's cursor is too large for the RDP pointer, such as an animated
+//! cursor's frame strip. Any other SkyLight failure keeps the last shape:
+//! `NSCursor` doesn't know when an app hides the cursor.
 //!
 //! With `--enable-mac-pointer-moves`, the position is read via
 //! CGEvent.location() on a fresh no-op event and sent as a Pointer Position
@@ -310,22 +310,27 @@ mod macos {
     ///   1. SkyLight `SLSGetGlobalCursorData` → the actually-rendered
     ///      system cursor (any process's I-beam, crosshair, hand, etc.).
     ///      Returns bitmap + hotspot directly.
-    ///   2. Fallback to `NSCursor.currentSystemCursor` when SkyLight gives
-    ///      no cursor: an image too large for the RDP pointer (an animated
-    ///      cursor's frames in one image), a refused call, or symbols that
-    ///      vanish in a future macOS.
+    ///   2. Fallback to `NSCursor.currentSystemCursor` only when SkyLight's
+    ///      image is too large for the RDP pointer (an animated cursor's
+    ///      frames in one image). Any other failure returns `None`, which
+    ///      keeps the last shape.
     unsafe fn read_cursor_bitmap() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
         // Try SkyLight first — this sees cursors set by other processes
         // (Safari's I-beam, `screencapture -i`'s crosshair, web link hand
         // pointers, etc.) and gives us the real hotspot in one call.
-        if let Some(t) = private_api::copy_current_system_cursor() {
-            return Some(t);
+        match private_api::copy_current_system_cursor() {
+            private_api::SkyLightCursor::Cursor(t) => return Some(t),
+            // Keep the last shape. Not the NSCursor fallback: it doesn't know
+            // when an app hides the cursor (full-screen video), so it showed
+            // the arrow there.
+            private_api::SkyLightCursor::Unavailable => return None,
+            private_api::SkyLightCursor::TooLarge => {}
         }
 
         // Fallback: NSCursor's current system cursor, which also sees cursors
-        // set by other processes. Used when SkyLight returns nothing, e.g. for
-        // an animated cursor (Chrome's `progress`) whose frame strip is taller
-        // than the RDP pointer limit, or if the private symbols are removed.
+        // set by other processes. Used only when SkyLight's cursor is larger
+        // than the RDP pointer allows: an animated cursor (Chrome's `progress`)
+        // whose frames come stacked in one image.
         let cursor: Retained<NSCursor> = match NSCursor::currentSystemCursor() {
             Some(c) => c,
             None => NSCursor::currentCursor(),
