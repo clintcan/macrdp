@@ -840,6 +840,14 @@ impl RdpServerDisplay for CaptureDisplay {
         if let Some(slot) = self.display_suppressed.as_ref() {
             slot.set(ctx.display_suppressed);
         }
+        // With the displays asleep ScreenCaptureKit lists none, so wake them
+        // first (only when asleep). The wait polls with thread::sleep; keep it
+        // off the server task that also carries input and audio.
+        tokio::task::spawn_blocking(|| {
+            crate::virtual_display::wake_displays_and_wait(Duration::from_secs(2))
+        })
+        .await
+        .ok();
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
