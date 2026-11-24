@@ -716,6 +716,7 @@ impl CliprdrBackendFactory for MacCliprdr {
             rich_clipboard: self.rich_clipboard,
             active_backends: self.active_backends.clone(),
             file_paths: self.file_paths.clone(),
+            locked_paths: std::collections::HashMap::new(),
             #[cfg(target_os = "macos")]
             download_router: self.download_router.clone(),
             #[cfg(target_os = "macos")]
@@ -753,6 +754,13 @@ struct MacCliprdrBackend {
     // Shared with `MacCliprdr` so the poller and the backend agree on which
     // paths back the currently-advertised FILEGROUPDESCRIPTORW.
     file_paths: Paths,
+    // Mac→client file copy: the paths each client lock (clipDataId) was taken
+    // against. ironrdp-cliprdr snapshots its descriptor list on a Lock PDU and
+    // serves requests carrying that id from the snapshot, so a newer Mac copy
+    // can't change what a paste in progress receives. This is the matching
+    // snapshot of the paths, so `request.index` names the same file. See
+    // `on_lock`.
+    locked_paths: std::collections::HashMap<u32, Vec<PathBuf>>,
     // Windows→Mac side: route FileContentsResponses to whichever download
     // task is awaiting the matching stream_id.
     #[cfg(target_os = "macos")]
@@ -948,17 +956,21 @@ impl MacCliprdrBackend {
         );
     }
 
-    /// Serve a single FileContentsRequest against the path snapshot built
-    /// during the most recent file-copy advertise. Returns `None` on any
-    /// failure so the caller can synthesize a CB_RESPONSE_FAIL.
+    /// Serve a single FileContentsRequest. A request carrying a clipDataId is
+    /// served from that lock's snapshot, the paths the client locked, and fails
+    /// if there is none; a request without one is served from the most recent
+    /// file-copy advertise. This mirrors how ironrdp-cliprdr picks the
+    /// descriptor list it validated the index against (it refuses a request
+    /// for an unknown lock before it reaches us). Returns `None` on any failure
+    /// so the caller can synthesize a CB_RESPONSE_FAIL.
     fn serve_file_contents(
         &self,
         request: FileContentsRequest,
     ) -> Option<FileContentsResponse<'static>> {
         let idx = usize::try_from(request.index).ok()?;
-        let path = {
-            let guard = self.file_paths.lock().unwrap();
-            guard.get(idx).cloned()?
+        let path = match request.data_id {
+            Some(id) => self.locked_paths.get(&id)?.get(idx).cloned()?,
+            None => self.file_paths.lock().unwrap().get(idx).cloned()?,
         };
         let meta = std::fs::metadata(&path)
             .map_err(|e| warn!(?path, "metadata failed: {e}"))
@@ -1024,6 +1036,85 @@ fn skip_connect_time_fetch(mac: &pb::Snapshot, session_end_cc: i64) -> bool {
     mac.has_content && !mac.is_remote && mac.change_count != session_end_cc
 }
 
+/// The descriptors to offer for a Mac file copy, and the path behind each one,
+/// in the same order: the client asks for file N by its position in the list.
+fn build_file_copy(entries: Vec<pb::FileEntry>) -> (Vec<FileDescriptor>, Vec<PathBuf>) {
+    let mut snapshot = Vec::with_capacity(entries.len());
+    let mut files = Vec::with_capacity(entries.len());
+    for e in entries {
+        // ironrdp-cliprdr drops descriptors it considers invalid, which
+        // would renumber the list the client sees while `snapshot`
+        // keeps the old order, so request N would get another file.
+        // Skip them here instead, so both lists stay aligned.
+        if !descriptor_fits_wire(&e.name, e.relative_path.as_deref()) {
+            warn!(
+                name = %e.name,
+                relative_path = ?e.relative_path,
+                "not offering a file the client can't receive (empty, too long, or an absolute path)"
+            );
+            continue;
+        }
+        let mut fd = FileDescriptor::new(e.name);
+        if let Some(rp) = e.relative_path {
+            fd = fd.with_relative_path(rp);
+        }
+        if e.is_dir {
+            fd = fd.with_attributes(ClipboardFileAttributes::DIRECTORY);
+        } else {
+            fd = fd.with_attributes(ClipboardFileAttributes::NORMAL);
+            if let Some(sz) = e.size {
+                fd = fd.with_file_size(sz);
+            }
+        }
+        files.push(fd);
+        snapshot.push(e.path);
+    }
+    (files, snapshot)
+}
+
+/// Cap on per-lock path snapshots, matching ironrdp-cliprdr's
+/// `MAX_LOCKED_FILE_LISTS` (which evicts its oldest lock there and tells us
+/// through `on_unlock`, so this only bounds locks it didn't store).
+const MAX_LOCKED_PATH_SNAPSHOTS: usize = 100;
+
+/// MS-RDPECLIP 2.2.5.2.3.1: `cFileName` holds 260 UTF-16 code units,
+/// including the terminating NUL.
+const MAX_WIRE_NAME_UTF16: usize = 259;
+
+/// Whether ironrdp-cliprdr's `initiate_file_copy` keeps this descriptor. Its
+/// filter drops an empty name, a wire name (`relative_path\name`) over 259
+/// characters, and, when the client set `CB_FILECLIP_NO_FILE_PATHS`, an
+/// absolute path. This check is at least as strict, so everything it passes
+/// survives the crate's filter and the two lists keep the same order: it
+/// counts UTF-16 units (the crate counts `char`s, so a name with characters
+/// outside the BMP can pass the crate yet not fit the field), and it treats
+/// absolute paths as invalid whatever the client advertised.
+fn descriptor_fits_wire(name: &str, relative_path: Option<&str>) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let relative_path = relative_path.filter(|p| !p.is_empty());
+    let wire_len = match relative_path {
+        Some(p) => p.encode_utf16().count() + 1 + name.encode_utf16().count(),
+        None => name.encode_utf16().count(),
+    };
+    if MAX_WIRE_NAME_UTF16 < wire_len {
+        return false;
+    }
+    !looks_absolute(relative_path.unwrap_or(name))
+}
+
+/// A superset of ironrdp-cliprdr's `is_absolute_path`: a leading `/` or `\`
+/// (Unix, UNC and `\\?\` paths), or a drive letter and colon.
+fn looks_absolute(path: &str) -> bool {
+    let mut chars = path.chars();
+    match (chars.next(), chars.next()) {
+        (Some('/' | '\\'), _) => true,
+        (Some(drive), Some(':')) => drive.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
 /// Read the current Mac pasteboard and push the appropriate "we have
 /// something to copy" event into the server. Returns
 /// [`Advertised::SenderGone`] if the sender has been dropped (the server is
@@ -1049,35 +1140,21 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> Advertise
     if pb::has_files() {
         let entries = pb::read_files();
         if !entries.is_empty() {
-            let mut snapshot = Vec::with_capacity(entries.len());
-            let mut files = Vec::with_capacity(entries.len());
-            for e in entries {
-                let mut fd = FileDescriptor::new(e.name);
-                if let Some(rp) = e.relative_path {
-                    fd = fd.with_relative_path(rp);
-                }
-                if e.is_dir {
-                    fd = fd.with_attributes(ClipboardFileAttributes::DIRECTORY);
-                } else {
-                    fd = fd.with_attributes(ClipboardFileAttributes::NORMAL);
-                    if let Some(sz) = e.size {
-                        fd = fd.with_file_size(sz);
-                    }
-                }
-                files.push(fd);
-                snapshot.push(e.path);
+            let (files, snapshot) = build_file_copy(entries);
+            if !files.is_empty() {
+                *paths.lock().unwrap() = snapshot;
+                debug!(
+                    file_count = files.len(),
+                    "advertising file copy to client (recursive)"
+                );
+                return send(
+                    sender,
+                    ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(files)),
+                );
             }
-            *paths.lock().unwrap() = snapshot;
-            debug!(
-                file_count = files.len(),
-                "advertising file copy to client (recursive)"
-            );
-            return send(
-                sender,
-                ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(files)),
-            );
         }
-        // Files claimed but read empty (race) — fall through to format list.
+        // Files claimed but read empty (race), or none could be sent to the
+        // client — fall through to format list.
     }
 
     let mut formats = Vec::new();
@@ -1561,8 +1638,43 @@ impl CliprdrBackend for MacCliprdrBackend {
         #[cfg(not(target_os = "macos"))]
         let _ = response;
     }
-    fn on_lock(&mut self, _data_id: LockDataId) {}
-    fn on_unlock(&mut self, _data_id: LockDataId) {}
+    /// The client locked our clipboard (MS-RDPECLIP 3.1.5.3.2) before pasting
+    /// our files. ironrdp-cliprdr has just snapshotted its descriptor list for
+    /// this id; snapshot the paths too. At its cap ironrdp-cliprdr evicts its
+    /// oldest lock and reports it through `on_unlock` first, so the two maps
+    /// stay in step. It also calls this when it stored nothing, so the map is
+    /// capped here too.
+    ///
+    /// One window is left: the poller swaps in a new path list before the
+    /// server sends the matching descriptors, so a lock processed in between
+    /// (well under a millisecond) pairs the old descriptors with the new
+    /// paths. Closing it needs ironrdp-cliprdr to hand the backend its list.
+    fn on_lock(&mut self, data_id: LockDataId) {
+        let paths = self.file_paths.lock().unwrap().clone();
+        if paths.is_empty() {
+            return;
+        }
+        if MAX_LOCKED_PATH_SNAPSHOTS <= self.locked_paths.len()
+            && !self.locked_paths.contains_key(&data_id.0)
+        {
+            warn!(
+                clip_data_id = data_id.0,
+                "too many clipboard locks held; this lock is served from the current file list"
+            );
+            return;
+        }
+        debug!(
+            clip_data_id = data_id.0,
+            files = paths.len(),
+            "clipboard lock: snapshotting file paths"
+        );
+        self.locked_paths.insert(data_id.0, paths);
+    }
+    /// Release (MS-RDPECLIP 3.1.5.3.4), or ironrdp-cliprdr evicting its oldest
+    /// lock at its cap, which it reports the same way.
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        self.locked_paths.remove(&data_id.0);
+    }
 
     /// Fires once per Windows clipboard transition, with the lock IDs
     /// that just expired. This is our "Windows clipboard changed"
@@ -2153,6 +2265,168 @@ mod tests {
         }
     }
 
+    fn range_request(index: i32, data_id: Option<u32>) -> FileContentsRequest {
+        FileContentsRequest {
+            stream_id: 1,
+            index,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 64,
+            data_id,
+        }
+    }
+
+    fn entry(name: &str, relative_path: Option<&str>, path: &str) -> pb::FileEntry {
+        pb::FileEntry {
+            name: name.to_owned(),
+            size: Some(1),
+            is_dir: false,
+            path: PathBuf::from(path),
+            relative_path: relative_path.map(str::to_owned),
+        }
+    }
+
+    /// The bug this guards: a Mac copy made while the client is pasting an
+    /// earlier one replaced the path list, so the rest of that paste got the
+    /// new copy's bytes under the old copy's names.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_locked_paste_keeps_its_files_after_a_new_mac_copy() {
+        let (mut backend, _rx) = test_backend();
+        let a = tmpfile(b"copy A");
+        let b = tmpfile(b"copy B");
+        *backend.file_paths.lock().unwrap() = vec![a.0.clone()];
+        backend.on_lock(LockDataId(7));
+        *backend.file_paths.lock().unwrap() = vec![b.0.clone()];
+
+        let locked = backend
+            .serve_file_contents(range_request(0, Some(7)))
+            .unwrap();
+        assert_eq!(
+            locked.data(),
+            b"copy A",
+            "a request under lock 7 reads what was locked"
+        );
+        let current = backend.serve_file_contents(range_request(0, None)).unwrap();
+        assert_eq!(
+            current.data(),
+            b"copy B",
+            "a request without a lock reads the current copy"
+        );
+    }
+
+    /// ironrdp-cliprdr refuses a request for a lock it doesn't hold (never
+    /// taken, released, or evicted at its cap, which it reports through
+    /// `on_unlock`), so we never serve one from the current files either.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_request_for_an_unknown_or_released_lock_fails() {
+        let (mut backend, _rx) = test_backend();
+        let a = tmpfile(b"copy A");
+        *backend.file_paths.lock().unwrap() = vec![a.0.clone()];
+        assert!(backend
+            .serve_file_contents(range_request(0, Some(8)))
+            .is_none());
+        backend.on_lock(LockDataId(7));
+        assert!(backend
+            .serve_file_contents(range_request(0, Some(7)))
+            .is_some());
+        backend.on_unlock(LockDataId(7));
+        assert!(backend
+            .serve_file_contents(range_request(0, Some(7)))
+            .is_none());
+    }
+
+    /// ironrdp-cliprdr calls `on_lock` even when it holds no file list, so a
+    /// client sending Lock PDUs must not grow the map without bound.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lock_snapshots_are_capped_and_skip_an_empty_list() {
+        let (mut backend, _rx) = test_backend();
+        backend.on_lock(LockDataId(1));
+        assert!(backend.locked_paths.is_empty(), "nothing to snapshot");
+
+        let a = tmpfile(b"copy A");
+        *backend.file_paths.lock().unwrap() = vec![a.0.clone()];
+        let cap = u32::try_from(MAX_LOCKED_PATH_SNAPSHOTS).unwrap();
+        for id in 0..cap + 10 {
+            backend.on_lock(LockDataId(id));
+        }
+        assert_eq!(backend.locked_paths.len(), MAX_LOCKED_PATH_SNAPSHOTS);
+        backend.on_lock(LockDataId(0));
+        assert_eq!(
+            backend.locked_paths.len(),
+            MAX_LOCKED_PATH_SNAPSHOTS,
+            "re-locking a held id at the cap still works"
+        );
+    }
+
+    #[test]
+    fn the_wire_name_limit_counts_utf16_units() {
+        assert!(descriptor_fits_wire(&"a".repeat(259), None));
+        assert!(!descriptor_fits_wire(&"a".repeat(260), None));
+        // 130 characters outside the BMP: 130 `char`s (ironrdp-cliprdr's count
+        // passes it) but 260 UTF-16 units, one more than the field holds.
+        assert!(!descriptor_fits_wire(&"\u{1F600}".repeat(130), None));
+        assert!(descriptor_fits_wire(&"\u{1F600}".repeat(129), None));
+        // `folder\name`: 200 + 1 + 58 = 259 fits, one more doesn't.
+        let folder = "f".repeat(200);
+        assert!(descriptor_fits_wire(&"n".repeat(58), Some(&folder)));
+        assert!(!descriptor_fits_wire(&"n".repeat(59), Some(&folder)));
+        assert!(!descriptor_fits_wire("", None));
+        assert!(
+            descriptor_fits_wire("report.txt", Some("")),
+            "an empty folder is no folder"
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_never_offered() {
+        for path in [
+            "/etc",
+            "\\\\server\\share",
+            "\\\\?\\C:\\x",
+            "//server/share",
+            "C:\\x",
+            "c:x",
+        ] {
+            assert!(!descriptor_fits_wire(path, None), "{path}");
+            assert!(
+                !descriptor_fits_wire("file.txt", Some(path)),
+                "{path} as the folder"
+            );
+        }
+        assert!(descriptor_fits_wire("file.txt", Some("My Folder\\sub")));
+        assert!(
+            descriptor_fits_wire("notes: draft.txt", None),
+            "a colon later in the name is fine"
+        );
+    }
+
+    /// The bug this guards: ironrdp-cliprdr dropped an entry it couldn't send,
+    /// renumbering the list the client saw while our path list kept the old
+    /// order, so the client's file N was served from another file.
+    #[test]
+    fn a_file_list_with_an_unsendable_entry_stays_aligned() {
+        let long = "x".repeat(300);
+        let (files, paths) = build_file_copy(vec![
+            entry("first.txt", None, "/tmp/first.txt"),
+            entry(&long, None, "/tmp/long"),
+            entry("second.txt", Some("/abs"), "/tmp/abs/second.txt"),
+            entry("third.txt", Some("Folder"), "/tmp/Folder/third.txt"),
+        ]);
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["first.txt", "third.txt"]);
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/tmp/first.txt"),
+                PathBuf::from("/tmp/Folder/third.txt")
+            ]
+        );
+        assert_eq!(files[1].relative_path.as_deref(), Some("Folder"));
+    }
+
     #[test]
     fn read_full_file_returns_all_bytes() {
         let data = b"hello world";
@@ -2251,6 +2525,7 @@ mod tests {
             rich_clipboard: true,
             active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             file_paths: Arc::new(Mutex::new(Vec::new())),
+            locked_paths: std::collections::HashMap::new(),
             download_router: crate::file_promise::DownloadRouter::default(),
             paste_temp_dir: Arc::new(Mutex::new(None)),
             self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
