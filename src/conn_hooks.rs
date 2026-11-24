@@ -90,6 +90,25 @@ impl ConnectionHandler for InputResetHook {
     }
 }
 
+/// Clears `CaptureDisplay::suppress_next_adopt` once per served connection.
+/// The capture loop arms that flag right before a reactivation it triggers, and
+/// `request_initial_size` consumes it. If the client disconnects after the flag
+/// is armed but before that reactivation reaches Confirm Active, the flag would
+/// otherwise survive into the next connection, which would then skip both the
+/// stale-resize cleanup and the adopt of its own size. The server calls
+/// `on_connection_info` in `client_accepted`, before `request_initial_size`,
+/// and not on a reactivation, so this never clears a flag armed for the live
+/// session.
+pub struct AdoptResetHook(pub Arc<AtomicBool>);
+
+impl ConnectionHandler for AdoptResetHook {
+    fn on_connection_info(&mut self, _info: &ConnectionInfo) {
+        if self.0.swap(false, Ordering::Relaxed) {
+            tracing::debug!("cleared a reactivation flag left by the previous connection");
+        }
+    }
+}
+
 /// Publishes the client's keyboard-layout id (KLID, from its GCC Client Core Data)
 /// so the input handler can auto-select a matching non-US layout when
 /// `--keyboard-layout` isn't given.
@@ -212,6 +231,14 @@ mod tests {
         std::net::Ipv4Addr::new(203, 0, 113, 5),
         51000,
     ));
+
+    #[test]
+    fn the_adopt_reset_hook_clears_a_flag_left_by_the_previous_connection() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut hooks = ConnectionHooks::new(vec![Box::new(AdoptResetHook(Arc::clone(&flag)))]);
+        hooks.on_connection_info(&info(0x0409));
+        assert!(!flag.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn the_stats_hook_reports_a_disconnect() {

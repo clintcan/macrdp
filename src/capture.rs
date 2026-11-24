@@ -252,6 +252,18 @@ impl PendingResize {
         }
         Some(unpack_size(self.inner.size.load(Ordering::Relaxed)))
     }
+
+    /// Drop any outstanding request, settled or not, and return the size it
+    /// carried. Called when a new connection negotiates its size: a request
+    /// queued by the previous connection (a resize less than
+    /// [`RESIZE_DEBOUNCE`] before it disconnected) belongs to a client that is
+    /// gone, and applying it would override the size the new client asked for.
+    pub fn clear(&self) -> Option<(u16, u16)> {
+        if self.inner.last_update_ms.swap(0, Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(unpack_size(self.inner.size.load(Ordering::Relaxed)))
+    }
 }
 
 impl Default for PendingResize {
@@ -699,8 +711,22 @@ impl RdpServerDisplay for CaptureDisplay {
             return DesktopSize { width, height };
         }
 
-        // A new connection (reactivations we trigger returned above). The
-        // server has just published the scale this client announced.
+        // A new connection (reactivations we trigger returned above). A live
+        // resize the previous client queued just before it disconnected is
+        // still pending (the state outlives connections); left alone, the
+        // capture loop applies it right after this connection is sized, at
+        // this client's scale. Seen live 2026-11-22: a 1920x1080 1x resize
+        // queued 0.24 s before a disconnect re-moded the next connection
+        // from 3456x2168 to 1920x1080 at 2x, 25 hours later.
+        if let Some((stale_w, stale_h)) = self.pending_resize.clear() {
+            tracing::info!(
+                stale_w,
+                stale_h,
+                "dropping a live resize left over from the previous connection"
+            );
+        }
+
+        // The server has just published the scale this client announced.
         self.pointer_ui_scale
             .store(self.vd_hidpi.ui_scale(), Ordering::Relaxed);
 
@@ -2728,6 +2754,123 @@ mod tests {
         pr.request(1024, 768);
         pr.request(1920, 1080);
         assert_eq!(pr.take_settled(Duration::ZERO), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn pending_resize_clear_drops_an_outstanding_request() {
+        let pr = PendingResize::new();
+        assert_eq!(pr.clear(), None);
+        pr.request(1920, 1080);
+        assert_eq!(pr.clear(), Some((1920, 1080)));
+        assert!(!pr.has_pending());
+        assert_eq!(pr.take_settled(Duration::ZERO), None);
+    }
+
+    /// A `CaptureDisplay` on the auto-size path with no virtual display, H.264
+    /// pipeline or blanking guard: enough to drive `request_initial_size`.
+    fn test_display(width: u16, height: u16) -> CaptureDisplay {
+        CaptureDisplay {
+            desktop_size: SharedDesktopSize::new(width, height),
+            auto_size: true,
+            stretch: false,
+            fps: 60,
+            display_id: None,
+            screen_size_pts: (f64::from(width), f64::from(height)),
+            warp_cursor_home: false,
+            cursor_scale: 1.0,
+            session_tracker: None,
+            #[cfg(target_os = "macos")]
+            gfx: None,
+            keyframe_on_change: KeyframeOnChange {
+                enabled: false,
+                change_pct: 0,
+                click_pct: 0,
+                click_window: Duration::ZERO,
+            },
+            click_signal: None,
+            flush_frames: 0,
+            capture_nv12: false,
+            display_suppressed: None,
+            pending_resize: PendingResize::new(),
+            max_client_size: None,
+            suppress_next_adopt: Arc::new(AtomicBool::new(false)),
+            virtual_display: None,
+            vd_hidpi: crate::virtual_display::HidpiPolicy::Off,
+            pointer_ui_scale: Arc::new(AtomicU32::new(1)),
+            captured_primary: None,
+            shielded_primary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn new_connection_drops_a_resize_left_by_the_previous_one() {
+        // Seen live 2026-11-22: the previous client resized to 1920x1080 and
+        // disconnected before the debounce settled; the next client asked for
+        // 3456x2168, got it, and was then re-moded to the leftover 1920x1080.
+        let mut display = test_display(3440, 1440);
+        display.pending_resize.request(1920, 1080);
+
+        let size = display
+            .request_initial_size(DesktopSize {
+                width: 3456,
+                height: 2168,
+            })
+            .await;
+
+        assert_eq!((size.width, size.height), (3456, 2168));
+        assert!(!display.pending_resize.has_pending());
+        assert_eq!(display.pending_resize.take_settled(Duration::ZERO), None);
+        assert_eq!(display.desktop_size.get(), (3456, 2168));
+    }
+
+    #[tokio::test]
+    async fn a_flag_armed_before_a_disconnect_does_not_reach_the_next_connection() {
+        // The capture loop armed `suppress_next_adopt` for a resize
+        // reactivation, and the client disconnected before Confirm Active.
+        // The connection hook clears it, so the next client still gets the
+        // leftover resize dropped and its own size adopted.
+        use ironrdp_server::ConnectionHandler as _;
+        let mut display = test_display(3440, 1440);
+        display.suppress_next_adopt.store(true, Ordering::Relaxed);
+        display.pending_resize.request(1920, 1080);
+
+        crate::conn_hooks::AdoptResetHook(display.suppress_next_adopt.clone()).on_connection_info(
+            &ironrdp_server::ConnectionInfo::new(
+                0x0409,
+                ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED,
+                String::new(),
+            ),
+        );
+        let size = display
+            .request_initial_size(DesktopSize {
+                width: 3456,
+                height: 2168,
+            })
+            .await;
+
+        assert_eq!((size.width, size.height), (3456, 2168));
+        assert_eq!(display.pending_resize.take_settled(Duration::ZERO), None);
+    }
+
+    #[tokio::test]
+    async fn a_reactivation_we_triggered_keeps_the_pending_resize() {
+        // Our own reactivations (blank recovery, an applied live resize) must
+        // not eat a resize the live client queued meanwhile.
+        let mut display = test_display(3440, 1440);
+        display.suppress_next_adopt.store(true, Ordering::Relaxed);
+        display.pending_resize.request(1920, 1080);
+
+        display
+            .request_initial_size(DesktopSize {
+                width: 3456,
+                height: 2168,
+            })
+            .await;
+
+        assert_eq!(
+            display.pending_resize.take_settled(Duration::ZERO),
+            Some((1920, 1080))
+        );
     }
 
     #[test]

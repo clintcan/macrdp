@@ -3761,6 +3761,11 @@ async fn async_main() -> Result<()> {
     // puts that connection's flag into this slot.
     let display_suppressed = capture::SuppressedFlag::default();
 
+    // Armed by the capture loop before a reactivation it triggers; cleared per
+    // connection by `conn_hooks::AdoptResetHook` so a flag the previous client
+    // left behind can't leak into the next one.
+    let suppress_next_adopt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,
@@ -3792,7 +3797,7 @@ async fn async_main() -> Result<()> {
             let (width, height) = args.max_client_size.unwrap_or(DEFAULT_MAX_CLIENT_SIZE);
             Some(ironrdp_server::DesktopSize { width, height })
         },
-        suppress_next_adopt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        suppress_next_adopt: Arc::clone(&suppress_next_adopt),
         // Shared so a live client resize can re-mode the display; None on
         // the mirror-primary path (no virtual display to re-mode).
         virtual_display: virtual_display.clone(),
@@ -3923,6 +3928,7 @@ async fn async_main() -> Result<()> {
     hooks.push(Box::new(conn_hooks::InputResetHook(
         input::modifier_reset_handle(),
     )));
+    hooks.push(Box::new(conn_hooks::AdoptResetHook(suppress_next_adopt)));
     // `--virtual-display-hidpi=auto` sizes the virtual display from the
     // desktop scale factor the connecting client announces.
     if matches!(vd_hidpi, virtual_display::HidpiPolicy::Auto(_)) {
