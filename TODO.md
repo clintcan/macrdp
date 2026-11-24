@@ -11,19 +11,24 @@ then delete; promote a parked item to *In flight* when work actually starts.
   App for macOS (blank recovery armed), a takeover by a second client, connect-time auto-detect
   (`NETWORK_AUTODETECT=1`), and (needing config changes) microphone, camera, USB and smart card.
 
-- [ ] **Open PRs — review state (as of 2026-11-24).** Labels track it: `waiting on author` = the
-  contributor owes a change; everything else is ours. Merged 11-21→24: #274 #276–#290.
+- [ ] **Open PRs and issues — review state (as of 2026-11-25).** Labels track it: `waiting on author` = the
+  contributor owes a change; everything else is ours. v0.10.10 released 2026-11-24 (#274 #276–#291 merged
+  11-21→24; #275 closed).
   - **#231 / #232** (@SferaDev) — he is away until at least 2026-12-01 and is fine with us taking them over.
     #231: rebase (after #201) with a `recreate()` that keeps HiDPI (the zhangyxXyz fork has one), live test.
     #232: drop or make opt-in the session-long display-awake hold and the 3 s wait in
     `DetachedPrimary::drop`.
+  - **Issues:** #237 ("can't connect unless already logged in") is the documented limit (README: someone has
+    to log in after a reboot); reply pointing there. #244 (universal binary and Intel support) needs a
+    decision on whether to build for Intel.
   - **zhangyxXyz/macrdp** (Seiun Zhang's fork): worth inviting PRs for screenshots as images, clipboard
     I/O off the connection loop, `mkdtemp` staging, capture-stop recovery, `SACLockScreenImmediate` for
     `--lock-on-disconnect`, and an opt-in File Provider paste. Not its power-default flip (`caffeinate
     -ims`) or per-session virtual display without live evidence.
   - **Upstream IronRDP:** #2489 (ours: server-side connect-time auto-detect), #2514 (ours: cliprdr's
     `initiate_file_copy` length check and silent renumbering), #2465 (glamberson: drops our divergence
-    (30)), #2477 (zrip for QOIZ; the zstd-safe 7.4 floor we asked for is in). No maintainer replies yet.
+    (30)), #2477 (zrip for QOIZ; its author bumped zstd-safe to 7.4 as we asked, worth a thank-you). No
+    maintainer replies yet.
   - **Cursor:** honour macOS's hidden flag without hiding the pointer while typing (Firefox's full-screen
     video; see known-quirks and the saved patch).
 
@@ -34,6 +39,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   offset at connect, which the user judged to be audio late rather than video. The A/V resync hotkey fixed it
   every time and reported 0 unacked frames each time, so there was no video backlog on the server side. Not a
   regression; next step is the audio side (client playback buffer start, or the first waves' timing).
+
+- [ ] **CI waits on macOS runners.** GitHub's macOS runner shortage cancelled or queued jobs for hours
+  around the v0.10.10 release. Options: merge the macOS "audit log" job into the macOS test job (one macOS
+  runner per run instead of two), skip CI for docs-only changes, and build the release archives locally
+  as the notarized DMG already is (then `release.yml` would no longer need a macOS runner). Keep PR CI on
+  GitHub: it checks contributors' code, and a self-hosted runner is unsafe for a public repo's fork PRs.
 
 - [ ] **Next toolchain bump:** clippy on Rust 1.98 flags `chunks_exact_to_as_chunks` in our code (reported
   by rophy on #228). We pin 1.95, so CI is unaffected until then.
@@ -637,17 +648,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `mt/session.rs`, a list-taking `request_soft_sync` in the dvc fork, and per-tunnel recovery. Disconnect must
   retire both tunnels' bound flags, or the listener reads the idle one as dead. Low value on a LAN, where
   video over UDP gains little over TCP.
-
-- [x] **Headless-lock arc — LANDED on `main` 2026-07-23 (pending a release tag).** Merged this
-  session: **`--shield-primary`** opt-in lockable headless blanking (#170; single-panel engage
-  #171, @antonmos), the **`Ctrl+Alt+G` majority-area gather** (mostly-off windows now swept),
-  the **`--detach-primary` launchd-restart stopgap for #168** (#169, @antonmos-verified on
-  26.5.2), the **blank-recovery established tier** (#172, @antonmos), plus #165 vd
-  client-resolution auto-adopt and #166 iOS touch-tap fix. All adversarially security-scanned
-  clean. **To run any of it live: signed rebuild+reinstall** (installed v0.9.0 predates them —
-  build the shield helper via `gui/make-shield-helper.sh`; Team ID QGLA89KHM7). Two ship
-  decisions remain the user's: (a) cut a release for the unreleased pile; (b) whether shield
-  should ever become the default over `--capture-primary` (currently opt-in, capture unchanged).
 
 - [ ] **#168 — `--detach-primary` panel-re-enable ROOT FIX (macOS 26.x).** The stopgap (#169,
   above) restarts the process so the CGS disable reverts, but the real fix — re-enabling the

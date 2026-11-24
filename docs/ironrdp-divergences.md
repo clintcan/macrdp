@@ -7,8 +7,10 @@ upstream Devolutions/IronRDP@79e763a0 plus macrdp's divergences in `ironrdp-serv
 drops the workspace lints from two crates (see "Lints" below). The subject has the crate and the
 number, for example `server: (35) measure bandwidth at connect time and report it`.
 
-The old branch `macrdp` (upstream e258f6a0 plus the divergences, last commit fd3798d3) stays. Releases
-before this pin build from it. Its log is in this file's git history.
+The old branch `macrdp` (upstream e258f6a0 plus the divergences, last commit fd3798d3) stays: v0.10.7
+to v0.10.9 build from it, and v0.10.10 onward from `macrdp-79e763a0`. Its log is in this file's git
+history. The fork keeps only `master` and the `macrdp*` branches; a feature branch is deleted once its PR
+is merged (the PR keeps a "Restore branch" button).
 
 To change a divergence: make the commit on the branch, then bump the rev in `Cargo.toml` (every
 `ironrdp-*` entry, so that all crates come from one source), and update the log below. The same rev
