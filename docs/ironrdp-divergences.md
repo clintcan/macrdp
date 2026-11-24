@@ -158,6 +158,21 @@ says otherwise.
   `egfx_on_udp` lives in the `mt` state; upstream has its own field of that name, which stays false.
   Upstream's own EGFX Soft-Sync stays inert, because it needs a `udp_transport` that only
   `with_udp_transport` creates.
+  **Two tunnels (clintcan/IronRDP#4, 2026-11-24):** with lossy audio and EGFX migration both on
+  (`MtConfig::second_tunnel`), the client's S_OK to the first (`UdpFecL`) offer owes a second
+  Initiate Multitransport Request (`UdpFecR`), sent on the message channel from
+  `mt_with_owed_soft_sync` (which now takes `message_channel_id`) with its own CSPRNG cookie,
+  registered with the listener and sharing the first tunnel's inbound sender (`ReliableTunnel`).
+  The Soft-Sync gate waits for it to bind (`SECOND_TUNNEL_BIND_TIMEOUT`, 5 s) and then sends one
+  request with two lists (dvc (3)'s `request_soft_sync_lists`): lossy audio on the lossy tunnel,
+  EGFX on the reliable one. A refusal or a timeout falls back to audio alone, as before. EGFX data
+  and replies to tunnel data use the reliable tunnel's cookie (`egfx_tunnel_cookie`); `Drop`
+  retires both tunnels. `MACRDP_UDP_SECOND_TUNNEL=0` turns it off.
+  **clintcan/IronRDP#5 (2026-11-24):** the client loop hands the tunnel's inbound receiver back when it
+  ends (`TunnelInbound::restore`), so a reactivation keeps reading the tunnel (a monitor move left the
+  picture blank with EGFX on the tunnel); and the two-tunnel Soft-Sync goes out from the client's
+  dynamic-channel data as soon as it can (`mt_soft_sync_after_dvc_input`, one hook line in
+  `process_x224`), since waiting for the first EGFX batch stalled mstsc for about 4 s.
   The multitransport offer needs the MCS message channel (since e258f6a0; the older fork fell back to
   the I/O channel). mstsc sends it; a client that doesn't gets no UDP offer.
   **The one Soft-Sync (fix of 2026-11-13, silent lossy audio since v0.10.0):** mstsc answers the
@@ -517,6 +532,12 @@ Every `ironrdp-*` crate comes from the same fork rev, so the git crates that dep
     and **does not register per-channel routing** — `tunnel_for_outgoing_channel`
     stays `None` and `process()` keeps accepting the channels' data over TCP. macrdp
     routes the data itself.
+
+    **`request_soft_sync_lists(lists)`** (2026-11-24, clintcan/IronRDP#4): the same with one
+    channel list per tunnel, for server (12)'s two tunnels (lossy audio on `LOSSY_UDP`, EGFX on
+    `RELIABLE_UDP`); `request_soft_sync` now calls it with one list. It also rejects a tunnel or a
+    channel named twice. Tests: `a_soft_sync_can_name_two_tunnels`,
+    `a_two_tunnel_soft_sync_rejects_a_repeated_tunnel_or_channel`.
 
     Tests: five `request_soft_sync_*` tests in `src/server.rs`'s test module (lossy request
     + response + TCP data still accepted; empty request carries no list; unrequested-tunnel

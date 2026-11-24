@@ -1873,6 +1873,292 @@ async fn the_soft_sync_moves_lossy_audio_onto_the_lossy_tunnel() -> anyhow::Resu
         .await
 }
 
+/// A client-side DVC with the EGFX channel's name, so the server's graphics
+/// channel opens. The Soft-Sync gate only needs it open.
+struct NamedGfxDvc;
+
+impl ironrdp_dvc::DvcProcessor for NamedGfxDvc {
+    fn channel_name(&self) -> &str {
+        "Microsoft::Windows::RDS::Graphics"
+    }
+
+    fn start(&mut self, _channel_id: u32) -> ironrdp_pdu::PduResult<Vec<ironrdp_dvc::DvcMessage>> {
+        Ok(Vec::new())
+    }
+
+    fn process(
+        &mut self,
+        _channel_id: u32,
+        _payload: &[u8],
+    ) -> ironrdp_pdu::PduResult<Vec<ironrdp_dvc::DvcMessage>> {
+        Ok(Vec::new())
+    }
+}
+
+impl ironrdp_dvc::DvcClientProcessor for NamedGfxDvc {}
+
+impl ironrdp_core::AsAny for NamedGfxDvc {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// An EGFX factory whose pipeline does nothing: the server opens the graphics
+/// channel, which is all the Soft-Sync gate looks at.
+struct NoopGfxFactory;
+
+impl ironrdp_server::ServerEventSender for NoopGfxFactory {
+    fn set_sender(
+        &mut self,
+        _sender: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+    ) {
+    }
+}
+
+impl ironrdp_server::GfxServerFactory for NoopGfxFactory {
+    fn build_gfx_handler(
+        &self,
+        _ctx: ironrdp_server::GfxContext,
+    ) -> Box<dyn ironrdp_egfx::server::GraphicsPipelineHandler> {
+        struct Noop;
+        impl ironrdp_egfx::server::GraphicsPipelineHandler for Noop {
+            fn capabilities_advertise(
+                &mut self,
+                _pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu,
+            ) {
+            }
+            fn on_ready(&mut self, _negotiated: &ironrdp_egfx::pdu::CapabilitySet) {}
+        }
+        Box::new(Noop)
+    }
+}
+
+/// With lossy audio and `--udp-migrate-egfx` both on, a connection gets a second,
+/// reliable tunnel for EGFX, and its one Soft-Sync moves lossy audio onto the
+/// lossy tunnel and EGFX onto the reliable one. Before, lossy audio took the
+/// Soft-Sync and EGFX stayed on TCP. A real IronRDP client accepts both offers,
+/// binding each tunnel the way the UDP listener does (taking its cookie).
+#[tokio::test]
+async fn one_soft_sync_moves_lossy_audio_and_egfx_onto_two_tunnels() -> anyhow::Result<()> {
+    use ironrdp_dvc::pdu::SoftSyncTunnelType;
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_pdu::gcc::MultiTransportFlags;
+    use ironrdp_pdu::mcs::{McsMessage, SendDataRequest};
+    use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+    use ironrdp_pdu::rdp::multitransport::{
+        MultitransportRequestPdu, MultitransportResponsePdu, RequestedProtocol,
+    };
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    init_tracing();
+    let registry = ironrdp_server::CookieRegistry::new();
+    let display = TestDisplay {
+        size: ServerDesktopSize {
+            width: 1024,
+            height: 768,
+        },
+    };
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(display)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .with_gfx_factory(Some(Box::new(NoopGfxFactory)))
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build();
+    server.set_multitransport_provider(Some(Box::new(LossyOffer)));
+    server.set_multitransport_cookie_registry(Some(registry.clone()));
+    server.set_migrate_egfx(true);
+    server.set_multitransport_lossy_audio_formats(Some(vec![ironrdp_rdpsnd::pdu::AudioFormat {
+        format: ironrdp_rdpsnd::pdu::WaveFormat::PCM,
+        n_channels: 2,
+        n_samples_per_sec: 44_100,
+        n_avg_bytes_per_sec: 176_400,
+        n_block_align: 4,
+        bits_per_sample: 16,
+        data: None,
+    }]));
+    let events = server.event_sender().clone();
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let egfx_ticks = tokio::task::spawn_local(async move {
+                loop {
+                    let _ = events.send(ironrdp_server::ServerEvent::Egfx(
+                        ironrdp_server::EgfxServerMessage::SendMessages {
+                            messages: Vec::new(),
+                        },
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+
+            let mut config = client_config(1024, 768);
+            config.multitransport_flags = Some(
+                MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                    | MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                    | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+            );
+            let mut drdynvc = DrdynvcClient::new()
+                .with_dynamic_channel(NamedDvc::<false>)
+                .with_dynamic_channel(NamedDvc::<true>)
+                .with_dynamic_channel(NamedGfxDvc);
+            drdynvc.enable_soft_sync_tunnel(SoftSyncTunnelType::LOSSY_UDP);
+            drdynvc.enable_soft_sync_tunnel(SoftSyncTunnelType::RELIABLE_UDP);
+            let mut connector =
+                ClientConnector::new(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .with_static_channel(drdynvc);
+
+            let mut framed = TokioFramed::new(client_io);
+            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+            let initial = framed.into_inner_no_leftover();
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+                .with_no_client_auth();
+            tls_cfg.resumption = rustls::client::Resumption::disabled();
+            let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost")?.to_owned(),
+                    initial,
+                )
+                .await?;
+            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = TokioFramed::new(tls_stream);
+
+            let offered = std::rc::Rc::new(std::cell::Cell::new(None::<u32>));
+            let seen = std::rc::Rc::clone(&offered);
+            let bind = registry.clone();
+            let result = ironrdp_tokio::connect_finalize_with_multitransport(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut NoNetwork,
+                "localhost".into(),
+                Vec::new(),
+                None,
+                async |request: MultitransportRequestPdu, _soft_sync| {
+                    assert_eq!(request.requested_protocol, RequestedProtocol::UdpFecL);
+                    seen.set(Some(request.request_id));
+                    assert!(bind.take(&request.security_cookie).is_some());
+                    Ok(ironrdp_connector::MultitransportResult::Success)
+                },
+            )
+            .await?
+            .into_connected()?;
+            let first_request_id = offered
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("the server never offered the lossy tunnel"))?;
+            let message_channel_id = result
+                .message_channel_id
+                .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
+            let user_channel_id = result.user_channel_id;
+            let mut channels = result.static_channels;
+            let drdynvc_id = channels
+                .get_channel_id_by_type::<DrdynvcClient>()
+                .ok_or_else(|| anyhow::anyhow!("no DRDYNVC channel"))?;
+
+            let s_ok = |request_id: u32| -> anyhow::Result<Vec<u8>> {
+                let response = MultitransportResponsePdu {
+                    security_header: BasicSecurityHeader {
+                        flags: BasicSecurityHeaderFlags::TRANSPORT_RSP,
+                    },
+                    request_id,
+                    hr_response: MultitransportResponsePdu::S_OK,
+                };
+                Ok(ironrdp_core::encode_vec(&X224(SendDataRequest {
+                    initiator_id: user_channel_id,
+                    channel_id: message_channel_id,
+                    user_data: ironrdp_core::encode_vec(&response)?.into(),
+                }))?)
+            };
+            // mstsc's order: S_OK on the message channel once the session is running.
+            framed.write_all(&s_ok(first_request_id)?).await?;
+
+            let mut second_offer = None;
+            let tunnels = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id == message_channel_id {
+                        // The second offer: accept it and bind its tunnel.
+                        if let Ok(request) =
+                            ironrdp_core::decode::<MultitransportRequestPdu>(&data.user_data)
+                        {
+                            assert_eq!(request.requested_protocol, RequestedProtocol::UdpFecR);
+                            assert!(registry.take(&request.security_cookie).is_some());
+                            second_offer = Some(request.request_id);
+                            framed.write_all(&s_ok(request.request_id)?).await?;
+                        }
+                        continue;
+                    }
+                    if data.channel_id != drdynvc_id {
+                        continue;
+                    }
+                    let svc = channels
+                        .get_by_channel_id_mut(drdynvc_id)
+                        .ok_or_else(|| anyhow::anyhow!("DRDYNVC disappeared"))?;
+                    let replies = svc.process(&data.user_data)?;
+                    if !replies.is_empty() {
+                        let bytes = ironrdp_svc::client_encode_svc_messages(
+                            replies,
+                            drdynvc_id,
+                            user_channel_id,
+                        )?;
+                        framed.write_all(&bytes).await?;
+                    }
+                    let client = svc
+                        .channel_processor_downcast_ref::<DrdynvcClient>()
+                        .ok_or_else(|| anyhow::anyhow!("DRDYNVC is not the client processor"))?;
+                    if client.soft_sync_complete() {
+                        let tunnel =
+                            |id: Option<u32>| id.and_then(|id| client.tunnel_for_channel(id));
+                        return anyhow::Ok((
+                            tunnel(client.get_dvc::<NamedDvc<true>>().map(|c| c.channel_id())),
+                            tunnel(client.get_dvc::<NamedGfxDvc>().map(|c| c.channel_id())),
+                        ));
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the server never sent a Soft-Sync request"))??;
+
+            assert!(
+                second_offer.is_some(),
+                "the server never offered the second tunnel"
+            );
+            assert_eq!(
+                tunnels,
+                (
+                    Some(SoftSyncTunnelType::LOSSY_UDP),
+                    Some(SoftSyncTunnelType::RELIABLE_UDP)
+                ),
+                "lossy audio should be on the lossy tunnel and EGFX on the reliable one"
+            );
+
+            egfx_ticks.abort();
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
 /// `--network-autodetect`: with IronRDP's auto-detect enabled and macrdp's
 /// ticker running, a client that opened the MCS message channel receives RTT
 /// Measure Requests on it. Nothing else in macrdp sends auto-detect PDUs, so

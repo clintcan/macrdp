@@ -17,7 +17,7 @@ ironrdp-core = { version = "0.3", features = ["alloc"] }
 # parent's [patch.crates-io] does NOT apply — replicate it. Keep the rev in sync
 # with the root macrdp Cargo.toml and vendor/macrdp-rdpeudp/Cargo.toml.
 [patch.crates-io]
-ironrdp-core = { git = "https://github.com/clintcan/IronRDP.git", rev = "0087f037ebbb569570c7a01c06c05cc40b835fba" }
+ironrdp-core = { git = "https://github.com/clintcan/IronRDP.git", rev = "4651b21a0208e8a167cb9311dccedb17a878aaa0" }
 
 [[bin]]
 name = "datagram_decode"
