@@ -287,6 +287,10 @@ struct ConnectionContext {
     /// never re-migrate to UDP in-session (no flapping); UDP is retried only on the
     /// next connection. Reset with the fresh context on reconnect.
     demigrated: bool,
+    /// When this connection's EGFX moved onto the reliable UDP tunnel (first seen
+    /// by the watchdog), so the watchdog doesn't count ack silence from before the
+    /// move. `None` until then.
+    egfx_udp_since: Option<Instant>,
     /// Adaptive-bitrate (congestion-responsive rate control) per-connection state.
     /// `adaptive_target_bps` is the controller's current target (starts at the
     /// configured `--bitrate` ceiling); `adaptive_last_control` rate-limits the AIMD
@@ -507,6 +511,22 @@ fn should_demigrate_to_tcp(
         && !acks_suspended
         && since_ship <= active_window
         && since_ack >= wedge_timeout
+}
+
+/// How long acks have been silent, as the EGFX-over-UDP watchdog sees it: from
+/// the last ack, or from when EGFX moved onto the tunnel if that came later. An
+/// ack gap from before the move says nothing about the tunnel: a connection can
+/// go seconds without shipping a frame (so without an ack) before the Soft-Sync,
+/// and measuring from the last ack then declared the tunnel wedged on its first
+/// frame (seen live with two tunnels, 2026-11-24: `since_ack_ms=5062`, 19 ms after
+/// the Soft-Sync). Pure, unit-tested.
+fn udp_watchdog_since_ack(
+    now: Instant,
+    last_ack_at: Instant,
+    udp_since: Option<Instant>,
+) -> Duration {
+    let from = udp_since.map_or(last_ack_at, |moved| moved.max(last_ack_at));
+    now.saturating_duration_since(from)
 }
 
 /// Whether capture must hold back a legacy bitmap update because this
@@ -2222,12 +2242,16 @@ impl Gfx {
             // EGFX is on the reliable UDP tunnel → default path unchanged.
             if self.watchdog_enabled {
                 let now = Instant::now();
-                let since_ack = now.saturating_duration_since(ctx.last_ack_at);
+                let on_udp = self.egfx_on_udp.load(Ordering::Relaxed);
+                if on_udp && ctx.egfx_udp_since.is_none() {
+                    ctx.egfx_udp_since = Some(now);
+                }
+                let since_ack = udp_watchdog_since_ack(now, ctx.last_ack_at, ctx.egfx_udp_since);
                 if should_demigrate_to_tcp(
                     now.saturating_duration_since(ctx.last_ship_at),
                     since_ack,
                     ctx.acks_suspended,
-                    self.egfx_on_udp.load(Ordering::Relaxed),
+                    on_udp,
                     self.egfx_on_lossy.load(Ordering::Relaxed),
                     ctx.demigrated,
                     self.watchdog_active_window,
@@ -3546,6 +3570,7 @@ impl Gfx {
             queue_delay_ms: 0.0,
             last_throttle_ship: Instant::now(),
             demigrated: false,
+            egfx_udp_since: None,
             adaptive_target_bps: initial_target_bps,
             adaptive_last_control: Instant::now(),
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
@@ -4158,6 +4183,71 @@ mod tests {
     // already_demigrated, active_window, wedge_timeout.
     const WD_ACTIVE: Duration = Duration::from_millis(1000);
     const WD_WEDGE: Duration = Duration::from_millis(3000);
+
+    /// The two-tunnel live case (2026-11-24): no frame (so no ack) for 5 s before
+    /// the Soft-Sync moved EGFX onto the reliable tunnel, then the first frame
+    /// 19 ms later. Ack silence counts from the move, so the watchdog stays quiet.
+    #[test]
+    fn watchdog_counts_ack_silence_from_the_move_onto_udp() {
+        let now = Instant::now();
+        let last_ack = now - Duration::from_millis(5062);
+        let moved = now - Duration::from_millis(19);
+        let since_ack = udp_watchdog_since_ack(now, last_ack, Some(moved));
+        assert_eq!(since_ack, Duration::from_millis(19));
+        assert!(!should_demigrate_to_tcp(
+            Duration::ZERO,
+            since_ack,
+            false,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+        // Measured from the last ack, as before, it would have fired.
+        assert!(should_demigrate_to_tcp(
+            Duration::ZERO,
+            now.saturating_duration_since(last_ack),
+            false,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+    }
+
+    #[test]
+    fn watchdog_ack_silence_still_grows_after_the_move() {
+        let now = Instant::now();
+        // An ack after the move counts from that ack.
+        let moved = now - Duration::from_millis(4000);
+        let acked = now - Duration::from_millis(500);
+        assert_eq!(
+            udp_watchdog_since_ack(now, acked, Some(moved)),
+            Duration::from_millis(500)
+        );
+        // No ack since the move: silence counts from the move, so a real wedge
+        // still trips the watchdog.
+        let stale_ack = now - Duration::from_millis(9000);
+        let since_ack = udp_watchdog_since_ack(now, stale_ack, Some(moved));
+        assert_eq!(since_ack, Duration::from_millis(4000));
+        assert!(should_demigrate_to_tcp(
+            Duration::ZERO,
+            since_ack,
+            false,
+            true,
+            false,
+            false,
+            WD_ACTIVE,
+            WD_WEDGE
+        ));
+        // Not on UDP yet: from the last ack, unchanged.
+        assert_eq!(
+            udp_watchdog_since_ack(now, acked, None),
+            Duration::from_millis(500)
+        );
+    }
 
     #[test]
     fn watchdog_fires_on_reliable_udp_wedge_while_shipping() {
