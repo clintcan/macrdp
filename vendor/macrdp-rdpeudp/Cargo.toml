@@ -29,4 +29,4 @@ bitflags = "2"
 # Honored only when this crate is built as the top-level (standalone tests).
 # Ignored when it's a path dependency of macrdp (the root's [patch] wins). Keep
 # the rev in sync with the root Cargo.toml.
-ironrdp-core = { git = "https://github.com/clintcan/IronRDP.git", rev = "4d7e1365bcb922afbaaf0f509f451a215e5205db" }
+ironrdp-core = { git = "https://github.com/clintcan/IronRDP.git", rev = "4651b21a0208e8a167cb9311dccedb17a878aaa0" }

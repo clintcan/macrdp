@@ -1,8 +1,11 @@
 # Two UDP tunnels: lossy audio and EGFX on UDP in one session
 
-Status: **built, not yet live-tested** (2026-11-24): clintcan/IronRDP#4, merged into `macrdp-79e763a0`
-(tip `4d7e1365`), points 1–7 below; macrdp's pins and the end-to-end test
-`one_soft_sync_moves_lossy_audio_and_egfx_onto_two_tunnels` move with it. Point 8 (the tunnel's inbound data after an in-place reactivation) is left for a follow-up: when it
+Status: **built and live-tested on mstsc (Windows 11), 2026-11-24.** clintcan/IronRDP#4 (points 1–7
+below) and #5 (point 8, plus sending the Soft-Sync as soon as both tunnels are bound and both channels
+are open: waiting for the first EGFX batch stalled every two-tunnel connect for about 4 s), merged into
+`macrdp-79e763a0` (tip `4651b21a`). macrdp's watchdog also counts ack silence from the move onto the
+tunnel, not from the last ack (a false de-migration on the first frame otherwise). Live: near-instant
+connect, sound, monitor moves both ways, minimize and restore. Point 8 (the tunnel's inbound data after an in-place reactivation) is left for a follow-up: when it
 bites, the EGFX watchdog moves video back to TCP. The bind timeout is 5 s.
 
 ## The gap

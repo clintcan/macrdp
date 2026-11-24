@@ -167,8 +167,12 @@ says otherwise.
   request with two lists (dvc (3)'s `request_soft_sync_lists`): lossy audio on the lossy tunnel,
   EGFX on the reliable one. A refusal or a timeout falls back to audio alone, as before. EGFX data
   and replies to tunnel data use the reliable tunnel's cookie (`egfx_tunnel_cookie`); `Drop`
-  retires both tunnels. `MACRDP_UDP_SECOND_TUNNEL=0` turns it off. Not done: the tunnel's inbound
-  receiver after an in-place reactivation (`docs/udp-two-tunnels-design.md`, point 8).
+  retires both tunnels. `MACRDP_UDP_SECOND_TUNNEL=0` turns it off.
+  **clintcan/IronRDP#5 (2026-11-24):** the client loop hands the tunnel's inbound receiver back when it
+  ends (`TunnelInbound::restore`), so a reactivation keeps reading the tunnel (a monitor move left the
+  picture blank with EGFX on the tunnel); and the two-tunnel Soft-Sync goes out from the client's
+  dynamic-channel data as soon as it can (`mt_soft_sync_after_dvc_input`, one hook line in
+  `process_x224`), since waiting for the first EGFX batch stalled mstsc for about 4 s.
   The multitransport offer needs the MCS message channel (since e258f6a0; the older fork fell back to
   the I/O channel). mstsc sends it; a client that doesn't gets no UDP offer.
   **The one Soft-Sync (fix of 2026-11-13, silent lossy audio since v0.10.0):** mstsc answers the

@@ -35,9 +35,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
     updated for ironrdp-cliprdr 0.9 (a request for an unknown lock fails, as the crate refuses it). Next:
     live-test after the soak (a large paste with a new Mac copy made mid-paste), then open a PR.
   - **Two UDP tunnels** (ours): lossy audio and EGFX on UDP in one session (design:
-    `docs/udp-two-tunnels-design.md`). Fork PR clintcan/IronRDP#4 merged 2026-11-24 (`macrdp-79e763a0` tip
-    `4d7e1365`); the macrdp PR moves the pins with the connection test
-    `one_soft_sync_moves_lossy_audio_and_egfx_onto_two_tunnels` and the docs. Next: live mstsc check.
+    `docs/udp-two-tunnels-design.md`). Fork PRs clintcan/IronRDP#4 and #5 merged 2026-11-24
+    (`macrdp-79e763a0` tip `4651b21a`); #288 moves the pins, with the watchdog fix and the connection test.
+    Live-tested on mstsc (Windows 11). Next: merge #288.
   - **zhangyxXyz/macrdp** (Seiun Zhang's fork): worth inviting PRs for screenshots as images, clipboard
     I/O off the connection loop, `mkdtemp` staging, capture-stop recovery, `SACLockScreenImmediate` for
     `--lock-on-disconnect`, and an opt-in File Provider paste. Not its power-default flip (`caffeinate
