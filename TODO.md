@@ -11,13 +11,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
   App for macOS (blank recovery armed), a takeover by a second client, connect-time auto-detect
   (`NETWORK_AUTODETECT=1`), and (needing config changes) microphone, camera, USB and smart card.
 
-- [ ] **Open PRs and issues — review state (as of 2026-11-25).** Labels track it: `waiting on author` = the
+- [ ] **Open PRs and issues — review state (as of 2026-11-25; no open PRs).** Labels track it: `waiting on author` = the
   contributor owes a change; everything else is ours. v0.10.10 released 2026-11-24 (#274 #276–#291 merged
   11-21→24; #275 closed).
-  - **#231 / #232** (@SferaDev) — he is away until at least 2026-12-01 and is fine with us taking them over.
-    #231: rebase (after #201) with a `recreate()` that keeps HiDPI (the zhangyxXyz fork has one), live test.
-    #232: drop or make opt-in the session-long display-awake hold and the 3 s wait in
-    `DetachedPrimary::drop`.
+  - **#231 / #232** (@SferaDev) — taken over and MERGED 2026-11-24 (#231 `90e778d`, #232 `2afe581`; SferaDev author,
+    maintainer co-author). Live on the mini: locked + displays asleep → SCK lists no displays; #232 wakes them at
+    authentication and the session comes up. The re-registration itself (SCK listing a new id) not reproduced.
+    Not yet in a release.
   - **Issues:** #237 ("can't connect unless already logged in") is the documented limit (README: someone has
     to log in after a reboot); reply pointing there. #244 (universal binary and Intel support) needs a
     decision on whether to build for Intel.
