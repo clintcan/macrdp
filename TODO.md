@@ -34,10 +34,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
     descriptors ironrdp-cliprdr would drop so the file lists stay aligned. Rebased on `main` 2026-11-23 and
     updated for ironrdp-cliprdr 0.9 (a request for an unknown lock fails, as the crate refuses it). Next:
     live-test after the soak (a large paste with a new Mac copy made mid-paste), then open a PR.
-  - **Two UDP tunnels** (ours, clintcan/IronRDP#4, 2026-11-24): lossy audio and EGFX on UDP in one session
-    (design: `docs/udp-two-tunnels-design.md`). Merge the fork PR, then a macrdp PR moving the pins, with the
-    connection test `one_soft_sync_moves_lossy_audio_and_egfx_onto_two_tunnels` (fails on the current pins)
-    and the docs; live mstsc check after the soak.
+  - **Two UDP tunnels** (ours): lossy audio and EGFX on UDP in one session (design:
+    `docs/udp-two-tunnels-design.md`). Fork PR clintcan/IronRDP#4 merged 2026-11-24 (`macrdp-79e763a0` tip
+    `4d7e1365`); the macrdp PR moves the pins with the connection test
+    `one_soft_sync_moves_lossy_audio_and_egfx_onto_two_tunnels` and the docs. Next: live mstsc check.
   - **zhangyxXyz/macrdp** (Seiun Zhang's fork): worth inviting PRs for screenshots as images, clipboard
     I/O off the connection loop, `mkdtemp` staging, capture-stop recovery, `SACLockScreenImmediate` for
     `--lock-on-disconnect`, and an opt-in File Provider paste. Not its power-default flip (`caffeinate
@@ -107,9 +107,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
   enumerator has no per-connection cap on DEVICE_ADDED (URBDRC has `MAX_DEVICE_CHANNELS`). (d) The
   client-supplied hostname is logged with `%` (log injection).
 
-- [ ] **UDP: lossy audio and `--udp-migrate-egfx` can't both migrate in one session.** A connection gets one
-  Soft-Sync request, and with lossy audio on, the audio channel takes it (`mt_soft_sync_on_egfx`). Fixing it
-  means one Soft-Sync naming both channels on their tunnels. Low priority: both are opt-in.
 - [ ] **Windows App (macOS) intermittently doesn't announce client copies to the server — pre-existing,
   NOT a pin-bump regression.** Found 2026-10-02 while live-testing the bump: after a copy on the MacBook,
   clicking into the Windows App session sometimes sends no CLIPRDR FormatList at all, so the mini never

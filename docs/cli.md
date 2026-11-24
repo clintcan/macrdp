@@ -411,6 +411,12 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   was always on TCP). Promoted 2026-06-28 from the
                           #   MACRDP_UDP_MIGRATE_EGFX env var (still works as a
                           #   fallback). macOS-built; protocol layer cross-platform.
+                          #   With --enable-lossy-audio too, the client is offered a
+                          #   second (reliable) tunnel for the video, next to the
+                          #   lossy one for audio, and one Soft-Sync moves both; if
+                          #   it isn't bound within 5 s, audio moves alone and the
+                          #   video stays on TCP. MACRDP_UDP_SECOND_TUNNEL=0 (env)
+                          #   turns the second tunnel off.
 --adaptive-bitrate        # Opt-in (default OFF; ADAPTIVE_BITRATE=1 in config.env).
                           #   Congestion-responsive H.264 rate control on BOTH the UDP
                           #   tunnel AND the TCP path (only with --enable-h264): an

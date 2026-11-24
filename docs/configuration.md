@@ -302,6 +302,9 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           like TCP — but an auto-recovery watchdog de-migrates
                           EGFX back to TCP on a wedge (no more freeze-until-
                           reconnect; audio always rode TCP). Off by default.
+                          With --enable-lossy-audio too, a second (reliable)
+                          tunnel carries the video next to the lossy one for
+                          audio (MACRDP_UDP_SECOND_TUNNEL=0 turns it off).
 --adaptive-bitrate        Opt-in. Congestion-responsive H.264 rate control on
                           both the UDP tunnel and the TCP path (only with
                           --enable-h264): an AIMD controller reads the client's
