@@ -164,6 +164,11 @@ impl Handle {
         self.display_id
     }
 
+    /// The id the display reports now, which moves when WindowServer re-registers it.
+    pub(super) fn live_display_id(&self) -> u32 {
+        unsafe { msg_send![self.raw, displayID] }
+    }
+
     /// Re-apply settings with a single new mode — the live-resize primitive.
     /// Same `applySettings:` call that registered the display in `create`;
     /// calling it again on the live instance switches the active mode (the
@@ -425,7 +430,7 @@ pub(super) fn create(
             0x6D616372 // "macr"
         };
         let _: () = msg_send![desc, setProductID: product];
-        let _: () = msg_send![desc, setVendorID: 0x6D616372u32];
+        let _: () = msg_send![desc, setVendorID: super::VENDOR_ID];
         // Was hardcoded to 1: a second macrdp process (e.g. two concurrent
         // installs, or dev testing alongside a running instance) registering a
         // display with an identical vendor/product/serial triple gets its

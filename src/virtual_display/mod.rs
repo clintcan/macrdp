@@ -14,9 +14,9 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    is_hidpi_virtual_display, run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
+    is_hidpi_virtual_display, online_display, run_select_mode_helper, screen_is_locked,
+    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -110,6 +110,105 @@ pub fn panel_size_mm(width_px: u32, height_px: u32, hidpi: bool) -> (f64, f64) {
 /// `VirtualDisplay` reports it.
 const HIDPI_PANEL_WIDTH_MM: f64 = 233.0;
 
+/// Vendor id on every macrdp display descriptor ("macr"). The product id
+/// varies (regular, HiDPI, test), so a display is recognised by vendor and
+/// serial only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const VENDOR_ID: u32 = 0x6D616372;
+
+/// Vendor and serial a display reports; ours carry the descriptor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayIdentity {
+    pub vendor: u32,
+    pub serial: u32,
+}
+
+impl DisplayIdentity {
+    /// The identity this process gives its virtual display (the serial is the pid).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn ours() -> Self {
+        Self {
+            vendor: VENDOR_ID,
+            serial: std::process::id(),
+        }
+    }
+}
+
+/// One online display, as the virtual display lookup sees it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineDisplay {
+    pub id: u32,
+    pub identity: DisplayIdentity,
+    pub builtin: bool,
+    pub size_px: (u32, u32),
+}
+
+/// The virtual display's id among `online`: the cached id while it is still ours, else the
+/// live handle's (0 when unknown), else the only display with our vendor and serial, else the
+/// only external display of `size_px`. `None` while it is gone. Used both when a capture starts
+/// and when one reopens after SCK stopped it, so the two always agree.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn pick_display_id(
+    cached: u32,
+    live: u32,
+    online: &[OnlineDisplay],
+    ours: DisplayIdentity,
+    size_px: (u32, u32),
+) -> Option<u32> {
+    // A virtual display's reported identity can differ from the one we created, so a display
+    // is only disowned when it is clearly another macrdp process's.
+    let another_macrdp =
+        |d: &OnlineDisplay| d.identity.vendor == ours.vendor && d.identity.serial != ours.serial;
+    let online_ours = |id: u32| id != 0 && online.iter().any(|d| d.id == id && !another_macrdp(d));
+    if online_ours(cached) {
+        return Some(cached);
+    }
+    if online_ours(live) {
+        return Some(live);
+    }
+    let unique = |f: &dyn Fn(&OnlineDisplay) -> bool| {
+        let mut it = online.iter().filter(|d| f(d));
+        match (it.next(), it.next()) {
+            (Some(d), None) => Some(d.id),
+            _ => None,
+        }
+    };
+    unique(&|d| d.identity.vendor == ours.vendor && d.identity.serial == ours.serial)
+        .or_else(|| unique(&|d| !d.builtin && d.size_px == size_px && !another_macrdp(d)))
+}
+
+/// Old virtual display ids and the ids WindowServer re-registered them under.
+static ID_REMAP: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Follows `remap` from `id` to the newest id; stops on a cycle.
+pub fn follow_remap(remap: &[(u32, u32)], id: u32) -> u32 {
+    let mut current = id;
+    for _ in 0..=remap.len() {
+        match remap.iter().rev().find(|&&(old, _)| old == current) {
+            Some(&(_, new)) if new != current => current = new,
+            _ => break,
+        }
+    }
+    current
+}
+
+/// Maps a possibly stale virtual display id to its current one.
+pub fn current_id(id: u32) -> u32 {
+    follow_remap(&ID_REMAP.lock().unwrap_or_else(|e| e.into_inner()), id)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn record_id_change(old: u32, new: u32) {
+    if old == new {
+        return;
+    }
+    let mut remap = ID_REMAP.lock().unwrap_or_else(|e| e.into_inner());
+    remap.retain(|&(o, _)| o != old && o != new);
+    remap.push((old, new));
+    tracing::warn!(old, new, "virtual display re-registered under a new id");
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::time::Duration;
@@ -153,6 +252,16 @@ mod macos {
     /// pixels per point) via `--virtual-display-hidpi`.
     pub fn is_hidpi_virtual_display(display_id: u32) -> bool {
         display_id != 0 && HIDPI_DISPLAY_ID.load(std::sync::atomic::Ordering::Relaxed) == display_id
+    }
+
+    /// Drops `display_id` from the HiDPI registry (it was replaced).
+    fn forget_scale(display_id: u32) {
+        let _ = HIDPI_DISPLAY_ID.compare_exchange(
+            display_id,
+            0,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// First argument that turns the binary into a one-shot helper: select
@@ -232,6 +341,29 @@ mod macos {
         private_api::screen_is_locked()
     }
 
+    /// How the virtual display lookup sees display `id`.
+    pub fn online_display(id: CGDirectDisplayID) -> super::OnlineDisplay {
+        extern "C" {
+            fn CGDisplayVendorNumber(display: CGDirectDisplayID) -> u32;
+            fn CGDisplaySerialNumber(display: CGDirectDisplayID) -> u32;
+        }
+        let d = CGDisplay::new(id);
+        let size_px = d.display_mode().map_or((0, 0), |m| {
+            (m.pixel_width() as u32, m.pixel_height() as u32)
+        });
+        super::OnlineDisplay {
+            id,
+            identity: unsafe {
+                super::DisplayIdentity {
+                    vendor: CGDisplayVendorNumber(id),
+                    serial: CGDisplaySerialNumber(id),
+                }
+            },
+            builtin: d.is_builtin(),
+            size_px,
+        }
+    }
+
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
     // core-graphics crate. "Online" includes both active displays and any
     // online-but-currently-disabled displays — which is exactly the set we
@@ -265,8 +397,9 @@ mod macos {
     pub struct VirtualDisplay {
         // RAII: dropped last so the CG handle is released after we've
         // logged anything we want to log about it.
-        _handle: private_api::Handle,
+        handle: Option<private_api::Handle>,
         display_id: u32,
+        refresh_hz: u32,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
         /// Created HiDPI (`--virtual-display-hidpi`): every mode is applied
@@ -413,8 +546,9 @@ mod macos {
             }
 
             let mut vd = Self {
-                _handle: handle,
+                handle: Some(handle),
                 display_id: id,
+                refresh_hz,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
                 hidpi,
@@ -478,6 +612,100 @@ mod macos {
 
         pub fn display_id(&self) -> u32 {
             self.display_id
+        }
+
+        /// Re-resolves the id WindowServer may have changed (seen across lock and display sleep).
+        pub fn refresh_id(&mut self) -> Option<u32> {
+            let live = self.handle.as_ref().map_or(0, |h| h.live_display_id());
+            // A failed query says nothing about the display: keep the id we have.
+            let online: Vec<_> = match online_displays() {
+                Ok(ids) => ids.into_iter().map(online_display).collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        error = e,
+                        "CGGetOnlineDisplayList failed; keeping the cached display id"
+                    );
+                    return Some(self.display_id);
+                }
+            };
+            let size_px = self.backing_px();
+            let id = super::pick_display_id(
+                self.display_id,
+                live,
+                &online,
+                super::DisplayIdentity::ours(),
+                size_px,
+            )?;
+            if id != self.display_id {
+                super::record_id_change(self.display_id, id);
+                forget_scale(self.display_id);
+                self.display_id = id;
+                let b = CGDisplay::new(id).bounds();
+                if b.size.width > 0.0 && b.size.height > 0.0 {
+                    self.origin_pts = (b.origin.x, b.origin.y);
+                    self.size_pts = (b.size.width, b.size.height);
+                }
+                // Record which scale the display has now under its new id, and
+                // let the next sync re-apply the session's mode.
+                self.record_scale(self.size_pts.0 as u32);
+                self.mode_px = (0, 0);
+            }
+            Some(id)
+        }
+
+        /// The framebuffer size in pixels: the session size last applied, else
+        /// the point size at the scale macOS gave the display.
+        fn backing_px(&self) -> (u32, u32) {
+            if self.mode_px != (0, 0) {
+                return self.mode_px;
+            }
+            let scale = if is_hidpi_virtual_display(self.display_id) {
+                2
+            } else {
+                1
+            };
+            (
+                self.size_pts.0 as u32 * scale,
+                self.size_pts.1 as u32 * scale,
+            )
+        }
+
+        /// Re-resolves the id, recreating the display if gone; returns whether the id moved.
+        pub fn ensure_live(&mut self) -> Result<bool> {
+            let before = self.display_id;
+            // A display can be missing from the list for a moment (around a wake),
+            // so look a few times before replacing it.
+            let mut found = self.refresh_id().is_some();
+            for _ in 0..3 {
+                if found {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                found = self.refresh_id().is_some();
+            }
+            if !found {
+                tracing::warn!(
+                    display_id = before,
+                    "virtual display is gone; recreating it"
+                );
+                self.recreate()?;
+            }
+            Ok(self.display_id != before)
+        }
+
+        /// Replaces the display with a fresh one of the same pixel size, HiDPI
+        /// setting and UI scale. The recorded mode is cleared, so the next
+        /// sync re-applies the session's mode.
+        pub fn recreate(&mut self) -> Result<()> {
+            let (width, height) = self.backing_px();
+            let before = self.display_id;
+            forget_scale(before);
+            // WindowServer rejects our serial while the old display is alive.
+            self.handle = None;
+            *self = Self::new(width, height, self.refresh_hz, self.hidpi, self.ui_scale)?;
+            self.mode_px = (0, 0);
+            super::record_id_change(before, self.display_id);
+            Ok(())
         }
 
         pub fn origin_pts(&self) -> (f64, f64) {
@@ -589,7 +817,9 @@ mod macos {
         fn apply_and_wait(&mut self, mode_w: u32, mode_h: u32) -> Result<Landed> {
             let before = CGDisplay::new(self.display_id).bounds().size;
             let before = (before.width as u32, before.height as u32);
-            self._handle
+            self.handle
+                .as_ref()
+                .context("virtual display handle released")?
                 .apply_mode(mode_w, mode_h, 60, self.hidpi)
                 .context("re-applying virtual display mode")?;
             self.wait_landed(before, mode_w, mode_h)
@@ -762,7 +992,7 @@ mod macos {
                 self.primary_old_origin.0,
                 self.primary_old_origin.1,
             );
-            let vd = CGDisplay::new(self.virtual_id);
+            let vd = CGDisplay::new(super::current_id(self.virtual_id));
             let _ = vd.configure_display_origin(
                 &config,
                 self.virtual_old_origin.0,
@@ -929,7 +1159,7 @@ mod macos {
                 detached_count = self.detached.len(),
                 "DetachedPrimary::drop running — re-enabling physical displays"
             );
-            let any = CGDisplay::new(self.virtual_id);
+            let any = CGDisplay::new(super::current_id(self.virtual_id));
 
             // Two transactions: re-enable in tx 1, reposition in tx 2.
             // Mixing both in a single transaction trips CGError 1001
@@ -1017,7 +1247,7 @@ mod macos {
             for (id, origin) in &self.detached {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
+            let _ = CGDisplay::new(super::current_id(self.virtual_id)).configure_display_origin(
                 &config,
                 self.virtual_old_origin.0,
                 self.virtual_old_origin.1,
@@ -1308,7 +1538,7 @@ mod macos {
             std::thread::sleep(TX_SETTLE);
 
             // Best-effort restore of the pre-install origins.
-            let any = CGDisplay::new(self.virtual_id);
+            let any = CGDisplay::new(super::current_id(self.virtual_id));
             let config = match any.begin_configuration() {
                 Ok(c) => c,
                 Err(e) => {
@@ -1322,7 +1552,7 @@ mod macos {
             for (id, origin) in &self.captured {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
+            let _ = CGDisplay::new(super::current_id(self.virtual_id)).configure_display_origin(
                 &config,
                 self.virtual_old_origin.0,
                 self.virtual_old_origin.1,
@@ -1960,7 +2190,7 @@ mod macos {
         /// Always returns 0 (nothing to report synchronously); failures are
         /// logged from the thread.
         pub fn reassert_blanking(&self) -> usize {
-            let vd = self.virtual_id;
+            let vd = super::current_id(self.virtual_id);
             std::thread::spawn(move || {
                 if let Err(e) = crate::shield::show(&[vd]) {
                     tracing::warn!("could not re-fit shields after a display change: {e:#}");
@@ -1992,7 +2222,7 @@ mod macos {
             // process EXIT — a clean disconnect keeps the process alive, so we
             // must re-mirror explicitly here or the built-in is left a separate,
             // empty extended desktop.
-            remirror_onto_vd(self.virtual_id, &self.broke_mirror);
+            remirror_onto_vd(super::current_id(self.virtual_id), &self.broke_mirror);
 
             // In keep-physical-main mode `install` never moved the arrangement,
             // so there is nothing to restore — lowering the shields (and any
@@ -2002,7 +2232,7 @@ mod macos {
                 return;
             }
 
-            let any = CGDisplay::new(self.virtual_id);
+            let any = CGDisplay::new(super::current_id(self.virtual_id));
             let config = match any.begin_configuration() {
                 Ok(c) => c,
                 Err(e) => {
@@ -2016,7 +2246,7 @@ mod macos {
             for (id, origin) in &self.shielded {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
+            let _ = CGDisplay::new(super::current_id(self.virtual_id)).configure_display_origin(
                 &config,
                 self.virtual_old_origin.0,
                 self.virtual_old_origin.1,
@@ -2079,6 +2309,15 @@ mod stub {
         }
         pub fn display_id(&self) -> u32 {
             0
+        }
+        pub fn refresh_id(&mut self) -> Option<u32> {
+            None
+        }
+        pub fn ensure_live(&mut self) -> Result<bool> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
+        pub fn recreate(&mut self) -> Result<()> {
+            Err(anyhow!("virtual display is macOS-only"))
         }
         pub fn origin_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
@@ -2352,5 +2591,148 @@ mod tests {
         // Fixed width (it can't change after creation), aspect follows.
         assert_eq!(panel_size_mm(1920, 1080, true).0, w_mm);
         assert!((h_mm / w_mm - 2168.0 / 3456.0).abs() < 1e-9);
+    }
+
+    const OURS: DisplayIdentity = DisplayIdentity {
+        vendor: VENDOR_ID,
+        serial: 4242,
+    };
+    const PANEL: DisplayIdentity = DisplayIdentity {
+        vendor: 0x610,
+        serial: 0,
+    };
+    const SESSION: (u32, u32) = (3024, 1898);
+
+    fn online(id: u32, identity: DisplayIdentity) -> OnlineDisplay {
+        OnlineDisplay {
+            id,
+            identity,
+            builtin: identity == PANEL,
+            size_px: if identity == PANEL {
+                (3024, 1964)
+            } else {
+                SESSION
+            },
+        }
+    }
+
+    fn pick(cached: u32, live: u32, online: &[OnlineDisplay]) -> Option<u32> {
+        pick_display_id(cached, live, online, OURS, SESSION)
+    }
+
+    #[test]
+    fn keeps_the_cached_id_while_it_is_ours() {
+        let online = [online(1, PANEL), online(17, OURS)];
+        assert_eq!(pick(17, 17, &online), Some(17));
+    }
+
+    #[test]
+    fn follows_the_live_id_after_re_registration() {
+        let online = [online(1, PANEL), online(21, OURS)];
+        assert_eq!(pick(17, 21, &online), Some(21));
+    }
+
+    #[test]
+    fn finds_the_display_by_identity_when_the_live_id_is_stale() {
+        let online = [online(1, PANEL), online(23, OURS)];
+        assert_eq!(pick(22, 22, &online), Some(23));
+    }
+
+    #[test]
+    fn a_reused_id_belonging_to_another_display_is_not_ours() {
+        let other = DisplayIdentity { serial: 7, ..OURS };
+        let online = [online(17, other), online(21, OURS)];
+        assert_eq!(pick(17, 17, &online), Some(21));
+    }
+
+    #[test]
+    fn keeps_an_online_cached_id_whose_identity_reads_differently() {
+        let odd = DisplayIdentity {
+            vendor: 0x756e6b6e,
+            serial: 99,
+        };
+        let online = [online(29, odd)];
+        assert_eq!(pick(29, 29, &online), Some(29));
+    }
+
+    #[test]
+    fn reports_a_display_that_is_gone() {
+        let online = [online(1, PANEL)];
+        assert_eq!(pick(17, 17, &online), None);
+        assert_eq!(pick(17, 0, &[]), None);
+    }
+
+    /// The reopen after SCK stopped the capture has no live id, only the cached one.
+    #[test]
+    fn a_reregistered_virtual_display_is_found_by_vendor_then_by_size() {
+        const ODD: DisplayIdentity = DisplayIdentity {
+            vendor: 1,
+            serial: 1,
+        };
+        let same = [online(22, OURS)];
+        assert_eq!(pick(22, 0, &same), Some(22));
+        let by_vendor = [online(1, PANEL), online(23, OURS)];
+        assert_eq!(pick(22, 0, &by_vendor), Some(23));
+        let by_size = [
+            OnlineDisplay {
+                size_px: SESSION,
+                ..online(1, PANEL)
+            },
+            online(23, ODD),
+        ];
+        assert_eq!(pick(22, 0, &by_size), Some(23));
+        let ambiguous = [online(23, ODD), online(24, ODD)];
+        assert_eq!(pick(22, 0, &ambiguous), None);
+        let gone = [online(1, PANEL)];
+        assert_eq!(pick(22, 0, &gone), None);
+    }
+
+    #[test]
+    fn another_macrdp_display_of_the_session_size_is_not_taken() {
+        let other = DisplayIdentity { serial: 7, ..OURS };
+        assert_eq!(pick(22, 0, &[online(23, other)]), None);
+    }
+
+    #[test]
+    fn remap_follows_chains_and_survives_cycles() {
+        assert_eq!(follow_remap(&[], 17), 17);
+        assert_eq!(follow_remap(&[(17, 21)], 17), 21);
+        assert_eq!(follow_remap(&[(17, 21), (21, 23)], 17), 23);
+        assert_eq!(follow_remap(&[(17, 21)], 5), 5);
+        assert!([17, 21].contains(&follow_remap(&[(17, 21), (21, 17)], 17)));
+    }
+
+    /// The handle's own id wins even when the display reads as someone else's
+    /// size and identity: nothing else would find it.
+    #[test]
+    fn follows_the_live_id_when_nothing_else_identifies_it() {
+        let odd = OnlineDisplay {
+            id: 21,
+            identity: DisplayIdentity {
+                vendor: 0x756e6b6e,
+                serial: 99,
+            },
+            builtin: false,
+            size_px: (800, 600),
+        };
+        assert_eq!(pick(17, 21, &[odd]), Some(21));
+        assert_eq!(pick(17, 0, &[odd]), None);
+    }
+
+    #[test]
+    fn a_display_that_moves_back_maps_to_its_newest_id() {
+        record_id_change(80_001, 80_002);
+        record_id_change(80_002, 80_001);
+        assert_eq!(current_id(80_001), 80_001);
+        assert_eq!(current_id(80_002), 80_001);
+    }
+
+    #[test]
+    fn recorded_changes_reach_current_id() {
+        record_id_change(90_017, 90_021);
+        record_id_change(90_021, 90_023);
+        assert_eq!(current_id(90_017), 90_023);
+        assert_eq!(current_id(90_021), 90_023);
+        assert_eq!(current_id(90_023), 90_023);
     }
 }
