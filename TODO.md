@@ -7,43 +7,25 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **IronRDP 79e763a0 (#276, merged 2026-11-22): finish the checks before a release.** Done: CI and
-  `cargo-deny` before and after (zstd-safe 7.4.1; hickory-proto not in our lockfile), the pin guard, and the
-  core live checks on the mini (2026-11-22, all pass): mstsc on Windows 11 (picture, sound, resize, minimize
-  and restore, audio latency during resize, clipboard both ways, drive, the stuck-modifier reset, a wrong
-  password refused) and Windows App on Windows (connects first time). **48 h soak running since
-  2026-11-22 09:52 UTC** (sampler `~/macrdp-soak-79e763a0-samples.log` on the mini; ends 2026-11-24 09:52;
-  healthy at 33 h: no restarts or panics, memory at most 80 MB, at most 43 file handles).
-  Still to do: auto-reconnect after a network drop; FreeRDP; Windows App for macOS (blank recovery armed);
-  a takeover by a second client; connect-time auto-detect (`NETWORK_AUTODETECT=1`); and, with config
-  changes after the soak, microphone, camera, USB and smart card.
+- [ ] **Not yet checked live since the IronRDP 79e763a0 rebase (shipped in v0.10.10):** FreeRDP, Windows
+  App for macOS (blank recovery armed), a takeover by a second client, connect-time auto-detect
+  (`NETWORK_AUTODETECT=1`), and (needing config changes) microphone, camera, USB and smart card.
 
-- [ ] **Open PRs — review state (as of 2026-11-23).** Labels track it: `waiting on author` = the
-  contributor owes a change; everything else is ours. Merged 11-21→23: #274 #276 #277 #278.
-  - **#279** (@rophy, last H.264 pixel column and row) and **#280** (@rophy, emoji as one key event, Unicode
-    key ups) — reviewed, CI green; live checks after the soak (#279: Windows 11 mstsc and Windows App on
-    Windows and Mac; #280: the emoji panel into Terminal, TextEdit, a browser and VS Code).
-  - **#281** (@rophy, default session-size cap) — changes requested: cap the macroblock count (level 5.2,
-    36 864) keeping the aspect ratio, not 3840x2160 per dimension, which clamps a 16-inch MacBook Pro
-    Retina session (~3456x2168) and a 5120x1440 ultrawide; check whether VideoToolbox encodes 5120 wide.
-  - **#231 / #232** (@SferaDev) — nudged 2026-11-22: rebase (after #201), #231 first with a `recreate()`
-    that keeps HiDPI (the zhangyxXyz fork has one), live-test answers; #232 to drop or make opt-in the
-    session-long display-awake hold and the 3 s wait in `DetachedPrimary::drop`.
-  - **Clipboard file-index fixes** (ours, local branch `fix/clipboard-file-lock-snapshots`, reported by
-    Seiun Zhang in the zhangyxXyz fork): serve a locked Mac file paste from its own paths, and skip
-    descriptors ironrdp-cliprdr would drop so the file lists stay aligned. Rebased on `main` 2026-11-23 and
-    updated for ironrdp-cliprdr 0.9 (a request for an unknown lock fails, as the crate refuses it). Next:
-    live-test after the soak (a large paste with a new Mac copy made mid-paste), then open a PR.
-  - **Two UDP tunnels** (ours): lossy audio and EGFX on UDP in one session (design:
-    `docs/udp-two-tunnels-design.md`). Fork PRs clintcan/IronRDP#4 and #5 merged 2026-11-24
-    (`macrdp-79e763a0` tip `4651b21a`); #288 moves the pins, with the watchdog fix and the connection test.
-    Live-tested on mstsc (Windows 11). Next: merge #288.
+- [ ] **Open PRs — review state (as of 2026-11-24).** Labels track it: `waiting on author` = the
+  contributor owes a change; everything else is ours. Merged 11-21→24: #274 #276–#290.
+  - **#231 / #232** (@SferaDev) — he is away until at least 2026-12-01 and is fine with us taking them over.
+    #231: rebase (after #201) with a `recreate()` that keeps HiDPI (the zhangyxXyz fork has one), live test.
+    #232: drop or make opt-in the session-long display-awake hold and the 3 s wait in
+    `DetachedPrimary::drop`.
   - **zhangyxXyz/macrdp** (Seiun Zhang's fork): worth inviting PRs for screenshots as images, clipboard
     I/O off the connection loop, `mkdtemp` staging, capture-stop recovery, `SACLockScreenImmediate` for
     `--lock-on-disconnect`, and an opt-in File Provider paste. Not its power-default flip (`caffeinate
     -ims`) or per-session virtual display without live evidence.
-  - **Upstream IronRDP:** #2489 (ours: server-side connect-time auto-detect), #2465 (glamberson: drops our
-    divergence (30)), #2477 (zrip for QOIZ; we asked for a zstd-safe 7.4 floor). No replies yet.
+  - **Upstream IronRDP:** #2489 (ours: server-side connect-time auto-detect), #2514 (ours: cliprdr's
+    `initiate_file_copy` length check and silent renumbering), #2465 (glamberson: drops our divergence
+    (30)), #2477 (zrip for QOIZ; the zstd-safe 7.4 floor we asked for is in). No maintainer replies yet.
+  - **Cursor:** honour macOS's hidden flag without hiding the pointer while typing (Firefox's full-screen
+    video; see known-quirks and the saved patch).
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
