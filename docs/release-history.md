@@ -4,6 +4,33 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.10.10 — IronRDP rebased onto upstream, two UDP tunnels, clipboard and cursor fixes
+
+macrdp now builds on a current upstream IronRDP, lossy audio and video can both use UDP in one session, and a batch of fixes from contributors.
+
+- **IronRDP rebased onto upstream master 79e763a0 (#275, #276, thanks @rophy).** The fork's changes now sit on upstream code 295 commits newer, and 9 of them are no longer needed. Soaked for 48 hours with no restarts, panics or errors.
+- **Lossy audio and video on two UDP tunnels (#288).** With `--enable-lossy-audio` and `--udp-migrate-egfx` both on, mstsc is offered a second, reliable UDP tunnel for video next to the lossy one for audio. Before, video stayed on TCP. Live on Windows 11 mstsc: fast connect, monitor moves, minimize and restore. `MACRDP_UDP_SECOND_TUNNEL=0` turns it off.
+- **Mac file paste could be corrupted (#290, found by @zhangyxXyz).** Copying another file on the Mac while Windows was still pasting a large one could feed the rest of the paste the new file's bytes; and a file the client can't receive (a name too long, for example) shifted the numbering so another file was served.
+- **The client is told when Screen Recording is missing (#277, thanks @rophy).** If the permission is removed while macrdp runs, the client gets an "insufficient privileges" error instead of a silent failure (mstsc words it as the account not being authorized).
+- **Default session-size cap of 4096x2304 (#281, thanks @rophy).** Larger requests showed a black screen on mstsc and FreeRDP; `--max-client-size` still overrides it. Retina sessions (3456x2168) are not affected.
+- **Animated cursors (#284, #289, thanks @rophy),** such as Chrome's and Safari's busy cursor, now show, as a still image.
+- **Emoji typed from the client arrive as one character (#280, thanks @rophy),** and the last pixel column and row of the H.264 picture are painted (#279, thanks @rophy).
+- **Capture fixes (#282, #283, thanks @antonmos):** a resize left over from the previous connection no longer sets the next connection's size, and on the legacy bitmap path, screen areas changed in a dropped frame are repainted.
+- **`--version`, and the version in the startup log; a fatal error is now written to `macrdp.log` as well as stderr (#286, #287, thanks @rophy).**
+- **Opt-in: `--enable-mac-pointer-moves` (#285, thanks @rophy)** sends the Mac's own pointer moves to the client (off by default).
+- **Security:** `url` 2.5.9 for RUSTSEC-2026-0592 (#278).
+
+**Verified before release**
+
+- CI green on Linux and macOS; fmt (stable and nightly), clippy, all tests, `cargo deny` and the IronRDP pin guard pass.
+- 48-hour soak of the IronRDP rebase on the Mac mini: no restarts, panics or errors; memory flat.
+- Live on the Mac mini with mstsc (Windows 11): picture, sound, resize, minimize/restore, clipboard both ways, drive, stuck-modifier reset, wrong password refused, auto-reconnect; Windows App on Windows connects first time; two UDP tunnels; the paste race (300 MB, byte-exact); cursors.
+
+**Known issues**
+
+- A cursor hidden with macOS's hidden flag (Firefox's full-screen video) still shows on the client.
+- Windows App on Windows: a small audio/video offset at connect, fixed by the resync hotkey (also in v0.10.9).
+
 ## v0.10.9 — Windows App on Windows connects first time, connection-quality reporting, IronRDP from a fork
 
 The `v0.10.8` tag was never released: its release build stopped in the new IronRDP pin check (below), whose cleanup failed on GitHub's macOS runner after the check itself had passed. v0.10.9 is v0.10.8 plus that fix.

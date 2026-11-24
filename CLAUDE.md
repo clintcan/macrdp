@@ -23,13 +23,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.9** (v0.10.8 was tagged but never released; Windows App on Windows no longer loops
-through blank recovery, #273/#269; opt-in `--network-autodetect` with a connect-time
-bandwidth burst, #274/#235; every `ironrdp-*` crate from clintcan/IronRDP's `macrdp`
-branch, #271; the IronRDP pin guard, #272).
-**On `main`, unreleased:** IronRDP rebased onto upstream 79e763a0 (fork branch `macrdp-79e763a0`,
-#275/#276; 48 h soak from 2026-11-22 09:52 UTC), `url` 2.5.9 (#278), the Screen Recording error
-reaches the client (#277).
+(VPN/ZeroTier). **Latest release: v0.10.10** (IronRDP rebased onto upstream 79e763a0 on the fork
+branch `macrdp-79e763a0`, #275/#276, soaked 48 h; lossy audio and EGFX on two UDP tunnels, #288; the
+Mac file-paste race and file-index fixes, #290; contributor fixes #277 #279–#287; the cursor fallback fix, #289).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
