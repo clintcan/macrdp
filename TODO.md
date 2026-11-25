@@ -7,16 +7,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Plan after the v0.11.2 soak (agreed 2026-11-26), in order:** (1) the slow first connect
-  after a restart (below); (2) `VD_HIDPI=auto` together with `MULTI_MONITOR` (below); (3) the Dock and
-  menu bar on the remote primary: `--main-display-while-connected` (branch
-  `feat/main-display-while-connected`, live on a MacBook 2026-11-26 with one and two monitors), the one
-  thing window-follow doesn't move. Not now: Detach with multi-monitor (macOS 26
-  needs a restart per disconnect, #168), a physical primary for multi-monitor (only when the client's
-  size is one of the monitor's modes), Blank (lockable) with multi-monitor (only if local privacy
-  matters).
+- [ ] **Release v0.12.0 after the v0.11.2 soak analysis (soak ends 2026-11-27 12:42 UTC).** On `main`
+  and live-tested on MacBooks: #303 (quick first connect after a restart), #304
+  (`--main-display-while-connected`), #305 (`VD_HIDPI` with `MULTI_MONITOR`). Then switch the mini to
+  it with `VD_HIDPI=auto` and `MAIN_DISPLAY_WHILE_CONNECTED=1`, and check them there.
 
-- [ ] **Slow first connect after a restart (2026-11-25, live, Windows App for macOS at 3024x1898).**
+- [ ] **Slow first connect after a restart: remaining part (2026-11-25).** #303 fixed the re-mode
+  (last-session-size) and the blank-detector misfire. Still open: (3) below.
   Auth to first frame 15.8 s on the first connect after a macrdp restart, 0.4-0.7 s on the next two.
   The first needs the virtual display re-moded from `VD_WIDTH`x`VD_HEIGHT` (1920x1080) to the
   client's size; then ScreenCaptureKit took 5.4 s to start the capture and 4.4 s more for its first
@@ -27,15 +24,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (3) start the capture off the event loop, and find why SCK is slow after a re-mode (the same
   slowness as the multi-monitor in-place re-layout's "opening the captures").
 
-- [ ] **Not yet checked live since the IronRDP 79e763a0 rebase (shipped in v0.10.10):** FreeRDP, Windows
-  App for macOS (blank recovery armed), a takeover by a second client, connect-time auto-detect
-  (`NETWORK_AUTODETECT=1`), and (needing config changes) microphone, camera, USB and smart card.
+- [ ] **Not yet checked live since the IronRDP 79e763a0 rebase (shipped in v0.10.10):** FreeRDP and a
+  takeover by a second client. Checked 2026-11-25/26: microphone, drive, smart card (TPM virtual card),
+  camera, USB (after #300, broken v0.10.10-v0.11.1), Windows App for macOS (its blank-detector misfire
+  fixed in #303), and connect-time auto-detect (default on).
 
 - [ ] **Open PRs and issues — review state (as of 2026-11-25; no open PRs).** Labels track it: `waiting on author` = the
   contributor owes a change; everything else is ours. v0.10.10 released 2026-11-24 (#274 #276–#291 merged
   11-21→24; #275 closed).
-  - **Issues:** #237 ("can't connect unless already logged in") is the documented limit (README: someone has
-    to log in after a reboot); reply pointing there. #244 (universal binary and Intel support) needs a
+  - **Issues:** #237 ("can't connect unless already logged in") is answered and covered in the README; left
+    open as an enhancement. #244 (universal binary and Intel support) needs a
     decision on whether to build for Intel.
   - **zhangyxXyz/macrdp** (Seiun Zhang's fork): worth inviting PRs for screenshots as images, clipboard
     I/O off the connection loop, `mkdtemp` staging, capture-stop recovery, `SACLockScreenImmediate` for
@@ -637,19 +635,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].
-
-- [ ] **`VD_HIDPI=auto` together with `MULTI_MONITOR` (asked for 2026-11-25).** Branch
-  `feat/hidpi-with-multi-monitor` lifts the refusal (multi-monitor sessions at UI scale 1,
-  `capture::session_ui_scale`); live test on the mini after the soak (MacBook Retina client one-monitor
-  at 2x, then the Windows PC two-monitor at 1x, then back). Before: refused
-  together (a phase 1 shortcut). The mini runs multi-monitor for the Windows PC, so Windows App on the
-  MacBook ("Optimize for Retina displays" on) gets 3024x1898 at 1:1 and tiny text. Plan: multi-monitor
-  sessions stay at 1x (as now), one-monitor clients announcing 200% get the HiDPI desktop. Check what
-  the refusal guarded: the arrangement maths (points vs pixels, `display_origins` already takes
-  points-per-pixel), the extra displays (1:1), the input mapping, and switching a HiDPI main display
-  between ui_scale 2 and 1 across connections (see the HiDPI notes in known-quirks: never switch the
-  display's HiDPI-ness, only its point size). Workaround meanwhile: turn off "Optimize for Retina
-  displays" in Windows App.
 
 - [ ] **Multi-monitor (client-side multi-display), experimental.** Phase 1 shipped in v0.11.0; live
   layout changes work on mstsc and Windows App on Windows (2026-11-25, branch
