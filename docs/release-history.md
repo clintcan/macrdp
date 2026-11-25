@@ -4,6 +4,28 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.11.0 — Multi-monitor sessions, connection quality by default, windows that follow you
+
+A client's monitors can each get their own remote monitor, the client's connection-quality view works by default, and windows move to the remote session and back on their own.
+
+- **Multi-monitor sessions (experimental, #294).** With `--multi-monitor` (`MULTI_MONITOR=1`) and `--virtual-display`, a client using several monitors (mstsc "Use all my monitors", Windows App's multiple displays) gets one virtual display per monitor, arranged like the client's, each with its own capture and H.264 stream. Pointer events go to the monitor they land on, and the bitrate is split by monitor area. Off by default; one-monitor clients are unaffected. Needs two IronRDP fork changes (acceptor (8), server (36)) so the session uses the client's monitor layout.
+- **Connection quality reported by default (#293).** macrdp measures round-trip time and bandwidth (a 256 KiB burst while the client logs in, then small probes) and reports them, so mstsc and Windows App no longer warn "Your network might be slow" on a fast network. `NETWORK_AUTODETECT=0` or `--no-network-autodetect` turns it off. **Upgrading:** the v0.10.9 and v0.10.10 install template wrote `NETWORK_AUTODETECT=0`, which keeps it off; remove that line, or use the controller's new toggle.
+- **Windows follow you in plain virtual-display mode (#296).** `--restore-windows-on-disconnect` (`RESTORE_WINDOWS_ON_DISCONNECT=1`) now also works without a Detach/Blank mode: on connect the Mac's windows move onto the virtual display the client sees (the primary monitor in a multi-monitor session), on disconnect they move back to the Mac's screen. No more Ctrl+Alt+G on every connect.
+- **Controller (#294, #295, #296):** toggles for multi-monitor, connection-quality reporting and moving windows to the remote session.
+- **The virtual display survives being re-registered (#231, thanks @SferaDev).** When macOS gave the virtual display a new id (seen after a session ended while the Mac was locked with its displays asleep), every reconnect failed until a restart; macrdp now follows the new id, or recreates the display when it's gone.
+- **Connecting to a locked Mac with its displays asleep works (#232, thanks @SferaDev).** A client that authenticates wakes the displays, and capture waits for them.
+
+**Verified before release**
+
+- CI green on Linux and macOS; fmt (stable and nightly), clippy, all tests, `cargo deny` and the IronRDP pin guard pass.
+- Live on the Mac mini with Windows 11, two monitors (1920x1080 and 1366x768): multi-monitor on mstsc and Windows App on Windows (each monitor shows its display, clicks and window drags land right, a macrdp restart reconnects by itself, single-monitor sessions after a multi-monitor one are unchanged); windows gathered on connect and returned on disconnect; connection quality "good" on mstsc, Windows App and the legacy bitmap path; connecting to a locked Mac with its displays asleep.
+
+**Known issues**
+
+- Multi-monitor: moving or resizing the client window between layouts isn't followed, blank recovery is off, and it can't be combined with the Detach/Blank modes or a HiDPI virtual display. Windows App for macOS and the legacy bitmap path are untested.
+- A cursor hidden with macOS's hidden flag (Firefox's full-screen video) still shows on the client.
+- Windows App on Windows: a small audio/video offset at connect, fixed by the resync hotkey.
+
 ## v0.10.10 — IronRDP rebased onto upstream, two UDP tunnels, clipboard and cursor fixes
 
 macrdp now builds on a current upstream IronRDP, lossy audio and video can both use UDP in one session, and a batch of fixes from contributors.

@@ -14,10 +14,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
 - [ ] **Open PRs and issues — review state (as of 2026-11-25; no open PRs).** Labels track it: `waiting on author` = the
   contributor owes a change; everything else is ours. v0.10.10 released 2026-11-24 (#274 #276–#291 merged
   11-21→24; #275 closed).
-  - **#231 / #232** (@SferaDev) — taken over and MERGED 2026-11-24 (#231 `90e778d`, #232 `2afe581`; SferaDev author,
-    maintainer co-author). Live on the mini: locked + displays asleep → SCK lists no displays; #232 wakes them at
-    authentication and the session comes up. The re-registration itself (SCK listing a new id) not reproduced.
-    Not yet in a release.
   - **Issues:** #237 ("can't connect unless already logged in") is the documented limit (README: someone has
     to log in after a reboot); reply pointing there. #244 (universal binary and Intel support) needs a
     decision on whether to build for Intel.
