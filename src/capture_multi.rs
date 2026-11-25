@@ -160,6 +160,10 @@ async fn open_streams(
     let mut monitors = Vec::new();
     for (m, &id) in layout.monitors().iter().zip(display_ids) {
         let display = find_sck_display(id).await?;
+        tracing::debug!(
+            display_id = id,
+            "multi-monitor: SCK listed the display; starting its capture"
+        );
         // Captured 1:1 at the monitor's own size: no scaling, no letterbox.
         let config = SCStreamConfiguration::new()
             .with_width(u32::from(m.width))
@@ -170,8 +174,14 @@ async fn open_streams(
             .with_scales_to_fit(true)
             .with_preserves_aspect_ratio(false)
             .with_queue_depth(SCK_QUEUE_DEPTH);
-        let stream = DisplayStream::start(&display, &config)
-            .map_err(|e| anyhow!("SCStream::start_capture failed (display {id}): {e:?}"))?;
+        // `start` blocks until macOS confirms; on a blocking thread, so a
+        // caller's time limit can still end the wait.
+        let start_config = config.clone();
+        let stream =
+            tokio::task::spawn_blocking(move || DisplayStream::start(&display, &start_config))
+                .await
+                .map_err(|e| anyhow!("capture start task failed (display {id}): {e}"))?
+                .map_err(|e| anyhow!("SCStream::start_capture failed (display {id}): {e:?}"))?;
         monitors.push(MonitorStream {
             stream: Some(stream),
             display_id: id,
@@ -276,24 +286,59 @@ impl MultiCaptureUpdates {
     /// False if the displays couldn't be set up; the caller then falls back to
     /// a reactivation, which retries them.
     async fn relayout_in_place(&mut self, layout: Layout) -> Result<bool> {
+        // Each step is time-limited: a step that doesn't finish falls back to
+        // the reactivation, which rebuilds everything, instead of hanging the
+        // session (a step hung live 2026-11-25).
+        const STEP_LIMIT: Duration = Duration::from_secs(10);
         // Stop the old captures first, while their displays are unchanged.
+        tracing::info!("multi-monitor: in-place re-layout: stopping the captures");
         self.monitors.clear();
+        tracing::info!("multi-monitor: in-place re-layout: re-moding and arranging the displays");
         let relayout = self.relayout.clone();
         let sync_layout = layout.clone();
-        let ids = match tokio::task::spawn_blocking(move || relayout.sync_displays(&sync_layout))
-            .await
-            .map_err(|e| anyhow!("multi-monitor: display sync task failed: {e}"))?
-        {
-            Ok(ids) => ids,
-            Err(e) => {
+        let synced = tokio::time::timeout(
+            STEP_LIMIT,
+            tokio::task::spawn_blocking(move || relayout.sync_displays(&sync_layout)),
+        )
+        .await;
+        let ids = match synced {
+            Ok(Ok(Ok(ids))) => ids,
+            Ok(Ok(Err(e))) => {
                 tracing::warn!(
                     error = format!("{e:#}"),
                     "multi-monitor: re-laying out the displays in place failed; reactivating instead"
                 );
                 return Ok(false);
             }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "multi-monitor: the display sync task failed; reactivating instead");
+                return Ok(false);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "multi-monitor: the display sync took too long; reactivating instead"
+                );
+                return Ok(false);
+            }
         };
-        let monitors = open_streams(&layout, &ids, self.fps).await?;
+        tracing::info!(displays = ?ids, "multi-monitor: in-place re-layout: opening the captures");
+        let monitors =
+            match tokio::time::timeout(STEP_LIMIT, open_streams(&layout, &ids, self.fps)).await {
+                Ok(Ok(monitors)) => monitors,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "multi-monitor: opening the captures failed; reactivating instead"
+                    );
+                    return Ok(false);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "multi-monitor: opening the captures took too long; reactivating instead"
+                    );
+                    return Ok(false);
+                }
+            };
         let (w, h) = layout.desktop();
         *self
             .relayout
