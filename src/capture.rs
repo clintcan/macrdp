@@ -248,6 +248,15 @@ impl PendingResize {
         self.request(width, height);
     }
 
+    /// What [`take_layout`](Self::take_layout) would return, left in place.
+    pub fn peek_layout(&self) -> Option<Option<crate::monitor_layout::Layout>> {
+        self.inner
+            .layout_ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// The layout of the last consumed request, if it carried one. `Some(None)`
     /// means the session became single-monitor.
     pub fn take_layout(&self) -> Option<Option<crate::monitor_layout::Layout>> {
@@ -813,6 +822,24 @@ impl RdpServerDisplay for CaptureDisplay {
             .as_ref()
             .map_or(0, |l| l.monitors().len());
         u32::try_from(session).unwrap_or(2).clamp(2, 16)
+    }
+
+    /// The layout the reactivation in progress will serve (IronRDP fork,
+    /// server divergence (36)): a layout change the capture loop just
+    /// applied, not yet moved into `session_layout` (`updates()` does that),
+    /// or the current one. Without it the reactivation's Monitor Layout PDU
+    /// kept the connect-time layout, and a client whose layout changed drew
+    /// both monitors' pictures on one screen (live 2026-11-25).
+    async fn monitor_layout(&mut self) -> Option<Vec<Monitor>> {
+        let layout = match self.pending_resize.peek_layout() {
+            Some(change) => change,
+            None => self
+                .session_layout
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        };
+        layout.map(|l| l.client_monitors().to_vec())
     }
 
     async fn size(&mut self) -> DesktopSize {
@@ -3508,6 +3535,8 @@ mod tests {
         assert_eq!(pr.take_settled(Duration::from_secs(3600)), None);
         assert_eq!(pr.take_layout(), None);
         assert_eq!(pr.take_settled(Duration::ZERO), Some((3200, 1080)));
+        // The reactivation reads it before `updates()` takes it.
+        assert_eq!(pr.peek_layout(), Some(Some(layout.clone())));
         assert_eq!(pr.take_layout(), Some(Some(layout)));
         assert_eq!(pr.take_layout(), None);
     }
