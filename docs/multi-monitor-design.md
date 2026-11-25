@@ -106,9 +106,10 @@ resets the surfaces, the same way a single-monitor resize does today (deactivati
 Phase 1 works live on mstsc (Windows 11, two monitors): the layout is adopted, one virtual display per
 monitor, one capture stream and one surface + encoder per monitor (`src/capture_multi.rs`,
 `ExtraSurface` in `src/h264.rs`), pointer events go to the monitor they land on. Still to do for phase 1:
-live layout changes are ignored, blank recovery is off in these sessions, the adaptive bitrate's target
-applies to every encoder (the link carries the sum), and keyframe requests from the UDP and recovery paths
-reach the primary monitor only. mstsc's requested desktop size varies (1920x1080, its primary, or
+live layout changes are ignored and blank recovery is off in these sessions. Each encoder gets its
+monitor's area share of the link's (adaptive) bitrate target, so the link carries the target (live: 3
+Mbit/s split 1.99 + 1.01 for 1920x1080 + 1366x768), and link-wide keyframe requests (resume, tunnel
+recovery and de-migration, the end of an IDR backoff) reach every monitor. mstsc's requested desktop size varies (1920x1080, its primary, or
 3284x1080); the session size comes from the layout either way.
 
 ## Phases
