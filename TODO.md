@@ -12,6 +12,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (`--main-display-while-connected`), #305 (`VD_HIDPI` with `MULTI_MONITOR`). Then switch the mini to
   it with `VD_HIDPI=auto` and `MAIN_DISPLAY_WHILE_CONNECTED=1`, and check them there.
 
+- [ ] **Watch: mstsc loses sound after a long idle with the client PC's screen asleep (2026-11-26).**
+  Seen once on the mini (v0.11.2 soak build, audio over the lossy UDP tunnel, session up ~2 h): sound
+  gone on playing YouTube again; video fine; came back later on its own. Not the screen-sleep mute (that
+  flag pauses video and audio together). Either the lossy UDP tunnel died during the idle (audio sent
+  into it, unheard) or the PC's audio engine stayed asleep. Nothing at info level tells them apart.
+  Next time: keep playing, check the mini's UDP send/ack traffic live, then try Ctrl+Alt+Shift+R (sound
+  back = server side). After the soak: an info line every few minutes with audio sent per path and the
+  UDP tunnel's last client ack.
+
 - [ ] **Slow first connect after a restart: remaining part (2026-11-25).** #303 fixed the re-mode
   (last-session-size) and the blank-detector misfire. Still open: (3) below.
   Auth to first frame 15.8 s on the first connect after a macrdp restart, 0.4-0.7 s on the next two.
