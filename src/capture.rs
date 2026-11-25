@@ -638,6 +638,10 @@ pub struct CaptureDisplay {
     /// single-monitor client), and the extra virtual displays serving its
     /// non-primary monitors (`None` without --multi-monitor).
     pub session_layout: crate::multi_monitor::SessionLayout,
+    /// Where the main virtual display's size is remembered after each re-mode,
+    /// for the next start (src/last_size.rs). `None` without a virtual display
+    /// or with --no-client-resolution.
+    pub last_size_path: Option<std::path::PathBuf>,
     pub extra_displays: Option<Arc<std::sync::Mutex<crate::multi_monitor::ExtraDisplays>>>,
     /// --multi-monitor: the monitors and displays being served, for input.
     pub active_monitors: crate::multi_monitor::ActiveMonitors,
@@ -1306,6 +1310,9 @@ impl CaptureDisplay {
         match vd.resize(u32::from(mode_w), u32::from(mode_h), ui_scale) {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
+                if let Some(path) = self.last_size_path.as_deref() {
+                    crate::last_size::save(path, mode_w, mode_h);
+                }
                 let vd_id = vd.display_id();
                 tracing::info!(
                     width = mode_w,
@@ -3612,6 +3619,7 @@ mod tests {
             virtual_display: None,
             vd_hidpi: crate::virtual_display::HidpiPolicy::Off,
             session_layout: Arc::default(),
+            last_size_path: None,
             extra_displays: None,
             active_monitors: Arc::default(),
             pointer_ui_scale: Arc::new(AtomicU32::new(1)),

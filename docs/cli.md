@@ -24,7 +24,14 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Config key PASSWORD_FILE (turns the USE_KEYCHAIN default off;
                           #   an explicit USE_KEYCHAIN=1 with it is an error)
 --skip-auth               # bypass PAM (also skips password validation)
---width  / --height       # override autodetected display size
+--width  / --height       # override autodetected display size. With --virtual-display
+                          #   (VD_WIDTH/VD_HEIGHT) the display's starting size; with
+                          #   client-resolution auto-adopt on (the default) it starts
+                          #   instead at the last size it was re-moded to, kept in
+                          #   ~/Library/Application Support/macrdp/last-session-size,
+                          #   so a returning client's first connect needs no re-mode
+                          #   (that first connect took ~16 s instead of <1 s). Delete
+                          #   the file to start at VD_WIDTH/VD_HEIGHT again.
 --hidpi                   # capture the primary display at backing (Retina) pixels
                           #   instead of logical points (~4x pixels; crisp; best
                           #   with --enable-h264). Ignored with --width/--height
