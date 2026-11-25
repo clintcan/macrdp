@@ -167,10 +167,35 @@ impl WireFormat {
 
 /// Per-connection state, shared between the `Gfx` factory/handle (capture
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
+/// --multi-monitor: one non-primary monitor's EGFX surface and H.264 encoder
+/// (docs/multi-monitor-design.md). The primary monitor keeps using the
+/// connection's own `encoder` / `surface_id`; link-wide state (acks, RTT,
+/// adaptive bitrate, UDP) stays on `ConnectionContext` and is shared.
+struct ExtraSurface {
+    encoder: Option<Encoder>,
+    surface_id: u16,
+    dims: (u16, u16),
+    need_keyframe: bool,
+    /// Bitrate last applied to this encoder, to follow the link's target.
+    applied_bps: u32,
+    submitted: Arc<AtomicU64>,
+    shipped: Arc<AtomicU64>,
+}
+
+/// Which surface a ship thread ships for.
+#[derive(Clone, Copy, Debug)]
+enum ShipTarget {
+    Primary,
+    Extra(usize),
+}
+
 struct ConnectionContext {
     server_handle: GfxServerHandle,
     encoder: Option<Encoder>,
     surface_id: Option<u16>,
+    /// --multi-monitor: the non-primary monitors' surfaces, in the layout's
+    /// order (primary skipped). Empty in a single-monitor session.
+    extras: Vec<ExtraSurface>,
     is_ready: bool,
     epoch: Instant,
     /// True once the next shipped frame must be a forced keyframe (IDR):
@@ -2173,6 +2198,96 @@ impl Gfx {
     /// [`Self::submit_bgra`] for a capture-owned full-range NV12 pixel buffer
     /// (`--capture-nv12`): VideoToolbox encodes it as-is, with no CPU colour
     /// conversion and no copy. Same return contract.
+    /// --multi-monitor: submit one monitor's frame (`monitor` in the layout's
+    /// order) to that monitor's surface. The primary monitor goes through the
+    /// single-monitor path ([`submit_bgra`](Self::submit_bgra)); the others
+    /// through [`submit_extra`](Self::submit_extra). Same return contract.
+    pub fn submit_bgra_monitor(
+        &self,
+        monitor: usize,
+        primary: usize,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+        flush: bool,
+    ) -> Result<bool> {
+        if monitor == primary {
+            return self.submit_bgra(bgra, stride, request_keyframe, flush);
+        }
+        let extra = if monitor > primary {
+            monitor - 1
+        } else {
+            monitor
+        };
+        self.submit_extra(extra, bgra, stride, request_keyframe)
+    }
+
+    /// Encode a frame for extra surface `index`. Before the primary monitor's
+    /// first frame has set the surfaces up, reports "not ready".
+    fn submit_extra(
+        &self,
+        index: usize,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+    ) -> Result<bool> {
+        let mut guard = self.ctx.lock().unwrap();
+        let Some(ctx) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if !ctx.is_ready || ctx.surface_id.is_none() {
+            return Ok(false);
+        }
+        let target_bps = ctx.adaptive_target_bps;
+        let Some(extra) = ctx.extras.get_mut(index) else {
+            return Ok(false);
+        };
+        if extra.encoder.is_none() {
+            let (w, h) = extra.dims;
+            let mut encoder = Encoder::new(w, h, self.fps, target_bps, self.keyframe_secs)?;
+            let rx = encoder
+                .take_receiver()
+                .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
+            extra.encoder = Some(encoder);
+            extra.applied_bps = target_bps;
+            extra.submitted.store(0, Ordering::Relaxed);
+            extra.shipped.store(0, Ordering::Relaxed);
+            let gfx = self.clone();
+            let shipped = extra.shipped.clone();
+            std::thread::Builder::new()
+                .name("egfx-ship-extra".into())
+                .spawn(move || gfx.ship_loop(rx, shipped, ShipTarget::Extra(index)))
+                .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
+            info!(
+                monitor_extra = index,
+                w, h, "EGFX encoder for an extra monitor initialized + ship thread started"
+            );
+        }
+        // Drop-to-latest, per encoder, as for the primary.
+        let outstanding = extra
+            .submitted
+            .load(Ordering::Relaxed)
+            .saturating_sub(extra.shipped.load(Ordering::Relaxed));
+        if outstanding >= u64::from(self.max_in_flight) {
+            extra.need_keyframe = true;
+            return Ok(true);
+        }
+        let force_keyframe = std::mem::replace(&mut extra.need_keyframe, false) || request_keyframe;
+        let Some(encoder) = extra.encoder.as_mut() else {
+            return Ok(true);
+        };
+        // Follow the link's adaptive target (shared across monitors).
+        if extra.applied_bps != target_bps {
+            if let Err(e) = encoder.set_bitrate(target_bps) {
+                trace!(error = ?e, target_bps, "extra monitor set_bitrate failed");
+            }
+            extra.applied_bps = target_bps;
+        }
+        encoder.encode_bgra(bgra, stride, force_keyframe)?;
+        extra.submitted.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     pub fn submit_nv12(
         &self,
         pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
@@ -2295,7 +2410,9 @@ impl Gfx {
             // attempt) drop the connection so the client auto-reconnects.
             // Decision here (under ctx), action after the guard drops.
             // `qoe_reports` resets so a re-fire needs a fresh all-zero window.
-            if self.blank_recovery_enabled && ctx.surface_id.is_some() {
+            // Not with several monitors yet: its evidence (QoE) names a frame,
+            // not a surface, and its levers act on the primary surface only.
+            if self.blank_recovery_enabled && ctx.surface_id.is_some() && ctx.extras.is_empty() {
                 // A GENUINELY-ESTABLISHED connection clears the reconnect-storm
                 // guard: the consecutive-drop counter only tracks UNBROKEN runs
                 // of blank-dropped connections (see `blank_drop_capped`).
@@ -2960,7 +3077,12 @@ impl Gfx {
     /// capture tick. Bumps `shipped` per frame so the capture thread's
     /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        shipped: Arc<AtomicU64>,
+        target: ShipTarget,
+    ) {
         while let Ok(frame) = rx.recv() {
             // Sweep up any others VT delivered alongside it (keeps order).
             let mut frames = vec![frame];
@@ -2968,7 +3090,7 @@ impl Gfx {
                 frames.push(f);
             }
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames) {
+            if let Err(e) = self.ship_frames(&frames, target) {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
             shipped.fetch_add(n, Ordering::Relaxed);
@@ -3014,6 +3136,53 @@ impl Gfx {
                 }],
             };
             server.resize_with_monitors(width, height, monitors);
+            // --multi-monitor: one surface per monitor, each mapped at its
+            // monitor's desktop position (as xrdp does): mstsc never splits a
+            // single surface across its monitors (seen live 2026-11-25).
+            let layout = self
+                .session_layout
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .filter(|l| l.desktop() == (width, height));
+            if let Some(layout) = layout {
+                let primary = layout.primary();
+                ctx.extras.clear();
+                for (i, m) in layout.monitors().iter().enumerate() {
+                    let sid = server
+                        .create_surface_with_format(m.width, m.height, PixelFormat::XRgb)
+                        .ok_or_else(|| anyhow!("EGFX: create_surface failed (monitor {i})"))?;
+                    if !server.map_surface_to_output(sid, u32::from(m.x), u32::from(m.y)) {
+                        return Err(anyhow!("EGFX: map_surface_to_output failed (monitor {i})"));
+                    }
+                    info!(
+                        monitor = i,
+                        surface_id = sid,
+                        x = m.x,
+                        y = m.y,
+                        w = m.width,
+                        h = m.height,
+                        "EGFX surface created + mapped (multi-monitor)"
+                    );
+                    if i == primary {
+                        ctx.surface_id = Some(sid);
+                        ctx.dims = (m.width, m.height);
+                    } else {
+                        ctx.extras.push(ExtraSurface {
+                            encoder: None,
+                            surface_id: sid,
+                            dims: (m.width, m.height),
+                            need_keyframe: true,
+                            applied_bps: 0,
+                            submitted: Arc::new(AtomicU64::new(0)),
+                            shipped: Arc::new(AtomicU64::new(0)),
+                        });
+                    }
+                }
+            }
+        }
+        if ctx.surface_id.is_none() {
+            let mut server = ctx.server_handle.lock().unwrap();
             // Create the surface with upstream's auto-allocated id. mstsc retains
             // EGFX surfaces by id for its whole process lifetime and no-ops a
             // CreateSurface for an id it already holds, so a reconnect to the
@@ -3071,7 +3240,7 @@ impl Gfx {
             let shipped = ctx.shipped.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped))
+                .spawn(move || gfx.ship_loop(rx, shipped, ShipTarget::Primary))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -3222,6 +3391,7 @@ impl Gfx {
             // encoder and resets the throttle counters).
             ctx.encoder = None;
             ctx.surface_id = None;
+            ctx.extras.clear();
             ctx.need_keyframe = true;
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
@@ -3264,10 +3434,22 @@ impl Gfx {
     /// the client has acknowledged everything already shipped (at most
     /// [`RESYNC_DRAIN_MAX`]), so the IDR doesn't queue behind a video backlog.
     /// See [`resync_drain_step`].
+    /// Every monitor's next frame is a keyframe (no drain, no log): a
+    /// multi-monitor session resuming from a minimize.
+    pub(crate) fn request_keyframe_all(&self) {
+        if let Ok(mut guard) = self.ctx.lock() {
+            if let Some(ctx) = guard.as_mut() {
+                ctx.need_keyframe = true;
+                ctx.extras.iter_mut().for_each(|e| e.need_keyframe = true);
+            }
+        }
+    }
+
     pub(crate) fn force_keyframe(&self) {
         if let Ok(mut guard) = self.ctx.lock() {
             if let Some(ctx) = guard.as_mut() {
                 ctx.need_keyframe = true;
+                ctx.extras.iter_mut().for_each(|e| e.need_keyframe = true);
                 ctx.resync_drain_until = Some(Instant::now() + RESYNC_DRAIN_MAX);
             }
         }
@@ -3290,6 +3472,7 @@ impl Gfx {
         if let Ok(mut guard) = self.ctx.lock() {
             if let Some(ctx) = guard.as_mut() {
                 ctx.need_keyframe = true;
+                ctx.extras.iter_mut().for_each(|e| e.need_keyframe = true);
             }
         }
         info!(
@@ -3342,7 +3525,7 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
+    fn ship_frames(&self, frames: &[EncodedFrame], target: ShipTarget) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -3361,10 +3544,20 @@ impl Gfx {
                 let ctx = guard
                     .as_mut()
                     .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
-                let surface_id = ctx
-                    .surface_id
-                    .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
-                let (width, height) = ctx.dims;
+                let (surface_id, (width, height)) = match target {
+                    ShipTarget::Primary => (
+                        ctx.surface_id
+                            .ok_or_else(|| anyhow!("EGFX: no surface_id"))?,
+                        ctx.dims,
+                    ),
+                    ShipTarget::Extra(i) => {
+                        let extra = ctx
+                            .extras
+                            .get(i)
+                            .ok_or_else(|| anyhow!("EGFX: extra surface {i} gone"))?;
+                        (extra.surface_id, extra.dims)
+                    }
+                };
                 let epoch = ctx.epoch;
                 // Liveness for ack-driven IDR recovery: we're actively shipping.
                 ctx.last_ship_at = Instant::now();
@@ -3410,7 +3603,9 @@ impl Gfx {
                 // into the RTT ring so `on_frame_ack` can time this frame's
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
-                    last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+                    // Max, not store: with several monitors, ship threads can
+                    // record their frames out of order.
+                    last_shipped.fetch_max(u64::from(frame_id), Ordering::Relaxed);
                     // stats: no-op unless --stats-endpoint.
                     if let Some(s) = crate::stats::global() {
                         s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);
@@ -3559,6 +3754,7 @@ impl Gfx {
             server_handle: handle.clone(),
             encoder: None,
             surface_id: None,
+            extras: Vec::new(),
             is_ready: false,
             epoch: Instant::now(),
             need_keyframe: true,
@@ -3762,6 +3958,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.is_ready = true;
                 ctx.egfx_ever_ready = true;
                 ctx.need_keyframe = true;
+                ctx.extras.iter_mut().for_each(|e| e.need_keyframe = true);
                 info!(?negotiated, "EGFX channel ready (H.264 active)");
             } else {
                 ctx.is_ready = false;
@@ -3962,6 +4159,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             ctx.is_ready = false;
             ctx.encoder = None;
             ctx.surface_id = None;
+            ctx.extras.clear();
             ctx.need_keyframe = true;
         } else {
             debug!("EGFX on_close: graphics channel closed (no active context)");

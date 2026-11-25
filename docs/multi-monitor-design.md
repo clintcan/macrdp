@@ -71,6 +71,14 @@ an index. `pick_display_id` (#231) and the HiDPI registry (one display today) be
 - **Legacy bitmap path:** composite all displays into one desktop, since bitmap updates carry desktop
   coordinates. Phase 2.
 
+**Tried and rejected (2026-11-25): one wide surface.** Compositing every display into one
+desktop-sized frame on a single surface kept the H.264 code unchanged, but mstsc never split a single
+surface across its monitors: it scaled the whole desktop into one monitor (whichever came first in the
+Monitor Layout PDU), and with the primary listed first, into both. Listing the primary first in either
+message and reporting a 16-monitor maximum (MS-RDPEDISP `MaxNumMonitors`) didn't change that. One surface
+per monitor, as xrdp does (`xrdp_mm_egfx_create_surfaces`), works: live on mstsc with a 1920x1080 primary
+and a 1366x768 monitor to its right, each monitor shows its own display.
+
 ### 4. Input
 
 Each pointer event is hit-tested against the monitor rectangles (client coordinates) and mapped onto that
@@ -92,6 +100,16 @@ resets the surfaces, the same way a single-monitor resize does today (deactivati
   disturbs the others.
 - **Audio** binds to the virtual display; with several, it binds to the primary.
 - **The app-switcher HUD** shows on the primary.
+
+## Status (2026-11-25)
+
+Phase 1 works live on mstsc (Windows 11, two monitors): the layout is adopted, one virtual display per
+monitor, one capture stream and one surface + encoder per monitor (`src/capture_multi.rs`,
+`ExtraSurface` in `src/h264.rs`), pointer events go to the monitor they land on. Still to do for phase 1:
+live layout changes are ignored, blank recovery is off in these sessions, the adaptive bitrate's target
+applies to every encoder (the link carries the sum), and keyframe requests from the UDP and recovery paths
+reach the primary monitor only. mstsc's requested desktop size varies (1920x1080, its primary, or
+3284x1080); the session size comes from the layout either way.
 
 ## Phases
 

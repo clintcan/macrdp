@@ -17,6 +17,12 @@ use crate::virtual_display::VirtualDisplay;
 /// display updates start.
 pub type SessionLayout = Arc<Mutex<Option<Layout>>>;
 
+/// The monitors being served and the virtual display behind each (in the
+/// layout's order), for input to send a pointer event to the monitor it lands
+/// on. Set when a multi-monitor capture starts, cleared for a single-monitor
+/// session.
+pub type ActiveMonitors = Arc<Mutex<Option<(Layout, Vec<u32>)>>>;
+
 /// The descriptor serial for extra display `index`: the pid with the index
 /// (from 1) in the top byte, so it never equals the main display's serial
 /// (the pid) or another extra's. macOS pids are below 2^24.

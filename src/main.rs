@@ -17,6 +17,8 @@ mod auth_status;
 mod avc444;
 mod camera;
 mod capture;
+#[cfg(target_os = "macos")]
+mod capture_multi;
 mod clipboard;
 mod clipboard_rich;
 mod conn_hooks;
@@ -345,9 +347,9 @@ struct Args {
     /// arranged like the client's. Requires --virtual-display; not yet with
     /// --virtual-display-hidpi, the headless modes (--capture-primary,
     /// --detach-primary, --shield-primary, --make-primary) or
-    /// --no-client-resolution. Until multi-monitor phase 1 is finished only the
-    /// primary monitor is captured. Config: MULTI_MONITOR=1. See
-    /// docs/multi-monitor-design.md.
+    /// --no-client-resolution. Each monitor gets its own capture and H.264
+    /// surface. Not yet: live layout changes, blank recovery. Config:
+    /// MULTI_MONITOR=1. See docs/multi-monitor-design.md.
     #[arg(long)]
     multi_monitor: bool,
 
@@ -3123,8 +3125,9 @@ async fn async_main() -> Result<()> {
             return Err(anyhow!("--multi-monitor {why}"));
         }
         warn!(
-            "--multi-monitor is EXPERIMENTAL and unfinished: a multi-monitor client gets one \
-             virtual display per monitor, but only the primary monitor is captured yet"
+            "--multi-monitor is EXPERIMENTAL: a multi-monitor client gets one virtual display, \
+             capture and H.264 surface per monitor; live layout changes are ignored and blank \
+             recovery is off in these sessions"
         );
     }
     if args.virtual_display_hidpi.is_some() && !args.virtual_display {
@@ -3805,6 +3808,7 @@ async fn async_main() -> Result<()> {
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
     // --multi-monitor: written by `MonitorLayoutHook` when a client connects.
     let session_layout: multi_monitor::SessionLayout = Arc::default();
+    let active_monitors: multi_monitor::ActiveMonitors = Arc::default();
     #[cfg(target_os = "macos")]
     let gfx = args.enable_h264.then(|| {
         h264::Gfx::new(
@@ -3886,6 +3890,7 @@ async fn async_main() -> Result<()> {
         virtual_display: virtual_display.clone(),
         vd_hidpi: vd_hidpi.clone(),
         session_layout: session_layout.clone(),
+        active_monitors: active_monitors.clone(),
         extra_displays: args.multi_monitor.then(|| {
             Arc::new(std::sync::Mutex::new(
                 multi_monitor::ExtraDisplays::default(),
@@ -3918,7 +3923,8 @@ async fn async_main() -> Result<()> {
         click_signal,
         args.keyboard_layout.clone(),
         Some(keyboard_layout_klid.clone()),
-    )?;
+    )?
+    .with_active_monitors(active_monitors.clone());
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {

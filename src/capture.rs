@@ -22,7 +22,7 @@ use ironrdp_server::{
 /// becomes a `ServerErrorKind::ErrorInfo` error: the server then sends
 /// ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES, so the client shows why the
 /// connection ended.
-fn display_error(error: anyhow::Error) -> ServerError {
+pub(crate) fn display_error(error: anyhow::Error) -> ServerError {
     use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
     if error.downcast_ref::<ScreenRecordingDenied>().is_some() {
         return ServerError::new(
@@ -521,6 +521,8 @@ pub struct CaptureDisplay {
     /// non-primary monitors (`None` without --multi-monitor).
     pub session_layout: crate::multi_monitor::SessionLayout,
     pub extra_displays: Option<Arc<std::sync::Mutex<crate::multi_monitor::ExtraDisplays>>>,
+    /// --multi-monitor: the monitors and displays being served, for input.
+    pub active_monitors: crate::multi_monitor::ActiveMonitors,
     /// The session's UI scale for the pointer (see `pointer_scale`): set at
     /// connect and from each monitor layout, and read live by the capture
     /// loop so a scale change resends the pointer.
@@ -683,6 +685,17 @@ impl RdpServerDisplay for CaptureDisplay {
         DesktopSize { width, height }
     }
 
+    /// --multi-monitor: tell the client (MS-RDPEDISP `MaxNumMonitors`) that
+    /// the session takes up to 16 monitors. Left at 1, mstsc drew the whole
+    /// multi-monitor desktop scaled into one monitor.
+    async fn monitor_count(&mut self) -> u32 {
+        if self.extra_displays.is_some() {
+            16
+        } else {
+            1
+        }
+    }
+
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         let (width, height) = self.desktop_size.get();
 
@@ -783,6 +796,20 @@ impl RdpServerDisplay for CaptureDisplay {
     /// surface swap without the core reactivation was tried first and was
     /// visually broken on a real client).
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+        // --multi-monitor: live layout changes aren't handled yet (phase 2);
+        // treating one as a single-monitor resize would break the session.
+        if self
+            .session_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            tracing::info!(
+                monitors = layout.monitors().len(),
+                "multi-monitor: ignoring a mid-session layout change (not supported yet)"
+            );
+            return;
+        }
         let resizable = self.auto_size || self.virtual_display.is_some();
         if !resizable {
             tracing::debug!(
@@ -1180,11 +1207,75 @@ impl CaptureDisplay {
 
     /// The body of [`RdpServerDisplay::updates`], parameterized on the final
     /// session size so the virtual-display sync above decides it first.
+    /// The multi-monitor capture, when this connection adopted a layout and
+    /// its extra displays are up; `None` to capture one display as usual.
+    #[cfg(target_os = "macos")]
+    async fn build_multi_updates(
+        &mut self,
+    ) -> Result<Option<Box<dyn RdpServerDisplayUpdates + Send>>> {
+        let layout = self
+            .session_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (Some(layout), Some(extras), Some(vd)) = (
+            layout,
+            self.extra_displays.clone(),
+            self.virtual_display.clone(),
+        ) else {
+            return Ok(None);
+        };
+        let main = vd
+            .lock()
+            .expect("virtual display mutex poisoned")
+            .display_id();
+        let extra_ids = extras.lock().unwrap_or_else(|e| e.into_inner()).ids();
+        if extra_ids.len() + 1 != layout.monitors().len() {
+            tracing::warn!(
+                monitors = layout.monitors().len(),
+                displays = extra_ids.len() + 1,
+                "multi-monitor: not every monitor has a display; capturing the main one only"
+            );
+            return Ok(None);
+        }
+        let ids = crate::capture_multi::display_ids(&layout, main, &extra_ids);
+        *self
+            .active_monitors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((layout.clone(), ids.clone()));
+        let updates = crate::capture_multi::MultiCaptureUpdates::start(
+            &layout,
+            &ids,
+            self.fps,
+            self.gfx.clone(),
+            self.cursor_scale,
+            self.flush_frames,
+            self.display_suppressed.clone(),
+            self.desktop_size.clone(),
+        )
+        .await
+        .map_err(screen_recording_denied)?;
+        Ok(Some(Box::new(updates)))
+    }
+
     async fn build_updates(
         &mut self,
         width: u16,
         height: u16,
     ) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        // --multi-monitor with an adopted layout: one stream per monitor,
+        // composited (src/capture_multi.rs).
+        *self
+            .active_monitors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        #[cfg(target_os = "macos")]
+        if let Some(inner) = self.build_multi_updates().await? {
+            return Ok(match self.session_tracker.clone() {
+                Some(tracker) => Box::new(CountedUpdates::new(inner, tracker)),
+                None => inner,
+            });
+        }
         #[cfg(target_os = "macos")]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
             macos::ScreenCaptureUpdates::start(
@@ -1268,7 +1359,7 @@ fn sck_needs_frame_cap(fps: u32, display_hz: f64) -> bool {
 
 /// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
 /// Returns the rect unchanged when it already fits.
-fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
+pub(crate) fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
@@ -1288,7 +1379,7 @@ fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
 }
 
 #[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod macos {
     use super::*;
 
     use anyhow::{anyhow, Context};
@@ -1304,7 +1395,7 @@ mod macos {
     /// SCK's surface-pool depth: its default (3) plus one for the frame the
     /// flush burst keeps retained (`ScreenCaptureUpdates::last_frame`), so
     /// holding it doesn't shrink the headroom SCK had before.
-    const SCK_QUEUE_DEPTH: u32 = 4;
+    pub(crate) const SCK_QUEUE_DEPTH: u32 = 4;
 
     /// SCK's surface-pool depth in NV12 mode (its maximum). There the encoder
     /// holds capture surfaces too — VideoToolbox retains each frame until it is
@@ -1316,7 +1407,7 @@ mod macos {
     /// the gate engages. A real minimize lasts seconds-to-minutes and
     /// trips easily; backpressure flaps under heavy local CPU/IO last
     /// tens of ms and are filtered out. 1 second is comfortably between.
-    const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
+    pub(crate) const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
     /// How long after a capture starts a pre-EGFX frame is kept for
     /// re-sending over H.264. The pipeline is normally ready ~100-250 ms
     /// after the first frame; this only bounds the copy for a client that
@@ -1393,7 +1484,7 @@ mod macos {
     /// something else changes there. (EGFX sends whole frames and doesn't
     /// need this.)
     #[derive(Debug, Default, PartialEq)]
-    enum LostDamage {
+    pub(crate) enum LostDamage {
         #[default]
         Nothing,
         Rects(Vec<CGRect>),
@@ -1459,13 +1550,16 @@ mod macos {
     /// An SCK display capture whose `next()` returns `None` once SCK stops it.
     /// `AsyncSCStream` has no delegate, so a stream SCK stops (its display went
     /// away, as on display sleep) would leave `next()` pending forever.
-    struct DisplayStream {
+    pub(crate) struct DisplayStream {
         stream: SCStream,
         samples: Arc<Samples>,
     }
 
     impl DisplayStream {
-        fn start(display: &SCDisplay, config: &SCStreamConfiguration) -> Result<Self, SCError> {
+        pub(crate) fn start(
+            display: &SCDisplay,
+            config: &SCStreamConfiguration,
+        ) -> Result<Self, SCError> {
             let filter = SCContentFilter::create()
                 .with_display(display)
                 .with_excluding_windows(&[])
@@ -1494,7 +1588,7 @@ mod macos {
         }
 
         /// The next sample, with what changed in samples dropped before it.
-        async fn next(&self) -> Option<(CMSampleBuffer, LostDamage)> {
+        pub(crate) async fn next(&self) -> Option<(CMSampleBuffer, LostDamage)> {
             loop {
                 {
                     let mut q = self.samples.queue.lock().unwrap();
@@ -1812,7 +1906,7 @@ mod macos {
     }
 
     /// Finds `target` in SCK's list, retrying while SCK trails WindowServer.
-    async fn find_sck_display(
+    pub(crate) async fn find_sck_display(
         target: u32,
     ) -> Result<screencapturekit::shareable_content::SCDisplay> {
         let mut attempt = 0;
@@ -2390,7 +2484,7 @@ mod macos {
 
     /// Build a `BitmapUpdate` for a sub-rectangle of the captured frame by
     /// copying the rect's pixels into a tightly-packed buffer.
-    fn rect_update(
+    pub(crate) fn rect_update(
         src: &[u8],
         src_stride: usize,
         x: u16,
@@ -3141,6 +3235,7 @@ mod tests {
             vd_hidpi: crate::virtual_display::HidpiPolicy::Off,
             session_layout: Arc::default(),
             extra_displays: None,
+            active_monitors: Arc::default(),
             pointer_ui_scale: Arc::new(AtomicU32::new(1)),
             captured_primary: None,
             shielded_primary: None,
