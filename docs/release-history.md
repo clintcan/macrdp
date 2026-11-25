@@ -4,6 +4,24 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.11.2 — USB redirection works again
+
+USB redirection has presented no devices since v0.10.10; this release fixes it, and quiets a log warning.
+
+- **Fixed: USB redirection (#300).** From v0.10.10 to v0.11.1 a redirected USB device never appeared on the Mac. The IronRDP rebase in v0.10.10 changed how one handshake message is decoded, and macrdp's USB code stopped answering it (clintcan/IronRDP#8). Also, a device's control channel no longer stalls when its transfer ring wraps.
+- **Quieter logs with `RUST_LOG` set, and a warning for a bad one (#292, thanks @rophy).** With `RUST_LOG` set, rustls no longer logs an "Illegal SNI extension" warning on every mstsc or FreeRDP connection; an invalid `RUST_LOG` is reported at startup instead of being silently ignored.
+
+**Verified before release**
+
+- CI green on Linux and macOS; fmt (stable and nightly), clippy, all tests, `cargo deny` and the IronRDP pin guard pass.
+- Live on the Mac mini with Windows 11 mstsc: an Xbox controller redirected over RemoteFX USB works on the Mac; microphone, drive, smart-card (a TPM virtual smart card) and camera redirection re-verified on the rebased IronRDP.
+
+**Known issues**
+
+- USB: after an auto-reconnect mstsc doesn't re-offer redirected USB devices (connect afresh); mstsc sometimes resets a device by itself shortly after connecting, and it comes back about 15 s later.
+- Multi-monitor: a layout change takes 2–6 s to appear; adding or removing a monitor mid-session, the Detach/Blank modes and Windows App for macOS are untested or unsupported.
+- A cursor hidden with macOS's hidden flag (Firefox's full-screen video) still shows on the client.
+
 ## v0.11.1 — Multi-monitor follows layout changes, and stops leaking captures
 
 Multi-monitor sessions now follow a client's monitor changes without reconnecting, and a capture leak in v0.11.0's multi-monitor sessions is fixed.
