@@ -7,6 +7,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **Plan after the v0.11.2 soak (agreed 2026-11-26), in order:** (1) the slow first connect
+  after a restart (below); (2) `VD_HIDPI=auto` together with `MULTI_MONITOR` (below); (3) the Dock and
+  menu bar on the remote primary: make the virtual display main while a client is connected and give
+  it back on disconnect (`--make-primary`, but per session; check it against multi-monitor's
+  arrangement), the one thing window-follow doesn't move. Not now: Detach with multi-monitor (macOS 26
+  needs a restart per disconnect, #168), a physical primary for multi-monitor (only when the client's
+  size is one of the monitor's modes), Blank (lockable) with multi-monitor (only if local privacy
+  matters).
+
 - [ ] **Slow first connect after a restart (2026-11-25, live, Windows App for macOS at 3024x1898).**
   Auth to first frame 15.8 s on the first connect after a macrdp restart, 0.4-0.7 s on the next two.
   The first needs the virtual display re-moded from `VD_WIDTH`x`VD_HEIGHT` (1920x1080) to the
