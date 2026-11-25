@@ -56,8 +56,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   captured down from the 2x backing. Normal-size UI
                           #   either way. 1x clients wider than ~2048 px fall back
                           #   to half-size UI. Config: VD_HIDPI=auto.
---multi-monitor           # EXPERIMENTAL, IN PROGRESS (multi-monitor phase 1,
-                          #   docs/multi-monitor-design.md). One remote monitor per
+--multi-monitor           # EXPERIMENTAL (docs/multi-monitor-design.md). One remote monitor per
                           #   client monitor (mstsc "Use all my monitors"): the
                           #   --virtual-display serves the client's primary monitor
                           #   and macrdp adds a virtual display per other monitor,
@@ -67,9 +66,13 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   the headless modes and --no-client-resolution for now.
                           #   Each monitor gets its own capture and H.264 surface
                           #   (needs --enable-h264 for that; otherwise legacy bitmaps).
-                          #   Live layout changes are ignored and blank recovery is
-                          #   off in these sessions. Works live on mstsc and Windows
-                          #   App on Windows with two monitors. Config: MULTI_MONITOR=1.
+                          #   A layout the client changes mid-session (a monitor's
+                          #   resolution, say) is applied in place, 2-6 s after the
+                          #   client reports it. Works live on mstsc and Windows App
+                          #   on Windows with two monitors. Config: MULTI_MONITOR=1.
+                          #   MACRDP_MULTI_MONITOR_MAX (config MULTI_MONITOR_MAX,
+                          #   1-16) overrides the most monitors a mid-session layout
+                          #   may have (default: the session's count, at least 2).
 --fps N                   # default 60 with --enable-h264, else 15
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your

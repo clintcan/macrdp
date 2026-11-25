@@ -977,8 +977,11 @@ mod macos {
             // display created at 960x540 points stayed there for a 1x
             // 1920x1080 client. Selecting the mode explicitly replaces the
             // stored one.
+            // Plain 1:1 displays too: a multi-monitor extra display created at
+            // 1280x720 stayed there when re-moded to 1366x768 (live
+            // 2026-11-25), the larger mode's list still holding 1280x720.
             let mut taken = self.take_mode(mode_w, mode_h);
-            if !taken && self.hidpi {
+            if !taken {
                 taken = self.select_mode(mode_w, mode_h);
             }
             if !taken {
@@ -1017,12 +1020,14 @@ mod macos {
         }
 
         /// After `mode_w × mode_h` points was applied but macOS kept another
-        /// mode, select the 2x-backed one from the display's mode list.
-        /// False when it isn't listed or didn't land.
+        /// mode, select it from the display's mode list: the 2x-backed one on
+        /// a HiDPI display, the 1:1 one otherwise. False when it isn't listed
+        /// or didn't land.
         fn select_mode(&mut self, mode_w: u32, mode_h: u32) -> bool {
             let before = CGDisplay::new(self.display_id).bounds().size;
             let before = (before.width as u32, before.height as u32);
-            let landed = select_mode_out_of_process(self.display_id, mode_w, mode_h, 2 * mode_w)
+            let pixel_w = if self.hidpi { 2 * mode_w } else { mode_w };
+            let landed = select_mode_out_of_process(self.display_id, mode_w, mode_h, pixel_w)
                 .and_then(|listed| {
                     if !listed {
                         return Err(anyhow!("the display doesn't list that mode"));
@@ -1033,8 +1038,9 @@ mod macos {
                 Ok(landed) => {
                     tracing::info!(
                         points = ?(mode_w, mode_h),
+                        pixel_w,
                         ?landed,
-                        "virtual display kept its previous mode — selected the HiDPI mode"
+                        "virtual display kept its previous mode — selected the mode from its list"
                     );
                     matches!(landed, Landed::Exact)
                 }
@@ -1042,7 +1048,7 @@ mod macos {
                     tracing::info!(
                         points = ?(mode_w, mode_h),
                         error = %format!("{e:#}"),
-                        "virtual display: selecting the HiDPI mode didn't work"
+                        "virtual display: selecting the mode from its list didn't work"
                     );
                     false
                 }

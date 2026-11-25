@@ -1,6 +1,7 @@
 # Multi-monitor sessions: design
 
-Status: **design, not started** (2026-11-25). Replaces the June 2026 exploration, which stopped at the
+Status: **phase 1 shipped in v0.11.0; live layout changes (phase 2, part one) work on mstsc and
+Windows App on Windows** (2026-11-25). Replaces the June 2026 exploration, which stopped at the
 acceptor's single-monitor layout; most of that blocker has since gone upstream.
 
 ## Goal
@@ -122,6 +123,51 @@ recovery and de-migration, the end of an IDR backoff) reach every monitor. mstsc
   restart never opened the graphics channel.
 - Frames that arrive while EGFX is negotiating are held per monitor and re-sent; a static display sends
   no new ones.
+
+## Live layout changes (2026-11-25)
+
+A client reports a changed layout (a monitor's resolution changed, say) over MS-RDPEDISP. macrdp
+advertises the session's monitor count as the maximum (at least 2; `MACRDP_MULTI_MONITOR_MAX`
+overrides). `CaptureDisplay::request_layout` validates it (`Layout::from_mid_session`, the acceptor's
+connect-time rules) and queues it with the debounced resize (`PendingResize::request_with_layout`).
+
+- **Multi-monitor to multi-monitor with H.264: in place** (`MultiCaptureUpdates::start_relayout`).
+  MS-RDPEDISP 1.3: a server using the graphics pipeline applies a layout by restarting the pipeline
+  with the surface commands; deactivation-reactivation is for servers that don't. The captures stop, a
+  task re-modes and arranges the displays and opens new captures, then the switch-over sets the session
+  layout, the input map and the desktop size, and resets the EGFX state; the next frame deletes the
+  surfaces, sends `RESET_GRAPHICS` with the new monitors and creates new ones. 2-6 s from the client's
+  report to the new picture: re-mode and arrange ~1.5 s, opening the captures 0.1-4 s.
+- **Without H.264, or between one and several monitors: deactivation-reactivation**, with the layout
+  applied by `updates()` (`PendingResize::take_layout`) and sent in the Monitor Layout PDU by IronRDP
+  fork divergences (8)/(36) (`RdpServerDisplay::monitor_layout`).
+- **Blank recovery is on in multi-monitor sessions** (reactivate at the session's desktop size, then
+  drop); the per-surface re-map lever is off there.
+
+**Lessons (all live, 2026-11-25).**
+- A core reactivation is the wrong tool with H.264: after one, mstsc sometimes kept a one-monitor
+  full-screen window and drew both monitors on it until Ctrl+Alt+Break twice.
+- `next_update` is cancelled whenever the server's select picks another event (input, say). Work with
+  awaits in it (the re-layout) must be a spawned task whose handle is awaited, or it is abandoned half
+  way; the first in-place version stopped the captures and never applied the layout.
+- `SCStream::stop_capture` blocks until macOS confirms and, for a stream whose display was just
+  re-moded, may never return: captures are stopped before re-moding, on their own thread
+  (`stop_detached`). Dropping an `SCStream` doesn't stop it; until this fix every multi-monitor session
+  (v0.11.0) leaked its captures.
+- macOS can keep a 1:1 virtual display on its stored mode after `applySettings:` (an extra display
+  stayed 1280x720 when asked for 1366x768); the out-of-process mode selection now covers 1:1 displays.
+- A re-layout takes longer than the session watcher's 2.5 s grace, so a reactivation macrdp triggers
+  now holds the session count (`SessionTracker::hold_for_reactivation`); before, window-follow swept
+  every window away and back.
+- Blank recovery's reactivation must use the session's desktop size: at the primary surface's size it
+  told mstsc the desktop was one monitor.
+- **Windows App on Windows reports a changed layout only when its window changes state** (after a
+  minimize and restore, or Ctrl+Alt+Break); changing a monitor's resolution while it stays put sends
+  nothing, and it draws the old desktop squeezed onto one monitor until it reports. mstsc reports at once.
+
+**Follow-up:** faster re-layout: keep the captures of monitors whose size didn't change, and update the
+others with `update_configuration` instead of restarting them (carefully: a stop on a re-moded display
+hung). Adding or removing a monitor mid-session and the headless modes are still untested/unsupported.
 
 ## Phases
 

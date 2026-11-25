@@ -2917,6 +2917,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
         ("STATS_PORT", "MACRDP_STATS_PORT"),
+        // --multi-monitor: the most monitors a mid-session layout may have
+        // (CaptureDisplay::monitor_count).
+        ("MULTI_MONITOR_MAX", "MACRDP_MULTI_MONITOR_MAX"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
@@ -3131,8 +3134,7 @@ async fn async_main() -> Result<()> {
         }
         warn!(
             "--multi-monitor is EXPERIMENTAL: a multi-monitor client gets one virtual display, \
-             capture and H.264 surface per monitor; live layout changes are ignored and blank \
-             recovery is off in these sessions"
+             capture and H.264 surface per monitor"
         );
     }
     if args.virtual_display_hidpi.is_some() && !args.virtual_display {

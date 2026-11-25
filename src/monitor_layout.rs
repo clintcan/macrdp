@@ -11,10 +11,6 @@
 //!
 //! Pure data, so it is the same on every platform and fully unit-tested.
 
-// Not wired in yet: the display, capture and input steps of multi-monitor
-// phase 1 use it. Remove this allow when they land.
-#![allow(dead_code)]
-
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 
 /// One monitor of the session.
@@ -95,6 +91,45 @@ impl Layout {
             desktop,
             client: monitors_in.to_vec(),
         })
+    }
+
+    /// The layout a multi-monitor session adopts from a mid-session layout
+    /// (MS-RDPEDISP), with the rules the acceptor applies at connect
+    /// (IronRDP fork, acceptor divergence (8)): 2 to 16 monitors, exactly one
+    /// primary at (0,0), each at least 200 pixels and at most `max`, none
+    /// overlapping. `None` for anything else.
+    pub fn from_mid_session(monitors: &[Monitor], max: (u16, u16)) -> Option<Self> {
+        if !(2..=16).contains(&monitors.len()) {
+            return None;
+        }
+        let mut primaries = monitors
+            .iter()
+            .filter(|m| m.flags.contains(MonitorFlags::PRIMARY));
+        match (primaries.next(), primaries.next()) {
+            (Some(p), None) if p.left == 0 && p.top == 0 => {}
+            _ => return None,
+        }
+        let layout = Self::from_client(monitors)?;
+        let usable = |m: &SessionMonitor| {
+            (200..=max.0).contains(&m.width) && (200..=max.1).contains(&m.height)
+        };
+        if !layout.monitors.iter().all(usable) {
+            return None;
+        }
+        let overlaps = |a: &SessionMonitor, b: &SessionMonitor| {
+            let (ax, ay) = (u32::from(a.x), u32::from(a.y));
+            let (bx, by) = (u32::from(b.x), u32::from(b.y));
+            ax < bx + u32::from(b.width)
+                && bx < ax + u32::from(a.width)
+                && ay < by + u32::from(b.height)
+                && by < ay + u32::from(a.height)
+        };
+        for (i, a) in layout.monitors.iter().enumerate() {
+            if layout.monitors[i + 1..].iter().any(|b| overlaps(a, b)) {
+                return None;
+            }
+        }
+        Some(layout)
     }
 
     pub fn monitors(&self) -> &[SessionMonitor] {
@@ -237,6 +272,71 @@ mod tests {
             layout.display_origins((0.0, 0.0), 0.5),
             vec![(1280.0, 180.0), (0.0, 0.0)]
         );
+    }
+
+    #[test]
+    fn a_mid_session_layout_follows_the_connect_rules() {
+        let max = (8192, 8192);
+        // The layout Windows App sent live (2026-11-25): a 1280x720 secondary.
+        let live = [mon(1920, 0, 1280, 720, false), mon(0, 0, 1920, 1080, true)];
+        let layout = Layout::from_mid_session(&live, max).unwrap();
+        assert_eq!(layout.desktop(), (3200, 1080));
+        assert_eq!(layout.client_monitors(), &live);
+        // One monitor: not a multi-monitor layout.
+        assert_eq!(
+            Layout::from_mid_session(&[mon(0, 0, 1920, 1080, true)], max),
+            None
+        );
+        // No primary, two primaries, a primary away from (0,0).
+        assert_eq!(
+            Layout::from_mid_session(
+                &[mon(0, 0, 1920, 1080, false), mon(1920, 0, 800, 600, false)],
+                max
+            ),
+            None
+        );
+        assert_eq!(
+            Layout::from_mid_session(
+                &[mon(0, 0, 1920, 1080, true), mon(1920, 0, 800, 600, true)],
+                max
+            ),
+            None
+        );
+        assert_eq!(
+            Layout::from_mid_session(
+                &[mon(10, 0, 1920, 1080, true), mon(1930, 0, 800, 600, false)],
+                max
+            ),
+            None
+        );
+        // Too small, larger than the maximum.
+        assert_eq!(
+            Layout::from_mid_session(
+                &[mon(0, 0, 1920, 1080, true), mon(1920, 0, 199, 600, false)],
+                max
+            ),
+            None
+        );
+        assert_eq!(
+            Layout::from_mid_session(
+                &[mon(0, 0, 1920, 1080, true), mon(1920, 0, 2560, 1440, false)],
+                (1920, 1080)
+            ),
+            None
+        );
+        // Overlapping; touching edges are fine.
+        assert_eq!(
+            Layout::from_mid_session(
+                &[mon(0, 0, 1920, 1080, true), mon(1919, 0, 800, 600, false)],
+                max
+            ),
+            None
+        );
+        assert!(Layout::from_mid_session(
+            &[mon(0, 0, 1920, 1080, true), mon(-800, 0, 800, 600, false)],
+            max
+        )
+        .is_some());
     }
 
     #[test]
