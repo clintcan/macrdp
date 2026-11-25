@@ -2559,6 +2559,18 @@ mod stub {
                  different target"
             ))
         }
+        #[allow(clippy::too_many_arguments)]
+        pub fn new_with_identity(
+            _width: u32,
+            _height: u32,
+            _refresh_hz: u32,
+            _hidpi: bool,
+            _ui_scale: u32,
+            _serial: u32,
+            _product: Option<u32>,
+        ) -> Result<Self> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
         pub fn display_id(&self) -> u32 {
             0
         }
