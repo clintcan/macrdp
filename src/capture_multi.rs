@@ -108,8 +108,12 @@ impl Relayout {
             .map_err(|_| anyhow!("virtual display mutex poisoned"))?;
         let p = layout.monitors()[layout.primary()];
         let size = (u32::from(p.width), u32::from(p.height));
-        if vd.mode_px() != size {
-            vd.resize(size.0, size.1, 1)
+        // At UI scale 1 (see capture::session_ui_scale): a HiDPI main display
+        // last used at 2x for a one-monitor client has the same pixels at a
+        // different scale.
+        let ui_scale = crate::capture::session_ui_scale(true, vd.ui_scale());
+        if vd.mode_px() != size || vd.ui_scale() != ui_scale {
+            vd.resize(size.0, size.1, ui_scale)
                 .context("re-moding the main display")?;
         }
         let mut extras = self

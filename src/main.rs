@@ -3123,8 +3123,6 @@ async fn async_main() -> Result<()> {
     if args.multi_monitor {
         let conflict = if !args.virtual_display {
             Some("needs --virtual-display")
-        } else if args.virtual_display_hidpi.is_some() {
-            Some("doesn't work with --virtual-display-hidpi yet")
         } else if args.capture_primary
             || args.detach_primary
             || args.shield_primary

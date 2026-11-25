@@ -69,8 +69,10 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   and macrdp adds a virtual display per other monitor,
                           #   arranged like the client's, right of the Mac's own
                           #   displays. The size cap applies per monitor. Needs
-                          #   --virtual-display; refused with --virtual-display-hidpi,
-                          #   the headless modes and --no-client-resolution for now.
+                          #   --virtual-display; refused with the headless modes and
+                          #   --no-client-resolution for now. With
+                          #   --virtual-display-hidpi, multi-monitor sessions run at 1x
+                          #   and one-monitor sessions keep the HiDPI behaviour.
                           #   Each monitor gets its own capture and H.264 surface
                           #   (needs --enable-h264 for that; otherwise legacy bitmaps).
                           #   A layout the client changes mid-session (a monitor's

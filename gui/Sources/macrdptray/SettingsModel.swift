@@ -126,8 +126,8 @@ final class SettingsModel: ObservableObject {
             if draft["AUTO_UNLOCK"] == "1" { draft["AUTO_UNLOCK"] = "0" }
         }
         // Multi-monitor only where the server accepts it: it refuses to start
-        // with --multi-monitor and no virtual display, a headless mode,
-        // VD_HIDPI, or --no-client-resolution (in EXTRA_FLAGS).
+        // with --multi-monitor and no virtual display, a headless mode, or
+        // --no-client-resolution (in EXTRA_FLAGS).
         if draft["MULTI_MONITOR"] == "1" && !multiMonitorAllowed {
             draft["MULTI_MONITOR"] = "0"
         }
@@ -144,16 +144,13 @@ final class SettingsModel: ObservableObject {
     // MARK: - Multi-monitor
 
     /// Whether `MULTI_MONITOR` can be on: the server needs the virtual display
-    /// and refuses it with a headless mode, a HiDPI virtual display, or
-    /// `--no-client-resolution`.
+    /// and refuses it with a headless mode or `--no-client-resolution`. (A HiDPI
+    /// virtual display is fine: multi-monitor sessions run at 1x.)
     var multiMonitorAllowed: Bool {
-        let hidpi = (draft["VD_HIDPI"] ?? "0").lowercased()
         let extra = draft["EXTRA_FLAGS"] ?? ""
         return (draft["VIRTUAL_DISPLAY"] ?? "0") == "1"
             && primaryMode == "none"
-            && (hidpi == "0" || hidpi.isEmpty)
             && !extra.contains("--no-client-resolution")
-            && !extra.contains("--virtual-display-hidpi")
     }
 
     // MARK: - Network bind (loopback <-> all interfaces, port preserved)

@@ -793,6 +793,19 @@ fn adopt_client_size(
 /// client can fill with its own requested size instead (mstsc asking for
 /// 3840x2160 was observed doing so, issue #211). The echo is client-controlled,
 /// so the ceiling has to be applied here too, before anything is sized from it.
+/// The UI scale for the main virtual display: the HiDPI policy's (2 for a
+/// Retina client under `VD_HIDPI=auto`), except 1 in a multi-monitor session.
+/// Multi-monitor arranges every display in points and treats a point as a
+/// pixel, and its extra displays are 1:1, so its main display is too. A HiDPI
+/// display keeps its HiDPI-ness; only its point size changes.
+pub(crate) fn session_ui_scale(multi_monitor: bool, policy: u32) -> u32 {
+    if multi_monitor {
+        1
+    } else {
+        policy
+    }
+}
+
 fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize {
     match max {
         Some(max) => DesktopSize {
@@ -1327,7 +1340,7 @@ impl CaptureDisplay {
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
         self.resolve_virtual_display(&mut vd);
-        let ui_scale = self.vd_hidpi.ui_scale();
+        let ui_scale = session_ui_scale(mode.is_some(), self.vd_hidpi.ui_scale());
         let (mode_w, mode_h) = mode.unwrap_or((width, height));
         // Compare in pixels: on a HiDPI vd the points are the session size
         // divided by the UI scale.
@@ -3843,6 +3856,14 @@ mod tests {
                 height: 8192
             })
         );
+    }
+
+    #[test]
+    fn a_multi_monitor_session_is_one_x() {
+        assert_eq!(session_ui_scale(false, 2), 2);
+        assert_eq!(session_ui_scale(false, 1), 1);
+        assert_eq!(session_ui_scale(true, 2), 1);
+        assert_eq!(session_ui_scale(true, 1), 1);
     }
 
     #[test]
