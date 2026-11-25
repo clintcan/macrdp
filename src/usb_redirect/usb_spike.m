@@ -1177,7 +1177,10 @@ static const uint32_t kStreamMinReadLen = 512;
         // next. Stopping here stalled the control endpoint once its ring wrapped
         // (an Xbox controller went dead after ~20 s of control traffic, live
         // 2026-11-25). Advance past it; the state machine follows the link.
-        if (msg_type(msg) == IOUSBHostCIMessageTypeLink) {
+        // Control endpoint only: on the async bulk/interrupt endpoints the
+        // state machine has usually followed the link already by the time this
+        // runs ("message does not match the current transfer", seen live).
+        if (msg_type(msg) == IOUSBHostCIMessageTypeLink && epNum == 0) {
             if (![ep enqueueTransferCompletionForMessage:msg
                                                  status:IOUSBHostCIMessageStatusSuccess
                                          transferLength:0
