@@ -101,35 +101,35 @@ screencapturekit = { version = "2.1", features = ["async"] }
 # branch. ironrdp-rdpeusb, -str and -error aren't direct dependencies, but other
 # ironrdp crates name them as crates.io dependencies, so they are listed too.
 [patch.crates-io]
-ironrdp-server         = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-acceptor       = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpdr          = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-dvc            = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpeusb        = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-str            = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-error          = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp                = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-ainput         = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-async          = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-cliprdr        = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-connector      = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-core           = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-displaycontrol = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-egfx           = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-graphics       = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-pdu            = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpsnd         = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-svc            = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-tokio          = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-echo           = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-nscodec        = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpeai         = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpei          = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpemt         = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpeudp        = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-rdpeudp-tokio  = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-tls            = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
-ironrdp-usb            = { git = "https://github.com/clintcan/IronRDP.git", rev = "3e39d746caa2c9f1612fcff3f5ae77906d342c9f" }
+ironrdp-server         = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-acceptor       = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpdr          = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-dvc            = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpeusb        = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-str            = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-error          = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp                = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-ainput         = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-async          = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-cliprdr        = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-connector      = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-core           = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-displaycontrol = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-egfx           = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-graphics       = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-pdu            = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpsnd         = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-svc            = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-tokio          = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-echo           = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-nscodec        = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpeai         = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpei          = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpemt         = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpeudp        = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-rdpeudp-tokio  = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-tls            = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
+ironrdp-usb            = { git = "https://github.com/clintcan/IronRDP.git", rev = "f1711d9a01964c300287e36ff503964ff24c0806" }
 
 # ironrdp-server's `multitransport` feature takes macrdp-rdpeudp as a git
 # dependency on this repo. Use the local copy, so there is one.
