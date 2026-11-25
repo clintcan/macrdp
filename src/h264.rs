@@ -2823,7 +2823,13 @@ impl Gfx {
             let result = match action {
                 BlankAction::Remap => self.perform_blank_remap(&server_handle, width, height),
                 BlankAction::Drop => self.perform_blank_drop(),
-                BlankAction::Reactivate => self.perform_blank_reactivate(width, height),
+                // The session's desktop, not the surface: with several
+                // monitors the surface is one monitor, and reactivating at its
+                // size told mstsc the desktop was that monitor (live 2026-11-25).
+                BlankAction::Reactivate => {
+                    let (w, h) = self.desktop_size.get();
+                    self.perform_blank_reactivate(w, h)
+                }
             };
             if let Err(e) = result {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
