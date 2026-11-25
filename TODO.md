@@ -40,6 +40,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
   every time and reported 0 unacked frames each time, so there was no video backlog on the server side. Not a
   regression; next step is the audio side (client playback buffer start, or the first waves' timing).
 
+- [ ] **Watch: network auto-detect and A/V drift.** In one LAN session with auto-detect on (2026-11-24,
+  v0.10.10), the picture fell steadily behind the sound on both mstsc and Windows App within about 20 s. A
+  repeat on the same build, with the mini's disk and CPU logged (idle), showed no drift, and nor did a build
+  without IronRDP's in-session bandwidth measurement, so the cause is unknown; that first session's video also
+  queued up to 364 ms on TCP. Auto-detect is on by default from the next release; the mini runs it. If the
+  drift recurs, A/B with `NETWORK_AUTODETECT=0`, and suspect the in-session measurement, which on this base
+  brackets single EGFX writes (upstream #2021).
+
 - [ ] **CI waits on macOS runners.** GitHub's macOS runner shortage cancelled or queued jobs for hours
   around the v0.10.10 release. Options: merge the macOS "audit log" job into the macOS test job (one macOS
   runner per run instead of two), skip CI for docs-only changes, and build the release archives locally

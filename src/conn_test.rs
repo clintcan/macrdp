@@ -2159,7 +2159,7 @@ async fn one_soft_sync_moves_lossy_audio_and_egfx_onto_two_tunnels() -> anyhow::
         .await
 }
 
-/// `--network-autodetect`: with IronRDP's auto-detect enabled and macrdp's
+/// Network auto-detect (on by default): with IronRDP's auto-detect enabled and macrdp's
 /// ticker running, a client that opened the MCS message channel receives RTT
 /// Measure Requests on it. Nothing else in macrdp sends auto-detect PDUs, so
 /// without the ticker (or without `enable_autodetect`) none ever arrive.
@@ -2253,7 +2253,7 @@ async fn network_autodetect_sends_rtt_probes_on_the_message_channel() -> anyhow:
     })?
 }
 
-/// `--network-autodetect` with the connect-time measurement (#235): the
+/// Network auto-detect with the connect-time measurement (#235): the
 /// bandwidth a client reports for the connect-time burst is what the server's
 /// later Network Characteristics Results carry. This client answers RTT probes
 /// after the logon but never a continuous bandwidth measurement, so a result

@@ -459,15 +459,24 @@ struct Args {
     #[arg(long)]
     stats_endpoint: bool,
 
-    /// Report network characteristics to the client (MS-RDPBCGR 2.2.14
-    /// auto-detect): RTT probes and bandwidth measurements on the MCS message
-    /// channel, and Network Characteristics Result PDUs the client can show, for
-    /// example in the Windows connection-quality dialog. IronRDP's own
-    /// auto-detect does the work; macrdp ticks it once a second. Only for
-    /// clients that open the message channel. Opt-in (default off). Config:
-    /// NETWORK_AUTODETECT=1.
-    #[arg(long)]
-    network_autodetect: bool,
+    /// Don't report network characteristics to the client. By default macrdp
+    /// does (MS-RDPBCGR 2.2.14 auto-detect): a 256 KiB bandwidth burst and an
+    /// RTT probe while the client logs in, then RTT probes and bandwidth
+    /// measurements on the MCS message channel, and Network Characteristics
+    /// Result PDUs the client can show, for example in the Windows
+    /// connection-quality dialog. Without them mstsc and Windows App can warn
+    /// "Your network might be slow" on a fast LAN. IronRDP's own auto-detect
+    /// does the work; macrdp ticks it once a second. Only for clients that open
+    /// the message channel. Config: NETWORK_AUTODETECT=0.
+    #[arg(long = "no-network-autodetect", action = clap::ArgAction::SetTrue)]
+    no_network_autodetect: bool,
+
+    /// Deprecated/no-op: network auto-detect is now the default. Accepted so
+    /// existing command lines that pass --network-autodetect keep working; use
+    /// --no-network-autodetect to disable.
+    #[arg(long = "network-autodetect", action = clap::ArgAction::SetTrue, hide = true)]
+    #[allow(dead_code)]
+    network_autodetect_compat: bool,
 
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
@@ -2654,8 +2663,8 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
-    if on("NETWORK_AUTODETECT", false) {
-        argv.push("--network-autodetect".into());
+    if !on("NETWORK_AUTODETECT", true) {
+        argv.push("--no-network-autodetect".into());
     }
     if on("CAPTURE_NV12", false) {
         argv.push("--capture-nv12".into());
@@ -2946,7 +2955,7 @@ fn report_auth_failure(
     }
 }
 
-/// How often `--network-autodetect` ticks IronRDP's auto-detect. Each tick
+/// How often network auto-detect ticks IronRDP's auto-detect. Each tick
 /// sends one RTT probe; every 8th starts a bandwidth measurement over the next
 /// 4 ticks; a Network Characteristics Result goes out at most once a second.
 const AUTODETECT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
@@ -4189,15 +4198,15 @@ async fn async_main() -> Result<()> {
         None
     };
 
-    // Network auto-detect (--network-autodetect). IronRDP's AutoDetectManager
+    // Network auto-detect (default on; --no-network-autodetect). IronRDP's AutoDetectManager
     // sends the RTT probes, brackets ordinary traffic for the bandwidth
     // measurement and reports the results; it only needs a periodic tick.
-    if args.network_autodetect {
+    if !args.no_network_autodetect {
         server.enable_autodetect();
         spawn_autodetect_ticker(server.event_sender().clone(), AUTODETECT_TICK);
         info!(
             tick_ms = AUTODETECT_TICK.as_millis() as u64,
-            "network auto-detect enabled (--network-autodetect): RTT and bandwidth are measured and \
+            "network auto-detect enabled (default; --no-network-autodetect to disable): RTT and bandwidth are measured and \
              reported to clients that open the message channel"
         );
     }
@@ -4463,6 +4472,27 @@ mod config_tests {
         fs::remove_file(&p).ok();
         let p = write_temp("rs0", "REVERSE_SCROLL=0\n");
         assert!(!args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn network_autodetect_is_on_unless_the_config_turns_it_off() {
+        for (name, body, off) in [
+            ("na-unset", "ENABLE_H264=1\n", false),
+            ("na-1", "NETWORK_AUTODETECT=1\n", false),
+            ("na-0", "NETWORK_AUTODETECT=0\n", true),
+        ] {
+            let p = write_temp(name, body);
+            assert_eq!(
+                args_from_config(&p).unwrap().no_network_autodetect,
+                off,
+                "{body}"
+            );
+            fs::remove_file(&p).ok();
+        }
+        // The old opt-in flag still parses, and changes nothing.
+        let p = write_temp("na-flag", "EXTRA_FLAGS=\"--network-autodetect\"\n");
+        assert!(!args_from_config(&p).unwrap().no_network_autodetect);
         fs::remove_file(&p).ok();
     }
 
