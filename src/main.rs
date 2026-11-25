@@ -2517,7 +2517,8 @@ fn main() -> Result<()> {
             // `virtual_display::arrange_displays`).
             Some(virtual_display::ARRANGE_ARG) => {
                 let spec = argv.next().unwrap_or_default();
-                std::process::exit(virtual_display::run_arrange_helper(&spec));
+                let for_session = argv.next().as_deref() == Some(virtual_display::FOR_SESSION_ARG);
+                std::process::exit(virtual_display::run_arrange_helper(&spec, for_session));
             }
             _ => {}
         }

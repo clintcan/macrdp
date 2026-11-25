@@ -149,7 +149,7 @@ mod imp {
         if moves.is_empty() {
             return Ok(false);
         }
-        crate::virtual_display::arrange_displays(&moves)?;
+        crate::virtual_display::arrange_displays_for_session(&moves)?;
         tracing::info!(
             ?moves,
             "the session's primary is the main display while connected"
@@ -178,7 +178,7 @@ mod imp {
         if moves.is_empty() {
             return;
         }
-        match crate::virtual_display::arrange_displays(&moves) {
+        match crate::virtual_display::arrange_displays_for_session(&moves) {
             Ok(()) => tracing::info!(?moves, "the Mac's own display is main again"),
             Err(e) => tracing::warn!(
                 error = format!("{e:#}"),

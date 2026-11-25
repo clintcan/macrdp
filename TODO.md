@@ -9,9 +9,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - [ ] **Plan after the v0.11.2 soak (agreed 2026-11-26), in order:** (1) the slow first connect
   after a restart (below); (2) `VD_HIDPI=auto` together with `MULTI_MONITOR` (below); (3) the Dock and
-  menu bar on the remote primary: make the virtual display main while a client is connected and give
-  it back on disconnect (`--make-primary`, but per session; check it against multi-monitor's
-  arrangement), the one thing window-follow doesn't move. Not now: Detach with multi-monitor (macOS 26
+  menu bar on the remote primary: `--main-display-while-connected` (branch
+  `feat/main-display-while-connected`, live on a MacBook 2026-11-26 with one and two monitors), the one
+  thing window-follow doesn't move. Not now: Detach with multi-monitor (macOS 26
   needs a restart per disconnect, #168), a physical primary for multi-monitor (only when the client's
   size is one of the monitor's modes), Blank (lockable) with multi-monitor (only if local privacy
   matters).
