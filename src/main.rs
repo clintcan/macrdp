@@ -36,6 +36,7 @@ mod h264_sps;
 mod health;
 mod input;
 mod keyboard_layout;
+mod last_size;
 mod lock_activity;
 mod logging;
 mod monitor_layout;
@@ -3432,6 +3433,13 @@ async fn async_main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let physical_main_id: u32 = 0;
 
+    // Where the last session size is remembered (virtual display with
+    // client-resolution auto-adopt only; src/last_size.rs).
+    let last_size_path = (args.virtual_display && !args.no_client_resolution)
+        .then(default_cert_dir)
+        .and_then(Result::ok)
+        .map(|dir| last_size::path_in(&dir));
+
     // The client's desktop scale factor, filled by the server per connection;
     // only consulted (and only wired to the server) for --virtual-display-hidpi=auto.
     let client_scale_factor = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3448,6 +3456,25 @@ async fn async_main() -> Result<()> {
             let h = args
                 .height
                 .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+            // With client-resolution auto-adopt, start at the size the last
+            // client was served, so its next first connect needs no re-mode
+            // (src/last_size.rs).
+            let remembered = last_size_path.as_deref().and_then(|p| {
+                last_size::load(p, args.max_client_size.unwrap_or(DEFAULT_MAX_CLIENT_SIZE))
+            });
+            let (w, h) = match remembered {
+                Some((rw, rh)) if (rw, rh) != (w, h) => {
+                    info!(
+                        width = rw,
+                        height = rh,
+                        configured_width = w,
+                        configured_height = h,
+                        "virtual display starts at the last session's size"
+                    );
+                    (rw, rh)
+                }
+                _ => (w, h),
+            };
             // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
             // metadata here (capture cadence is governed by --fps); pass a
             // safe value so CGVirtualDisplay doesn't reject the mode.
@@ -3924,6 +3951,7 @@ async fn async_main() -> Result<()> {
         virtual_display: virtual_display.clone(),
         vd_hidpi: vd_hidpi.clone(),
         session_layout: session_layout.clone(),
+        last_size_path: last_size_path.clone(),
         active_monitors: active_monitors.clone(),
         extra_displays: args.multi_monitor.then(|| {
             Arc::new(std::sync::Mutex::new(

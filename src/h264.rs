@@ -399,6 +399,9 @@ struct ConnectionContext {
     /// connection epoch, which also serves as the arm-delay baseline).
     blank_recovery_attempts: u32,
     last_blank_recovery_at: Instant,
+    /// When the first frame went to the client: the blank detector's clocks
+    /// start here, not at EGFX ready (see [`ConnectionContext::blank_clock`]).
+    first_frame_at: Option<Instant>,
     /// Kernel-measured TCP RTT (ms) for this connection, sampled at accept by
     /// the vendored server (divergence 15) and frozen here at connection setup.
     /// 0 = unknown. Drives the blank-detector RTT gate ([`blank_rtt_gate`]) and
@@ -464,6 +467,23 @@ impl ConnectionContext {
     /// ready, so restarting every connection-start baseline here is exactly
     /// "the connection starts now". A new connection-start clock belongs here
     /// too.
+    /// The blank detector's time since the session started presenting:
+    /// zero at the first frame, which (re)starts the detector's clocks there.
+    /// Its clocks used to start at EGFX ready, but the first frame can come
+    /// seconds later (a capture slow to start after a re-mode: 6 s, live
+    /// 2026-11-25), and the detector then fired 0.2 s after the client began
+    /// presenting, adding a reactivation to an already slow connect.
+    fn blank_clock(&mut self, now: Instant) -> Duration {
+        let first = *self.first_frame_at.get_or_insert_with(|| {
+            if self.blank_recovery_attempts == 0 {
+                self.last_nonzero_qoe_at = now;
+                self.last_blank_recovery_at = now;
+            }
+            now
+        });
+        now.saturating_duration_since(first)
+    }
+
     fn start_clocks(&mut self, now: Instant) {
         self.epoch = now;
         self.last_ack_at = now;
@@ -2562,6 +2582,7 @@ impl Gfx {
                 }
                 let effective_params = gate.map(|m| blank_params_scaled(&self.blank_params, m));
                 let now = Instant::now();
+                let since_first_frame = ctx.blank_clock(now);
                 // `gate == None` (disarmed: link too slow) skips detection but
                 // never the frame path — this whole branch is decision-only.
                 if effective_params.as_ref().is_some_and(|p| {
@@ -2569,7 +2590,7 @@ impl Gfx {
                         ctx.qoe,
                         ctx.egfx_acks_seen,
                         ctx.acks_suspended,
-                        now.saturating_duration_since(ctx.epoch),
+                        since_first_frame,
                         now.saturating_duration_since(ctx.last_nonzero_qoe_at),
                         now.saturating_duration_since(ctx.last_blank_recovery_at),
                         ctx.blank_recovery_attempts,
@@ -3901,6 +3922,7 @@ impl Gfx {
             last_nonzero_qoe_at: Instant::now(),
             blank_recovery_attempts: 0,
             last_blank_recovery_at: Instant::now(),
+            first_frame_at: None,
             link_rtt_ms,
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
@@ -7138,6 +7160,41 @@ mod tests {
             assert!(*clock >= ready_at, "clock {i} still counts the login");
         }
         assert!(ctx.epoch.elapsed() < gfx.blank_params.arm_delay);
+    }
+
+    /// The bug (live, 2026-11-25): EGFX was ready 6 s before the first frame
+    /// (the capture was slow to start after a re-mode), so the detector's arm
+    /// delay and wall-clock window had run out and it fired 0.2 s after the
+    /// client began presenting. Its clocks start at the first frame.
+    #[test]
+    fn the_blank_detector_counts_from_the_first_frame() {
+        let gfx = gfx_with_context();
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        let ready = Instant::now() - Duration::from_secs(6);
+        ctx.start_clocks(ready);
+        let first = Instant::now();
+        assert_eq!(ctx.blank_clock(first), Duration::ZERO);
+        assert_eq!(ctx.last_nonzero_qoe_at, first);
+        assert_eq!(ctx.last_blank_recovery_at, first);
+        // Later frames count from the first one, without moving its clocks.
+        let later = first + Duration::from_secs(5);
+        assert_eq!(ctx.blank_clock(later), Duration::from_secs(5));
+        assert_eq!(ctx.last_blank_recovery_at, first);
+    }
+
+    /// After a recovery attempt the detector's own attempt clock is kept: the
+    /// first-frame start only applies to a connection that hasn't tried yet.
+    #[test]
+    fn the_first_frame_keeps_an_earlier_attempt_clock() {
+        let gfx = gfx_with_context();
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        let attempt = Instant::now() - Duration::from_secs(2);
+        ctx.blank_recovery_attempts = 1;
+        ctx.last_blank_recovery_at = attempt;
+        ctx.blank_clock(Instant::now());
+        assert_eq!(ctx.last_blank_recovery_at, attempt);
     }
 
     /// A capabilities re-advertise on a live connection is not a new start:
