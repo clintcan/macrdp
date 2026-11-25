@@ -1173,6 +1173,24 @@ static const uint32_t kStreamMinReadLen = 512;
             [self raiseBulk:msg endpointKey:key];
             return; // async; completion re-walks
         }
+        // A Link entry ends one array of transfer messages and points to the
+        // next. Stopping here stalled the control endpoint once its ring wrapped
+        // (an Xbox controller went dead after ~20 s of control traffic, live
+        // 2026-11-25). Advance past it; the state machine follows the link.
+        // Control endpoint only: on the async bulk/interrupt endpoints the
+        // state machine has usually followed the link already by the time this
+        // runs ("message does not match the current transfer", seen live).
+        if (msg_type(msg) == IOUSBHostCIMessageTypeLink && epNum == 0) {
+            if (![ep enqueueTransferCompletionForMessage:msg
+                                                 status:IOUSBHostCIMessageStatusSuccess
+                                         transferLength:0
+                                                  error:&e]) {
+                NSLog(@"[usb2] advancing past a Link on ep key %@ failed: %@ — stopping ring walk", key, e);
+                break;
+            }
+            NSLog(@"[usb2] advanced past a Link on ep key %@", key);
+            continue;
+        }
         NSUInteger moved = 0;
         IOUSBHostCIMessageStatus status = [self processTransfer:msg endpointKey:key transferLength:&moved];
         if (msg_no_response(msg)) {
