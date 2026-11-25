@@ -261,9 +261,13 @@ impl MultiCaptureUpdates {
                     return Ok(());
                 }
                 Ok(false) if flush || gfx.hold_legacy(self.started_at) => return Ok(()),
-                // Still negotiating, or ready but the primary's first frame
-                // hasn't set the surfaces up yet: wait, no legacy bitmaps.
-                Ok(false) if gfx.pipeline_pending() || gfx.pipeline_ready() => return Ok(()),
+                // Ready, but the primary's first frame hasn't set the surfaces
+                // up yet: wait for it (no legacy bitmaps under a live EGFX).
+                // Still negotiating past the hold limit falls through to legacy
+                // bitmaps, as in the single-monitor path: a client that never
+                // opens EGFX (seen live: Windows App reconnecting after a
+                // server restart) must still get a picture.
+                Ok(false) if gfx.pipeline_ready() => return Ok(()),
                 Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(monitor = i, error = ?e, "multi-monitor: EGFX submit failed");

@@ -685,17 +685,6 @@ impl RdpServerDisplay for CaptureDisplay {
         DesktopSize { width, height }
     }
 
-    /// --multi-monitor: tell the client (MS-RDPEDISP `MaxNumMonitors`) that
-    /// the session takes up to 16 monitors. Left at 1, mstsc drew the whole
-    /// multi-monitor desktop scaled into one monitor.
-    async fn monitor_count(&mut self) -> u32 {
-        if self.extra_displays.is_some() {
-            16
-        } else {
-            1
-        }
-    }
-
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         let (width, height) = self.desktop_size.get();
 
