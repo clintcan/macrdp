@@ -186,6 +186,10 @@ struct ExtraSurface {
     /// This monitor's share of the link's bitrate target (its area over the
     /// desktop's monitors' total).
     share: f64,
+    /// When the ack-lag throttle last let one of this monitor's frames through.
+    last_throttle_ship: Instant,
+    /// The keyframe interval (frames) last applied, to follow IDR backoff.
+    applied_keyframe_frames: Option<u32>,
     submitted: Arc<AtomicU64>,
     shipped: Arc<AtomicU64>,
 }
@@ -207,6 +211,9 @@ struct ConnectionContext {
     /// The primary monitor's share of the link's bitrate target: 1.0 with one
     /// monitor, its area share with several.
     primary_share: f64,
+    /// The keyframe interval (frames) the adaptive controller last set (IDR
+    /// backoff), for the extra monitors' encoders to follow.
+    keyframe_frames_target: Option<u32>,
     is_ready: bool,
     epoch: Instant,
     /// True once the next shipped frame must be a forced keyframe (IDR):
@@ -2257,7 +2264,40 @@ impl Gfx {
         if !ctx.is_ready || ctx.surface_id.is_none() {
             return Ok(false);
         }
+        // Flow control shared with the primary (submit_frame), applied to this
+        // monitor's frames too, since every monitor's frames load the link.
+        // A manual resync drain: hold until the primary's drain finishes, so
+        // every monitor resumes from its IDR together (keyframe_all armed it).
+        if ctx.resync_drain_until.is_some() {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if self.adaptive_enabled
+            && frame_drop_at_floor(
+                ctx.adaptive_target_bps <= self.adaptive_floor_bps,
+                ctx.adaptive_congested,
+                now.duration_since(ctx.last_floor_fps_pass),
+                self.adaptive_min_fps_interval,
+            )
+        {
+            return Ok(true);
+        }
+        let lag_limit = ack_lag_limit(
+            self.egfx_on_udp.load(Ordering::Relaxed),
+            self.max_frame_lag,
+            self.tcp_max_frame_lag,
+            false,
+        );
+        let lagging = lag_limit > 0
+            && ctx.egfx_acks_seen
+            && !ctx.acks_suspended
+            && ctx
+                .last_shipped_frame_id
+                .load(Ordering::Relaxed)
+                .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed))
+                > lag_limit;
         let target_bps = ctx.adaptive_target_bps;
+        let keyframe_frames = ctx.keyframe_frames_target;
         let Some(extra) = ctx.extras.get_mut(index) else {
             return Ok(false);
         };
@@ -2286,6 +2326,12 @@ impl Gfx {
                 "EGFX encoder for an extra monitor initialized + ship thread started"
             );
         }
+        if lagging {
+            if now.duration_since(extra.last_throttle_ship) < UDP_THROTTLE_FLOOR {
+                return Ok(true);
+            }
+            extra.last_throttle_ship = now;
+        }
         // Drop-to-latest, per encoder, as for the primary.
         let outstanding = extra
             .submitted
@@ -2299,6 +2345,12 @@ impl Gfx {
         let Some(encoder) = extra.encoder.as_mut() else {
             return Ok(true);
         };
+        if keyframe_frames.is_some() && extra.applied_keyframe_frames != keyframe_frames {
+            if let Some(frames) = keyframe_frames {
+                encoder.set_keyframe_interval(frames);
+            }
+            extra.applied_keyframe_frames = keyframe_frames;
+        }
         // Follow the link's adaptive target: this monitor's share of it.
         let bps = share_bps(target_bps, extra.share);
         if extra.applied_bps != bps {
@@ -2795,6 +2847,7 @@ impl Gfx {
             }
             if let Some(frames) = adaptive.keyframe_frames {
                 encoder.set_keyframe_interval(frames);
+                ctx.keyframe_frames_target = Some(frames);
             }
             match frame {
                 FrameInput::Bgra { bgra, stride } => {
@@ -3206,6 +3259,8 @@ impl Gfx {
                             need_keyframe: true,
                             applied_bps: 0,
                             share: area(m) / total,
+                            last_throttle_ship: Instant::now(),
+                            applied_keyframe_frames: None,
                             submitted: Arc::new(AtomicU64::new(0)),
                             shipped: Arc::new(AtomicU64::new(0)),
                         });
@@ -3788,6 +3843,7 @@ impl Gfx {
             surface_id: None,
             extras: Vec::new(),
             primary_share: 1.0,
+            keyframe_frames_target: None,
             is_ready: false,
             epoch: Instant::now(),
             need_keyframe: true,

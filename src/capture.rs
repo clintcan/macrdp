@@ -986,8 +986,18 @@ impl CaptureDisplay {
             let p = l.monitors()[l.primary()];
             (p.width, p.height)
         });
+        // A single-monitor client: release the extra displays BEFORE re-moding
+        // the main one. macOS refused the main display a size an extra display
+        // still had (1366x768, seen live 2026-11-25) and allowed it once the
+        // extra was gone. With a layout, the main display goes first, since
+        // the extras are arranged around it.
+        if layout.is_none() {
+            self.sync_extra_displays(None);
+        }
         let served = self.sync_primary_display(primary_size);
-        self.sync_extra_displays(layout.as_ref());
+        if layout.is_some() {
+            self.sync_extra_displays(layout.as_ref());
+        }
         served
     }
 
@@ -1033,8 +1043,8 @@ impl CaptureDisplay {
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
-                    width,
-                    height,
+                    width = mode_w,
+                    height = mode_h,
                     ui_scale,
                     display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
@@ -1219,13 +1229,17 @@ impl CaptureDisplay {
             .expect("virtual display mutex poisoned")
             .display_id();
         let extra_ids = extras.lock().unwrap_or_else(|e| e.into_inner()).ids();
+        // Not every monitor got a display (creating one failed; see the
+        // warning from sync_extra_displays). Serving the main display alone
+        // would leave the surfaces and input sized for the layout, so end the
+        // connection with the reason instead.
         if extra_ids.len() + 1 != layout.monitors().len() {
-            tracing::warn!(
-                monitors = layout.monitors().len(),
-                displays = extra_ids.len() + 1,
-                "multi-monitor: not every monitor has a display; capturing the main one only"
-            );
-            return Ok(None);
+            return Err(anyhow::anyhow!(
+                "multi-monitor: {} of the client's {} monitors have a virtual display; \
+                 can't serve this layout (see the earlier warning)",
+                extra_ids.len() + 1,
+                layout.monitors().len()
+            ));
         }
         let ids = crate::capture_multi::display_ids(&layout, main, &extra_ids);
         *self

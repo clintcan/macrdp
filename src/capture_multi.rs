@@ -45,6 +45,10 @@ struct MonitorStream {
     /// The last frame sent over H.264, retained (not copied) for the flush
     /// burst that drains mstsc's presentation buffer on a static screen.
     last_frame: Option<screencapturekit::cv::CVPixelBuffer>,
+    /// A frame that couldn't go out yet (EGFX negotiating, or ready but the
+    /// surfaces not created): re-sent once it can, since a static display
+    /// sends no new frames (the single-monitor path's `held_frame`).
+    held: Option<screencapturekit::cv::CVPixelBuffer>,
 }
 
 pub struct MultiCaptureUpdates {
@@ -135,6 +139,7 @@ impl MultiCaptureUpdates {
                 config,
                 stopped_at: None,
                 last_frame: None,
+                held: None,
             });
         }
         let desktop = layout.desktop();
@@ -250,6 +255,9 @@ impl MultiCaptureUpdates {
         if let Some(gfx) = self.gfx.as_ref() {
             match gfx.submit_bgra_monitor(i, self.primary, src, src_stride, keyframe, flush) {
                 Ok(true) => {
+                    if !flush {
+                        self.monitors[i].held = None;
+                    }
                     if i == self.primary {
                         self.first_egfx_frame_sent = true;
                     }
@@ -260,14 +268,23 @@ impl MultiCaptureUpdates {
                     }
                     return Ok(());
                 }
-                Ok(false) if flush || gfx.hold_legacy(self.started_at) => return Ok(()),
+                Ok(false) if flush => return Ok(()),
+                Ok(false) if gfx.hold_legacy(self.started_at) => {
+                    drop(guard);
+                    self.monitors[i].held = Some(pb.clone());
+                    return Ok(());
+                }
                 // Ready, but the primary's first frame hasn't set the surfaces
                 // up yet: wait for it (no legacy bitmaps under a live EGFX).
                 // Still negotiating past the hold limit falls through to legacy
                 // bitmaps, as in the single-monitor path: a client that never
                 // opens EGFX (seen live: Windows App reconnecting after a
                 // server restart) must still get a picture.
-                Ok(false) if gfx.pipeline_ready() => return Ok(()),
+                Ok(false) if gfx.pipeline_ready() => {
+                    drop(guard);
+                    self.monitors[i].held = Some(pb.clone());
+                    return Ok(());
+                }
                 Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(monitor = i, error = ?e, "multi-monitor: EGFX submit failed");
@@ -278,6 +295,7 @@ impl MultiCaptureUpdates {
         if flush {
             return Ok(());
         }
+        self.monitors[i].held = None;
         // Legacy bitmaps: paste, then send this monitor's area.
         let m = &self.monitors[i];
         let (mx, my, mw, mh) = (m.x, m.y, m.width, m.height);
@@ -299,6 +317,30 @@ impl MultiCaptureUpdates {
         for (sx, sy, sw, sh) in split_strips(mx, my, mw, mh) {
             if let Some(update) = rect_update(&self.composite, stride, sx, sy, sw, sh) {
                 self.pending.push_back(update);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-sends held frames once they can go out: EGFX ready (primary first,
+    /// since its frame creates the surfaces) or the negotiation hold over
+    /// (then as legacy bitmaps).
+    fn send_held(&mut self) -> Result<()> {
+        if self.monitors.iter().all(|m| m.held.is_none()) {
+            return Ok(());
+        }
+        let can_send = self
+            .gfx
+            .as_ref()
+            .is_none_or(|gfx| gfx.pipeline_ready() || !gfx.hold_legacy(self.started_at));
+        if !can_send {
+            return Ok(());
+        }
+        let order = std::iter::once(self.primary)
+            .chain((0..self.monitors.len()).filter(|&k| k != self.primary));
+        for k in order.collect::<Vec<_>>() {
+            if let Some(pb) = self.monitors[k].held.take() {
+                self.send(k, &pb, true, false)?;
             }
         }
         Ok(())
@@ -332,6 +374,8 @@ impl MultiCaptureUpdates {
                     return Ok(Some(first));
                 }
             }
+
+            self.send_held()?;
 
             if let Some(update) = self.pending.pop_front() {
                 return Ok(Some(update));

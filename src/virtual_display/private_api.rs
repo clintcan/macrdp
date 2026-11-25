@@ -387,6 +387,7 @@ pub(super) fn create(
     hidpi: bool,
     size_mm: (f64, f64),
     serial: u32,
+    product_override: Option<u32>,
 ) -> Result<Handle> {
     let desc_class = class_required("CGVirtualDisplayDescriptor")?;
     let display_class = class_required("CGVirtualDisplay")?;
@@ -424,8 +425,13 @@ pub(super) fn create(
         // with a running macrdp: macOS applies mode settings per vendor/product,
         // so re-moding one display also re-modes the other (observed: a test's
         // re-modes dragged the agent's display from 3456×2170 to 800×502).
+        // A multi-monitor session's extra displays pass their own product
+        // id: one sharing the main display's had macOS refuse a mode for the
+        // main display that an extra display had used (seen live 2026-11-25).
         let product: u32 = if cfg!(test) {
             0x6D616354 // "macT"
+        } else if let Some(product) = product_override {
+            product
         } else if hidpi_capable {
             0x6D616348 // "macH"
         } else {

@@ -113,6 +113,16 @@ Mbit/s split 1.99 + 1.01 for 1920x1080 + 1366x768), and link-wide keyframe reque
 recovery and de-migration, the end of an IDR backoff) reach every monitor. mstsc's requested desktop size varies (1920x1080, its primary, or
 3284x1080); the session size comes from the layout either way.
 
+**Lessons from live testing (2026-11-25).**
+- The display arrangement runs in a helper process (`macrdp --arrange-displays`), like the HiDPI mode
+  selection: configuring displays in macrdp's own process froze its view of the main display, so a later
+  single-monitor session's re-mode (which macOS applied) looked failed and the pointer was mapped with the
+  old bounds.
+- No MS-RDPEDISP `MaxNumMonitors` above 1: with 16, Windows App on Windows reconnecting after a server
+  restart never opened the graphics channel.
+- Frames that arrive while EGFX is negotiating are held per monitor and re-sent; a static display sends
+  no new ones.
+
 ## Phases
 
 1. **Two monitors, H.264, `--virtual-display`, no headless mode, mstsc.** The fork change (1), displays

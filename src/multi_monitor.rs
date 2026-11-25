@@ -31,6 +31,14 @@ pub fn extra_serial(index: usize) -> u32 {
     (std::process::id() & 0x00FF_FFFF) | (index << 24)
 }
 
+/// The descriptor product id for extra display `index`: "mac1", "mac2", ...
+/// Different from the main display's ("macr"/"macH"), since macOS remembers
+/// modes per vendor/product and refused the main display a mode an extra
+/// display had used (seen live 2026-11-25).
+pub fn extra_product(index: usize) -> u32 {
+    0x6D61_6331 + u32::try_from(index).unwrap_or(0).min(0x4E)
+}
+
 /// The non-primary monitors' rectangles, in the layout's order.
 fn others(layout: &Layout) -> Vec<crate::monitor_layout::SessionMonitor> {
     let primary = layout.primary();
@@ -93,9 +101,16 @@ impl ExtraDisplays {
                         .with_context(|| format!("re-moding extra display {i}"))?;
                 }
             } else {
-                let vd =
-                    VirtualDisplay::new_with_serial(size.0, size.1, 60, false, 1, extra_serial(i))
-                        .with_context(|| format!("creating extra display {i}"))?;
+                let vd = VirtualDisplay::new_with_identity(
+                    size.0,
+                    size.1,
+                    60,
+                    false,
+                    1,
+                    extra_serial(i),
+                    Some(extra_product(i)),
+                )
+                .with_context(|| format!("creating extra display {i}"))?;
                 tracing::info!(
                     index = i,
                     display_id = vd.display_id(),
@@ -126,14 +141,25 @@ impl ExtraDisplays {
             .iter()
             .enumerate()
             .filter_map(|(i, &(x, y))| {
-                let id = if i == primary_index {
-                    primary.display_id()
+                let vd = if i == primary_index {
+                    &*primary
                 } else {
-                    extras.next()?.display_id()
+                    extras.next()?
                 };
-                Some((id, x.round() as i32, y.round() as i32))
+                let target = (x.round() as i32, y.round() as i32);
+                let (cx, cy) = vd.origin_pts();
+                // Only displays not already in place, so the main display
+                // isn't reconfigured when it doesn't move.
+                (target != (cx.round() as i32, cy.round() as i32)).then_some((
+                    vd.display_id(),
+                    target.0,
+                    target.1,
+                ))
             })
             .collect();
+        if placements.is_empty() {
+            return Ok(());
+        }
         crate::virtual_display::arrange_displays(&placements)?;
         primary.refresh_bounds();
         for vd in &mut self.displays {
@@ -160,6 +186,18 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), serials.len());
+    }
+
+    #[test]
+    fn extra_products_differ_from_the_main_displays_and_each_other() {
+        assert_eq!(&extra_product(0).to_be_bytes(), b"mac1");
+        assert_eq!(&extra_product(1).to_be_bytes(), b"mac2");
+        let main = [0x6D61_6372, 0x6D61_6348, 0x6D61_6354]; // "macr", "macH", "macT"
+        let products: Vec<_> = (0..15).map(extra_product).collect();
+        assert!(products.iter().all(|p| !main.contains(p)));
+        let mut unique = products.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), products.len());
     }
 
     #[test]
