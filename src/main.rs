@@ -36,6 +36,7 @@ mod input;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
+mod monitor_layout;
 mod multitransport;
 mod rdpdr;
 mod reaper;

@@ -102,17 +102,35 @@ resets the surfaces, the same way a single-monitor resize does today (deactivati
 
 ## Testing
 
-- **Unit:** layout normalisation (client coordinates can be negative; EGFX output origins can't), the
+- **Unit:** layout normalisation (client coordinates can be negative; EGFX output origins can't, see
+  Coordinates), the
   monitor hit-test, display arrangement from a layout.
 - **Connection test:** a client announcing two monitors gets a two-monitor Monitor Layout PDU and two
   mapped surfaces.
 - **Live:** mstsc with two monitors (different resolutions, primary on either side, one above the other),
   then Windows App. Moving windows across, full-screen video on one, reconnects.
 
+## Coordinates (settled 2026-11-25)
+
+From MS-RDPBCGR 2.2.1.3.6.1 (TS_MONITOR_DEF) and MS-RDPEGFX, and what xrdp (`master` 7a7a112) and
+FreeRDP (`master` bd0ccc7) do:
+
+- **Monitor rectangles are primary-relative and signed.** The client's Client Monitor Data puts the
+  primary monitor's top-left at (0,0); a monitor to its left or above has negative coordinates;
+  right/bottom are inclusive. At most 16 monitors.
+- **The Monitor Layout PDU and the `RESET_GRAPHICS` monitor array carry them unchanged.** xrdp
+  (`xrdp_caps_send_monitorlayout`, `xrdp_mm_egfx_caps_advertise`) and FreeRDP's server
+  (`freerdp_display_send_monitor_layout`) both echo the client's raw rectangles.
+- **Everything unsigned is relative to the bounding box's top-left:** the desktop size, surface origins
+  (`MapSurfaceToOutput` is unsigned), bitmap updates and input. xrdp keeps a second, shifted copy
+  (`minfo_wm`) for these and maps one surface per monitor at the shifted position
+  (`xrdp_mm_egfx_create_surfaces`).
+- Exactly one monitor is primary, at (0,0); mid-session MS-RDPEDISP monitors are 200–8192 with an even
+  width. `RESET_GRAPHICS` needs at least one monitor (xrdp comment, for the Microsoft macOS client).
+
 ## Open questions
 
-- Whether mstsc expects the Monitor Layout PDU coordinates as the client sent them (possibly negative) or
-  normalised to a (0,0) origin; and how `RESET_GRAPHICS` monitors relate to surface origins. Check
-  against a capture of mstsc talking to Windows.
+- What a real Windows server sends in the Monitor Layout PDU (no primary source found; the open-source
+  servers echo the client's).
 - Whether Windows App for macOS sends Client Monitor Data at all.
 - How macOS places the Dock and menu bar across several virtual displays in each headless mode.
