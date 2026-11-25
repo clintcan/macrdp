@@ -33,11 +33,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (3) start the capture off the event loop, and find why SCK is slow after a re-mode (the same
   slowness as the multi-monitor in-place re-layout's "opening the captures").
 
-- [ ] **Not yet checked live since the IronRDP 79e763a0 rebase (shipped in v0.10.10):** FreeRDP and a
-  takeover by a second client. Checked 2026-11-25/26: microphone, drive, smart card (TPM virtual card),
-  camera, USB (after #300, broken v0.10.10-v0.11.1), Windows App for macOS (its blank-detector misfire
-  fixed in #303), and connect-time auto-detect (default on).
-
 - [ ] **Open PRs and issues — review state (as of 2026-11-25; no open PRs).** Labels track it: `waiting on author` = the
   contributor owes a change; everything else is ours. v0.10.10 released 2026-11-24 (#274 #276–#291 merged
   11-21→24; #275 closed).
