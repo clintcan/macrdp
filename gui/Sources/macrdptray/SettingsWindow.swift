@@ -260,6 +260,13 @@ private struct ConnectionTab: View {
                 }
                 Text("Off = loopback only (127.0.0.1), reachable from this Mac only.")
                     .font(.caption).foregroundColor(.secondary)
+                Toggle("Report connection quality to the client",
+                       isOn: model.boolBinding("NETWORK_AUTODETECT", default: true))
+                Text("Measures round-trip time and bandwidth (a short burst at login, then small "
+                    + "probes) and reports them to clients that show connection quality, such as "
+                    + "mstsc and Windows App. Without it they can warn “Your network might be "
+                    + "slow” on a fast network.")
+                    .font(.caption).foregroundColor(.secondary)
             }
             Section("Account") {
                 Button(model.controller.hasKeychainPassword()
