@@ -1522,6 +1522,12 @@ impl CaptureDisplay {
             self.desktop_size.clone(),
             self.pending_resize.clone(),
             self.suppress_next_adopt.clone(),
+            crate::capture_multi::Relayout {
+                session_layout: self.session_layout.clone(),
+                active_monitors: self.active_monitors.clone(),
+                virtual_display: vd,
+                extra_displays: extras,
+            },
         )
         .await
         .map_err(screen_recording_denied)?;
@@ -1826,6 +1832,13 @@ pub(crate) mod macos {
     }
 
     impl DisplayStream {
+        /// Stops the capture. Dropping a `DisplayStream` doesn't: the crate's
+        /// `SCStream` drop only releases its reference, and a capture left
+        /// running keeps its slot (leaked streams starve capture).
+        pub(crate) fn stop(&self) {
+            let _ = self.stream.stop_capture();
+        }
+
         pub(crate) fn start(
             display: &SCDisplay,
             config: &SCStreamConfiguration,
