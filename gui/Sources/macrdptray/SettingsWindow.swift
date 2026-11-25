@@ -363,8 +363,8 @@ private struct DisplayTab: View {
                        isOn: model.boolBinding("MAIN_DISPLAY_WHILE_CONNECTED"))
                     .disabled(!model.bool("VIRTUAL_DISPLAY") || model.primaryMode != "none")
                 Text("The Dock, the menu bar and new windows appear in the remote session; the "
-                    + "Mac's own screen stays on as a second display, and is main again when the "
-                    + "last client leaves.")
+                    + "Mac's own screen stays on as a second display, and is main again, with "
+                    + "the windows back on it, when the last client leaves.")
                     .font(.caption).foregroundColor(.secondary)
                 Toggle("Use all of the client's monitors (experimental)",
                        isOn: model.boolBinding("MULTI_MONITOR"))

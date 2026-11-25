@@ -99,6 +99,25 @@ pub fn scale_wants_hidpi(desktop_scale_factor: u32) -> bool {
 /// live resize changes the pixel count, so the width is a constant chosen to
 /// keep common Retina session widths inside the band, not derived from the
 /// initial size.
+/// The pixel size a HiDPI panel's millimetre geometry is derived from, when
+/// it shouldn't follow the creation size: macrdp sets it to the configured
+/// `VD_WIDTH`x`VD_HEIGHT` because the display is created at the last client's
+/// size (src/last_size.rs), and a portrait or unusual-aspect client would
+/// otherwise fix a panel shape that keeps later Retina clients out of the 2x
+/// pixel-density band for the whole process.
+static PANEL_SIZE_PX: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+
+/// See [`PANEL_SIZE_PX`]. Only the first call counts.
+pub fn set_panel_size_px(width: u32, height: u32) {
+    let _ = PANEL_SIZE_PX.set((width, height));
+}
+
+/// The size [`panel_size_mm`] uses for a display created at `width`x`height`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn panel_basis(width: u32, height: u32) -> (u32, u32) {
+    PANEL_SIZE_PX.get().copied().unwrap_or((width, height))
+}
+
 pub fn panel_size_mm(width_px: u32, height_px: u32, hidpi: bool) -> (f64, f64) {
     if !hidpi {
         return (600.0, 338.0);
@@ -436,13 +455,13 @@ mod macos {
         }
     }
 
-    /// The right edge (global points) of the online displays not in
-    /// `exclude`; 0 if there are none.
     /// Every online display's id (an empty list if the query fails).
     pub fn online_display_ids() -> Vec<u32> {
         online_displays().unwrap_or_default()
     }
 
+    /// The right edge (global points) of the online displays not in
+    /// `exclude`; 0 if there are none.
     pub fn right_edge_excluding(exclude: &[u32]) -> f64 {
         online_displays()
             .unwrap_or_default()
@@ -772,7 +791,10 @@ mod macos {
                 "macrdp",
                 hidpi,
                 hidpi,
-                super::panel_size_mm(width, height, hidpi),
+                {
+                    let (pw, ph) = super::panel_basis(width, height);
+                    super::panel_size_mm(pw, ph, hidpi)
+                },
                 serial,
                 product,
             )
@@ -2565,8 +2587,6 @@ mod stub {
         false
     }
 
-    /// No screen-lock concept off macOS — definitively not locked, not
-    /// "unknown" (there's nothing to fail to look up).
     pub fn arrange_displays_for_session(_origins: &[(u32, i32, i32)]) -> Result<()> {
         Ok(())
     }
@@ -2583,6 +2603,8 @@ mod stub {
         0.0
     }
 
+    /// No screen-lock concept off macOS — definitively not locked, not
+    /// "unknown" (there's nothing to fail to look up).
     pub fn screen_is_locked() -> Option<bool> {
         Some(false)
     }
@@ -2882,6 +2904,20 @@ mod tests {
             c(false, m, m, Some(1920), false, false),
             Some(L::Exact)
         ));
+    }
+
+    #[test]
+    fn the_panel_keeps_the_configured_shape() {
+        // Before it's set, a display's panel follows its creation size.
+        // (The one global: no other test sets it.)
+        assert!(PANEL_SIZE_PX.get().is_none());
+        assert_eq!(panel_basis(1170, 2532), (1170, 2532));
+        // Once set (to VD_WIDTH x VD_HEIGHT), a portrait creation size from
+        // the last session doesn't change the panel's shape.
+        set_panel_size_px(1920, 1080);
+        assert_eq!(panel_basis(1170, 2532), (1920, 1080));
+        set_panel_size_px(800, 600); // only the first call counts
+        assert_eq!(panel_basis(3456, 2168), (1920, 1080));
     }
 
     #[test]

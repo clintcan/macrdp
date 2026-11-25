@@ -103,8 +103,10 @@ mod imp {
 
     use super::{after_session, changes, while_connected, Placed};
 
-    /// The session's display ids from the last connect, for the restore.
-    static SESSION: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    /// The session's displays from the last arrangement (id, position
+    /// relative to the primary): for the restore, and for re-applying the
+    /// arrangement when a client connects (see `reapply`).
+    static SESSION: Mutex<Vec<(u32, i32, i32)>> = Mutex::new(Vec::new());
     /// The Mac's own main display, recorded at startup before any virtual
     /// display existed.
     static PHYSICAL_MAIN: Mutex<Option<u32>> = Mutex::new(None);
@@ -137,7 +139,7 @@ mod imp {
     /// primary at (0,0)). True if anything moved.
     pub fn arrange_as_main(session: &[(u32, i32, i32)]) -> Result<bool> {
         let ids: Vec<u32> = session.iter().map(|&(id, _, _)| id).collect();
-        *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = ids.clone();
+        *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = session.to_vec();
         let placed: Vec<Placed> = session
             .iter()
             .map(|&(id, x, y)| Placed { x, y, ..rect(id) })
@@ -157,16 +159,41 @@ mod imp {
         Ok(true)
     }
 
+    /// Re-applies the last arrangement when a client connects. The arrangement
+    /// is made when the session's displays are set up, which can come before
+    /// a restore for the previous disconnect (a reconnect whose capture start
+    /// outlasts the session watcher's grace); without this the session would
+    /// run without the Dock and menu bar. Moves nothing when already in place.
+    pub fn reapply() {
+        let session = SESSION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if session.is_empty() {
+            return;
+        }
+        let session: Vec<(u32, i32, i32)> = session
+            .into_iter()
+            .map(|(id, x, y)| (crate::virtual_display::current_id(id), x, y))
+            .collect();
+        if let Err(e) = arrange_as_main(&session) {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "re-applying the main display failed"
+            );
+        }
+    }
+
     /// Gives the main display back to the Mac after the last client left.
+    /// The session's record is kept, so a failed restore is retried by the
+    /// next disconnect, and a reconnect can re-apply it.
     pub fn restore() {
-        let ids = std::mem::take(&mut *SESSION.lock().unwrap_or_else(|e| e.into_inner()));
+        let ids: Vec<u32> = SESSION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|&(id, _, _)| crate::virtual_display::current_id(id))
+            .collect();
         if ids.is_empty() {
             return;
         }
-        let ids: Vec<u32> = ids
-            .into_iter()
-            .map(crate::virtual_display::current_id)
-            .collect();
         let Some(physical_main) = *PHYSICAL_MAIN.lock().unwrap_or_else(|e| e.into_inner()) else {
             return;
         };
@@ -198,19 +225,23 @@ mod imp {
         Ok(false)
     }
 
+    pub fn reapply() {}
+
     pub fn restore() {}
 }
 
-pub use imp::{arrange_as_main, restore, set_physical_main};
+pub use imp::{arrange_as_main, reapply, restore, set_physical_main};
 
-/// The session watcher's guard (see `spawn_primary_overlay_watcher`): nothing
-/// to do on connect, since the arrangement happens when the session's
-/// displays are set up; dropping it on the last disconnect gives the main
+/// The session watcher's guard (see `spawn_primary_overlay_watcher`). The
+/// arrangement is made when the session's displays are set up; installing the
+/// guard on connect re-applies it in case a late restore undid it (see
+/// [`reapply`]), and dropping it on the last disconnect gives the main
 /// display back.
 pub struct Guard;
 
 impl Guard {
     pub fn install(_vd_id: u32) -> anyhow::Result<Self> {
+        reapply();
         Ok(Self)
     }
 }

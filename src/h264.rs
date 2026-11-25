@@ -456,17 +456,6 @@ impl ConnectionContext {
         self.extras.iter_mut().for_each(|e| e.need_keyframe = true);
     }
 
-    /// Starts the connection's clocks at `now`, the moment the EGFX channel goes
-    /// ready. The context is built when the server attaches channels, which is
-    /// at TCP accept, before TLS and authentication. A slow login (a
-    /// certificate prompt, a typed password, NLA over a distant link) used to
-    /// count as connected time: by the first frame the blank detector's 3 s arm
-    /// delay and the adaptive controller's 3 s no-ack grace had already run out,
-    /// so a session that had not yet had a chance to present was "recovered"
-    /// within a fraction of a second. Nothing ships or is acknowledged before
-    /// ready, so restarting every connection-start baseline here is exactly
-    /// "the connection starts now". A new connection-start clock belongs here
-    /// too.
     /// The blank detector's time since the session started presenting:
     /// zero at the first frame, which (re)starts the detector's clocks there.
     /// Its clocks used to start at EGFX ready, but the first frame can come
@@ -484,6 +473,17 @@ impl ConnectionContext {
         now.saturating_duration_since(first)
     }
 
+    /// Starts the connection's clocks at `now`, the moment the EGFX channel goes
+    /// ready. The context is built when the server attaches channels, which is
+    /// at TCP accept, before TLS and authentication. A slow login (a
+    /// certificate prompt, a typed password, NLA over a distant link) used to
+    /// count as connected time: by the first frame the blank detector's 3 s arm
+    /// delay and the adaptive controller's 3 s no-ack grace had already run out,
+    /// so a session that had not yet had a chance to present was "recovered"
+    /// within a fraction of a second. Nothing ships or is acknowledged before
+    /// ready, so restarting every connection-start baseline here is exactly
+    /// "the connection starts now". A new connection-start clock belongs here
+    /// too.
     fn start_clocks(&mut self, now: Instant) {
         self.epoch = now;
         self.last_ack_at = now;
