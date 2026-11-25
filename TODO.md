@@ -7,6 +7,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **Slow first connect after a restart (2026-11-25, live, Windows App for macOS at 3024x1898).**
+  Auth to first frame 15.8 s on the first connect after a macrdp restart, 0.4-0.7 s on the next two.
+  The first needs the virtual display re-moded from `VD_WIDTH`x`VD_HEIGHT` (1920x1080) to the
+  client's size; then ScreenCaptureKit took 5.4 s to start the capture and 4.4 s more for its first
+  frame, and the blank detector misfired (its clocks start at EGFX ready, the first frame came 6 s
+  later) and added a reactivation. The capture start also blocks the server's event loop ("PDU
+  dispatch stalled" up to 1.7 s). Fixes, after the v0.11.2 soak: (1) create the display at the last
+  served size, saved across restarts; (2) start the blank detector's clocks at the first frame sent;
+  (3) start the capture off the event loop, and find why SCK is slow after a re-mode (the same
+  slowness as the multi-monitor in-place re-layout's "opening the captures").
+
 - [ ] **Not yet checked live since the IronRDP 79e763a0 rebase (shipped in v0.10.10):** FreeRDP, Windows
   App for macOS (blank recovery armed), a takeover by a second client, connect-time auto-detect
   (`NETWORK_AUTODETECT=1`), and (needing config changes) microphone, camera, USB and smart card.
