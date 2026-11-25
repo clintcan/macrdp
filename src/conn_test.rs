@@ -409,11 +409,29 @@ async fn connect_client_with_cookie<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    let (result, framed) =
+        connect_client_with_config(client_io, client_config(client_w, client_h), cookie).await?;
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        framed,
+    ))
+}
+
+/// The handshake behind [`connect_client_with_cookie`], with the caller's
+/// client `config`, returning the client's whole `ConnectionResult`.
+async fn connect_client_with_config<S>(
+    client_io: S,
+    config: Config,
+    cookie: Option<ServerAutoReconnect>,
+) -> anyhow::Result<(
+    ironrdp_connector::ConnectionResult,
+    TokioFramed<tokio_rustls::client::TlsStream<S>>,
+)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
-    let mut connector = ClientConnector::new(
-        client_config(client_w, client_h),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-    );
+    let mut connector = ClientConnector::new(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     if let Some(cookie) = cookie {
         connector = connector.with_auto_reconnect_cookie(cookie);
     }
@@ -448,10 +466,7 @@ where
     )
     .await?
     .into_connected()?;
-    Ok((
-        (result.desktop_size.width, result.desktop_size.height),
-        tls_framed,
-    ))
+    Ok((result, tls_framed))
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
@@ -490,6 +505,100 @@ async fn negotiate(
             size
         })
         .await
+}
+
+/// Multi-monitor (docs/multi-monitor-design.md, acceptor divergence 8): with
+/// the monitor-layout option on, a client announcing two monitors gets a
+/// desktop the size of their bounding box, past the per-desktop size cap,
+/// and a Monitor Layout PDU listing its monitors as it sent them, including a
+/// monitor at negative coordinates. With the option off it gets today's
+/// single monitor, at a size the cap limits.
+async fn negotiate_monitors(
+    layout_option: bool,
+) -> anyhow::Result<ironrdp_connector::ConnectionResult> {
+    use ironrdp_pdu::gcc::{ClientMonitorData, Monitor, MonitorFlags};
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .with_honor_client_desktop_size(honor_client_size(true, Some((4096, 2304))))
+        .with_honor_client_monitor_layout(layout_option)
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build();
+    // A 3440x1440 primary with a 1920x1080 monitor to its left, top-aligned.
+    let mut config = client_config(5360, 1440);
+    config.monitor_layout = Some(ClientMonitorData {
+        monitors: vec![
+            Monitor {
+                left: 0,
+                top: 0,
+                right: 3439,
+                bottom: 1439,
+                flags: MonitorFlags::PRIMARY,
+            },
+            Monitor {
+                left: -1920,
+                top: 0,
+                right: -1,
+                bottom: 1079,
+                flags: MonitorFlags::empty(),
+            },
+        ],
+    });
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let result = connect_client_with_config(client_io, config, None).await;
+            server_task.abort();
+            result.map(|(result, _framed)| result)
+        })
+        .await
+}
+
+#[tokio::test]
+async fn a_two_monitor_client_gets_its_monitor_layout() -> anyhow::Result<()> {
+    let result = negotiate_monitors(true).await?;
+    assert_eq!(
+        (result.desktop_size.width, result.desktop_size.height),
+        (5360, 1440)
+    );
+    let layout = result.monitor_layout.expect("a Monitor Layout PDU");
+    let rects: Vec<_> = layout
+        .monitors
+        .iter()
+        .map(|m| (m.left, m.top, m.right, m.bottom, m.flags.bits()))
+        .collect();
+    assert_eq!(rects, vec![(0, 0, 3439, 1439, 1), (-1920, 0, -1, 1079, 0)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_the_option_a_two_monitor_client_gets_one_monitor() -> anyhow::Result<()> {
+    let result = negotiate_monitors(false).await?;
+    // The desktop request is capped as a whole, as before.
+    assert_eq!(
+        (result.desktop_size.width, result.desktop_size.height),
+        (4096, 1440)
+    );
+    let layout = result.monitor_layout.expect("a Monitor Layout PDU");
+    assert_eq!(layout.monitors.len(), 1);
+    assert_eq!(
+        (layout.monitors[0].right, layout.monitors[0].bottom),
+        (4095, 1439)
+    );
+    Ok(())
 }
 
 #[tokio::test]

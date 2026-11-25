@@ -14,15 +14,17 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    is_hidpi_virtual_display, online_display, run_select_mode_helper, screen_is_locked,
-    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
+    arrange_displays, is_hidpi_virtual_display, online_display, right_edge_excluding,
+    run_arrange_helper, run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay, ARRANGE_ARG, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    is_hidpi_virtual_display, screen_is_locked, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange_displays, is_hidpi_virtual_display, right_edge_excluding, screen_is_locked,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 /// When the virtual display runs HiDPI (`--virtual-display-hidpi`).
@@ -433,6 +435,116 @@ mod macos {
         }
     }
 
+    /// The right edge (global points) of the online displays not in
+    /// `exclude`; 0 if there are none.
+    pub fn right_edge_excluding(exclude: &[u32]) -> f64 {
+        online_displays()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !exclude.contains(id))
+            .map(|id| {
+                let b = CGDisplay::new(id).bounds();
+                b.origin.x + b.size.width
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// First argument that turns the binary into a one-shot helper: move
+    /// the displays given by the next argument (`id:x:y,id:x:y,...`, global
+    /// points) and exit. See `arrange_displays`.
+    pub const ARRANGE_ARG: &str = "--arrange-displays";
+
+    /// Body of the arrange helper process. Returns its exit code.
+    pub fn run_arrange_helper(spec: &str) -> i32 {
+        let parsed: Option<Vec<(u32, i32, i32)>> = spec
+            .split(',')
+            .map(|item| {
+                let mut f = item.split(':');
+                Some((
+                    f.next()?.parse().ok()?,
+                    f.next()?.parse().ok()?,
+                    f.next()?.parse().ok()?,
+                ))
+            })
+            .collect();
+        let Some(origins) = parsed else {
+            eprintln!("{ARRANGE_ARG}: expected id:x:y,..., got {spec:?}");
+            return 2;
+        };
+        match arrange_in_process(&origins) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{ARRANGE_ARG}: {e:#}");
+                1
+            }
+        }
+    }
+
+    /// Moves each `(display id, x, y)` to its origin in the global display
+    /// space (points), in one transaction, in a short-lived helper process.
+    ///
+    /// Another process, like `select_mode_out_of_process`: after macrdp
+    /// configured displays itself, its own view of the main display stayed
+    /// frozen, so a later re-mode that had worked (system_profiler showed the
+    /// new size) looked failed to macrdp, and input mapped with the old
+    /// bounds (seen live 2026-11-25). App-scoped in the helper, so it outlives
+    /// the helper only as a process-less arrangement macOS keeps until the
+    /// next reconfiguration; every multi-monitor setup re-arranges after a
+    /// re-mode.
+    pub fn arrange_displays(origins: &[(u32, i32, i32)]) -> Result<()> {
+        if origins.is_empty() {
+            return Ok(());
+        }
+        let spec = origins
+            .iter()
+            .map(|(id, x, y)| format!("{id}:{x}:{y}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        #[cfg(test)]
+        {
+            let _ = spec;
+            arrange_in_process(origins)
+        }
+        #[cfg(not(test))]
+        {
+            let exe = std::env::current_exe().context("locating the macrdp binary")?;
+            let out = std::process::Command::new(exe)
+                .arg(ARRANGE_ARG)
+                .arg(&spec)
+                .output()
+                .context("starting the display-arrange helper")?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "display-arrange helper failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        }
+    }
+
+    fn arrange_in_process(origins: &[(u32, i32, i32)]) -> Result<()> {
+        let Some(&(first, _, _)) = origins.first() else {
+            return Ok(());
+        };
+        let any = CGDisplay::new(first);
+        let config = any
+            .begin_configuration()
+            .map_err(|e| anyhow!("CGBeginDisplayConfiguration (arrange): CGError {e}"))?;
+        for &(id, x, y) in origins {
+            if let Err(e) = CGDisplay::new(id).configure_display_origin(&config, x, y) {
+                let _ = any.cancel_configuration(&config);
+                return Err(anyhow!(
+                    "CGConfigureDisplayOrigin(display={id}, {x}, {y}) (arrange): CGError {e}"
+                ));
+            }
+        }
+        any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+            .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (arrange): CGError {e}"))
+    }
+
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
     // core-graphics crate. "Online" includes both active displays and any
     // online-but-currently-disabled displays — which is exactly the set we
@@ -469,6 +581,13 @@ mod macos {
         handle: Option<private_api::Handle>,
         display_id: u32,
         refresh_hz: u32,
+        /// The descriptor serial: the pid for the main display, unique per
+        /// display in a multi-monitor session. Identifies the display after
+        /// WindowServer re-registers it (`refresh_id`).
+        serial: u32,
+        /// The descriptor product id, when not the default for the mode
+        /// (a multi-monitor session's extra displays).
+        product: Option<u32>,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
         /// Created HiDPI (`--virtual-display-hidpi`): every mode is applied
@@ -586,6 +705,30 @@ mod macos {
             hidpi: bool,
             ui_scale: u32,
         ) -> Result<Self> {
+            Self::new_with_identity(
+                width,
+                height,
+                refresh_hz,
+                hidpi,
+                ui_scale,
+                std::process::id(),
+                None,
+            )
+        }
+
+        /// [`new`](Self::new) with the descriptor serial and, optionally,
+        /// product id given: a multi-monitor session's extra displays each
+        /// need their own of both (macOS remembers modes per vendor/product).
+        #[allow(clippy::too_many_arguments)]
+        pub fn new_with_identity(
+            width: u32,
+            height: u32,
+            refresh_hz: u32,
+            hidpi: bool,
+            ui_scale: u32,
+            serial: u32,
+            product: Option<u32>,
+        ) -> Result<Self> {
             let ui_scale = if hidpi { ui_scale.max(1) } else { 1 };
             let (mode_w, mode_h) = (mode_points(width, ui_scale), mode_points(height, ui_scale));
             let handle = private_api::create(
@@ -596,6 +739,8 @@ mod macos {
                 hidpi,
                 hidpi,
                 super::panel_size_mm(width, height, hidpi),
+                serial,
+                product,
             )
             .context("creating virtual display")?;
 
@@ -618,6 +763,8 @@ mod macos {
                 handle: Some(handle),
                 display_id: id,
                 refresh_hz,
+                serial,
+                product,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
                 hidpi,
@@ -702,7 +849,10 @@ mod macos {
                 self.display_id,
                 live,
                 &online,
-                super::DisplayIdentity::ours(),
+                super::DisplayIdentity {
+                    vendor: super::VENDOR_ID,
+                    serial: self.serial,
+                },
                 size_px,
             )?;
             if id != self.display_id {
@@ -771,10 +921,28 @@ mod macos {
             forget_scale(before);
             // WindowServer rejects our serial while the old display is alive.
             self.handle = None;
-            *self = Self::new(width, height, self.refresh_hz, self.hidpi, self.ui_scale)?;
+            *self = Self::new_with_identity(
+                width,
+                height,
+                self.refresh_hz,
+                self.hidpi,
+                self.ui_scale,
+                self.serial,
+                self.product,
+            )?;
             self.mode_px = (0, 0);
             super::record_id_change(before, self.display_id);
             Ok(())
+        }
+
+        /// Re-reads the display's position and size after something else
+        /// moved it (a multi-monitor arrangement).
+        pub fn refresh_bounds(&mut self) {
+            let b = CGDisplay::new(self.display_id).bounds();
+            if b.size.width > 0.0 && b.size.height > 0.0 {
+                self.origin_pts = (b.origin.x, b.origin.y);
+                self.size_pts = (b.size.width, b.size.height);
+            }
         }
 
         pub fn origin_pts(&self) -> (f64, f64) {
@@ -2359,6 +2527,14 @@ mod stub {
 
     /// No screen-lock concept off macOS — definitively not locked, not
     /// "unknown" (there's nothing to fail to look up).
+    pub fn arrange_displays(_origins: &[(u32, i32, i32)]) -> Result<()> {
+        Err(anyhow!("virtual display is macOS-only"))
+    }
+
+    pub fn right_edge_excluding(_exclude: &[u32]) -> f64 {
+        0.0
+    }
+
     pub fn screen_is_locked() -> Option<bool> {
         Some(false)
     }
@@ -2383,6 +2559,18 @@ mod stub {
                  different target"
             ))
         }
+        #[allow(clippy::too_many_arguments)]
+        pub fn new_with_identity(
+            _width: u32,
+            _height: u32,
+            _refresh_hz: u32,
+            _hidpi: bool,
+            _ui_scale: u32,
+            _serial: u32,
+            _product: Option<u32>,
+        ) -> Result<Self> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
         pub fn display_id(&self) -> u32 {
             0
         }
@@ -2395,6 +2583,7 @@ mod stub {
         pub fn recreate(&mut self) -> Result<()> {
             Err(anyhow!("virtual display is macOS-only"))
         }
+        pub fn refresh_bounds(&mut self) {}
         pub fn origin_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
         }

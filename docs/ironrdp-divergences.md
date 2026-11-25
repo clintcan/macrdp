@@ -113,6 +113,7 @@ renamed for this (11): `RdpdrDriveServerFactory`, `RdpdrDriveMessage`, `RdpdrDri
 | (25) | Our MS-RDPEAI microphone | `audin.rs` (`AudinChannelFactory`) | `with_audin_factory` |
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the auto-reconnect check; `macrdp.rs` `is_stale_reconnect_cookie` | — |
 | (35) | Optional Connect-Time Auto-Detection when auto-detect is enabled: an RTT probe, a 256 KiB bandwidth burst and a Network Characteristics Result between Client Info and licensing; later results report this connect-time bandwidth instead of the continuous figure. Based on clintcan/macrdp#235 by @JulyStar-Lv. Pairs with acceptor divergence (7) | `macrdp.rs` `connect_time_autodetect`, `await_autodetect_reply`, `connect_time_autodetect_hook`; the `accept_finalize_with_hooks` call in `accept_finalize`; `autodetect.rs` `connect_time_*`, `PendingBandwidth::ConnectTime`, `build_netchar_result` | `--network-autodetect` (macrdp: `enable_autodetect()` + a 1 s `ServerEvent::AutoDetectRttRequest` ticker) |
+| (36) | Pass the monitor-layout option to every connection and report the adopted layout (multi-monitor, with acceptor (8)) | `server.rs` `PendingConnection::new`, `RdpServerOptions::honor_client_monitor_layout`, `ConnectionInfo::monitor_layout`; `builder.rs` | `with_honor_client_monitor_layout(bool)`, `ConnectionInfo::monitor_layout` |
 
 Notes on the port to 79e763a0. Upstream replaced the per-connection `Rc<Mutex<Self>>` and the
 parallel dispatch futures with one `select!` loop over a FIFO outbound queue (#2349, #2431, #2312),
@@ -336,7 +337,7 @@ multitransport client, a successful NLA for (18), and (20)'s placement in `clien
 
 ## ironrdp-acceptor
 
-`src/` is upstream 79e763a0 except `connection.rs`, which carries (4), (5) and (7), and `lib.rs`,
+`src/` is upstream 79e763a0 except `connection.rs`, which carries (4), (5), (7) and (8), and `lib.rs`,
 which carries (7)'s finalize driver. Every insertion is marked `(macrdp divergence N)`. The crate keeps
 IronRDP's workspace lints and is lint-clean under them.
 
@@ -372,6 +373,21 @@ IronRDP's workspace lints and is lint-clean under them.
     `accept_finalize_with_handlers()` now calls it with a no-op handler, so its behaviour is
     unchanged. A client whose credentials are refused gets no burst. Used by server
     divergence (35). Upstream candidate.
+
+(8) **Adopt a multi-monitor client's layout** (NOT upstreamed; added 2026-11-25 in
+    clintcan/IronRDP#6, for macrdp's multi-monitor sessions, `docs/multi-monitor-design.md`).
+    `Acceptor::set_honor_client_monitor_layout(bool)`, off by default. With it on and
+    `set_honor_client_desktop_size` set, a client whose Client Monitor Data holds a usable
+    layout (2 to 16 monitors, exactly one primary at (0,0), each 200 pixels to the operator
+    maximum, no overlaps, a bounding box that is a valid desktop size; `adopt_monitor_layout`)
+    gets a desktop the size of the bounding box, and a Monitor Layout PDU listing its monitors
+    as it sent them, primary-relative and possibly negative, as xrdp and FreeRDP's server do.
+    The operator maximum then applies per monitor. `AcceptorResult::monitor_layout` reports
+    the adopted layout; server divergence (36) passes the option in and reports it in
+    `ConnectionInfo`. If a later resize moves the desktop off the bounding box, the layout
+    PDU falls back to one monitor. Tests: three unit tests in `connection.rs`
+    (`a_side_by_side_layout_is_adopted_with_its_bounding_box` and two more) and macrdp's
+    `conn_test::a_two_monitor_client_gets_its_monitor_layout`. Upstream candidate.
 
 ### Testing
 

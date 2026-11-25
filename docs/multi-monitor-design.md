@@ -71,6 +71,14 @@ an index. `pick_display_id` (#231) and the HiDPI registry (one display today) be
 - **Legacy bitmap path:** composite all displays into one desktop, since bitmap updates carry desktop
   coordinates. Phase 2.
 
+**Tried and rejected (2026-11-25): one wide surface.** Compositing every display into one
+desktop-sized frame on a single surface kept the H.264 code unchanged, but mstsc never split a single
+surface across its monitors: it scaled the whole desktop into one monitor (whichever came first in the
+Monitor Layout PDU), and with the primary listed first, into both. Listing the primary first in either
+message and reporting a 16-monitor maximum (MS-RDPEDISP `MaxNumMonitors`) didn't change that. One surface
+per monitor, as xrdp does (`xrdp_mm_egfx_create_surfaces`), works: live on mstsc with a 1920x1080 primary
+and a 1366x768 monitor to its right, each monitor shows its own display.
+
 ### 4. Input
 
 Each pointer event is hit-tested against the monitor rectangles (client coordinates) and mapped onto that
@@ -93,6 +101,28 @@ resets the surfaces, the same way a single-monitor resize does today (deactivati
 - **Audio** binds to the virtual display; with several, it binds to the primary.
 - **The app-switcher HUD** shows on the primary.
 
+## Status (2026-11-25)
+
+Phase 1 works live on mstsc and Windows App on Windows (Windows 11, two monitors; a reconnect from
+either picks up the same desktop): the layout is adopted, one virtual display per
+monitor, one capture stream and one surface + encoder per monitor (`src/capture_multi.rs`,
+`ExtraSurface` in `src/h264.rs`), pointer events go to the monitor they land on. Still to do for phase 1:
+live layout changes are ignored and blank recovery is off in these sessions. Each encoder gets its
+monitor's area share of the link's (adaptive) bitrate target, so the link carries the target (live: 3
+Mbit/s split 1.99 + 1.01 for 1920x1080 + 1366x768), and link-wide keyframe requests (resume, tunnel
+recovery and de-migration, the end of an IDR backoff) reach every monitor. mstsc's requested desktop size varies (1920x1080, its primary, or
+3284x1080); the session size comes from the layout either way.
+
+**Lessons from live testing (2026-11-25).**
+- The display arrangement runs in a helper process (`macrdp --arrange-displays`), like the HiDPI mode
+  selection: configuring displays in macrdp's own process froze its view of the main display, so a later
+  single-monitor session's re-mode (which macOS applied) looked failed and the pointer was mapped with the
+  old bounds.
+- No MS-RDPEDISP `MaxNumMonitors` above 1: with 16, Windows App on Windows reconnecting after a server
+  restart never opened the graphics channel.
+- Frames that arrive while EGFX is negotiating are held per monitor and re-sent; a static display sends
+  no new ones.
+
 ## Phases
 
 1. **Two monitors, H.264, `--virtual-display`, no headless mode, mstsc.** The fork change (1), displays
@@ -102,17 +132,35 @@ resets the surfaces, the same way a single-monitor resize does today (deactivati
 
 ## Testing
 
-- **Unit:** layout normalisation (client coordinates can be negative; EGFX output origins can't), the
+- **Unit:** layout normalisation (client coordinates can be negative; EGFX output origins can't, see
+  Coordinates), the
   monitor hit-test, display arrangement from a layout.
 - **Connection test:** a client announcing two monitors gets a two-monitor Monitor Layout PDU and two
   mapped surfaces.
 - **Live:** mstsc with two monitors (different resolutions, primary on either side, one above the other),
   then Windows App. Moving windows across, full-screen video on one, reconnects.
 
+## Coordinates (settled 2026-11-25)
+
+From MS-RDPBCGR 2.2.1.3.6.1 (TS_MONITOR_DEF) and MS-RDPEGFX, and what xrdp (`master` 7a7a112) and
+FreeRDP (`master` bd0ccc7) do:
+
+- **Monitor rectangles are primary-relative and signed.** The client's Client Monitor Data puts the
+  primary monitor's top-left at (0,0); a monitor to its left or above has negative coordinates;
+  right/bottom are inclusive. At most 16 monitors.
+- **The Monitor Layout PDU and the `RESET_GRAPHICS` monitor array carry them unchanged.** xrdp
+  (`xrdp_caps_send_monitorlayout`, `xrdp_mm_egfx_caps_advertise`) and FreeRDP's server
+  (`freerdp_display_send_monitor_layout`) both echo the client's raw rectangles.
+- **Everything unsigned is relative to the bounding box's top-left:** the desktop size, surface origins
+  (`MapSurfaceToOutput` is unsigned), bitmap updates and input. xrdp keeps a second, shifted copy
+  (`minfo_wm`) for these and maps one surface per monitor at the shifted position
+  (`xrdp_mm_egfx_create_surfaces`).
+- Exactly one monitor is primary, at (0,0); mid-session MS-RDPEDISP monitors are 200–8192 with an even
+  width. `RESET_GRAPHICS` needs at least one monitor (xrdp comment, for the Microsoft macOS client).
+
 ## Open questions
 
-- Whether mstsc expects the Monitor Layout PDU coordinates as the client sent them (possibly negative) or
-  normalised to a (0,0) origin; and how `RESET_GRAPHICS` monitors relate to surface origins. Check
-  against a capture of mstsc talking to Windows.
+- What a real Windows server sends in the Monitor Layout PDU (no primary source found; the open-source
+  servers echo the client's).
 - Whether Windows App for macOS sends Client Monitor Data at all.
 - How macOS places the Dock and menu bar across several virtual displays in each headless mode.

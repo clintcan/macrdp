@@ -63,6 +63,19 @@ impl MacInputHandler {
     }
 }
 
+impl MacInputHandler {
+    /// --multi-monitor: share the cell the multi-monitor capture fills, so a
+    /// pointer event goes to the monitor it lands on.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut, unused_variables))]
+    pub fn with_active_monitors(mut self, monitors: crate::multi_monitor::ActiveMonitors) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.active_monitors = monitors;
+        }
+        self
+    }
+}
+
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
         #[cfg(target_os = "macos")]
@@ -110,6 +123,24 @@ impl RdpServerInputHandler for MacInputHandler {
 ///   screen edge rather than off-screen.
 ///
 /// Pure (no platform deps) so it's unit-tested on every target.
+/// --multi-monitor: desktop point `(x, y)` on monitor `(mx, my, mw, mh)`
+/// (desktop pixels), mapped onto that monitor's display at global bounds
+/// `(ox, oy, w, h)` (points). A point off the monitor (in a gap) is clamped to
+/// its nearest edge.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn map_onto_monitor(
+    (x, y): (u16, u16),
+    (mx, my, mw, mh): (u16, u16, u16, u16),
+    (ox, oy, w, h): (f64, f64, f64, f64),
+) -> (f64, f64) {
+    let local = |p: u16, start: u16, len: u16| {
+        f64::from(p.saturating_sub(start).min(len.saturating_sub(1)))
+    };
+    let sx = w / f64::from(mw.max(1));
+    let sy = h / f64::from(mh.max(1));
+    (ox + local(x, mx, mw) * sx, oy + local(y, my, mh) * sy)
+}
+
 fn map_client_to_display(
     x: u16,
     y: u16,
@@ -327,6 +358,32 @@ mod coord_tests {
         remove_switcher_selection, resync_plan, scroll_lines, should_alt_q_quit,
         should_remap_click, wheel_delta, ResyncPlan,
     };
+
+    #[test]
+    fn a_point_maps_onto_its_monitors_display() {
+        // The secondary monitor (1366x768) at desktop (1920,0); its display at
+        // global (3840,0), 1:1.
+        let secondary = (1920, 0, 1366, 768);
+        let display = (3840.0, 0.0, 1366.0, 768.0);
+        assert_eq!(
+            super::map_onto_monitor((1920, 0), secondary, display),
+            (3840.0, 0.0)
+        );
+        assert_eq!(
+            super::map_onto_monitor((3285, 767), secondary, display),
+            (5205.0, 767.0)
+        );
+        // A point in the gap under it clamps to its bottom edge.
+        assert_eq!(
+            super::map_onto_monitor((2000, 900), secondary, display),
+            (3920.0, 767.0)
+        );
+        // A 2x HiDPI display: half the pixels in points.
+        assert_eq!(
+            super::map_onto_monitor((100, 50), (0, 0, 1920, 1080), (0.0, 0.0, 960.0, 540.0)),
+            (50.0, 25.0)
+        );
+    }
 
     #[test]
     fn reverse_scroll_inverts_the_wheel_only_when_on() {
@@ -1071,6 +1128,9 @@ mod macos {
         // --detach-primary disabling the built-in mid-flight) doesn't
         // strand events on stale coords.
         target_display_id: Option<u32>,
+        /// --multi-monitor: the monitors and their displays, when a
+        /// multi-monitor session is being served (see `move_to`).
+        pub(super) active_monitors: crate::multi_monitor::ActiveMonitors,
         // TTL cache for `target_bounds`: the CoreGraphics bounds query sits
         // on the busiest input path (mouse-move fires hundreds of times/s
         // during a drag) while display geometry changes only on a rare
@@ -1191,6 +1251,7 @@ mod macos {
                 middle_down: false,
                 mods: ModifierState::default(),
                 target_display_id,
+                active_monitors: std::sync::Arc::default(),
                 cached_bounds: None,
                 bounds_cached_at: Instant::now(),
                 click_left: None,
@@ -1987,7 +2048,31 @@ mod macos {
             }
         }
 
+        /// --multi-monitor: the global point for desktop `(x, y)` on the
+        /// monitor it lands on (the nearest one in a gap), or `None` outside
+        /// a multi-monitor session.
+        fn multi_monitor_point(&self, x: u16, y: u16) -> Option<(f64, f64)> {
+            let guard = self
+                .active_monitors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (layout, ids) = guard.as_ref()?;
+            let i = layout.monitor_at(x, y);
+            let m = layout.monitors().get(i)?;
+            let id = crate::virtual_display::current_id(*ids.get(i)?);
+            let b = CGDisplay::new(id).bounds();
+            Some(super::map_onto_monitor(
+                (x, y),
+                (m.x, m.y, m.width, m.height),
+                (b.origin.x, b.origin.y, b.size.width, b.size.height),
+            ))
+        }
+
         fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16, letterbox: bool) {
+            if let Some((gx, gy)) = self.multi_monitor_point(x, y) {
+                self.post_move(gx, gy);
+                return;
+            }
             // Scale desktop coords → screen points, then translate into the
             // target display's slot in the global coord space. The origin
             // offset is what makes CGEventPost route events to a non-primary

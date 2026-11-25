@@ -115,6 +115,12 @@ final class SettingsModel: ObservableObject {
             if draft["LOCK_ON_DISCONNECT"] == "1" { draft["LOCK_ON_DISCONNECT"] = "0" }
             if draft["AUTO_UNLOCK"] == "1" { draft["AUTO_UNLOCK"] = "0" }
         }
+        // Multi-monitor only where the server accepts it: it refuses to start
+        // with --multi-monitor and no virtual display, a headless mode,
+        // VD_HIDPI, or --no-client-resolution (in EXTRA_FLAGS).
+        if draft["MULTI_MONITOR"] == "1" && !multiMonitorAllowed {
+            draft["MULTI_MONITOR"] = "0"
+        }
         // Tunnel off => clear the video-migrate child. Tunnel on + migrate on =>
         // ensure H.264 (the migrate toggle is UI-disabled until the tunnel is on,
         // so this never has to re-enable the tunnel itself).
@@ -123,6 +129,21 @@ final class SettingsModel: ObservableObject {
         } else if (draft["UDP_MIGRATE_EGFX"] ?? "0") == "1" {
             draft["ENABLE_H264"] = "1"
         }
+    }
+
+    // MARK: - Multi-monitor
+
+    /// Whether `MULTI_MONITOR` can be on: the server needs the virtual display
+    /// and refuses it with a headless mode, a HiDPI virtual display, or
+    /// `--no-client-resolution`.
+    var multiMonitorAllowed: Bool {
+        let hidpi = (draft["VD_HIDPI"] ?? "0").lowercased()
+        let extra = draft["EXTRA_FLAGS"] ?? ""
+        return (draft["VIRTUAL_DISPLAY"] ?? "0") == "1"
+            && primaryMode == "none"
+            && (hidpi == "0" || hidpi.isEmpty)
+            && !extra.contains("--no-client-resolution")
+            && !extra.contains("--virtual-display-hidpi")
     }
 
     // MARK: - Network bind (loopback <-> all interfaces, port preserved)

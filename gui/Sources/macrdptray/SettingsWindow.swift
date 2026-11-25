@@ -353,6 +353,17 @@ private struct DisplayTab: View {
                     }
                 }
                 .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                Toggle("Use all of the client's monitors (experimental)",
+                       isOn: model.boolBinding("MULTI_MONITOR"))
+                    .disabled(!model.multiMonitorAllowed)
+                Text(model.multiMonitorAllowed
+                    ? "A client using several monitors (mstsc “Use all my monitors”, Windows App’s "
+                        + "multiple displays) gets one remote monitor per local one, each its own "
+                        + "virtual display. Not yet: moving or resizing the client window between "
+                        + "monitor layouts."
+                    : "Needs the headless virtual display, “Keep local screen on” below, and no "
+                        + "HiDPI virtual display.")
+                    .font(.caption).foregroundColor(.secondary)
             }
             Section("Primary screen (while connected)") {
                 Picker("Physical panel", selection: Binding(
