@@ -113,7 +113,7 @@ renamed for this (11): `RdpdrDriveServerFactory`, `RdpdrDriveMessage`, `RdpdrDri
 | (25) | Our MS-RDPEAI microphone | `audin.rs` (`AudinChannelFactory`) | `with_audin_factory` |
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the auto-reconnect check; `macrdp.rs` `is_stale_reconnect_cookie` | — |
 | (35) | Optional Connect-Time Auto-Detection when auto-detect is enabled: an RTT probe, a 256 KiB bandwidth burst and a Network Characteristics Result between Client Info and licensing; later results report this connect-time bandwidth instead of the continuous figure. Based on clintcan/macrdp#235 by @JulyStar-Lv. Pairs with acceptor divergence (7) | `macrdp.rs` `connect_time_autodetect`, `await_autodetect_reply`, `connect_time_autodetect_hook`; the `accept_finalize_with_hooks` call in `accept_finalize`; `autodetect.rs` `connect_time_*`, `PendingBandwidth::ConnectTime`, `build_netchar_result` | `--network-autodetect` (macrdp: `enable_autodetect()` + a 1 s `ServerEvent::AutoDetectRttRequest` ticker) |
-| (36) | Pass the monitor-layout option to every connection and report the adopted layout (multi-monitor, with acceptor (8)) | `server.rs` `PendingConnection::new`, `RdpServerOptions::honor_client_monitor_layout`, `ConnectionInfo::monitor_layout`; `builder.rs` | `with_honor_client_monitor_layout(bool)`, `ConnectionInfo::monitor_layout` |
+| (36) | Pass the monitor-layout option to every connection and report the adopted layout (multi-monitor, with acceptor (8)); before a reactivation, ask the display for the layout it now serves | `server.rs` `PendingConnection::new`, `RdpServerOptions::honor_client_monitor_layout`, `ConnectionInfo::monitor_layout`, the `DeactivationReactivation` arm, `BoundDisplaySlot::monitor_layout`; `builder.rs`; `display.rs` | `with_honor_client_monitor_layout(bool)`, `ConnectionInfo::monitor_layout`, `RdpServerDisplay::monitor_layout()` |
 
 Notes on the port to 79e763a0. Upstream replaced the per-connection `Rc<Mutex<Self>>` and the
 parallel dispatch futures with one `select!` loop over a FIFO outbound queue (#2349, #2431, #2312),
@@ -388,6 +388,13 @@ IronRDP's workspace lints and is lint-clean under them.
     PDU falls back to one monitor. Tests: three unit tests in `connection.rs`
     (`a_side_by_side_layout_is_adopted_with_its_bounding_box` and two more) and macrdp's
     `conn_test::a_two_monitor_client_gets_its_monitor_layout`. Upstream candidate.
+    **Mid-session layouts (2026-11-25, branch `macrdp-mm-live-layout`):**
+    `Acceptor::set_monitor_layout(Option<Vec<Monitor>>)` gives a deactivation-reactivation
+    acceptor the layout the session now serves (same checks, `reactivation_monitor_layout`;
+    test `a_reactivation_keeps_a_new_layout_only_when_it_can_be_served`). Server (36) calls it
+    before each reactivation with `RdpServerDisplay::monitor_layout()` (a new trait method,
+    default `None`). Without it, a reactivation after the client changed its layout sent the
+    connect-time layout, and mstsc drew both monitors on one screen.
 
 ### Testing
 

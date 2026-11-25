@@ -618,11 +618,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].
 
-- [ ] **Multi-monitor (client-side multi-display).**
-  Extend `--virtual-display` to N monitors. **Blocker:** the git-pinned `ironrdp-acceptor`
-  hardcodes a single-monitor `MonitorLayoutPdu`, so true separate monitors needs an acceptor
-  change. Open design question: true-monitors vs one-big-desktop vs phased. (PAUSED, no code.)
-  Also listed as Tier 3 in the production-readiness roadmap below.
+- [ ] **Multi-monitor (client-side multi-display), experimental.** Phase 1 shipped in v0.11.0; live
+  layout changes work on mstsc and Windows App on Windows (2026-11-25, branch
+  `feat/multi-monitor-live-layout` + fork branch `macrdp-mm-live-layout`). Next: a faster re-layout
+  (keep unchanged captures, `update_configuration` for the rest); adding or removing a monitor
+  mid-session; the headless modes; windows spread across monitors (window-follow and Ctrl+Alt+G use the
+  primary only); Windows App for macOS. Notes: `docs/multi-monitor-design.md`, "Live layout changes".
 
 - [ ] **Production-readiness roadmap** (scoped 2026-06-29, in progress). What would lift
   macrdp from "polished v0 daily-driver for trusted LANs" to "reliable, secure, unattended
