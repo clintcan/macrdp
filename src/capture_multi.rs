@@ -124,12 +124,20 @@ impl Relayout {
     }
 }
 
+/// Stops a capture on its own thread: `stop_capture` blocks until macOS
+/// confirms, and for a stream whose display was just re-moded or slept the
+/// confirmation may never come, which hung the capture loop (live
+/// 2026-11-25).
+fn stop_detached(stream: DisplayStream) {
+    std::thread::spawn(move || stream.stop());
+}
+
 impl Drop for MonitorStream {
     fn drop(&mut self) {
         // Until 2026-11-25 nothing stopped these, so each multi-monitor
-        // session (and each in-place re-layout) leaked its captures.
-        if let Some(stream) = self.stream.as_ref() {
-            stream.stop();
+        // session leaked its captures.
+        if let Some(stream) = self.stream.take() {
+            stop_detached(stream);
         }
     }
 }
@@ -268,6 +276,8 @@ impl MultiCaptureUpdates {
     /// False if the displays couldn't be set up; the caller then falls back to
     /// a reactivation, which retries them.
     async fn relayout_in_place(&mut self, layout: Layout) -> Result<bool> {
+        // Stop the old captures first, while their displays are unchanged.
+        self.monitors.clear();
         let relayout = self.relayout.clone();
         let sync_layout = layout.clone();
         let ids = match tokio::task::spawn_blocking(move || relayout.sync_displays(&sync_layout))
@@ -283,8 +293,6 @@ impl MultiCaptureUpdates {
                 return Ok(false);
             }
         };
-        // Stop the old captures before opening the new ones on the same displays.
-        self.monitors.clear();
         let monitors = open_streams(&layout, &ids, self.fps).await?;
         let (w, h) = layout.desktop();
         *self
@@ -595,7 +603,7 @@ impl MultiCaptureUpdates {
                     "multi-monitor: SCK stopped a capture; retrying"
                 );
                 if let Some(stream) = self.monitors[i].stream.take() {
-                    stream.stop();
+                    stop_detached(stream);
                 }
                 self.monitors[i].stopped_at = Some(Instant::now());
                 continue;
