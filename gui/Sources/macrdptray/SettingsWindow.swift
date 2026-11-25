@@ -353,6 +353,12 @@ private struct DisplayTab: View {
                     }
                 }
                 .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                Toggle("Move windows to the remote session while connected",
+                       isOn: model.boolBinding("RESTORE_WINDOWS_ON_DISCONNECT"))
+                    .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                Text("On connect, the Mac's windows move onto the virtual display the client "
+                    + "sees (no Ctrl+Alt+G needed); on disconnect, they move back to the Mac's screen.")
+                    .font(.caption).foregroundColor(.secondary)
                 Toggle("Use all of the client's monitors (experimental)",
                        isOn: model.boolBinding("MULTI_MONITOR"))
                     .disabled(!model.multiMonitorAllowed)

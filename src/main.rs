@@ -423,8 +423,8 @@ struct Args {
     shield_primary: bool,
 
     /// Make windows follow you between the local built-in screen and the
-    /// remote virtual display (opt-in; only meaningful with
-    /// --detach-primary/--capture-primary). By default the virtual display
+    /// remote virtual display (opt-in; needs --virtual-display, in plain mode
+    /// or a headless mode). By default the virtual display
     /// is process-lifetime, so on disconnect its windows stay stranded on
     /// the (now off-screen) virtual display — invisible on a laptop's
     /// built-in panel until you reconnect. With this flag, the last-client
@@ -2139,11 +2139,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                     {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
-                            info!(
-                                label,
-                                "RDP client connected — Mac is now headless via the \
-                                 virtual display"
-                            );
+                            info!(label, "RDP client connected");
                             *slot.lock().expect("overlay mutex poisoned") = Some(ovr);
                             // (--restore-windows-on-disconnect) Auto-gather any
                             // windows stranded on the built-in panel (e.g. swept
@@ -3189,14 +3185,16 @@ async fn async_main() -> Result<()> {
              (pick one mechanism for going headless)"
         ));
     }
-    if (args.restore_windows_on_disconnect || args.lock_on_disconnect || args.auto_unlock)
+    if args.restore_windows_on_disconnect && !args.virtual_display {
+        warn!("--restore-windows-on-disconnect has no effect without --virtual-display; ignoring");
+    }
+    if (args.lock_on_disconnect || args.auto_unlock)
         && !(args.detach_primary || args.capture_primary || args.shield_primary)
     {
         warn!(
-            "--restore-windows-on-disconnect / --lock-on-disconnect / \
-             --auto-unlock have no effect without --detach-primary, \
-             --capture-primary or --shield-primary (they need the headless \
-             session watcher); ignoring"
+            "--lock-on-disconnect / --auto-unlock have no effect without \
+             --detach-primary, --capture-primary or --shield-primary (they need \
+             the headless session watcher); ignoring"
         );
     }
     if args.lock_on_disconnect {
@@ -3490,6 +3488,7 @@ async fn async_main() -> Result<()> {
     // at (0,0)), so if both are set, only the lazy path runs.
 
     let session_tracker = capture::SessionTracker::default();
+    let headless = args.detach_primary || args.capture_primary || args.shield_primary;
     // (--lock-on-disconnect) Connection activity the pending lock consults so
     // it doesn't fire under a reconnect's handshake. None when the flag is off.
     let lock_activity = args
@@ -3560,6 +3559,34 @@ async fn async_main() -> Result<()> {
             Arc::clone(&password),
             auto_unlock,
         );
+    } else if args.virtual_display && args.restore_windows_on_disconnect {
+        // Plain --virtual-display: nothing to install on connect; the watcher
+        // only moves windows (onto the virtual display on connect, back to the
+        // Mac's screen on disconnect). Lock and auto-unlock stay headless-only.
+        let vd_id = virtual_display
+            .as_ref()
+            .expect("checked: --virtual-display")
+            .lock()
+            .expect("virtual display mutex poisoned")
+            .display_id();
+        fn no_overlay(_vd_id: u32) -> Result<()> {
+            Ok(())
+        }
+        spawn_primary_overlay_watcher(
+            "windows",
+            vd_id,
+            session_tracker.clone(),
+            Arc::new(std::sync::Mutex::new(None::<()>)),
+            no_overlay,
+            true,
+            physical_main_id,
+            None,
+            Arc::clone(&password),
+            false,
+        );
+        if args.make_primary {
+            warn!("--make-primary is ignored with --restore-windows-on-disconnect in plain mode");
+        }
     } else if args.make_primary {
         let vd_id = virtual_display
             .as_ref()
@@ -3876,8 +3903,11 @@ async fn async_main() -> Result<()> {
         cursor_scale: args.cursor_scale,
         // Only attach the tracker when the watchdog needs it. Saves
         // a useless atomic increment/decrement per session otherwise.
-        session_tracker: (args.detach_primary || args.capture_primary || args.shield_primary)
+        // Headless modes, and plain --virtual-display with
+        // --restore-windows-on-disconnect, count sessions for their watcher.
+        session_tracker: (headless || (args.virtual_display && args.restore_windows_on_disconnect))
             .then(|| session_tracker.clone()),
+        headless,
         #[cfg(target_os = "macos")]
         gfx: gfx.clone(),
         keyframe_on_change,
