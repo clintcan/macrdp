@@ -23,9 +23,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.10.10** (IronRDP rebased onto upstream 79e763a0 on the fork
-branch `macrdp-79e763a0`, #275/#276, soaked 48 h; lossy audio and EGFX on two UDP tunnels, #288; the
-Mac file-paste race and file-index fixes, #290; contributor fixes #277 #279–#287; the cursor fallback fix, #289).
+(VPN/ZeroTier). **Latest release: v0.11.0** (multi-monitor sessions, experimental, #294; network
+auto-detect on by default, #293; `--restore-windows-on-disconnect` in plain virtual-display mode, #296;
+controller toggles, #295; virtual-display re-registration and display wake, #231/#232).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
