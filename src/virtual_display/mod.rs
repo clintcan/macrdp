@@ -14,17 +14,18 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    arrange_displays, is_hidpi_virtual_display, online_display, right_edge_excluding,
-    run_arrange_helper, run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay, ARRANGE_ARG, SELECT_MODE_ARG,
+    arrange_displays, arrange_displays_for_session, is_hidpi_virtual_display, online_display,
+    online_display_ids, right_edge_excluding, run_arrange_helper, run_select_mode_helper,
+    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
+    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay, ARRANGE_ARG,
+    FOR_SESSION_ARG, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    arrange_displays, is_hidpi_virtual_display, right_edge_excluding, screen_is_locked,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    arrange_displays, arrange_displays_for_session, is_hidpi_virtual_display, online_display_ids,
+    right_edge_excluding, screen_is_locked, take_detach_reenable_failed, CapturedPrimary,
+    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 /// When the virtual display runs HiDPI (`--virtual-display-hidpi`).
@@ -437,6 +438,11 @@ mod macos {
 
     /// The right edge (global points) of the online displays not in
     /// `exclude`; 0 if there are none.
+    /// Every online display's id (an empty list if the query fails).
+    pub fn online_display_ids() -> Vec<u32> {
+        online_displays().unwrap_or_default()
+    }
+
     pub fn right_edge_excluding(exclude: &[u32]) -> f64 {
         online_displays()
             .unwrap_or_default()
@@ -454,8 +460,13 @@ mod macos {
     /// points) and exit. See `arrange_displays`.
     pub const ARRANGE_ARG: &str = "--arrange-displays";
 
+    /// Optional third argument of the arrange helper: complete the
+    /// configuration for the login session instead of the helper's own
+    /// lifetime (see `arrange_displays_for_session`).
+    pub const FOR_SESSION_ARG: &str = "--for-session";
+
     /// Body of the arrange helper process. Returns its exit code.
-    pub fn run_arrange_helper(spec: &str) -> i32 {
+    pub fn run_arrange_helper(spec: &str, for_session: bool) -> i32 {
         let parsed: Option<Vec<(u32, i32, i32)>> = spec
             .split(',')
             .map(|item| {
@@ -471,7 +482,7 @@ mod macos {
             eprintln!("{ARRANGE_ARG}: expected id:x:y,..., got {spec:?}");
             return 2;
         };
-        match arrange_in_process(&origins) {
+        match arrange_in_process(&origins, for_session) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{ARRANGE_ARG}: {e:#}");
@@ -492,6 +503,21 @@ mod macos {
     /// next reconfiguration; every multi-monitor setup re-arranges after a
     /// re-mode.
     pub fn arrange_displays(origins: &[(u32, i32, i32)]) -> Result<()> {
+        arrange_out_of_process(origins, false)
+    }
+
+    /// Like [`arrange_displays`], but the arrangement lasts for the login
+    /// session. An app-scoped one ends with the helper process, which undid
+    /// moving a virtual display to (0,0) as the main display at once (live
+    /// 2026-11-26, `--main-display-while-connected`), as it did for the
+    /// headless modes (#161). The virtual displays still go with macrdp, so
+    /// after a crash macOS makes the remaining physical display main again; an
+    /// odd arrangement of several physical displays lasts until logout at worst.
+    pub fn arrange_displays_for_session(origins: &[(u32, i32, i32)]) -> Result<()> {
+        arrange_out_of_process(origins, true)
+    }
+
+    fn arrange_out_of_process(origins: &[(u32, i32, i32)], for_session: bool) -> Result<()> {
         if origins.is_empty() {
             return Ok(());
         }
@@ -503,14 +529,17 @@ mod macos {
         #[cfg(test)]
         {
             let _ = spec;
-            arrange_in_process(origins)
+            arrange_in_process(origins, for_session)
         }
         #[cfg(not(test))]
         {
             let exe = std::env::current_exe().context("locating the macrdp binary")?;
-            let out = std::process::Command::new(exe)
-                .arg(ARRANGE_ARG)
-                .arg(&spec)
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg(ARRANGE_ARG).arg(&spec);
+            if for_session {
+                cmd.arg(FOR_SESSION_ARG);
+            }
+            let out = cmd
                 .output()
                 .context("starting the display-arrange helper")?;
             if out.status.success() {
@@ -525,7 +554,7 @@ mod macos {
         }
     }
 
-    fn arrange_in_process(origins: &[(u32, i32, i32)]) -> Result<()> {
+    fn arrange_in_process(origins: &[(u32, i32, i32)], for_session: bool) -> Result<()> {
         let Some(&(first, _, _)) = origins.first() else {
             return Ok(());
         };
@@ -541,7 +570,12 @@ mod macos {
                 ));
             }
         }
-        any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+        let scope = if for_session {
+            CGConfigureOption::ConfigureForSession
+        } else {
+            CGConfigureOption::ConfigureForAppOnly
+        };
+        any.complete_configuration(&config, scope)
             .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (arrange): CGError {e}"))
     }
 
@@ -2533,8 +2567,16 @@ mod stub {
 
     /// No screen-lock concept off macOS — definitively not locked, not
     /// "unknown" (there's nothing to fail to look up).
+    pub fn arrange_displays_for_session(_origins: &[(u32, i32, i32)]) -> Result<()> {
+        Ok(())
+    }
+
     pub fn arrange_displays(_origins: &[(u32, i32, i32)]) -> Result<()> {
         Err(anyhow!("virtual display is macOS-only"))
+    }
+
+    pub fn online_display_ids() -> Vec<u32> {
+        Vec::new()
     }
 
     pub fn right_edge_excluding(_exclude: &[u32]) -> f64 {

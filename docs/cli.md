@@ -209,6 +209,16 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   Config: PRIMARY_MODE=shield.
                           #   Env: MACRDP_SHIELD_HELPER (path override),
                           #   MACRDP_SHIELD_PORT (default 40244). macOS-only.
+--main-display-while-connected  # While a client is connected, the session's primary
+                          #   display is the Mac's main display: the Dock, the menu
+                          #   bar and new windows appear remotely, and the Mac's own
+                          #   screen stays on as a secondary display to the right.
+                          #   On the last disconnect the Mac's display is main again.
+                          #   Plain --virtual-display mode, multi-monitor included;
+                          #   refused with the headless modes and --make-primary,
+                          #   which already do this. While it's on, a lock started at
+                          #   the Mac draws on the virtual display, not the Mac's own
+                          #   screen. Config: MAIN_DISPLAY_WHILE_CONNECTED=1.
 --restore-windows-on-disconnect  # Make windows follow you between the local
                           #   built-in screen and the remote virtual display
                           #   (opt-in; needs --virtual-display: works in plain
