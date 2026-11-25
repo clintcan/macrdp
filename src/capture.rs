@@ -85,6 +85,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use crate::cursor::CursorState;
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 
 /// Tuning for the H.264 on-demand-keyframe feature (`--keyframe-on-change`).
 /// Built from CLI flags in `main.rs`; all percentages are of the full frame.
@@ -194,6 +195,11 @@ struct PendingResizeInner {
     /// Milliseconds since `epoch` of the last `request()` call; 0 = no
     /// pending request (never requested, or already consumed).
     last_update_ms: AtomicU64,
+    /// --multi-monitor: the session layout that goes with the queued size
+    /// (`Some(None)` = a single-monitor session). Moved to `layout_ready` when
+    /// the size is consumed, for the reactivation's `updates()` to apply.
+    layout_queued: std::sync::Mutex<Option<Option<crate::monitor_layout::Layout>>>,
+    layout_ready: std::sync::Mutex<Option<Option<crate::monitor_layout::Layout>>>,
 }
 
 impl PendingResize {
@@ -203,6 +209,8 @@ impl PendingResize {
                 epoch: Instant::now(),
                 size: AtomicU32::new(0),
                 last_update_ms: AtomicU64::new(0),
+                layout_queued: std::sync::Mutex::new(None),
+                layout_ready: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -221,6 +229,33 @@ impl PendingResize {
         self.inner
             .last_update_ms
             .store(self.now_ms().max(1), Ordering::Relaxed);
+    }
+
+    /// Like [`request`](Self::request), with the session layout that goes
+    /// with the size (`None` = a single-monitor session). It reaches
+    /// [`take_layout`](Self::take_layout) once the size has been consumed.
+    pub fn request_with_layout(
+        &self,
+        width: u16,
+        height: u16,
+        layout: Option<crate::monitor_layout::Layout>,
+    ) {
+        *self
+            .inner
+            .layout_queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(layout);
+        self.request(width, height);
+    }
+
+    /// The layout of the last consumed request, if it carried one. `Some(None)`
+    /// means the session became single-monitor.
+    pub fn take_layout(&self) -> Option<Option<crate::monitor_layout::Layout>> {
+        self.inner
+            .layout_ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// True if a request is outstanding (settled or not yet). The capture
@@ -250,6 +285,17 @@ impl PendingResize {
         {
             return None;
         }
+        let queued = self
+            .inner
+            .layout_queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        *self
+            .inner
+            .layout_ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = queued;
         Some(unpack_size(self.inner.size.load(Ordering::Relaxed)))
     }
 
@@ -259,6 +305,9 @@ impl PendingResize {
     /// [`RESIZE_DEBOUNCE`] before it disconnected) belongs to a client that is
     /// gone, and applying it would override the size the new client asked for.
     pub fn clear(&self) -> Option<(u16, u16)> {
+        for slot in [&self.inner.layout_queued, &self.inner.layout_ready] {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         if self.inner.last_update_ms.swap(0, Ordering::Relaxed) == 0 {
             return None;
         }
@@ -687,18 +736,29 @@ fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize
 #[async_trait::async_trait]
 impl RdpServerDisplay for CaptureDisplay {
     /// The most monitors a mid-session layout may have (MS-RDPEDISP
-    /// MaxNumMonitors). 1 unless --multi-monitor is on and
-    /// MACRDP_MULTI_MONITOR_MAX says otherwise: 16 stopped Windows App on
-    /// Windows from opening graphics on a reconnect after a server restart.
+    /// MaxNumMonitors). 1 without --multi-monitor. With it, the session's
+    /// monitor count and at least 2, unless MACRDP_MULTI_MONITOR_MAX says
+    /// otherwise. Not 16 for everyone: with 16, Windows App on Windows didn't
+    /// open graphics on a reconnect after a server restart (2 works, live
+    /// 2026-11-25).
     async fn monitor_count(&mut self) -> u32 {
         if self.extra_displays.is_none() {
             return 1;
         }
-        std::env::var("MACRDP_MULTI_MONITOR_MAX")
+        if let Some(n) = std::env::var("MACRDP_MULTI_MONITOR_MAX")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&n| (1..=16).contains(&n))
-            .unwrap_or(1)
+        {
+            return n;
+        }
+        let session = self
+            .session_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |l| l.monitors().len());
+        u32::try_from(session).unwrap_or(2).clamp(2, 16)
     }
 
     async fn size(&mut self) -> DesktopSize {
@@ -806,19 +866,9 @@ impl RdpServerDisplay for CaptureDisplay {
     /// surface swap without the core reactivation was tried first and was
     /// visually broken on a real client).
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
-        // --multi-monitor: live layout changes aren't handled yet (phase 2);
-        // treating one as a single-monitor resize would break the session.
-        if self
-            .session_layout
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
-            tracing::info!(
-                monitors = layout.monitors().len(),
-                layout = ?layout.monitors(),
-                "multi-monitor: ignoring a mid-session layout change (not supported yet)"
-            );
+        // --multi-monitor: a layout with several monitors, or one monitor in a
+        // multi-monitor session, changes the session's layout.
+        if self.extra_displays.is_some() && self.request_multi_monitor_layout(&layout) {
             return;
         }
         let resizable = self.auto_size || self.virtual_display.is_some();
@@ -873,7 +923,7 @@ impl RdpServerDisplay for CaptureDisplay {
                     ui_scale = self.vd_hidpi.ui_scale(),
                     "client display scale changed — re-moding at the same size (debounced)"
                 );
-                self.pending_resize.request(cur_w, cur_h);
+                self.queue_resize(cur_w, cur_h);
             }
             return;
         };
@@ -887,7 +937,7 @@ impl RdpServerDisplay for CaptureDisplay {
             ui_scale = self.vd_hidpi.ui_scale(),
             "client resized its window — resizing the session (debounced)"
         );
-        self.pending_resize.request(adopted.width, adopted.height);
+        self.queue_resize(adopted.width, adopted.height);
     }
 
     async fn updates(
@@ -908,6 +958,18 @@ impl RdpServerDisplay for CaptureDisplay {
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
+        // --multi-monitor: a layout change applied by the live resize that
+        // led to this reactivation.
+        if let Some(layout) = self.pending_resize.take_layout() {
+            tracing::info!(
+                monitors = layout.as_ref().map_or(1, |l| l.monitors().len()),
+                "multi-monitor: applying the client's new monitor layout"
+            );
+            *self
+                .session_layout
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = layout;
+        }
         let (width, height) = self.sync_virtual_display();
         self.build_updates(width, height)
             .await
@@ -916,6 +978,106 @@ impl RdpServerDisplay for CaptureDisplay {
 }
 
 impl CaptureDisplay {
+    /// Queues a live resize. With --multi-monitor it also queues the
+    /// single-monitor layout, so an earlier multi-monitor layout still
+    /// waiting on the debounce can't be applied with this size.
+    fn queue_resize(&self, width: u16, height: u16) {
+        if self.extra_displays.is_some() {
+            self.pending_resize.request_with_layout(width, height, None);
+        } else {
+            self.pending_resize.request(width, height);
+        }
+    }
+
+    /// --multi-monitor: handles a mid-session layout that has several
+    /// monitors, or one monitor in a multi-monitor session. Returns false to
+    /// leave a one-monitor layout in a single-monitor session to the
+    /// single-monitor resize.
+    fn request_multi_monitor_layout(
+        &mut self,
+        layout: &ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout,
+    ) -> bool {
+        let current = self
+            .session_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let entries = layout.monitors();
+        if entries.len() < 2 {
+            if current.is_none() {
+                return false;
+            }
+            // Back to one monitor (the client left full screen across its
+            // monitors, say): a single-monitor session at that monitor's size.
+            let Some(m) = entries.first() else {
+                return true;
+            };
+            let (w, h) = m.dimensions();
+            let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
+                tracing::warn!(
+                    w,
+                    h,
+                    "client-requested monitor size out of range — ignoring"
+                );
+                return true;
+            };
+            let size = cap_client_size(DesktopSize { width, height }, self.max_client_size);
+            tracing::info!(
+                w = size.width,
+                h = size.height,
+                "multi-monitor: the client went back to one monitor (debounced)"
+            );
+            self.pending_resize
+                .request_with_layout(size.width, size.height, None);
+            return true;
+        }
+        let monitors: Option<Vec<Monitor>> = entries
+            .iter()
+            .map(|e| {
+                let (left, top) = e.position()?;
+                let (w, h) = e.dimensions();
+                let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
+                Some(Monitor {
+                    left,
+                    top,
+                    right: left.checked_add(w)?.checked_sub(1)?,
+                    bottom: top.checked_add(h)?.checked_sub(1)?,
+                    flags: if e.is_primary() {
+                        MonitorFlags::PRIMARY
+                    } else {
+                        MonitorFlags::empty()
+                    },
+                })
+            })
+            .collect();
+        let max = self
+            .max_client_size
+            .map_or((8192, 8192), |m| (m.width, m.height));
+        let Some(new) = monitors
+            .as_deref()
+            .and_then(|m| crate::monitor_layout::Layout::from_mid_session(m, max))
+        else {
+            tracing::info!(
+                layout = ?entries,
+                "multi-monitor: ignoring a mid-session layout we can't serve"
+            );
+            return true;
+        };
+        if current.as_ref() == Some(&new) {
+            return true;
+        }
+        let (width, height) = new.desktop();
+        tracing::info!(
+            monitors = new.monitors().len(),
+            desktop = ?new.desktop(),
+            layout = ?new.client_monitors(),
+            "multi-monitor: the client's monitor layout changed — re-laying out the session (debounced)"
+        );
+        self.pending_resize
+            .request_with_layout(width, height, Some(new));
+        true
+    }
+
     /// How much to enlarge the pointer on the HiDPI virtual display, whose
     /// cursor SkyLight returns as the 1× image (measured: a 28×40 arrow whose
     /// NSCursor has 28×40 points, at both UI scales).
@@ -1277,6 +1439,8 @@ impl CaptureDisplay {
             self.flush_frames,
             self.display_suppressed.clone(),
             self.desktop_size.clone(),
+            self.pending_resize.clone(),
+            self.suppress_next_adopt.clone(),
         )
         .await
         .map_err(screen_recording_denied)?;
@@ -3226,6 +3390,64 @@ mod tests {
         assert_eq!(pr.clear(), Some((1920, 1080)));
         assert!(!pr.has_pending());
         assert_eq!(pr.take_settled(Duration::ZERO), None);
+    }
+
+    fn two_monitor_layout(secondary_width: i32) -> crate::monitor_layout::Layout {
+        let m = |left: i32, width: i32, height: i32, primary: bool| Monitor {
+            left,
+            top: 0,
+            right: left + width - 1,
+            bottom: height - 1,
+            flags: if primary {
+                MonitorFlags::PRIMARY
+            } else {
+                MonitorFlags::empty()
+            },
+        };
+        crate::monitor_layout::Layout::from_mid_session(
+            &[m(0, 1920, 1080, true), m(1920, secondary_width, 720, false)],
+            (8192, 8192),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_resize_hands_over_its_layout_only_once_consumed() {
+        let pr = PendingResize::new();
+        let layout = two_monitor_layout(1280);
+        pr.request_with_layout(3200, 1080, Some(layout.clone()));
+        // Not settled: the reactivation hasn't happened, nothing to apply.
+        assert_eq!(pr.take_settled(Duration::from_secs(3600)), None);
+        assert_eq!(pr.take_layout(), None);
+        assert_eq!(pr.take_settled(Duration::ZERO), Some((3200, 1080)));
+        assert_eq!(pr.take_layout(), Some(Some(layout)));
+        assert_eq!(pr.take_layout(), None);
+    }
+
+    #[test]
+    fn pending_resize_a_later_single_monitor_request_supersedes_a_layout() {
+        // A multi-monitor layout, then the client drops to one monitor before
+        // the debounce: the session must become single-monitor, not apply the
+        // earlier layout with the later size.
+        let pr = PendingResize::new();
+        pr.request_with_layout(3200, 1080, Some(two_monitor_layout(1280)));
+        pr.request_with_layout(1920, 1080, None);
+        assert_eq!(pr.take_settled(Duration::ZERO), Some((1920, 1080)));
+        assert_eq!(pr.take_layout(), Some(None));
+    }
+
+    #[test]
+    fn pending_resize_clear_drops_a_queued_or_ready_layout() {
+        let pr = PendingResize::new();
+        pr.request_with_layout(3200, 1080, Some(two_monitor_layout(1280)));
+        pr.clear();
+        assert_eq!(pr.take_settled(Duration::ZERO), None);
+        assert_eq!(pr.take_layout(), None);
+        // Consumed but not yet applied when a new connection arrives.
+        pr.request_with_layout(3366, 1080, Some(two_monitor_layout(1446)));
+        assert!(pr.take_settled(Duration::ZERO).is_some());
+        pr.clear();
+        assert_eq!(pr.take_layout(), None);
     }
 
     /// A `CaptureDisplay` on the auto-size path with no virtual display, H.264

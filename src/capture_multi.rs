@@ -72,6 +72,12 @@ pub struct MultiCaptureUpdates {
     next_start: usize,
     /// The primary monitor's index in the layout.
     primary: usize,
+    /// A live layout change (`CaptureDisplay::request_layout`), applied like a
+    /// single-monitor live resize: a reactivation at the new desktop size,
+    /// after which `updates()` rebuilds the displays, capture and surfaces.
+    pending_resize: crate::capture::PendingResize,
+    desktop_size: crate::capture::SharedDesktopSize,
+    suppress_next_adopt: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The first of `futures` to finish, polling from `start` (mod len) so a
@@ -105,6 +111,8 @@ impl MultiCaptureUpdates {
         flush_frames: u32,
         display_suppressed: Option<SuppressedFlag>,
         desktop_size: crate::capture::SharedDesktopSize,
+        pending_resize: crate::capture::PendingResize,
+        suppress_next_adopt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self> {
         if display_ids.len() != layout.monitors().len() {
             return Err(anyhow!(
@@ -144,7 +152,11 @@ impl MultiCaptureUpdates {
         }
         let desktop = layout.desktop();
         let primary_id = display_ids[layout.primary()];
-        let cursor = CursorState::new(desktop_size, primary_id, cursor_scale.clamp(0.1, 8.0))?;
+        let cursor = CursorState::new(
+            desktop_size.clone(),
+            primary_id,
+            cursor_scale.clamp(0.1, 8.0),
+        )?;
         if let Some(flag) = display_suppressed.as_ref() {
             flag.clear();
         }
@@ -171,6 +183,9 @@ impl MultiCaptureUpdates {
             started_at: Instant::now(),
             next_start: 0,
             primary: layout.primary(),
+            pending_resize,
+            desktop_size,
+            suppress_next_adopt,
         })
     }
 
@@ -358,6 +373,26 @@ impl MultiCaptureUpdates {
                         height: h,
                     })));
                 }
+            }
+
+            // A live layout change, as the single-monitor loop applies a live
+            // resize: the new size now, surfaces and encoders rebuilt after
+            // the reactivation, and the reactivation's size not re-adopted
+            // from the client's echo.
+            if let Some((w, h)) = self
+                .pending_resize
+                .take_settled(crate::capture::RESIZE_DEBOUNCE)
+            {
+                self.desktop_size.set(w, h);
+                self.suppress_next_adopt.store(true, Ordering::Relaxed);
+                if let Some(gfx) = self.gfx.as_ref() {
+                    gfx.reset_for_live_resize();
+                }
+                tracing::info!(w, h, "multi-monitor: applying the client's layout change");
+                return Ok(Some(DisplayUpdate::Resize(ironrdp_server::DesktopSize {
+                    width: w,
+                    height: h,
+                })));
             }
 
             if self
