@@ -141,6 +141,35 @@ impl ConnectionHandler for DesktopScaleHook {
     }
 }
 
+/// With `--multi-monitor`, records the monitor layout the connection adopted
+/// (`ConnectionInfo::monitor_layout`, from acceptor divergence 8), or `None`
+/// for a single-monitor client, for the display to serve each monitor. Runs at
+/// `client_accepted`, before the display's `updates()`.
+pub struct MonitorLayoutHook(pub crate::multi_monitor::SessionLayout);
+
+impl ConnectionHandler for MonitorLayoutHook {
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        let layout = info
+            .monitor_layout
+            .as_deref()
+            .and_then(crate::monitor_layout::Layout::from_client);
+        match &layout {
+            Some(l) => tracing::info!(
+                monitors = l.monitors().len(),
+                desktop = ?l.desktop(),
+                layout = ?info.monitor_layout,
+                "multi-monitor: the client's monitor layout was adopted"
+            ),
+            None if info.client_monitors.len() > 1 => tracing::info!(
+                monitors = ?info.client_monitors,
+                "multi-monitor: the client sent several monitors, but not a layout we can serve; one monitor"
+            ),
+            None => {}
+        }
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = layout;
+    }
+}
+
 /// With `--stats-endpoint`, clears the per-session stats when a connection ends,
 /// so the endpoint reports `connected:false` instead of the last session's numbers.
 /// Connections are served one at a time, and a preempting client is served only

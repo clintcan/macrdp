@@ -516,6 +516,11 @@ pub struct CaptureDisplay {
     /// `Auto`, decided per connection from the client's desktop scale factor
     /// in `sync_virtual_display`.
     pub vd_hidpi: crate::virtual_display::HidpiPolicy,
+    /// --multi-monitor: the connection's adopted monitor layout (`None` for a
+    /// single-monitor client), and the extra virtual displays serving its
+    /// non-primary monitors (`None` without --multi-monitor).
+    pub session_layout: crate::multi_monitor::SessionLayout,
+    pub extra_displays: Option<Arc<std::sync::Mutex<crate::multi_monitor::ExtraDisplays>>>,
     /// The session's UI scale for the pointer (see `pointer_scale`): set at
     /// connect and from each monitor layout, and read live by the capture
     /// loop so a scale change resends the pointer.
@@ -725,7 +730,19 @@ impl RdpServerDisplay for CaptureDisplay {
         self.pointer_ui_scale
             .store(self.vd_hidpi.ui_scale(), Ordering::Relaxed);
 
-        let client_size = cap_client_size(client_size, self.max_client_size);
+        // A multi-monitor session's size is the monitors' bounding box, which
+        // the acceptor already checked monitor by monitor against the cap.
+        let multi_monitor = self
+            .session_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|l| l.desktop() == (client_size.width, client_size.height));
+        let client_size = if multi_monitor {
+            client_size
+        } else {
+            cap_client_size(client_size, self.max_client_size)
+        };
         if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
             tracing::info!(
                 client_w = adopted.width,
@@ -941,6 +958,45 @@ impl CaptureDisplay {
     /// back to serving the display's actual current size. No-op without a
     /// virtual display (mirror-primary).
     fn sync_virtual_display(&mut self) -> (u16, u16) {
+        let layout = self
+            .session_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // A multi-monitor session: the main display serves the primary monitor.
+        let primary_size = layout.as_ref().map(|l| {
+            let p = l.monitors()[l.primary()];
+            (p.width, p.height)
+        });
+        let served = self.sync_primary_display(primary_size);
+        self.sync_extra_displays(layout.as_ref());
+        served
+    }
+
+    /// --multi-monitor: gives the session's non-primary monitors their own
+    /// virtual displays (or releases them for a single-monitor client) and
+    /// arranges all of them like the client's monitors.
+    fn sync_extra_displays(&mut self, layout: Option<&crate::monitor_layout::Layout>) {
+        let (Some(extras), Some(vd)) = (self.extra_displays.clone(), self.virtual_display.clone())
+        else {
+            return;
+        };
+        let mut extras = extras.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(layout) = layout else {
+            extras.release_all();
+            return;
+        };
+        let mut vd = vd.lock().expect("virtual display mutex poisoned");
+        if let Err(e) = extras.sync(layout, &mut vd) {
+            tracing::warn!(error = ?e, "multi-monitor: setting up the extra displays failed");
+        }
+        self.screen_size_pts = vd.size_pts();
+    }
+
+    /// Keeps the main virtual display's mode in sync: the session size, or
+    /// with `mode` (a multi-monitor session) the primary monitor's size.
+    /// Returns the size to serve.
+    fn sync_primary_display(&mut self, mode: Option<(u16, u16)>) -> (u16, u16) {
         let (width, height) = self.desktop_size.get();
         let Some(vd) = self.virtual_display.clone() else {
             return (width, height);
@@ -948,12 +1004,13 @@ impl CaptureDisplay {
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
         self.resolve_virtual_display(&mut vd);
         let ui_scale = self.vd_hidpi.ui_scale();
+        let (mode_w, mode_h) = mode.unwrap_or((width, height));
         // Compare in pixels: on a HiDPI vd the points are the session size
         // divided by the UI scale.
-        if vd.mode_px() == (u32::from(width), u32::from(height)) && vd.ui_scale() == ui_scale {
+        if vd.mode_px() == (u32::from(mode_w), u32::from(mode_h)) && vd.ui_scale() == ui_scale {
             return (width, height);
         }
-        match vd.resize(u32::from(width), u32::from(height), ui_scale) {
+        match vd.resize(u32::from(mode_w), u32::from(mode_h), ui_scale) {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
@@ -3080,6 +3137,8 @@ mod tests {
             suppress_next_adopt: Arc::new(AtomicBool::new(false)),
             virtual_display: None,
             vd_hidpi: crate::virtual_display::HidpiPolicy::Off,
+            session_layout: Arc::default(),
+            extra_displays: None,
             pointer_ui_scale: Arc::new(AtomicU32::new(1)),
             captured_primary: None,
             shielded_primary: None,

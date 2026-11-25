@@ -377,6 +377,7 @@ pub(super) fn select_mode(display: u32, w: u32, h: u32, px_w: u32) -> Result<boo
 /// selects the scaled mode, so the caller picks it (`panel_size_mm`).
 /// `hidpi_capable` marks a display that may run HiDPI at some point in its
 /// life (it gets its own product id); `hidpi` is the initial mode.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create(
     width: u32,
     height: u32,
@@ -385,6 +386,7 @@ pub(super) fn create(
     hidpi_capable: bool,
     hidpi: bool,
     size_mm: (f64, f64),
+    serial: u32,
 ) -> Result<Handle> {
     let desc_class = class_required("CGVirtualDisplayDescriptor")?;
     let display_class = class_required("CGVirtualDisplay")?;
@@ -435,8 +437,9 @@ pub(super) fn create(
         // installs, or dev testing alongside a running instance) registering a
         // display with an identical vendor/product/serial triple gets its
         // descriptor rejected by CGVirtualDisplay initWithDescriptor: outright
-        // (returns nil). Per-process id keeps concurrent instances from colliding.
-        let _: () = msg_send![desc, setSerialNum: std::process::id()];
+        // (returns nil). The caller passes a per-process (and, with several
+        // displays, per-display) serial so they don't collide.
+        let _: () = msg_send![desc, setSerialNum: serial];
 
         // 2. CGVirtualDisplay instance from the descriptor.
         let display: *mut AnyObject = msg_send![display_class, alloc];

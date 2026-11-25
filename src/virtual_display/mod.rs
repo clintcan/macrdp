@@ -14,15 +14,17 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    is_hidpi_virtual_display, online_display, run_select_mode_helper, screen_is_locked,
-    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
+    arrange_displays, is_hidpi_virtual_display, online_display, right_edge_excluding,
+    run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    is_hidpi_virtual_display, screen_is_locked, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange_displays, is_hidpi_virtual_display, right_edge_excluding, screen_is_locked,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 /// When the virtual display runs HiDPI (`--virtual-display-hidpi`).
@@ -433,6 +435,46 @@ mod macos {
         }
     }
 
+    /// Moves each `(display id, x, y)` to its origin in the global display
+    /// space (points), in one transaction. Session-scoped, like the headless
+    /// modes' arrangement: an app-scoped one is undone by the next re-mode of
+    /// any of the displays (macOS re-derives the arrangement from the session
+    /// store). Used for a multi-monitor session's displays, which go away with
+    /// the process, so nothing is left behind.
+    /// The right edge (global points) of the online displays not in
+    /// `exclude`; 0 if there are none.
+    pub fn right_edge_excluding(exclude: &[u32]) -> f64 {
+        online_displays()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !exclude.contains(id))
+            .map(|id| {
+                let b = CGDisplay::new(id).bounds();
+                b.origin.x + b.size.width
+            })
+            .fold(0.0, f64::max)
+    }
+
+    pub fn arrange_displays(origins: &[(u32, i32, i32)]) -> Result<()> {
+        let Some(&(first, _, _)) = origins.first() else {
+            return Ok(());
+        };
+        let any = CGDisplay::new(first);
+        let config = any
+            .begin_configuration()
+            .map_err(|e| anyhow!("CGBeginDisplayConfiguration (arrange): CGError {e}"))?;
+        for &(id, x, y) in origins {
+            if let Err(e) = CGDisplay::new(id).configure_display_origin(&config, x, y) {
+                let _ = any.cancel_configuration(&config);
+                return Err(anyhow!(
+                    "CGConfigureDisplayOrigin(display={id}, {x}, {y}) (arrange): CGError {e}"
+                ));
+            }
+        }
+        any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+            .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (arrange): CGError {e}"))
+    }
+
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
     // core-graphics crate. "Online" includes both active displays and any
     // online-but-currently-disabled displays — which is exactly the set we
@@ -469,6 +511,10 @@ mod macos {
         handle: Option<private_api::Handle>,
         display_id: u32,
         refresh_hz: u32,
+        /// The descriptor serial: the pid for the main display, unique per
+        /// display in a multi-monitor session. Identifies the display after
+        /// WindowServer re-registers it (`refresh_id`).
+        serial: u32,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
         /// Created HiDPI (`--virtual-display-hidpi`): every mode is applied
@@ -586,6 +632,26 @@ mod macos {
             hidpi: bool,
             ui_scale: u32,
         ) -> Result<Self> {
+            Self::new_with_serial(
+                width,
+                height,
+                refresh_hz,
+                hidpi,
+                ui_scale,
+                std::process::id(),
+            )
+        }
+
+        /// [`new`](Self::new) with the descriptor serial given: a
+        /// multi-monitor session's extra displays each need their own.
+        pub fn new_with_serial(
+            width: u32,
+            height: u32,
+            refresh_hz: u32,
+            hidpi: bool,
+            ui_scale: u32,
+            serial: u32,
+        ) -> Result<Self> {
             let ui_scale = if hidpi { ui_scale.max(1) } else { 1 };
             let (mode_w, mode_h) = (mode_points(width, ui_scale), mode_points(height, ui_scale));
             let handle = private_api::create(
@@ -596,6 +662,7 @@ mod macos {
                 hidpi,
                 hidpi,
                 super::panel_size_mm(width, height, hidpi),
+                serial,
             )
             .context("creating virtual display")?;
 
@@ -618,6 +685,7 @@ mod macos {
                 handle: Some(handle),
                 display_id: id,
                 refresh_hz,
+                serial,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
                 hidpi,
@@ -702,7 +770,10 @@ mod macos {
                 self.display_id,
                 live,
                 &online,
-                super::DisplayIdentity::ours(),
+                super::DisplayIdentity {
+                    vendor: super::VENDOR_ID,
+                    serial: self.serial,
+                },
                 size_px,
             )?;
             if id != self.display_id {
@@ -771,10 +842,27 @@ mod macos {
             forget_scale(before);
             // WindowServer rejects our serial while the old display is alive.
             self.handle = None;
-            *self = Self::new(width, height, self.refresh_hz, self.hidpi, self.ui_scale)?;
+            *self = Self::new_with_serial(
+                width,
+                height,
+                self.refresh_hz,
+                self.hidpi,
+                self.ui_scale,
+                self.serial,
+            )?;
             self.mode_px = (0, 0);
             super::record_id_change(before, self.display_id);
             Ok(())
+        }
+
+        /// Re-reads the display's position and size after something else
+        /// moved it (a multi-monitor arrangement).
+        pub fn refresh_bounds(&mut self) {
+            let b = CGDisplay::new(self.display_id).bounds();
+            if b.size.width > 0.0 && b.size.height > 0.0 {
+                self.origin_pts = (b.origin.x, b.origin.y);
+                self.size_pts = (b.size.width, b.size.height);
+            }
         }
 
         pub fn origin_pts(&self) -> (f64, f64) {
@@ -2359,6 +2447,14 @@ mod stub {
 
     /// No screen-lock concept off macOS — definitively not locked, not
     /// "unknown" (there's nothing to fail to look up).
+    pub fn arrange_displays(_origins: &[(u32, i32, i32)]) -> Result<()> {
+        Err(anyhow!("virtual display is macOS-only"))
+    }
+
+    pub fn right_edge_excluding(_exclude: &[u32]) -> f64 {
+        0.0
+    }
+
     pub fn screen_is_locked() -> Option<bool> {
         Some(false)
     }
@@ -2395,6 +2491,7 @@ mod stub {
         pub fn recreate(&mut self) -> Result<()> {
             Err(anyhow!("virtual display is macOS-only"))
         }
+        pub fn refresh_bounds(&mut self) {}
         pub fn origin_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
         }

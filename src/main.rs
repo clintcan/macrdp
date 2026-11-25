@@ -37,6 +37,7 @@ mod keyboard_layout;
 mod lock_activity;
 mod logging;
 mod monitor_layout;
+mod multi_monitor;
 mod multitransport;
 mod rdpdr;
 mod reaper;
@@ -337,6 +338,18 @@ struct Args {
     /// future macOS releases.
     #[arg(long)]
     virtual_display: bool,
+
+    /// EXPERIMENTAL, IN PROGRESS: serve one remote monitor per client monitor
+    /// (mstsc "Use all my monitors"). The virtual display serves the client's
+    /// primary monitor and macrdp adds one virtual display per other monitor,
+    /// arranged like the client's. Requires --virtual-display; not yet with
+    /// --virtual-display-hidpi, the headless modes (--capture-primary,
+    /// --detach-primary, --shield-primary, --make-primary) or
+    /// --no-client-resolution. Until multi-monitor phase 1 is finished only the
+    /// primary monitor is captured. Config: MULTI_MONITOR=1. See
+    /// docs/multi-monitor-design.md.
+    #[arg(long)]
+    multi_monitor: bool,
 
     /// Make the virtual display a Retina-style HiDPI display: the session
     /// size (--width/--height, or the size the client requests) is its pixel
@@ -2709,6 +2722,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_LOSSY_AUDIO", false) {
         argv.push("--enable-lossy-audio".into());
     }
+    if on("MULTI_MONITOR", false) {
+        argv.push("--multi-monitor".into());
+    }
     if on("VIRTUAL_DISPLAY", false) {
         argv.push("--virtual-display".into());
         argv.push("--width".into());
@@ -3087,6 +3103,30 @@ async fn async_main() -> Result<()> {
         tokio::spawn(crate::stats::serve(port, stats));
     }
 
+    if args.multi_monitor {
+        let conflict = if !args.virtual_display {
+            Some("needs --virtual-display")
+        } else if args.virtual_display_hidpi.is_some() {
+            Some("doesn't work with --virtual-display-hidpi yet")
+        } else if args.capture_primary
+            || args.detach_primary
+            || args.shield_primary
+            || args.make_primary
+        {
+            Some("doesn't work with the headless modes (--capture-primary, --detach-primary, --shield-primary, --make-primary) yet")
+        } else if args.no_client_resolution {
+            Some("needs the client's resolution (drop --no-client-resolution)")
+        } else {
+            None
+        };
+        if let Some(why) = conflict {
+            return Err(anyhow!("--multi-monitor {why}"));
+        }
+        warn!(
+            "--multi-monitor is EXPERIMENTAL and unfinished: a multi-monitor client gets one \
+             virtual display per monitor, but only the primary monitor is captured yet"
+        );
+    }
     if args.virtual_display_hidpi.is_some() && !args.virtual_display {
         return Err(anyhow!(
             "--virtual-display-hidpi requires --virtual-display"
@@ -3806,6 +3846,8 @@ async fn async_main() -> Result<()> {
     // left behind can't leak into the next one.
     let suppress_next_adopt = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // --multi-monitor: written by `MonitorLayoutHook` when a client connects.
+    let session_layout: multi_monitor::SessionLayout = Arc::default();
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,
@@ -3842,6 +3884,12 @@ async fn async_main() -> Result<()> {
         // the mirror-primary path (no virtual display to re-mode).
         virtual_display: virtual_display.clone(),
         vd_hidpi: vd_hidpi.clone(),
+        session_layout: session_layout.clone(),
+        extra_displays: args.multi_monitor.then(|| {
+            Arc::new(std::sync::Mutex::new(
+                multi_monitor::ExtraDisplays::default(),
+            ))
+        }),
         pointer_ui_scale: Arc::new(std::sync::atomic::AtomicU32::new(vd_hidpi.ui_scale())),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
@@ -3976,6 +4024,12 @@ async fn async_main() -> Result<()> {
     if matches!(vd_hidpi, virtual_display::HidpiPolicy::Auto(_)) {
         hooks.push(Box::new(conn_hooks::DesktopScaleHook(client_scale_factor)));
     }
+    // --multi-monitor: the layout each connection adopted, for the display.
+    if args.multi_monitor {
+        hooks.push(Box::new(conn_hooks::MonitorLayoutHook(
+            session_layout.clone(),
+        )));
+    }
     // With --stats-endpoint, clear the per-session stats when a connection ends.
     if let Some(stats) = stats::global() {
         hooks.push(Box::new(conn_hooks::StatsHook(Arc::clone(stats))));
@@ -4050,6 +4104,7 @@ async fn async_main() -> Result<()> {
         .with_gfx_factory(gfx_factory)
         .with_connection_handler(Some(Box::new(conn_hooks::ConnectionHooks::new(hooks))))
         .with_honor_client_desktop_size(honor_client_size)
+        .with_honor_client_monitor_layout(args.multi_monitor)
         .with_auto_reconnect_cookie(auto_reconnect_cookie.flatten())
         // macrdp is a single console session: a new authenticated client takes it
         // over. Without this the default (Queue) leaves the second client hanging
@@ -4473,6 +4528,17 @@ mod config_tests {
         fs::remove_file(&p).ok();
         let p = write_temp("rs0", "REVERSE_SCROLL=0\n");
         assert!(!args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn multi_monitor_config_bridge() {
+        let p = write_temp("mm1", "MULTI_MONITOR=1\nVIRTUAL_DISPLAY=1\n");
+        let a = args_from_config(&p).unwrap();
+        assert!(a.multi_monitor && a.virtual_display);
+        fs::remove_file(&p).ok();
+        let p = write_temp("mm0", "VIRTUAL_DISPLAY=1\n");
+        assert!(!args_from_config(&p).unwrap().multi_monitor);
         fs::remove_file(&p).ok();
     }
 
