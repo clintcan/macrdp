@@ -39,6 +39,7 @@ mod keyboard_layout;
 mod last_size;
 mod lock_activity;
 mod logging;
+mod main_display;
 mod monitor_layout;
 mod multi_monitor;
 mod multitransport;
@@ -435,6 +436,14 @@ struct Args {
     /// Reuses the same window-gather machinery as the Ctrl+Alt+G hotkey.
     #[arg(long)]
     restore_windows_on_disconnect: bool,
+
+    /// While a client is connected, make the session's primary display the
+    /// Mac's main display (Dock, menu bar, new windows), with the Mac's own
+    /// screen moved aside as a secondary display; give it back on the last
+    /// disconnect. Plain --virtual-display mode (multi-monitor included);
+    /// the headless modes already do this. Config: MAIN_DISPLAY_WHILE_CONNECTED.
+    #[arg(long)]
+    main_display_while_connected: bool,
 
     /// Lock the local macOS session when the last RDP client genuinely
     /// disconnects (opt-in; only meaningful with --detach-primary/
@@ -2673,6 +2682,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("RESTORE_WINDOWS_ON_DISCONNECT", false) {
         argv.push("--restore-windows-on-disconnect".into());
     }
+    if on("MAIN_DISPLAY_WHILE_CONNECTED", false) {
+        argv.push("--main-display-while-connected".into());
+    }
     if on("LOCK_ON_DISCONNECT", false) {
         argv.push("--lock-on-disconnect".into());
     }
@@ -3181,6 +3193,19 @@ async fn async_main() -> Result<()> {
              (pick one mechanism for going headless)"
         ));
     }
+    if args.main_display_while_connected {
+        if !args.virtual_display {
+            return Err(anyhow!(
+                "--main-display-while-connected needs --virtual-display"
+            ));
+        }
+        if args.detach_primary || args.capture_primary || args.shield_primary || args.make_primary {
+            return Err(anyhow!(
+                "--main-display-while-connected is for plain --virtual-display mode: the \
+                 headless modes (and --make-primary) already make the virtual display main"
+            ));
+        }
+    }
     if args.restore_windows_on_disconnect && !args.virtual_display {
         warn!("--restore-windows-on-disconnect has no effect without --virtual-display; ignoring");
     }
@@ -3432,6 +3457,7 @@ async fn async_main() -> Result<()> {
     let physical_main_id: u32 = core_graphics::display::CGDisplay::main().id;
     #[cfg(not(target_os = "macos"))]
     let physical_main_id: u32 = 0;
+    main_display::set_physical_main(physical_main_id);
 
     // Where the last session size is remembered (virtual display with
     // client-resolution auto-adopt only; src/last_size.rs).
@@ -3581,10 +3607,15 @@ async fn async_main() -> Result<()> {
             Arc::clone(&password),
             auto_unlock,
         );
-    } else if args.virtual_display && args.restore_windows_on_disconnect {
+    } else if args.virtual_display
+        && (args.restore_windows_on_disconnect || args.main_display_while_connected)
+    {
         // Plain --virtual-display: nothing to install on connect; the watcher
-        // only moves windows (onto the virtual display on connect, back to the
-        // Mac's screen on disconnect). Lock and auto-unlock stay headless-only.
+        // moves windows (onto the virtual display on connect, back to the Mac's
+        // screen on disconnect) and, with --main-display-while-connected, gives
+        // the main display back on disconnect (src/main_display.rs; the session
+        // arrangement itself happens when its displays are set up). Lock and
+        // auto-unlock stay headless-only.
         let vd_id = virtual_display
             .as_ref()
             .expect("checked: --virtual-display")
@@ -3594,18 +3625,33 @@ async fn async_main() -> Result<()> {
         fn no_overlay(_vd_id: u32) -> Result<()> {
             Ok(())
         }
-        spawn_primary_overlay_watcher(
-            "windows",
-            vd_id,
-            session_tracker.clone(),
-            Arc::new(std::sync::Mutex::new(None::<()>)),
-            no_overlay,
-            true,
-            physical_main_id,
-            None,
-            Arc::clone(&password),
-            false,
-        );
+        if args.main_display_while_connected {
+            spawn_primary_overlay_watcher(
+                "windows",
+                vd_id,
+                session_tracker.clone(),
+                Arc::new(std::sync::Mutex::new(None::<main_display::Guard>)),
+                main_display::Guard::install,
+                args.restore_windows_on_disconnect,
+                physical_main_id,
+                None,
+                Arc::clone(&password),
+                false,
+            );
+        } else {
+            spawn_primary_overlay_watcher(
+                "windows",
+                vd_id,
+                session_tracker.clone(),
+                Arc::new(std::sync::Mutex::new(None::<()>)),
+                no_overlay,
+                true,
+                physical_main_id,
+                None,
+                Arc::clone(&password),
+                false,
+            );
+        }
         if args.make_primary {
             warn!("--make-primary is ignored with --restore-windows-on-disconnect in plain mode");
         }
@@ -3927,7 +3973,9 @@ async fn async_main() -> Result<()> {
         // a useless atomic increment/decrement per session otherwise.
         // Headless modes, and plain --virtual-display with
         // --restore-windows-on-disconnect, count sessions for their watcher.
-        session_tracker: (headless || (args.virtual_display && args.restore_windows_on_disconnect))
+        session_tracker: (headless
+            || (args.virtual_display
+                && (args.restore_windows_on_disconnect || args.main_display_while_connected)))
             .then(|| session_tracker.clone()),
         headless,
         #[cfg(target_os = "macos")]
@@ -3955,9 +4003,11 @@ async fn async_main() -> Result<()> {
         active_monitors: active_monitors.clone(),
         extra_displays: args.multi_monitor.then(|| {
             Arc::new(std::sync::Mutex::new(
-                multi_monitor::ExtraDisplays::default(),
+                multi_monitor::ExtraDisplays::default()
+                    .with_main_while_connected(args.main_display_while_connected),
             ))
         }),
+        main_display_while_connected: args.main_display_while_connected,
         pointer_ui_scale: Arc::new(std::sync::atomic::AtomicU32::new(vd_hidpi.ui_scale())),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.

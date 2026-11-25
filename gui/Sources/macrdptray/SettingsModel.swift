@@ -114,6 +114,13 @@ final class SettingsModel: ObservableObject {
         // headless session watcher, so without a mode the server ignores them
         // (with a startup warning) and a stale ON would silently re-arm the moment
         // a mode is picked again. `primaryMode` honors a legacy CAPTURE_PRIMARY=1.
+        // The main-display switch is for plain virtual-display mode: the
+        // headless modes do it themselves, and the server refuses both.
+        if (draft["VIRTUAL_DISPLAY"] ?? "0") != "1" || primaryMode != "none" {
+            if draft["MAIN_DISPLAY_WHILE_CONNECTED"] == "1" {
+                draft["MAIN_DISPLAY_WHILE_CONNECTED"] = "0"
+            }
+        }
         if primaryMode == "none" {
             if draft["LOCK_ON_DISCONNECT"] == "1" { draft["LOCK_ON_DISCONNECT"] = "0" }
             if draft["AUTO_UNLOCK"] == "1" { draft["AUTO_UNLOCK"] = "0" }

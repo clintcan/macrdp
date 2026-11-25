@@ -58,9 +58,17 @@ fn others(layout: &Layout) -> Vec<crate::monitor_layout::SessionMonitor> {
 #[derive(Default)]
 pub struct ExtraDisplays {
     displays: Vec<VirtualDisplay>,
+    /// --main-display-while-connected: arrange with the session's primary at
+    /// (0,0), the Mac's own displays aside (src/main_display.rs).
+    main_while_connected: bool,
 }
 
 impl ExtraDisplays {
+    pub fn with_main_while_connected(mut self, on: bool) -> Self {
+        self.main_while_connected = on;
+        self
+    }
+
     /// The extra displays' ids, in the order of the layout's non-primary
     /// monitors.
     pub fn ids(&self) -> Vec<u32> {
@@ -131,6 +139,9 @@ impl ExtraDisplays {
         if self.displays.is_empty() {
             return Ok(());
         }
+        if self.main_while_connected {
+            return self.arrange_as_main(layout, primary);
+        }
         let primary_index = layout.primary();
         let mut ours = self.ids();
         ours.push(primary.display_id());
@@ -169,6 +180,40 @@ impl ExtraDisplays {
             ?placements,
             "multi-monitor: arranged the session's displays"
         );
+        Ok(())
+    }
+}
+
+impl ExtraDisplays {
+    /// The session's displays like the client's monitors, with the primary at
+    /// (0,0) as the main display and the Mac's own displays aside.
+    fn arrange_as_main(&mut self, layout: &Layout, primary: &mut VirtualDisplay) -> Result<()> {
+        let p = layout.monitors()[layout.primary()];
+        let mut extras = self.displays.iter();
+        let session: Vec<(u32, i32, i32)> = layout
+            .monitors()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let id = if i == layout.primary() {
+                    primary.display_id()
+                } else {
+                    extras.next()?.display_id()
+                };
+                // Points are pixels in a multi-monitor session (UI scale 1).
+                Some((
+                    id,
+                    i32::from(m.x) - i32::from(p.x),
+                    i32::from(m.y) - i32::from(p.y),
+                ))
+            })
+            .collect();
+        if crate::main_display::arrange_as_main(&session)? {
+            primary.refresh_bounds();
+            for vd in &mut self.displays {
+                vd.refresh_bounds();
+            }
+        }
         Ok(())
     }
 }

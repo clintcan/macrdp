@@ -642,6 +642,9 @@ pub struct CaptureDisplay {
     /// for the next start (src/last_size.rs). `None` without a virtual display
     /// or with --no-client-resolution.
     pub last_size_path: Option<std::path::PathBuf>,
+    /// --main-display-while-connected: the session's primary display is the
+    /// main display while connected (src/main_display.rs).
+    pub main_display_while_connected: bool,
     pub extra_displays: Option<Arc<std::sync::Mutex<crate::multi_monitor::ExtraDisplays>>>,
     /// --multi-monitor: the monitors and displays being served, for input.
     pub active_monitors: crate::multi_monitor::ActiveMonitors,
@@ -1265,9 +1268,33 @@ impl CaptureDisplay {
         }
         let served = self.sync_primary_display(primary_size);
         if layout.is_some() {
+            // With a layout the extra displays' arrangement also places the
+            // main display (multi_monitor::ExtraDisplays::arrange).
             self.sync_extra_displays(layout.as_ref());
+        } else if self.main_display_while_connected {
+            self.make_primary_the_main_display();
         }
         served
+    }
+
+    /// --main-display-while-connected, one monitor: the virtual display to
+    /// (0,0) as the main display, the Mac's own displays aside.
+    fn make_primary_the_main_display(&mut self) {
+        let Some(vd) = self.virtual_display.clone() else {
+            return;
+        };
+        let mut vd = vd.lock().expect("virtual display mutex poisoned");
+        match crate::main_display::arrange_as_main(&[(vd.display_id(), 0, 0)]) {
+            Ok(true) => {
+                vd.refresh_bounds();
+                self.screen_size_pts = vd.size_pts();
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "making the virtual display the main display failed"
+            ),
+        }
     }
 
     /// --multi-monitor: gives the session's non-primary monitors their own
@@ -3620,6 +3647,7 @@ mod tests {
             vd_hidpi: crate::virtual_display::HidpiPolicy::Off,
             session_layout: Arc::default(),
             last_size_path: None,
+            main_display_while_connected: false,
             extra_displays: None,
             active_monitors: Arc::default(),
             pointer_ui_scale: Arc::new(AtomicU32::new(1)),

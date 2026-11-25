@@ -14,17 +14,17 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    arrange_displays, is_hidpi_virtual_display, online_display, right_edge_excluding,
-    run_arrange_helper, run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay, ARRANGE_ARG, SELECT_MODE_ARG,
+    arrange_displays, is_hidpi_virtual_display, online_display, online_display_ids,
+    right_edge_excluding, run_arrange_helper, run_select_mode_helper, screen_is_locked,
+    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay, ARRANGE_ARG, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    arrange_displays, is_hidpi_virtual_display, right_edge_excluding, screen_is_locked,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    arrange_displays, is_hidpi_virtual_display, online_display_ids, right_edge_excluding,
+    screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 /// When the virtual display runs HiDPI (`--virtual-display-hidpi`).
@@ -437,6 +437,11 @@ mod macos {
 
     /// The right edge (global points) of the online displays not in
     /// `exclude`; 0 if there are none.
+    /// Every online display's id (an empty list if the query fails).
+    pub fn online_display_ids() -> Vec<u32> {
+        online_displays().unwrap_or_default()
+    }
+
     pub fn right_edge_excluding(exclude: &[u32]) -> f64 {
         online_displays()
             .unwrap_or_default()
@@ -2535,6 +2540,10 @@ mod stub {
     /// "unknown" (there's nothing to fail to look up).
     pub fn arrange_displays(_origins: &[(u32, i32, i32)]) -> Result<()> {
         Err(anyhow!("virtual display is macOS-only"))
+    }
+
+    pub fn online_display_ids() -> Vec<u32> {
+        Vec::new()
     }
 
     pub fn right_edge_excluding(_exclude: &[u32]) -> f64 {
