@@ -61,13 +61,17 @@ impl SessionMonitor {
 pub struct Layout {
     monitors: Vec<SessionMonitor>,
     desktop: (u16, u16),
+    /// The client's rectangles as it sent them, for the messages that carry
+    /// them unchanged (Monitor Layout PDU, EGFX `RESET_GRAPHICS`).
+    client: Vec<Monitor>,
 }
 
 impl Layout {
     /// The layout for the client's monitors, as the session adopted them
     /// (`ConnectionInfo::monitor_layout`). `None` for an empty list or one
     /// whose rectangles don't fit the 16-bit desktop.
-    pub fn from_client(monitors: &[Monitor]) -> Option<Self> {
+    pub fn from_client(monitors_in: &[Monitor]) -> Option<Self> {
+        let monitors = monitors_in;
         let left = monitors.iter().map(|m| m.left).min()?;
         let top = monitors.iter().map(|m| m.top).min()?;
         let right = monitors.iter().map(|m| m.right).max()?;
@@ -86,11 +90,20 @@ impl Layout {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(Self { monitors, desktop })
+        Some(Self {
+            monitors,
+            desktop,
+            client: monitors_in.to_vec(),
+        })
     }
 
     pub fn monitors(&self) -> &[SessionMonitor] {
         &self.monitors
+    }
+
+    /// The client's rectangles as it sent them (primary-relative).
+    pub fn client_monitors(&self) -> &[Monitor] {
+        &self.client
     }
 
     /// The desktop size: the monitors' bounding box.

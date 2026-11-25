@@ -731,17 +731,19 @@ impl RdpServerDisplay for CaptureDisplay {
             .store(self.vd_hidpi.ui_scale(), Ordering::Relaxed);
 
         // A multi-monitor session's size is the monitors' bounding box, which
-        // the acceptor already checked monitor by monitor against the cap.
-        let multi_monitor = self
+        // the acceptor negotiated (and capped monitor by monitor). mstsc
+        // confirms its primary monitor's size instead (seen live 2026-11-25:
+        // Demand Active 3286x1080, Confirm Active 1920x1080), so the layout,
+        // not the echo, decides.
+        let layout_desktop = self
             .session_layout
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|l| l.desktop() == (client_size.width, client_size.height));
-        let client_size = if multi_monitor {
-            client_size
-        } else {
-            cap_client_size(client_size, self.max_client_size)
+            .map(crate::monitor_layout::Layout::desktop);
+        let client_size = match layout_desktop {
+            Some((width, height)) => DesktopSize { width, height },
+            None => cap_client_size(client_size, self.max_client_size),
         };
         if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
             tracing::info!(

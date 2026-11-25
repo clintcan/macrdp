@@ -3803,6 +3803,8 @@ async fn async_main() -> Result<()> {
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
+    // --multi-monitor: written by `MonitorLayoutHook` when a client connects.
+    let session_layout: multi_monitor::SessionLayout = Arc::default();
     #[cfg(target_os = "macos")]
     let gfx = args.enable_h264.then(|| {
         h264::Gfx::new(
@@ -3819,6 +3821,7 @@ async fn async_main() -> Result<()> {
             congestion_retransmits.clone(),
             link_rtt_ms.clone(),
         )
+        .with_session_layout(session_layout.clone())
     });
 
     // On-change keyframes are off by default; --keyframe-on-change opts in.
@@ -3846,8 +3849,6 @@ async fn async_main() -> Result<()> {
     // left behind can't leak into the next one.
     let suppress_next_adopt = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // --multi-monitor: written by `MonitorLayoutHook` when a client connects.
-    let session_layout: multi_monitor::SessionLayout = Arc::default();
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,

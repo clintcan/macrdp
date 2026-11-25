@@ -1600,6 +1600,9 @@ pub struct Gfx {
     /// surface + encoder are created, so the H.264 pipeline tracks the
     /// client-resolution auto-adopt without rebuilding the factory.
     desktop_size: crate::capture::SharedDesktopSize,
+    /// --multi-monitor: the connection's adopted layout, announced in
+    /// `RESET_GRAPHICS` instead of one monitor spanning the desktop.
+    session_layout: crate::multi_monitor::SessionLayout,
     fps: u32,
     bitrate_bps: u32,
     /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
@@ -1776,6 +1779,12 @@ enum FrameInput<'a> {
 }
 
 impl Gfx {
+    /// --multi-monitor: share the connection's adopted monitor layout.
+    pub fn with_session_layout(mut self, layout: crate::multi_monitor::SessionLayout) -> Self {
+        self.session_layout = layout;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         desktop_size: crate::capture::SharedDesktopSize,
@@ -2010,6 +2019,7 @@ impl Gfx {
             sender: Arc::new(Mutex::new(None)),
             ctx: Arc::new(Mutex::new(None)),
             desktop_size,
+            session_layout: Arc::default(),
             fps,
             bitrate_bps,
             keyframe_secs,
@@ -2984,14 +2994,26 @@ impl Gfx {
             // + acked surface has nowhere to composite and the screen stays
             // blank. resize_with_monitors sets reset_graphics_sent=true so the
             // empty-monitor reset never fires. (reconnect-blank fix 2026-05-20.)
-            let monitor = Monitor {
-                left: 0,
-                top: 0,
-                right: i32::from(width).saturating_sub(1),
-                bottom: i32::from(height).saturating_sub(1),
-                flags: MonitorFlags::PRIMARY,
+            let monitors = match self
+                .session_layout
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                // --multi-monitor: the client's monitors, as it sent them
+                // (docs/multi-monitor-design.md, "Coordinates").
+                Some(layout) if layout.desktop() == (width, height) => {
+                    layout.client_monitors().to_vec()
+                }
+                _ => vec![Monitor {
+                    left: 0,
+                    top: 0,
+                    right: i32::from(width).saturating_sub(1),
+                    bottom: i32::from(height).saturating_sub(1),
+                    flags: MonitorFlags::PRIMARY,
+                }],
             };
-            server.resize_with_monitors(width, height, vec![monitor]);
+            server.resize_with_monitors(width, height, monitors);
             // Create the surface with upstream's auto-allocated id. mstsc retains
             // EGFX surfaces by id for its whole process lifetime and no-ops a
             // CreateSurface for an id it already holds, so a reconnect to the
