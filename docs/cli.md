@@ -546,15 +546,19 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   when off. Loopback-only, carries no client IP/hostname.
                           #   Port MACRDP_STATS_PORT (default 40245). Config keys:
                           #   STATS_ENDPOINT, STATS_PORT. macOS-built; cross-platform.
---network-autodetect      # Opt-in (default OFF; NETWORK_AUTODETECT=1 in config.env).
-                          #   Report network characteristics to the client (MS-RDPBCGR
-                          #   2.2.14 auto-detect) using IronRDP's own AutoDetectManager:
-                          #   an RTT probe each second, a bandwidth measurement every
-                          #   8 s that brackets ordinary traffic (no extra payload),
-                          #   and a Network Characteristics Result at most once a
-                          #   second, e.g. for the Windows connection-quality dialog.
-                          #   Only clients that open the MCS message channel take
-                          #   part (mstsc does). Idea from #235.
+--no-network-autodetect   # Don't report network characteristics to the client (on by
+                          #   default; NETWORK_AUTODETECT=0 in config.env). By default
+                          #   macrdp uses IronRDP's AutoDetectManager (MS-RDPBCGR 2.2.14
+                          #   auto-detect): a 256 KiB bandwidth burst and an RTT probe
+                          #   while the client logs in, then an RTT probe each second,
+                          #   bandwidth measurements over ordinary traffic, and a
+                          #   Network Characteristics Result at most once a second,
+                          #   e.g. for the Windows connection-quality dialog. Without
+                          #   them mstsc and Windows App can warn "Your network might
+                          #   be slow" on a fast LAN. Only clients that open the MCS
+                          #   message channel take part (mstsc and Windows App do).
+                          #   The old opt-in flag --network-autodetect is still
+                          #   accepted and does nothing. Idea from #235.
 ```
 
 Auth hardening (env-only, **on by default**). macrdp rate-limits and briefly

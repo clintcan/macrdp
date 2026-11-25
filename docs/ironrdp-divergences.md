@@ -239,7 +239,8 @@ says otherwise.
   `measured_bandwidth_kbps`, and the connect-time measurement does not update `AutoDetectHandles`.
   Tests: `autodetect::connect_time_tests` (run by the CI server-test step) and macrdp's
   `conn_test::network_autodetect_reports_the_connect_time_bandwidth`. Upstream candidate (together
-  with acceptor (7)). Not live-tested on this base yet.
+  with acceptor (7)). Live on this base (2026-11-24, v0.10.10 on the mini): mstsc and Windows App on
+  Windows showed 91.27 and 95.42 Mbps, "good", with no noticeable login delay.
   **Open follow-up:** results still always report the connect-time figure. Upstream #2021 (in
   79e763a0) now brackets a single large EGFX write, so in-session measurements are better than before,
   and always preferring the connect-time figure hides them. Changing the rule to "connect-time until a
