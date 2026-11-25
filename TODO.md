@@ -629,6 +629,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].
 
+- [ ] **`VD_HIDPI=auto` together with `MULTI_MONITOR` (asked for 2026-11-25).** Today they're refused
+  together (a phase 1 shortcut). The mini runs multi-monitor for the Windows PC, so Windows App on the
+  MacBook ("Optimize for Retina displays" on) gets 3024x1898 at 1:1 and tiny text. Plan: multi-monitor
+  sessions stay at 1x (as now), one-monitor clients announcing 200% get the HiDPI desktop. Check what
+  the refusal guarded: the arrangement maths (points vs pixels, `display_origins` already takes
+  points-per-pixel), the extra displays (1:1), the input mapping, and switching a HiDPI main display
+  between ui_scale 2 and 1 across connections (see the HiDPI notes in known-quirks: never switch the
+  display's HiDPI-ness, only its point size). Workaround meanwhile: turn off "Optimize for Retina
+  displays" in Windows App.
+
 - [ ] **Multi-monitor (client-side multi-display), experimental.** Phase 1 shipped in v0.11.0; live
   layout changes work on mstsc and Windows App on Windows (2026-11-25, branch
   `feat/multi-monitor-live-layout` + fork branch `macrdp-mm-live-layout`). Next: a faster re-layout
