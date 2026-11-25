@@ -4,6 +4,26 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.11.1 — Multi-monitor follows layout changes, and stops leaking captures
+
+Multi-monitor sessions now follow a client's monitor changes without reconnecting, and a capture leak in v0.11.0's multi-monitor sessions is fixed.
+
+- **Live layout changes in multi-monitor sessions (#298).** When the client's monitors change mid-session (a monitor's resolution, say), the remote monitors follow, 2–6 s after the client reports it. With H.264 the change is applied in place, by restarting the graphics pipeline as MS-RDPEDISP asks, with no reconnect. Windows App on Windows reports a change only after its window is minimized and restored, or after Ctrl+Alt+Break; mstsc reports it at once. Uses a further IronRDP fork change (clintcan/IronRDP#7).
+- **Fixed: multi-monitor sessions leaked their screen captures (#298).** Every multi-monitor session in v0.11.0 left its captures running after it ended; enough of them can starve macOS's screen capture. Restarting macrdp, which an upgrade does, ends any leaked ones.
+- **Blank-screen recovery now works in multi-monitor sessions (#298),** and a reactivation macrdp triggers no longer counts as a disconnect, so window-follow doesn't sweep the windows away and back (this also helps single-monitor resizes in the Detach/Blank modes).
+- **A virtual display gets the mode it asks for** when macOS would keep an earlier one (#298).
+
+**Verified before release**
+
+- CI green on Linux and macOS; fmt (stable and nightly), clippy, all tests, `cargo deny` and the IronRDP pin guard pass.
+- Live on the Mac mini with Windows 11 and two monitors: mstsc and Windows App on Windows follow resolution changes on the secondary monitor in place; windows stay put; a macrdp restart reconnects with the current layout, and a blank reconnect heals.
+
+**Known issues**
+
+- Multi-monitor: a layout change takes 2–6 s to appear; adding or removing a monitor mid-session, the Detach/Blank modes and Windows App for macOS are untested or unsupported.
+- A cursor hidden with macOS's hidden flag (Firefox's full-screen video) still shows on the client.
+- Windows App on Windows: a small audio/video offset at connect, fixed by the resync hotkey.
+
 ## v0.11.0 — Multi-monitor sessions, connection quality by default, windows that follow you
 
 A client's monitors can each get their own remote monitor, the client's connection-quality view works by default, and windows move to the remote session and back on their own.

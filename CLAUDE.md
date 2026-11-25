@@ -23,9 +23,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.11.0** (multi-monitor sessions, experimental, #294; network
-auto-detect on by default, #293; `--restore-windows-on-disconnect` in plain virtual-display mode, #296;
-controller toggles, #295; virtual-display re-registration and display wake, #231/#232).
+(VPN/ZeroTier). **Latest release: v0.11.1** (multi-monitor live layout changes applied in place
+with RESET_GRAPHICS, IronRDP fork #7, and the v0.11.0 multi-monitor capture leak fixed, #298; v0.11.0:
+multi-monitor sessions #294, network auto-detect on by default #293, window-follow in plain
+virtual-display mode #296).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
