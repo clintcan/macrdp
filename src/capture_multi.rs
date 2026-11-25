@@ -79,9 +79,14 @@ pub struct MultiCaptureUpdates {
     desktop_size: crate::capture::SharedDesktopSize,
     suppress_next_adopt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fps: u32,
-    /// What an in-place re-layout updates (see `relayout_in_place`).
+    /// What an in-place re-layout updates (see `start_relayout`).
     relayout: Relayout,
+    /// An in-place re-layout in progress: the new layout, its display ids
+    /// and its captures, once the displays are set up.
+    relayout_task: Option<tokio::task::JoinHandle<Result<RelayoutDone>>>,
 }
+
+type RelayoutDone = (Layout, Vec<u32>, Vec<MonitorStream>);
 
 /// The shared state an in-place re-layout changes: the displays, the session
 /// layout (H.264 surfaces are built from it) and the input map.
@@ -272,73 +277,56 @@ impl MultiCaptureUpdates {
             suppress_next_adopt,
             fps,
             relayout,
+            relayout_task: None,
         })
     }
 
-    /// Applies a new multi-monitor layout inside the running session, as
-    /// MS-RDPEDISP 1.3 asks of a server using the graphics pipeline ("restart
-    /// the graphics pipeline using the surface management commands"): the
-    /// displays are re-moded and re-arranged, the captures restarted, and the
-    /// next frame deletes the surfaces, sends RESET_GRAPHICS with the new
-    /// monitors and creates new ones (`Gfx::setup_locked`). No core
+    /// Starts applying a new multi-monitor layout inside the running
+    /// session, as MS-RDPEDISP 1.3 asks of a server using the graphics
+    /// pipeline ("restart the graphics pipeline using the surface management
+    /// commands"): the captures stop, and a task re-modes and re-arranges the
+    /// displays and opens new captures; `finish_relayout` then switches over,
+    /// and the next frame deletes the surfaces, sends RESET_GRAPHICS with the
+    /// new monitors and creates new ones (`Gfx::setup_locked`). No core
     /// deactivation-reactivation: after one, mstsc sometimes kept a one-monitor
     /// full-screen window and drew both monitors on it (live 2026-11-25).
-    /// False if the displays couldn't be set up; the caller then falls back to
-    /// a reactivation, which retries them.
-    async fn relayout_in_place(&mut self, layout: Layout) -> Result<bool> {
-        // Each step is time-limited: a step that doesn't finish falls back to
-        // the reactivation, which rebuilds everything, instead of hanging the
-        // session (a step hung live 2026-11-25).
-        const STEP_LIMIT: Duration = Duration::from_secs(10);
+    ///
+    /// The work is a spawned task because `next_update` is cancelled whenever
+    /// the server's select picks another event (input, say): done inline, an
+    /// await in the middle of it was cancelled and the layout never applied
+    /// (live 2026-11-25). Awaiting the task's handle can be resumed.
+    fn start_relayout(&mut self, layout: Layout) {
         // Stop the old captures first, while their displays are unchanged.
         tracing::info!("multi-monitor: in-place re-layout: stopping the captures");
         self.monitors.clear();
-        tracing::info!("multi-monitor: in-place re-layout: re-moding and arranging the displays");
         let relayout = self.relayout.clone();
-        let sync_layout = layout.clone();
-        let synced = tokio::time::timeout(
-            STEP_LIMIT,
-            tokio::task::spawn_blocking(move || relayout.sync_displays(&sync_layout)),
-        )
-        .await;
-        let ids = match synced {
-            Ok(Ok(Ok(ids))) => ids,
-            Ok(Ok(Err(e))) => {
-                tracing::warn!(
-                    error = format!("{e:#}"),
-                    "multi-monitor: re-laying out the displays in place failed; reactivating instead"
-                );
-                return Ok(false);
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "multi-monitor: the display sync task failed; reactivating instead");
-                return Ok(false);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "multi-monitor: the display sync took too long; reactivating instead"
-                );
-                return Ok(false);
-            }
-        };
-        tracing::info!(displays = ?ids, "multi-monitor: in-place re-layout: opening the captures");
-        let monitors =
-            match tokio::time::timeout(STEP_LIMIT, open_streams(&layout, &ids, self.fps)).await {
-                Ok(Ok(monitors)) => monitors,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        error = format!("{e:#}"),
-                        "multi-monitor: opening the captures failed; reactivating instead"
-                    );
-                    return Ok(false);
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "multi-monitor: opening the captures took too long; reactivating instead"
-                    );
-                    return Ok(false);
-                }
-            };
+        let fps = self.fps;
+        self.relayout_task = Some(tokio::spawn(async move {
+            // Each step is time-limited, so a stuck step falls back to the
+            // reactivation (which rebuilds everything) instead of hanging.
+            const STEP_LIMIT: Duration = Duration::from_secs(10);
+            tracing::info!(
+                "multi-monitor: in-place re-layout: re-moding and arranging the displays"
+            );
+            let sync_layout = layout.clone();
+            let ids = tokio::time::timeout(
+                STEP_LIMIT,
+                tokio::task::spawn_blocking(move || relayout.sync_displays(&sync_layout)),
+            )
+            .await
+            .map_err(|_| anyhow!("the display sync took too long"))?
+            .map_err(|e| anyhow!("the display sync task failed: {e}"))??;
+            tracing::info!(displays = ?ids, "multi-monitor: in-place re-layout: opening the captures");
+            let monitors = tokio::time::timeout(STEP_LIMIT, open_streams(&layout, &ids, fps))
+                .await
+                .map_err(|_| anyhow!("opening the captures took too long"))??;
+            Ok((layout, ids, monitors))
+        }));
+    }
+
+    /// Switches over to a finished re-layout. No awaits: nothing here can be
+    /// cancelled half-way.
+    fn finish_relayout(&mut self, layout: Layout, ids: Vec<u32>, monitors: Vec<MonitorStream>) {
         let (w, h) = layout.desktop();
         *self
             .relayout
@@ -366,7 +354,21 @@ impl MultiCaptureUpdates {
             layout = ?layout.client_monitors(),
             "multi-monitor: applied the client's layout change in place (graphics reset, no reactivation)"
         );
-        Ok(true)
+    }
+
+    /// The reactivation route for a layout change: the new size now, the
+    /// layout applied by `updates()` after the reactivation.
+    fn reactivate_for_layout(&mut self, w: u16, h: u16) -> DisplayUpdate {
+        self.desktop_size.set(w, h);
+        self.suppress_next_adopt.store(true, Ordering::Relaxed);
+        if let Some(gfx) = self.gfx.as_ref() {
+            gfx.reset_for_live_resize();
+        }
+        tracing::info!(w, h, "multi-monitor: applying the client's layout change");
+        DisplayUpdate::Resize(ironrdp_server::DesktopSize {
+            width: w,
+            height: h,
+        })
     }
 
     fn stride(&self) -> usize {
@@ -555,6 +557,38 @@ impl MultiCaptureUpdates {
                 }
             }
 
+            // An in-place re-layout in progress (`start_relayout`). Awaiting
+            // the handle is cancel-safe: a cancelled poll resumes here.
+            if let Some(task) = self.relayout_task.as_mut() {
+                let result = task.await;
+                self.relayout_task = None;
+                match result {
+                    Ok(Ok((layout, ids, monitors))) => {
+                        self.pending_resize.take_layout();
+                        self.finish_relayout(layout, ids, monitors);
+                    }
+                    failed => {
+                        let error = match failed {
+                            Ok(Err(e)) => format!("{e:#}"),
+                            Err(e) => e.to_string(),
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                        tracing::warn!(
+                            error,
+                            "multi-monitor: the in-place re-layout failed; reactivating instead"
+                        );
+                        // The layout is still queued for `updates()`.
+                        let (w, h) = self
+                            .pending_resize
+                            .peek_layout()
+                            .flatten()
+                            .map_or_else(|| self.desktop_size.get(), |l| l.desktop());
+                        return Ok(Some(self.reactivate_for_layout(w, h)));
+                    }
+                }
+                continue;
+            }
+
             // A live layout change, as the single-monitor loop applies a live
             // resize: the new size now, surfaces and encoders rebuilt after
             // the reactivation, and the reactivation's size not re-adopted
@@ -568,21 +602,21 @@ impl MultiCaptureUpdates {
                 // single-monitor capture loop takes over), a reactivation.
                 let egfx = self.gfx.as_ref().is_some_and(|g| g.pipeline_ready());
                 if let (true, Some(Some(layout))) = (egfx, self.pending_resize.peek_layout()) {
-                    if self.relayout_in_place(layout).await? {
+                    let current = self
+                        .relayout
+                        .session_layout
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    // The client resends a layout while one is being applied.
+                    if current.as_ref() == Some(&layout) {
                         self.pending_resize.take_layout();
                         continue;
                     }
+                    self.start_relayout(layout);
+                    continue;
                 }
-                self.desktop_size.set(w, h);
-                self.suppress_next_adopt.store(true, Ordering::Relaxed);
-                if let Some(gfx) = self.gfx.as_ref() {
-                    gfx.reset_for_live_resize();
-                }
-                tracing::info!(w, h, "multi-monitor: applying the client's layout change");
-                return Ok(Some(DisplayUpdate::Resize(ironrdp_server::DesktopSize {
-                    width: w,
-                    height: h,
-                })));
+                return Ok(Some(self.reactivate_for_layout(w, h)));
             }
 
             if self
