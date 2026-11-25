@@ -372,10 +372,9 @@ private struct DisplayTab: View {
                 Text(model.multiMonitorAllowed
                     ? "A client using several monitors (mstsc “Use all my monitors”, Windows App’s "
                         + "multiple displays) gets one remote monitor per local one, each its own "
-                        + "virtual display. Not yet: moving or resizing the client window between "
-                        + "monitor layouts."
-                    : "Needs the headless virtual display, “Keep local screen on” below, and no "
-                        + "HiDPI virtual display.")
+                        + "virtual display. Multi-monitor sessions run at 1x; with a HiDPI virtual "
+                        + "display, one-monitor Retina clients still get a 2x desktop."
+                    : "Needs the headless virtual display and “Keep local screen on” below.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Primary screen (while connected)") {

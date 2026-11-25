@@ -638,7 +638,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].
 
-- [ ] **`VD_HIDPI=auto` together with `MULTI_MONITOR` (asked for 2026-11-25).** Today they're refused
+- [ ] **`VD_HIDPI=auto` together with `MULTI_MONITOR` (asked for 2026-11-25).** Branch
+  `feat/hidpi-with-multi-monitor` lifts the refusal (multi-monitor sessions at UI scale 1,
+  `capture::session_ui_scale`); live test on the mini after the soak (MacBook Retina client one-monitor
+  at 2x, then the Windows PC two-monitor at 1x, then back). Before: refused
   together (a phase 1 shortcut). The mini runs multi-monitor for the Windows PC, so Windows App on the
   MacBook ("Optimize for Retina displays" on) gets 3024x1898 at 1:1 and tiny text. Plan: multi-monitor
   sessions stay at 1x (as now), one-monitor clients announcing 200% get the HiDPI desktop. Check what
