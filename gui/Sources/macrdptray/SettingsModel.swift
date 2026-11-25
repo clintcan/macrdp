@@ -105,6 +105,9 @@ final class SettingsModel: ObservableObject {
         // already enables VD when a mode is chosen, so this can't fight a VD-off.
         if (draft["VIRTUAL_DISPLAY"] ?? "0") != "1" {
             if modeActive { draft["PRIMARY_MODE"] = "none" }
+            if draft["RESTORE_WINDOWS_ON_DISCONNECT"] == "1" {
+                draft["RESTORE_WINDOWS_ON_DISCONNECT"] = "0"
+            }
             if draft["CAPTURE_PRIMARY"] == "1" { draft["CAPTURE_PRIMARY"] = "0" }
         }
         // No headless mode => clear the lock/unlock pair. Both only run inside the

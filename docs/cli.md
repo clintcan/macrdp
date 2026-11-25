@@ -201,7 +201,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   MACRDP_SHIELD_PORT (default 40244). macOS-only.
 --restore-windows-on-disconnect  # Make windows follow you between the local
                           #   built-in screen and the remote virtual display
-                          #   (opt-in; needs --detach-primary/--capture-primary).
+                          #   (opt-in; needs --virtual-display: works in plain
+                          #   mode, multi-monitor included, and in the
+                          #   detach/capture/shield modes).
                           #   By default the virtual display is process-lifetime,
                           #   so on disconnect its windows stay stranded on the
                           #   (now off-screen) virtual display — invisible on a

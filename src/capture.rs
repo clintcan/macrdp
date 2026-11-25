@@ -456,6 +456,12 @@ pub struct CaptureDisplay {
     /// counter that drives the `--detach-primary` session-transition
     /// watcher. `None` disables the wrap entirely (zero overhead).
     pub session_tracker: Option<SessionTracker>,
+    /// A headless mode (--detach-primary / --capture-primary /
+    /// --shield-primary) is on: the virtual display is the only visible one,
+    /// so it is re-anchored as main and windows are gathered after a re-mode.
+    /// Not implied by `session_tracker`, which plain --virtual-display also
+    /// has with --restore-windows-on-disconnect.
+    pub headless: bool,
     /// EGFX/H.264 frame sink (macOS-only, opt-in via `--enable-h264`). When
     /// `Some`, every captured SCK frame is submitted to the H.264 encoder; once
     /// EGFX has negotiated, the legacy BitmapUpdate path is suppressed and the
@@ -948,7 +954,7 @@ impl CaptureDisplay {
                 self.screen_size_pts = vd.size_pts();
                 // A re-registered display lands where WindowServer puts it; keep it main.
                 #[cfg(target_os = "macos")]
-                if self.session_tracker.is_some()
+                if self.headless
                     && !(self.shielded_primary.is_some()
                         && crate::virtual_display::shield_keeps_physical_main())
                 {
@@ -1068,12 +1074,12 @@ impl CaptureDisplay {
                 //      settles (off-thread, ~0.7 s) and read the FINAL (0,0)
                 //      bounds; too soon and it sweeps windows in a coordinate space
                 //      that's about to shift → they land off-screen.
-                // Headless-only (session_tracker is Some exactly for
-                // --capture-primary/--detach-primary, where the vd is the only
-                // visible display); skipped for plain --virtual-display, where a
-                // window off the vd may be intentionally on the physical panel.
+                // Headless-only (`headless`: --capture-primary/--detach-primary/
+                // --shield-primary, where the vd is the only visible display);
+                // skipped for plain --virtual-display, where a window off the vd
+                // may be intentionally on the physical panel.
                 #[cfg(target_os = "macos")]
-                if self.session_tracker.is_some() {
+                if self.headless {
                     // --shield-primary in keep-physical-main mode deliberately
                     // does NOT make the vd the system main display (so the lock
                     // screen stays on the visible physical panel). Re-anchoring
@@ -3219,6 +3225,7 @@ mod tests {
             warp_cursor_home: false,
             cursor_scale: 1.0,
             session_tracker: None,
+            headless: false,
             #[cfg(target_os = "macos")]
             gfx: None,
             keyframe_on_change: KeyframeOnChange {
