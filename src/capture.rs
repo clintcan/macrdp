@@ -379,10 +379,59 @@ pub struct SessionTracker {
     /// edge-triggered; we wake one waiter per state transition, which
     /// is what the watchdog needs.
     pub notify: Arc<Notify>,
+    /// Sessions kept counted across a reactivation macrdp triggered (see
+    /// [`hold_for_reactivation`](Self::hold_for_reactivation)), each taken
+    /// over by the next `enter`.
+    holds: Arc<AtomicUsize>,
 }
 
+/// How long a reactivation hold lasts if no new display stream takes it over
+/// (the client left during the reactivation).
+const REACTIVATION_HOLD_MAX: Duration = Duration::from_secs(15);
+
 impl SessionTracker {
+    /// Keeps the session counted across a reactivation macrdp triggered: the
+    /// old display stream ends before the new one starts, and a multi-monitor
+    /// re-layout takes 2-4 s in between (re-moding and arranging displays),
+    /// longer than the session watcher's grace, so it read as a disconnect and
+    /// a reconnect (window-follow swept the windows away and back, live
+    /// 2026-11-25). The next `enter` takes the hold over; if none comes within
+    /// `max`, the hold is released as a leave.
+    fn hold_for_reactivation(&self, max: Duration) {
+        self.holds.fetch_add(1, Ordering::SeqCst);
+        let prev = self.count.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(
+            prev,
+            now = prev + 1,
+            "SessionTracker::hold (macrdp-triggered reactivation)"
+        );
+        self.notify.notify_one();
+        let tracker = self.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(max);
+            if tracker.take_hold() {
+                tracing::warn!(
+                    "SessionTracker: no display stream after a reactivation — releasing its hold"
+                );
+                tracker.leave();
+            }
+        });
+    }
+
+    fn take_hold(&self) -> bool {
+        self.holds
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| h.checked_sub(1))
+            .is_ok()
+    }
+
     fn enter(&self) {
+        if self.take_hold() {
+            tracing::info!(
+                now = self.count.load(Ordering::SeqCst),
+                "SessionTracker::enter (takes over the reactivation hold)"
+            );
+            return;
+        }
         let prev = self.count.fetch_add(1, Ordering::SeqCst);
         tracing::info!(prev, now = prev + 1, "SessionTracker::enter");
         self.notify.notify_one();
@@ -423,7 +472,12 @@ impl Drop for CountedUpdates {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for CountedUpdates {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
-        self.inner.next_update().await
+        let update = self.inner.next_update().await;
+        // The server reactivates on a Resize and then drops this stream.
+        if let Ok(Some(DisplayUpdate::Resize(_))) = &update {
+            self.tracker.hold_for_reactivation(REACTIVATION_HOLD_MAX);
+        }
+        update
     }
 }
 
@@ -3349,6 +3403,40 @@ mod tests {
         let clone = size.clone();
         clone.set(u16::MAX, 1);
         assert_eq!(size.get(), (u16::MAX, 1));
+    }
+
+    #[test]
+    fn a_reactivation_hold_keeps_the_session_counted() {
+        let t = SessionTracker::default();
+        t.enter();
+        // The stream hands the server a Resize, then is dropped, and the
+        // reactivation builds a new one: the count never reaches zero.
+        t.hold_for_reactivation(Duration::from_secs(3600));
+        assert_eq!(t.count.load(Ordering::SeqCst), 2);
+        t.leave();
+        assert_eq!(t.count.load(Ordering::SeqCst), 1);
+        t.enter();
+        assert_eq!(t.count.load(Ordering::SeqCst), 1);
+        // The hold is used up: a real disconnect reaches zero.
+        t.leave();
+        assert_eq!(t.count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_reactivation_hold_nobody_takes_over_is_released() {
+        let t = SessionTracker::default();
+        t.enter();
+        t.hold_for_reactivation(Duration::from_millis(20));
+        t.leave();
+        assert_eq!(t.count.load(Ordering::SeqCst), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while t.count.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(t.count.load(Ordering::SeqCst), 0);
+        // Released, so a later connection counts normally.
+        t.enter();
+        assert_eq!(t.count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
