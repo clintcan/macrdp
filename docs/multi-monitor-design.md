@@ -103,7 +103,8 @@ resets the surfaces, the same way a single-monitor resize does today (deactivati
 
 ## Status (2026-11-25)
 
-Phase 1 works live on mstsc (Windows 11, two monitors): the layout is adopted, one virtual display per
+Phase 1 works live on mstsc and Windows App on Windows (Windows 11, two monitors; a reconnect from
+either picks up the same desktop): the layout is adopted, one virtual display per
 monitor, one capture stream and one surface + encoder per monitor (`src/capture_multi.rs`,
 `ExtraSurface` in `src/h264.rs`), pointer events go to the monitor they land on. Still to do for phase 1:
 live layout changes are ignored and blank recovery is off in these sessions. Each encoder gets its

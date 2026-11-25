@@ -68,8 +68,8 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Each monitor gets its own capture and H.264 surface
                           #   (needs --enable-h264 for that; otherwise legacy bitmaps).
                           #   Live layout changes are ignored and blank recovery is
-                          #   off in these sessions. Works live on mstsc with two
-                          #   monitors. Config: MULTI_MONITOR=1.
+                          #   off in these sessions. Works live on mstsc and Windows
+                          #   App on Windows with two monitors. Config: MULTI_MONITOR=1.
 --fps N                   # default 60 with --enable-h264, else 15
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
