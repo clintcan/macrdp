@@ -3134,8 +3134,7 @@ async fn async_main() -> Result<()> {
         }
         warn!(
             "--multi-monitor is EXPERIMENTAL: a multi-monitor client gets one virtual display, \
-             capture and H.264 surface per monitor; live layout changes are ignored and blank \
-             recovery is off in these sessions"
+             capture and H.264 surface per monitor"
         );
     }
     if args.virtual_display_hidpi.is_some() && !args.virtual_display {

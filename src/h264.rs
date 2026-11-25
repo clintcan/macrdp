@@ -2486,9 +2486,12 @@ impl Gfx {
             // attempt) drop the connection so the client auto-reconnects.
             // Decision here (under ctx), action after the guard drops.
             // `qoe_reports` resets so a re-fire needs a fresh all-zero window.
-            // Not with several monitors yet: its evidence (QoE) names a frame,
-            // not a surface, and its levers act on the primary surface only.
-            if self.blank_recovery_enabled && ctx.surface_id.is_some() && ctx.extras.is_empty() {
+            // With several monitors too (live 2026-11-25: mstsc reconnected
+            // blank after a drop and nothing healed it), but only with the
+            // connection-wide levers (reactivate, drop): the re-map acts on the
+            // primary surface alone. QoE names a frame, not a surface, so a
+            // blank client is one that presents none of them.
+            if self.blank_recovery_enabled && ctx.surface_id.is_some() {
                 // A GENUINELY-ESTABLISHED connection clears the reconnect-storm
                 // guard: the consecutive-drop counter only tracks UNBROKEN runs
                 // of blank-dropped connections (see `blank_drop_capped`).
@@ -2593,6 +2596,11 @@ impl Gfx {
                         }
                     } else {
                         blank_action(attempt_no, self.blank_params.max_attempts)
+                    };
+                    let action = if action == BlankAction::Remap && !ctx.extras.is_empty() {
+                        BlankAction::Drop
+                    } else {
+                        action
                     };
                     let drops_so_far = self.consecutive_blank_drops.load(Ordering::Relaxed);
                     if action == BlankAction::Drop
