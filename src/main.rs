@@ -2917,6 +2917,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
         ("STATS_PORT", "MACRDP_STATS_PORT"),
+        // --multi-monitor: the most monitors a mid-session layout may have
+        // (CaptureDisplay::monitor_count).
+        ("MULTI_MONITOR_MAX", "MACRDP_MULTI_MONITOR_MAX"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {

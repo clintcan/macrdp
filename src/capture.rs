@@ -686,6 +686,21 @@ fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize
 
 #[async_trait::async_trait]
 impl RdpServerDisplay for CaptureDisplay {
+    /// The most monitors a mid-session layout may have (MS-RDPEDISP
+    /// MaxNumMonitors). 1 unless --multi-monitor is on and
+    /// MACRDP_MULTI_MONITOR_MAX says otherwise: 16 stopped Windows App on
+    /// Windows from opening graphics on a reconnect after a server restart.
+    async fn monitor_count(&mut self) -> u32 {
+        if self.extra_displays.is_none() {
+            return 1;
+        }
+        std::env::var("MACRDP_MULTI_MONITOR_MAX")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| (1..=16).contains(&n))
+            .unwrap_or(1)
+    }
+
     async fn size(&mut self) -> DesktopSize {
         let (width, height) = self.desktop_size.get();
         DesktopSize { width, height }
@@ -801,6 +816,7 @@ impl RdpServerDisplay for CaptureDisplay {
         {
             tracing::info!(
                 monitors = layout.monitors().len(),
+                layout = ?layout.monitors(),
                 "multi-monitor: ignoring a mid-session layout change (not supported yet)"
             );
             return;
