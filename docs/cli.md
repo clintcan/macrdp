@@ -545,7 +545,19 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   client. Plain TCP (both flags off) remains the
                           #   zero-risk config for overlay-only setups.
                           #   macOS-only.
---cert-dir PATH           # default ~/Library/Application Support/macrdp
+--cert-dir PATH           # default ~/Library/Application Support/macrdp. Holds
+                          #   the self-signed cert.pem/key.pem macrdp generates on
+                          #   first run: named for this Mac (its host name, with and
+                          #   without .local, plus localhost and the addresses it
+                          #   had then), valid 10 years, and replaced on the next
+                          #   start once expired. Self-signed, it only encrypts:
+                          #   it can't prove the server is this Mac, so a client
+                          #   asks you to trust it once. Compare the fingerprint
+                          #   the client shows with `openssl x509 -in cert.pem
+                          #   -noout -fingerprint -sha256`, or use --cert. Certs
+                          #   generated before v0.12.0 name only localhost and
+                          #   last until 4096; delete both files and restart to get
+                          #   a new one (clients then ask to trust it again).
 --cert PATH               # Operator-supplied TLS certificate (PEM; leaf first,
                           #   then any intermediate chain). Serve a real CA / ACME
                           #   / Let's Encrypt cert instead of the self-signed

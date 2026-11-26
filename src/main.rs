@@ -81,7 +81,7 @@ use ironrdp_pdu::rdp::capability_sets::{
     BitmapCodecs, Codec, CodecProperty, NsCodec, RemoteFxContainer,
 };
 use ironrdp_server::{Credentials, RdpServer};
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::CertifiedKey;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -1304,6 +1304,142 @@ fn load_pem_cert_and_key(
     Ok((certs, key))
 }
 
+/// What a generated self-signed certificate names (#310): the Mac's host
+/// name as the common name, and as subject alternative names that name with
+/// and without `.local`, `localhost`, the loopback addresses and `ips` (the
+/// Mac's other addresses when the certificate is made; one that changes
+/// later just stops matching). Self-signed, it can't be validated, but a
+/// client that checks or pins names now has the host's to check.
+fn cert_names(
+    hostname: Option<&str>,
+    ips: &[std::net::IpAddr],
+) -> (String, Vec<String>, Vec<std::net::IpAddr>) {
+    let host = hostname.map(str::trim).filter(|h| !h.is_empty());
+    let mut dns: Vec<String> = Vec::new();
+    let mut push = |name: String| {
+        if !dns.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
+            dns.push(name);
+        }
+    };
+    if let Some(h) = host {
+        push(h.to_string());
+        match h.strip_suffix(".local") {
+            Some(short) if !short.is_empty() => push(short.to_string()),
+            _ if !h.contains('.') => push(format!("{h}.local")),
+            _ => {}
+        }
+    }
+    push("localhost".to_string());
+    let mut addrs = vec![
+        std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+    ];
+    for ip in ips {
+        let usable = match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+            }
+        };
+        if usable && !addrs.contains(ip) {
+            addrs.push(*ip);
+        }
+    }
+    (host.unwrap_or("localhost").to_string(), dns, addrs)
+}
+
+/// How long a generated self-signed certificate is valid. When it expires,
+/// macrdp makes a new one on the next start (see `make_tls_acceptor`).
+const SELF_SIGNED_VALIDITY_DAYS: i64 = 3650;
+
+/// This Mac's host name, if the system will say.
+fn host_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer and its length are valid; gethostname writes at most
+    // that many bytes.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+/// This Mac's interface addresses (an empty list if the query fails).
+fn interface_addrs() -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list we free with freeifaddrs;
+    // each entry's ifa_addr is null or points at a sockaddr of the family it
+    // names.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let addr = (*cur).ifa_addr;
+            if !addr.is_null() {
+                match i32::from((*addr).sa_family) {
+                    libc::AF_INET => {
+                        let sin = &*(addr as *const libc::sockaddr_in);
+                        out.push(std::net::IpAddr::from(
+                            u32::from_be(sin.sin_addr.s_addr).to_be_bytes(),
+                        ));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = &*(addr as *const libc::sockaddr_in6);
+                        out.push(std::net::IpAddr::from(sin6.sin6_addr.s6_addr));
+                    }
+                    _ => {}
+                }
+            }
+            cur = (*cur).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+/// A self-signed certificate naming this Mac (see [`cert_names`]), valid for
+/// [`SELF_SIGNED_VALIDITY_DAYS`].
+fn generate_host_cert() -> Result<CertifiedKey> {
+    let (common_name, dns, ips) = cert_names(host_name().as_deref(), &interface_addrs());
+    let mut params = rcgen::CertificateParams::new(dns)?;
+    params
+        .subject_alt_names
+        .extend(ips.into_iter().map(rcgen::SanType::IpAddress));
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    let now = time::OffsetDateTime::now_utc();
+    // A day back, for a client whose clock is a little behind.
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(SELF_SIGNED_VALIDITY_DAYS);
+    let key_pair = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    Ok(CertifiedKey { cert, key_pair })
+}
+
+/// Whether the persisted self-signed certificate at `cert_path` has expired
+/// (false if it can't be read: loading it reports that).
+fn self_signed_expired(cert_path: &Path) -> bool {
+    let Ok(pem) = fs::read(cert_path) else {
+        return false;
+    };
+    let Some(Ok(der)) = rustls_pemfile::certs(&mut BufReader::new(pem.as_slice())).next() else {
+        return false;
+    };
+    let Ok(parsed) = Certificate::from_der(der.as_ref()) else {
+        return false;
+    };
+    let not_after = parsed.tbs_certificate.validity.not_after.to_system_time();
+    classify_expiry(not_after, std::time::SystemTime::now(), 0) == CertExpiry::Expired
+}
+
 fn generate_and_persist(
     cert_dir: &Path,
     cert_path: &Path,
@@ -1313,8 +1449,7 @@ fn generate_and_persist(
         .with_context(|| format!("create cert dir {}", cert_dir.display()))?;
 
     let CertifiedKey { cert, key_pair } =
-        generate_simple_self_signed(vec!["localhost".to_string()])
-            .context("generate self-signed cert")?;
+        generate_host_cert().context("generate self-signed cert")?;
 
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
@@ -1441,7 +1576,12 @@ fn make_tls_acceptor(
         (None, None) => {
             let cert_path = cert_dir.join("cert.pem");
             let key_path = cert_dir.join("key.pem");
-            if cert_path.exists() && key_path.exists() {
+            if cert_path.exists() && key_path.exists() && self_signed_expired(&cert_path) {
+                // Clients would show it as expired; a new one costs them one
+                // more "trust this certificate?" prompt.
+                warn!(dir = %cert_dir.display(), "the self-signed TLS cert has expired; generating a new one");
+                generate_and_persist(cert_dir, &cert_path, &key_path)?
+            } else if cert_path.exists() && key_path.exists() {
                 info!(dir = %cert_dir.display(), "loading persisted TLS cert");
                 load_pem_cert_and_key(&cert_path, &key_path)?
             } else {
@@ -5002,6 +5142,107 @@ mod tls_tests {
         fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
         (cert_path, key_path)
+    }
+
+    #[test]
+    fn a_generated_cert_names_the_host() {
+        use std::net::IpAddr;
+        let lan: IpAddr = "192.168.0.228".parse().unwrap();
+        let zt: IpAddr = "10.241.176.121".parse().unwrap();
+        let v6: IpAddr = "2001:db8::5".parse().unwrap();
+        let skipped: [IpAddr; 4] = [
+            "127.0.0.1".parse().unwrap(),
+            "169.254.3.4".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "0.0.0.0".parse().unwrap(),
+        ];
+        let mut ips = vec![lan, zt, v6, lan];
+        ips.extend(skipped);
+        let (cn, dns, addrs) = cert_names(Some("Clints-Mac-mini.local"), &ips);
+        assert_eq!(cn, "Clints-Mac-mini.local");
+        assert_eq!(
+            dns,
+            ["Clints-Mac-mini.local", "Clints-Mac-mini", "localhost"]
+        );
+        assert_eq!(
+            addrs,
+            [
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+                "::1".parse().unwrap(),
+                lan,
+                zt,
+                v6
+            ]
+        );
+        // A bare name gets its .local form; no name falls back to localhost.
+        assert_eq!(
+            cert_names(Some("mini"), &[]).1,
+            ["mini", "mini.local", "localhost"]
+        );
+        let (cn, dns, _) = cert_names(None, &[]);
+        assert_eq!(
+            (cn.as_str(), dns),
+            ("localhost", vec!["localhost".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_generated_cert_carries_the_names_and_a_finite_life() {
+        let ck = generate_host_cert().expect("generate");
+        let parsed = Certificate::from_der(ck.cert.der().as_ref()).expect("parse");
+        let validity = &parsed.tbs_certificate.validity;
+        let life = validity
+            .not_after
+            .to_system_time()
+            .duration_since(validity.not_before.to_system_time())
+            .unwrap();
+        let days = life.as_secs() / 86_400;
+        assert!((3650..=3652).contains(&days), "validity {days} days");
+        let pem = ck.cert.pem();
+        let der = rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(der.as_ref()).into_owned();
+        assert!(text.contains("localhost"), "no localhost SAN");
+        // iPAddress SAN [7] for 127.0.0.1: tag 0x87, length 4, the address.
+        assert!(
+            der.as_ref()
+                .windows(6)
+                .any(|w| w == [0x87, 4, 127, 0, 0, 1]),
+            "no 127.0.0.1 address SAN"
+        );
+        if let Some(host) = host_name() {
+            assert!(
+                text.contains(host.trim()),
+                "the host name {host} is missing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_self_signed_cert_is_noticed() {
+        let dir = unique_dir("expired");
+        let write = |name: &str, not_after: time::OffsetDateTime| {
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            params.not_before = not_after - time::Duration::days(30);
+            params.not_after = not_after;
+            let key = rcgen::KeyPair::generate().unwrap();
+            let path = dir.join(name);
+            fs::write(&path, params.self_signed(&key).unwrap().pem()).unwrap();
+            path
+        };
+        let now = time::OffsetDateTime::now_utc();
+        assert!(self_signed_expired(&write(
+            "old.pem",
+            now - time::Duration::days(1)
+        )));
+        assert!(!self_signed_expired(&write(
+            "new.pem",
+            now + time::Duration::days(1)
+        )));
+        assert!(!self_signed_expired(&dir.join("missing.pem")));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
