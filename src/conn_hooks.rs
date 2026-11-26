@@ -90,6 +90,26 @@ impl ConnectionHandler for InputResetHook {
     }
 }
 
+/// Releases the keys, buttons and modifiers a connection left pressed on the
+/// Mac, when it ends. A dropped link or a killed client sends no key-up, so
+/// without this a held key stays down on the Mac, for the local user too,
+/// until the same key is pressed again. Windows, as an RDP server, also
+/// releases held keys when the connection drops. `InputResetHook` releases
+/// the same state again on the next connection.
+pub struct InputReleaseHook(pub crate::input::InputRelease);
+
+impl ConnectionHandler for InputReleaseHook {
+    fn on_disconnected(
+        &mut self,
+        _peer: SocketAddr,
+        _duration: Duration,
+        _error: Option<&ServerError>,
+    ) -> PostConnectionAction {
+        self.0.release_all("connection ended");
+        PostConnectionAction::Continue
+    }
+}
+
 /// Clears `CaptureDisplay::suppress_next_adopt` once per served connection.
 /// The capture loop arms that flag right before a reactivation it triggers, and
 /// `request_initial_size` consumes it. If the client disconnects after the flag
