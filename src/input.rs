@@ -23,8 +23,35 @@ pub struct MacInputHandler {
     /// Records mouse-button-down timestamps so the H.264 path can lower its
     /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
     click_signal: Option<crate::capture::ClickSignal>,
+    /// Shared with `InputRelease`, so the connection hook can release what a
+    /// connection left pressed when it ends (the server owns this handler).
     #[cfg(target_os = "macos")]
-    inner: macos::Inner,
+    inner: std::sync::Arc<std::sync::Mutex<macos::Inner>>,
+}
+
+/// Releases the keys, buttons and modifiers the ended connection left pressed
+/// on the Mac. `conn_hooks::InputReleaseHook` calls it from `on_disconnected`.
+#[derive(Clone)]
+pub struct InputRelease {
+    #[cfg(target_os = "macos")]
+    inner: std::sync::Arc<std::sync::Mutex<macos::Inner>>,
+}
+
+impl InputRelease {
+    pub fn release_all(&self, why: &'static str) {
+        #[cfg(target_os = "macos")]
+        lock_inner(&self.inner).release_all(why);
+        #[cfg(not(target_os = "macos"))]
+        let _ = why;
+    }
+}
+
+/// A panic while the lock was held leaves the state as it was; input goes on.
+#[cfg(target_os = "macos")]
+fn lock_inner(inner: &std::sync::Mutex<macos::Inner>) -> std::sync::MutexGuard<'_, macos::Inner> {
+    inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl MacInputHandler {
@@ -58,19 +85,27 @@ impl MacInputHandler {
             desktop_size,
             click_signal,
             #[cfg(target_os = "macos")]
-            inner,
+            inner: std::sync::Arc::new(std::sync::Mutex::new(inner)),
         })
+    }
+
+    /// The handle `conn_hooks::InputReleaseHook` uses when a connection ends.
+    pub fn release_handle(&self) -> InputRelease {
+        InputRelease {
+            #[cfg(target_os = "macos")]
+            inner: std::sync::Arc::clone(&self.inner),
+        }
     }
 }
 
 impl MacInputHandler {
     /// --multi-monitor: share the cell the multi-monitor capture fills, so a
     /// pointer event goes to the monitor it lands on.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut, unused_variables))]
-    pub fn with_active_monitors(mut self, monitors: crate::multi_monitor::ActiveMonitors) -> Self {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    pub fn with_active_monitors(self, monitors: crate::multi_monitor::ActiveMonitors) -> Self {
         #[cfg(target_os = "macos")]
         {
-            self.inner.active_monitors = monitors;
+            lock_inner(&self.inner).active_monitors = monitors;
         }
         self
     }
@@ -79,7 +114,7 @@ impl MacInputHandler {
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
         #[cfg(target_os = "macos")]
-        self.inner.keyboard(event);
+        lock_inner(&self.inner).keyboard(event);
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "keyboard event (stub)");
     }
@@ -104,7 +139,7 @@ impl RdpServerInputHandler for MacInputHandler {
         {
             let (width, height) = self.desktop_size.get();
             let letterbox = self.desktop_size.letterbox();
-            self.inner.mouse(event, width, height, letterbox);
+            lock_inner(&self.inner).mouse(event, width, height, letterbox);
         }
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
@@ -283,6 +318,38 @@ fn is_activating_click(left_button: bool, cmd: bool, ctrl: bool) -> bool {
     left_button && !cmd && !ctrl
 }
 
+/// Non-modifier keys this server posted a key-down for on the Mac and no
+/// key-up yet, by macOS virtual keycode.
+///
+/// No key-up comes for a key that was down when the connection ended (a
+/// dropped link, a killed client, a takeover): the Mac keeps it pressed until
+/// the same key is pressed again, for the local user and the next client.
+/// `Inner::release_all` posts a key-up for each key in this set. Modifiers are
+/// tracked apart, in `ModifierState`, because they are posted as FlagsChanged.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct HeldKeys {
+    down: std::collections::BTreeSet<u16>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl HeldKeys {
+    /// Record a posted key-down (`down`) or key-up of `vk`.
+    fn note(&mut self, vk: u16, down: bool) {
+        if down {
+            self.down.insert(vk);
+        } else {
+            self.down.remove(&vk);
+        }
+    }
+
+    /// Forget every held key; returns them (ascending) for the caller to post
+    /// a key-up each.
+    fn take_all(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.down).into_iter().collect()
+    }
+}
+
 /// What `resync_modifiers_if_stale` must do for one trigger. Split out pure —
 /// like `should_remap_click` — so the decision table is unit-tested on every
 /// target; the method itself only gathers the inputs and performs the effects.
@@ -356,7 +423,7 @@ mod coord_tests {
     use super::{
         is_remappable_shortcut, map_client_to_display, map_display_to_client,
         remove_switcher_selection, resync_plan, scroll_lines, should_alt_q_quit,
-        should_remap_click, wheel_delta, ResyncPlan,
+        should_remap_click, wheel_delta, HeldKeys, ResyncPlan,
     };
 
     #[test]
@@ -411,6 +478,23 @@ mod coord_tests {
     fn scroll_reversal_ignores_the_previous_direction() {
         let (_, accum) = scroll_lines(0, -1236);
         assert_eq!(scroll_lines(accum, 120), (2, 0));
+    }
+
+    /// A key that went down and not up is released by `take_all`; a key that
+    /// went down and up is not; auto-repeat downs count once; after `take_all`
+    /// nothing is held.
+    #[test]
+    fn held_keys_tracks_downs_without_ups() {
+        let mut h = HeldKeys::default();
+        h.note(0x28, true); // K down
+        h.note(0x28, true); // auto-repeat
+        h.note(0x00, true); // A down
+        h.note(0x00, false); // A up
+        h.note(0x31, true); // Space down
+        assert_eq!(h.take_all(), vec![0x28, 0x31]);
+        assert!(h.take_all().is_empty(), "take_all forgets the keys");
+        h.note(0x07, false); // a stray key-up (its down was before a reset)
+        assert!(h.take_all().is_empty());
     }
 
     /// Connection edge: every tracked button is released, the gesture state is
@@ -1157,6 +1241,9 @@ mod macos {
         // key-up gets swallowed too so the focused app doesn't see a bare
         // release with no preceding press.
         consumed_keys: HashSet<u16>,
+        // Non-modifier keys posted down and not up yet; released by
+        // `release_all` when a connection ends or starts.
+        held_keys: super::HeldKeys,
         // RDP Unicode key events: surrogate pairs joined into one character.
         unicode: UnicodeKeys,
         // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
@@ -1260,6 +1347,7 @@ mod macos {
                 scroll_v_accum: 0,
                 scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
+                held_keys: super::HeldKeys::default(),
                 unicode: UnicodeKeys::default(),
                 remapped_keys: HashSet::new(),
                 left_click_remapped: false,
@@ -1345,8 +1433,10 @@ mod macos {
         ///  * **A new served connection** (`reset_request`, raised by the
         ///    vendored server once at the top of `run_connection` /
         ///    `serve_negotiated` — never on a reactivation, never for a
-        ///    preemption candidate) — clears EVERYTHING, unconditionally:
-        ///    modifiers, the click latch, outstanding remapped key-downs, and
+        ///    preemption candidate) — clears EVERYTHING, unconditionally
+        ///    (`release_all`, which also runs when a connection ends):
+        ///    modifiers, non-modifier keys still down (a key-up is posted),
+        ///    the click latch, outstanding remapped key-downs, and
         ///    any button still down — which is RELEASED (a synthetic Up through
         ///    `button()`), not merely forgotten, since macOS itself still
         ///    believes it held. Nothing from the previous connection is live,
@@ -1384,10 +1474,45 @@ mod macos {
             let reconnected = self
                 .reset_request
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
-            if !(idled || reconnected) {
+            if reconnected {
+                self.release_all("new connection");
                 return;
             }
+            if !idled {
+                return;
+            }
+            self.apply_resync(false);
+        }
 
+        /// Release everything a connection may have left pressed on the Mac:
+        /// mouse buttons, non-modifier keys, remapped Ctrl->Cmd keys and held
+        /// modifiers (Caps Lock, a toggle, stays). Runs when a connection ends
+        /// (`conn_hooks::InputReleaseHook`, from `on_disconnected`) and again
+        /// on the first input of the next connection (`reset_request`), which
+        /// then finds nothing left. Nothing from the previous connection is
+        /// live, so none of it is worth keeping.
+        pub fn release_all(&mut self, why: &'static str) {
+            let buttons = [self.left_down, self.right_down, self.middle_down];
+            let mods = self.mods.cg_flags().bits();
+            let had_mods = self.mods.any_held();
+            let (keys, remapped) = self.apply_resync(true);
+            if buttons.contains(&true) || !keys.is_empty() || !remapped.is_empty() || had_mods {
+                tracing::info!(
+                    why,
+                    keycodes = ?keys,
+                    remapped = ?remapped,
+                    modifier_flags = format!("0x{mods:08X}"),
+                    buttons = buttons.iter().filter(|b| **b).count(),
+                    "released held input"
+                );
+            }
+        }
+
+        /// The effects of `resync_plan`. On a connection edge (`reconnected`)
+        /// it also posts a key-up for every held key and remapped key, before
+        /// the modifiers go up, as a real keyboard would, and returns them
+        /// (held keys, remapped keys).
+        fn apply_resync(&mut self, reconnected: bool) -> (Vec<u16>, Vec<u16>) {
             let plan = super::resync_plan(
                 reconnected,
                 [self.left_down, self.right_down, self.middle_down],
@@ -1413,16 +1538,43 @@ mod macos {
                 self.button(CGMouseButton::Center, false);
             }
 
+            // Keys whose key-up never came, posted with the modifier flags
+            // still set. A remapped Ctrl->Cmd key went down as Cmd+key, so
+            // its up does too (`post_ctrl_as_cmd` restores the real flags).
+            let mut released = (Vec::new(), Vec::new());
+            if plan.clear_gesture_state {
+                released.0 = self.held_keys.take_all();
+                let flags = self.mods.cg_flags();
+                for &vk in &released.0 {
+                    let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, false) else {
+                        warn!(vk, "CGEvent::new_keyboard_event failed (release)");
+                        continue;
+                    };
+                    let mut f = flags;
+                    if is_numeric_pad_vk(vk) {
+                        f |= CGEventFlags::CGEventFlagNumericPad;
+                    }
+                    ev.set_flags(f);
+                    ev.post(CGEventTapLocation::HID);
+                }
+                released.1 = self.remapped_keys.drain().collect();
+                released.1.sort_unstable();
+                for &vk in &released.1 {
+                    self.post_ctrl_as_cmd(vk, false);
+                }
+            }
+
             // Snapshot first so the log shows WHAT was stuck.
             let stuck = self.mods.cg_flags().bits();
             self.mods.clear_non_lock();
 
             if plan.clear_gesture_state {
                 // Drop the remaining per-gesture state regardless of whether a
-                // modifier was held (see the doc): an outstanding remapped
-                // key-down or a latch left by a Down whose Up never came.
-                self.remapped_keys.clear();
+                // modifier was held (see the doc): a latch left by a Down whose
+                // Up never came, and swallowed hotkey downs (nothing was
+                // posted for them, so nothing to release).
                 self.left_click_remapped = false;
+                self.consumed_keys.clear();
             }
 
             // Only bother macOS when a modifier was actually released: our
@@ -1432,7 +1584,7 @@ mod macos {
             if plan.post_flags_changed {
                 debug!(
                     reason = if reconnected {
-                        "new connection"
+                        "connection edge"
                     } else {
                         "idle gap"
                     },
@@ -1444,6 +1596,7 @@ mod macos {
                 CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 commit_cycle_session();
             }
+            released
         }
 
         /// When auto-detecting (no explicit `--keyboard-layout`), (re)resolve
@@ -1649,6 +1802,7 @@ mod macos {
             }
             ev.set_flags(flags);
             ev.post(CGEventTapLocation::HID);
+            self.held_keys.note(vk, down);
         }
 
         /// Emit one FlagsChanged event for `vk` from the HID source. The
