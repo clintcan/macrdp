@@ -182,8 +182,13 @@ pub enum Outcome {
     Failure,
     /// The client authenticated and the server then failed the session: no
     /// lockout strike, and the attempt is refunded from the rate-limit window.
-    /// Deliberately only for errored sessions: a clean disconnect keeps its attempt.
     ServerError,
+    /// The client authenticated and the session ended cleanly: a success whose
+    /// attempt is refunded too. Only a password holder can produce one, so the
+    /// refund gives a brute-forcer nothing, while a user who reconnects often
+    /// (a flaky link, takeovers between devices) isn't rate-limited out
+    /// (#311). Audited as "success".
+    Authenticated,
 }
 
 /// Classify a finished connection for lockout accounting.
@@ -209,8 +214,12 @@ pub fn classify_outcome(
     duration: Duration,
     failfast_window: Duration,
 ) -> Outcome {
-    if errored && authenticated {
-        Outcome::ServerError
+    if authenticated {
+        if errored {
+            Outcome::ServerError
+        } else {
+            Outcome::Authenticated
+        }
     } else if errored && duration < failfast_window {
         Outcome::Failure
     } else {
@@ -312,7 +321,7 @@ impl AuthGuardCore {
                 entry.consecutive_failures = 0;
                 entry.cooldown_until = None;
             }
-            Outcome::ServerError => {
+            Outcome::ServerError | Outcome::Authenticated => {
                 entry.consecutive_failures = 0;
                 entry.cooldown_until = None;
                 // The newest attempt may be another connection's behind the same NAT; the count is what matters.
@@ -489,7 +498,7 @@ pub fn audit_disconnect(ip: IpAddr, port: u16, duration: Duration, outcome: Outc
             src_port = port,
             duration_ms = duration.as_millis() as u64,
             outcome = match outcome {
-                Outcome::Success => "success",
+                Outcome::Success | Outcome::Authenticated => "success",
                 Outcome::Failure => "failure",
                 Outcome::ServerError => "server_error",
             },
@@ -774,9 +783,10 @@ mod tests {
             classify_outcome(true, true, Duration::from_secs(60), w),
             Outcome::ServerError
         );
+        // A clean end after authenticating refunds its attempt too (#311).
         assert_eq!(
             classify_outcome(false, true, Duration::from_millis(400), w),
-            Outcome::Success
+            Outcome::Authenticated
         );
     }
 
@@ -820,6 +830,44 @@ mod tests {
             handler.on_disconnected(peer, Duration::from_millis(300), Some(&err));
         }
         assert!(locked);
+    }
+
+    #[test]
+    fn authenticated_reconnects_are_not_rate_limited() {
+        // #311: a user reconnecting often (a flaky link, takeovers between
+        // devices) used to spend the 10-per-minute budget even though every
+        // session authenticated and ended cleanly.
+        let _audit = AUDIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+        use ironrdp_server::ConnectionHandler;
+        let mut handler = AuthGuardHandler {
+            core: AuthGuardCore::with_config(test_cfg()),
+            last_peer: None,
+            authenticated: Default::default(),
+        };
+        let ip = Ipv4Addr::new(203, 0, 113, 23);
+        for k in 0..30u16 {
+            let peer = std::net::SocketAddr::from((ip, 51000 + k));
+            assert!(
+                handler.on_accept(peer),
+                "authenticated reconnect {k} was rate-limited"
+            );
+            handler.on_authenticated(true, None);
+            handler.on_disconnected(peer, Duration::from_secs(20), None);
+        }
+        // Connections that never authenticate still spend it.
+        let mut limited = false;
+        for k in 0..30u16 {
+            let peer = std::net::SocketAddr::from((ip, 52000 + k));
+            if !handler.on_accept(peer) {
+                limited = true;
+                break;
+            }
+            handler.on_disconnected(peer, Duration::from_secs(20), None);
+        }
+        assert!(
+            limited,
+            "unauthenticated connections were never rate-limited"
+        );
     }
 
     #[test]

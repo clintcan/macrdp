@@ -620,6 +620,12 @@ MACRDP_GUARD_FAILFAST_SECS=3      # only errored connections that fail within th
 MACRDP_GUARD_COOLDOWN_BASE_SECS=30  # first lockout length (doubles per extra failure)
 MACRDP_GUARD_COOLDOWN_MAX_SECS=900  # lockout escalation cap (15 min)
 ```
+A connection that authenticates gives its rate-limit attempt back when it ends, so
+only connections that never authenticate count toward `GUARD_RL_MAX`: a user who
+reconnects often (a flaky link, switching devices) isn't limited, while password
+guessing and port scans are. A refused connection is closed as soon as it's
+accepted, which a client reports as the connection being reset. The limits are
+per source address, so clients behind one NAT share them.
 The lockout **escalates and auto-expires** — duration `COOLDOWN_BASE << (failures −
 threshold)`, capped at `COOLDOWN_MAX`. With the defaults it triggers at the 5th
 consecutive failure and doubles from 30 s as the IP keeps failing past each cooldown:
