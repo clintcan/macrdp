@@ -313,6 +313,39 @@ fn is_remappable_shortcut(vk: u16) -> bool {
 /// way `map_client_to_display` is; the impure inputs are gathered by
 /// `Inner::click_remap_active`, which checks the cheap flags through this
 /// function first and only then pays for the frontmost-app lookup.
+/// How `Inner::key` handles a key in the translated block while a non-US
+/// layout is active.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum LayoutRoute {
+    /// Translate the key-down to a character and post it as a string. With
+    /// `release_keycode`, the key is down as a keycode (an earlier Ctrl+K
+    /// down or repeat): post that keycode's up first.
+    Translate { release_keycode: bool },
+    /// Post the keycode, as with no layout.
+    Keycode,
+    /// Swallow the key-up of a translated key-down (a string has no release).
+    Swallow,
+}
+
+/// The route of one event of a key in the translated block under a non-US
+/// layout. `plain` means no Cmd/Ctrl is held now; `keycode_held` means the
+/// key's last key-down went out as a keycode. The key-up follows the last
+/// key-down, not the modifiers held at the key-up: Ctrl+K down goes out as a
+/// keycode, so its up must too, also when Ctrl is released first. An
+/// auto-repeat down after Ctrl is released is translated, so the keycode is
+/// released first and the up is swallowed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn layout_route(down: bool, plain: bool, keycode_held: bool) -> LayoutRoute {
+    match (down, plain, keycode_held) {
+        (true, true, held) => LayoutRoute::Translate {
+            release_keycode: held,
+        },
+        (true, false, _) | (false, _, true) => LayoutRoute::Keycode,
+        (false, _, false) => LayoutRoute::Swallow,
+    }
+}
+
 fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded: bool) -> bool {
     remap_on && ctrl && !cmd && !alt && !excluded
 }
@@ -430,9 +463,9 @@ fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        is_remappable_shortcut, map_client_to_display, map_display_to_client,
+        is_remappable_shortcut, layout_route, map_client_to_display, map_display_to_client,
         remove_switcher_selection, resync_plan, scroll_lines, should_alt_q_quit,
-        should_remap_click, wheel_delta, HeldKeys, ResyncPlan,
+        should_remap_click, wheel_delta, HeldKeys, LayoutRoute, ResyncPlan,
     };
 
     #[test]
@@ -504,6 +537,36 @@ mod coord_tests {
         assert!(h.take_all().is_empty(), "take_all forgets the keys");
         h.note(0x07, false); // a stray key-up (its down was before a reset)
         assert!(h.take_all().is_empty());
+    }
+
+    /// Under a non-US layout the key-up follows the key's last key-down.
+    #[test]
+    fn layout_key_up_follows_its_last_key_down() {
+        use LayoutRoute::*;
+        // Plain typing: translate the down, swallow the up.
+        assert_eq!(
+            layout_route(true, true, false),
+            Translate {
+                release_keycode: false
+            }
+        );
+        assert_eq!(layout_route(false, true, false), Swallow);
+        // Ctrl+K, Ctrl released before K: the up goes out as a keycode (it was
+        // swallowed, and K stayed down on the Mac).
+        assert_eq!(layout_route(true, false, false), Keycode);
+        assert_eq!(layout_route(false, true, true), Keycode);
+        // Ctrl+K held, Ctrl released, K repeats: release the keycode first,
+        // then translate; the up is then swallowed.
+        assert_eq!(
+            layout_route(true, true, true),
+            Translate {
+                release_keycode: true
+            }
+        );
+        // K translated, then Ctrl pressed before the K up: still swallowed.
+        assert_eq!(layout_route(false, false, false), Swallow);
+        // Ctrl held for the whole key: keycodes.
+        assert_eq!(layout_route(false, false, true), Keycode);
     }
 
     /// Connection edge: every tracked button is released, the gesture state is
@@ -1253,6 +1316,10 @@ mod macos {
         // Non-modifier keys posted down and not up yet; released by
         // `release_all` when a connection ends or starts.
         held_keys: super::HeldKeys,
+        // Keys in the layout's translated block whose last key-down went out
+        // as a keycode (Ctrl/Cmd held), so their key-up goes out as a keycode
+        // too (see `layout_route`).
+        keycode_keys: HashSet<u16>,
         // RDP Unicode key events: surrogate pairs joined into one character.
         unicode: UnicodeKeys,
         // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
@@ -1358,6 +1425,7 @@ mod macos {
                 scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
                 held_keys: super::HeldKeys::default(),
+                keycode_keys: HashSet::new(),
                 unicode: UnicodeKeys::default(),
                 remapped_keys: HashSet::new(),
                 left_click_remapped: false,
@@ -1586,6 +1654,7 @@ mod macos {
                 // posted for them, so nothing to release).
                 self.left_click_remapped = false;
                 self.consumed_keys.clear();
+                self.keycode_keys.clear();
             }
 
             // Only bother macOS when a modifier was actually released: our
@@ -1769,16 +1838,32 @@ mod macos {
             // Cmd/Ctrl held, produce the character this key yields in the
             // configured layout and post it as a Unicode string, leaving the
             // Mac's own input source untouched. Cmd/Ctrl combos fall through to
-            // the keycode path below so shortcuts still work. Once a layout is
-            // active these keys are fully owned here — the matching key-up is
-            // swallowed too (Unicode string events have no release side, like
-            // the RDP Unicode-keyboard path).
-            if self.layout.is_some()
-                && !self.mods.has_cmd()
-                && !self.mods.has_ctrl()
-                && crate::keyboard_layout::is_translatable_keycode(vk)
-            {
-                if down {
+            // the keycode path below so shortcuts still work. The key-up of a
+            // translated key is swallowed too (Unicode string events have no
+            // release side, like the RDP Unicode-keyboard path); the key-up of a
+            // key whose down went out as a keycode goes out as a keycode, even
+            // when the Cmd/Ctrl was released first (`layout_route`).
+            let route = (self.layout.is_some()
+                && crate::keyboard_layout::is_translatable_keycode(vk))
+            .then(|| {
+                let plain = !self.mods.has_cmd() && !self.mods.has_ctrl();
+                super::layout_route(down, plain, self.keycode_keys.contains(&vk))
+            });
+            match route {
+                None => {}
+                Some(super::LayoutRoute::Swallow) => return,
+                Some(super::LayoutRoute::Keycode) => {
+                    if down {
+                        self.keycode_keys.insert(vk);
+                    } else {
+                        self.keycode_keys.remove(&vk);
+                    }
+                }
+                Some(super::LayoutRoute::Translate { release_keycode }) => {
+                    if release_keycode {
+                        self.keycode_keys.remove(&vk);
+                        self.post_key(vk, false);
+                    }
                     let shift = self.mods.has_shift();
                     let option = self.mods.has_alt();
                     let caps = self.mods.caps_lock;
@@ -1799,10 +1884,15 @@ mod macos {
                             }
                         }
                     }
+                    return;
                 }
-                return;
             }
 
+            self.post_key(vk, down);
+        }
+
+        /// Post a key-down or key-up of `vk` with the held modifier flags.
+        fn post_key(&mut self, vk: u16, down: bool) {
             let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) else {
                 warn!(vk, down, "CGEvent::new_keyboard_event failed");
                 return;
