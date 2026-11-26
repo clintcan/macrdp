@@ -786,13 +786,6 @@ fn adopt_client_size(
     }
 }
 
-/// Clamp a client-requested size to `--max-client-size`, per dimension.
-///
-/// The acceptor clamps the size it negotiates in Demand Active, but
-/// `request_initial_size` receives the client's Confirm Active echo, which a
-/// client can fill with its own requested size instead (mstsc asking for
-/// 3840x2160 was observed doing so, issue #211). The echo is client-controlled,
-/// so the ceiling has to be applied here too, before anything is sized from it.
 /// The UI scale for the main virtual display: the HiDPI policy's (2 for a
 /// Retina client under `VD_HIDPI=auto`), except 1 in a multi-monitor session.
 /// Multi-monitor arranges every display in points and treats a point as a
@@ -806,6 +799,13 @@ pub(crate) fn session_ui_scale(multi_monitor: bool, policy: u32) -> u32 {
     }
 }
 
+/// Clamp a client-requested size to `--max-client-size`, per dimension.
+///
+/// The acceptor clamps the size it negotiates in Demand Active, but
+/// `request_initial_size` receives the client's Confirm Active echo, which a
+/// client can fill with its own requested size instead (mstsc asking for
+/// 3840x2160 was observed doing so, issue #211). The echo is client-controlled,
+/// so the ceiling has to be applied here too, before anything is sized from it.
 fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize {
     match max {
         Some(max) => DesktopSize {

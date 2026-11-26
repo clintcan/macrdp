@@ -215,7 +215,11 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   display is the Mac's main display: the Dock, the menu
                           #   bar and new windows appear remotely, and the Mac's own
                           #   screen stays on as a secondary display to the right.
-                          #   On the last disconnect the Mac's display is main again.
+                          #   On the last disconnect the Mac's display is main again,
+                          #   and windows come back to it (as with
+                          #   --restore-windows-on-disconnect, which this implies:
+                          #   windows opened during the session are on the virtual
+                          #   display).
                           #   Plain --virtual-display mode, multi-monitor included;
                           #   refused with the headless modes and --make-primary,
                           #   which already do this. While it's on, a lock started at

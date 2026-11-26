@@ -43,7 +43,9 @@ sample_row() {
     # Established inbound connections = "is a client connected right now". More
     # reliable than trying to detect an SCStream: system frameworks live in the
     # dyld shared cache, so `lsof | grep ScreenCaptureKit` never matched.
-    conns=$(lsof -nP -p "$pid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+    # -a: AND the selections. Without it lsof ORs "-p PID" and "-iTCP", and
+    # the column counted every established TCP connection on the Mac.
+    conns=$(lsof -a -nP -p "$pid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
     procs=$(pgrep -f "$MACRDP_RE" 2>/dev/null | wc -l | tr -d ' ')
     nfs=$(mount 2>/dev/null | grep -c 'macrdp-rdpdr\|localhost:/')
     tmp=$(ls -d "${TMPDIR:-/tmp/}"macrdp-* /tmp/macrdp-* 2>/dev/null | wc -l | tr -d ' ')

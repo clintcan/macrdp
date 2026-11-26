@@ -2095,6 +2095,9 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     // auth. A no-op if the screen isn't locked.
     password: Arc<Zeroizing<String>>,
     auto_unlock: bool,
+    // Run when a connection ends within the connect debounce, before its
+    // guard was installed. None: nothing to undo.
+    on_flap: Option<fn()>,
 ) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
@@ -2142,6 +2145,12 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             label,
                             "connection flapped during debounce — skipping install"
                         );
+                        // Undo what the connection did before the guard was
+                        // installed (--main-display-while-connected arranges
+                        // the displays as the capture starts).
+                        if let Some(cleanup) = on_flap {
+                            tokio::task::spawn_blocking(cleanup);
+                        }
                         was_zero = true;
                         continue;
                     }
@@ -3487,6 +3496,9 @@ async fn async_main() -> Result<()> {
             let remembered = last_size_path.as_deref().and_then(|p| {
                 last_size::load(p, args.max_client_size.unwrap_or(DEFAULT_MAX_CLIENT_SIZE))
             });
+            // A HiDPI panel's shape stays that of the configured size.
+            virtual_display::set_panel_size_px(u32::from(w), u32::from(h));
+            let configured = (w, h);
             let (w, h) = match remembered {
                 Some((rw, rh)) if (rw, rh) != (w, h) => {
                     info!(
@@ -3503,17 +3515,38 @@ async fn async_main() -> Result<()> {
             // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
             // metadata here (capture cadence is governed by --fps); pass a
             // safe value so CGVirtualDisplay doesn't reject the mode.
-            let vd = virtual_display::VirtualDisplay::new(
-                u32::from(w),
-                u32::from(h),
-                60,
-                vd_hidpi.capable(),
-                // Before any client: --width/--height are Retina pixels (the
-                // UI at half that), for `auto` too. Each connection then picks
-                // its own UI scale in `CaptureDisplay::sync_virtual_display`.
-                if vd_hidpi.capable() { 2 } else { 1 },
-            )
-            .context("attaching virtual display")?;
+            // Before any client: --width/--height are Retina pixels (the UI at
+            // half that), for `auto` too. Each connection then picks its own
+            // UI scale in `CaptureDisplay::sync_virtual_display`.
+            let create = |(w, h): (u16, u16)| {
+                virtual_display::VirtualDisplay::new(
+                    u32::from(w),
+                    u32::from(h),
+                    60,
+                    vd_hidpi.capable(),
+                    if vd_hidpi.capable() { 2 } else { 1 },
+                )
+            };
+            // The remembered size came from a client: if the display can't be
+            // created at it, forget it and use the configured size, rather
+            // than failing every start until someone deletes the file.
+            let vd = match create((w, h)) {
+                Ok(vd) => vd,
+                Err(e) if (w, h) != configured => {
+                    warn!(
+                        error = format!("{e:#}"),
+                        width = w,
+                        height = h,
+                        "couldn't create the virtual display at the last session's size; \
+                         using the configured size"
+                    );
+                    if let Some(p) = last_size_path.as_deref() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    create(configured).context("attaching virtual display")?
+                }
+                Err(e) => return Err(e).context("attaching virtual display"),
+            };
             info!(
                 display_id = vd.display_id(),
                 origin = ?vd.origin_pts(),
@@ -3567,6 +3600,7 @@ async fn async_main() -> Result<()> {
             lock_activity.clone(),
             Arc::clone(&password),
             auto_unlock,
+            None,
         );
     } else if args.capture_primary {
         let vd_id = virtual_display
@@ -3586,6 +3620,7 @@ async fn async_main() -> Result<()> {
             lock_activity.clone(),
             Arc::clone(&password),
             auto_unlock,
+            None,
         );
     } else if args.shield_primary {
         let vd_id = virtual_display
@@ -3605,6 +3640,7 @@ async fn async_main() -> Result<()> {
             lock_activity.clone(),
             Arc::clone(&password),
             auto_unlock,
+            None,
         );
     } else if args.virtual_display
         && (args.restore_windows_on_disconnect || args.main_display_while_connected)
@@ -3631,11 +3667,15 @@ async fn async_main() -> Result<()> {
                 session_tracker.clone(),
                 Arc::new(std::sync::Mutex::new(None::<main_display::Guard>)),
                 main_display::Guard::install,
-                args.restore_windows_on_disconnect,
+                // Windows open on the virtual display while it's main; bring
+                // them back to the Mac's screen on disconnect (and onto the
+                // virtual display on connect), or they'd be stranded there.
+                true,
                 physical_main_id,
                 None,
                 Arc::clone(&password),
                 false,
+                Some(main_display::restore),
             );
         } else {
             spawn_primary_overlay_watcher(
@@ -3649,6 +3689,7 @@ async fn async_main() -> Result<()> {
                 None,
                 Arc::clone(&password),
                 false,
+                None,
             );
         }
         if args.make_primary {
@@ -3708,13 +3749,20 @@ async fn async_main() -> Result<()> {
     //   - primary panel with override: use the override + main geometry.
     let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
         let vd = vd.lock().expect("virtual display mutex poisoned");
-        // Both required earlier, so the unwraps can't fire.
-        let w = args
-            .width
-            .expect("checked above when --virtual-display set");
-        let h = args
-            .height
-            .expect("checked above when --virtual-display set");
+        // The size the display was created at: the last session's (see
+        // last_size.rs) or --width/--height, both required earlier.
+        let (w, h) = match vd.mode_px() {
+            (pw, ph) if pw > 0 && ph > 0 => (
+                u16::try_from(pw).unwrap_or(u16::MAX),
+                u16::try_from(ph).unwrap_or(u16::MAX),
+            ),
+            _ => (
+                args.width
+                    .expect("checked above when --virtual-display set"),
+                args.height
+                    .expect("checked above when --virtual-display set"),
+            ),
+        };
         // Re-query CGDisplayBounds rather than trusting the cached
         // values from VirtualDisplay creation: if --make-primary
         // moved the display to (0, 0), the cached size is fine but
