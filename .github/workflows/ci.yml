@@ -80,16 +80,18 @@ jobs:
       # in `server::macrdp::tests`). scripts/check-ironrdp-pin.sh first checks that
       # every IronRDP pin is one commit on a protected macrdp* branch of
       # clintcan/IronRDP, then leaves that commit checked out; `--lib` runs the
-      # tests there. Platform-independent, so Linux is enough. `egfx` as macrdp
-      # builds it; `multitransport` (BoringSSL from source) is left out to keep
-      # the job fast. `--locked` uses the fork's committed Cargo.lock.
+      # tests there. Platform-independent, so Linux is enough. `egfx` and
+      # `multitransport` as macrdp builds them: `multitransport` builds BoringSSL
+      # from source, which costs time, but without it the UDP listener's tests
+      # (mt/, divergence 12) never ran. `--locked` uses the fork's committed
+      # Cargo.lock.
       - name: Test ironrdp-server (clintcan/IronRDP at the pinned rev, unit tests)
         env:
           RUSTFLAGS: ''
         run: |
           dir="$RUNNER_TEMP/ironrdp"
           scripts/check-ironrdp-pin.sh --checkout "$dir"
-          cargo test --locked --manifest-path "$dir/crates/ironrdp-server/Cargo.toml" --lib --features egfx
+          cargo test --locked --manifest-path "$dir/crates/ironrdp-server/Cargo.toml" --lib --features egfx,multitransport
 
   test-macos:
     name: test (macos)

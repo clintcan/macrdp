@@ -334,6 +334,12 @@ mod tests {
         .expect("bind listener");
         let server_addr = listener.local_addr();
 
+        // On the wire the SYN was zero-padded to the MTU (UDP length 1240 in
+        // the capture); the array above is its first 84 bytes. Since #308 the
+        // listener pads its SYN+ACK to at most the SYN's size, so send it as
+        // the client did.
+        let mut client_syn = client_syn.to_vec();
+        client_syn.resize(cfg.mtu as usize, 0);
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.send_to(&client_syn, server_addr).await.unwrap();
 
