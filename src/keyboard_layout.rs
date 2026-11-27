@@ -129,13 +129,19 @@ mod macos {
             } else {
                 spec_to_source_id(spec).map(str::to_string)
             };
-            if let Some(id) = &id {
-                if let Some(uchr) = source_data_for_id(id) {
+            // A `-PC` layout that is not installed falls back to the Mac
+            // layout of the same language before the language lookup.
+            let candidates = id
+                .iter()
+                .flat_map(|id| [Some(id.clone()), id.strip_suffix("-PC").map(str::to_string)])
+                .flatten();
+            for id in candidates {
+                if let Some(uchr) = source_data_for_id(&id) {
                     return Some(KeyboardLayout {
                         uchr,
                         kbd_type,
                         dead_key_state: 0,
-                        label: id.clone(),
+                        label: id,
                     });
                 }
             }
@@ -389,11 +395,14 @@ mod macos {
 
     fn klid_to_source_id(klid: u32) -> Option<&'static str> {
         // Match on the low 16 bits (the LANGID); the high word is the layout
-        // variant, which we don't distinguish here.
+        // variant, which we don't distinguish here. A KLID names a Windows
+        // layout, so where macOS ships the Windows variant (`-PC`), use it:
+        // the client's user expects the characters of their Windows layout
+        // (French AltGr+E is €, the 6 key is -), not the Mac layout's.
         Some(match klid & 0xFFFF {
             0x0409 => "com.apple.keylayout.US",
-            0x0809 => "com.apple.keylayout.British",
-            0x040C => "com.apple.keylayout.French",
+            0x0809 => "com.apple.keylayout.British-PC",
+            0x040C => "com.apple.keylayout.French-PC",
             0x080C => "com.apple.keylayout.Belgian",
             0x0C0C => "com.apple.keylayout.Canadian-CSA",
             0x0407 => "com.apple.keylayout.German",
@@ -477,13 +486,18 @@ mod macos {
             // `de` is all-hex-digits but must resolve as the German *name*,
             // not KLID 0x00DE.
             assert_eq!(spec_to_source_id("de"), Some("com.apple.keylayout.German"));
+            // A KLID is a Windows layout: the `-PC` variant where one exists.
             assert_eq!(
                 spec_to_source_id("0x040C"),
-                Some("com.apple.keylayout.French")
+                Some("com.apple.keylayout.French-PC")
             );
             assert_eq!(
                 spec_to_source_id("040c"),
-                Some("com.apple.keylayout.French")
+                Some("com.apple.keylayout.French-PC")
+            );
+            assert_eq!(
+                spec_to_source_id("0x0809"),
+                Some("com.apple.keylayout.British-PC")
             );
             assert_eq!(
                 spec_to_source_id("0x0407"),
@@ -513,6 +527,22 @@ mod macos {
             assert!(us.grave_types_backtick());
             let mut es = KeyboardLayout::resolve("es").expect("Spanish layout resolves");
             assert!(!es.grave_types_backtick());
+        }
+
+        #[test]
+        fn windows_klid_types_the_windows_layout() {
+            let mut fr = KeyboardLayout::resolve("0x040C").expect("French-PC resolves");
+            assert_eq!(fr.label(), "com.apple.keylayout.French-PC");
+            // kVK_ANSI_E = 0x0E: AltGr+E is the euro sign on Windows French.
+            assert_eq!(fr.translate(0x0E, false, true, false).as_deref(), Some("€"));
+            // kVK_ANSI_6 = 0x16 types '-' on Windows French (the Mac layout: '§').
+            assert_eq!(
+                fr.translate(0x16, false, false, false).as_deref(),
+                Some("-")
+            );
+            // A missing `-PC` layout falls back to the Mac layout.
+            let us = KeyboardLayout::resolve("com.apple.keylayout.US-PC").expect("falls back");
+            assert_eq!(us.label(), "com.apple.keylayout.US");
         }
 
         #[test]
