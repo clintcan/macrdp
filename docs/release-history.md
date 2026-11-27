@@ -4,6 +4,33 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.12.0 — Security fixes, a quicker first connect, HiDPI with multi-monitor
+
+Four security fixes found in a review of macrdp's network-facing code, a quicker first connect after a restart, HiDPI in multi-monitor sessions, an option to put the Dock and menu bar on the remote screen, and the camera back in the DMG.
+
+- **Security: a few idle connections could keep everyone out (#307).** With takeovers on (the default), the server negotiated only one newcomer at a time besides the connection being served, so two connections held open without sending anything kept everyone else from connecting, renewably and with no credentials. Up to eight newcomers now negotiate at once. Fix submitted upstream (Devolutions/IronRDP#2535); macrdp carries it as fork divergence (37) meanwhile.
+- **Security: the UDP listener reflected small packets as large ones (#308).** With UDP multitransport on (off by default), a 20-byte SYN from any address got a 1232-byte reply, then keepalives for a minute: a 62× reflection. A reply is now no larger than the packet that caused it (real clients pad their SYN to that size, so they see no change), peers that never answer are dropped after 5 s, and the peer table is capped at 256.
+- **Fixed: reconnecting often could trip the connection rate limit (#311).** Every connection used one of the 10 attempts per minute an address gets, even after logging in. A connection that authenticates now gives its attempt back, so only failed logins and port scans count.
+- **The self-signed certificate names the Mac (#310).** A newly generated certificate carries the Mac's host name and addresses and is valid for 10 years (it was "localhost" until the year 4096), and an expired one is replaced at startup. Existing certificates are left as they are; `docs/cli.md` says how to regenerate one.
+- **A quicker first connect after a restart (#303).** The virtual display starts at the size the last session used, so a returning client needs no display change; on a test MacBook the first connect after a restart dropped from 4.5 s to 1.3 s. The blank-screen detector also starts its clock at the first frame, so a slow start is no longer mistaken for a blank screen.
+- **HiDPI in multi-monitor sessions (#305).** `--virtual-display-hidpi` now works with `--multi-monitor`: a single-monitor session from a Retina client is sharp at 2×, and a multi-monitor session runs at 1×.
+- **New: `--main-display-while-connected` (#304, config `MAIN_DISPLAY_WHILE_CONNECTED`).** In plain virtual-display mode, the session's primary monitor becomes the Mac's main display while a client is connected, so the Dock and menu bar are on the remote screen; when the last client leaves, the Mac's own screen is main again and windows come back to it. A setting in the controller.
+- **Fixed: the camera in the DMG (#319, #320).** The v0.11.2 DMG's controller was built without the camera extension, so "Enable macrdp Camera" failed with "Missing entitlement". This release's DMG includes it, and the DMG build now refuses a controller without it.
+- **Review fixes (#306).** A code review before this release fixed eight smaller issues in the changes above, among them a remembered display size that could stop macrdp from starting.
+- Looked into and left as is: a reported NTLM relay (#309) isn't exploitable, since CredSSP binds the TLS key separately; and answering a refused connection with a negotiation failure instead of a reset (#316) would make mstsc show a misleading reason, for every failure code.
+
+**Verified before release**
+
+- TODO tonight: the 48 h soak of v0.11.2 on the Mac mini (result), CI, the DMG checks from `packaging/README.md` on the published DMG, and the mini switched to this release.
+- Live during development: the security fixes against the measured attacks (two idle connections; a 20-byte UDP SYN) and with real mstsc (UDP audio, takeovers, the new certificate's prompt); the first-connect, HiDPI and main-display changes on a MacBook Pro test server with a MacBook Air (Retina) and a Windows PC with two monitors.
+
+**Known issues**
+
+- Upstream behaviour noted, not changed: Quit doesn't interrupt a connection that is still in its handshake.
+- USB: after an auto-reconnect mstsc doesn't re-offer redirected USB devices (connect afresh).
+- Multi-monitor: a layout change takes 2–6 s to appear; adding or removing a monitor mid-session, the Detach/Blank modes and Windows App for macOS are untested or unsupported.
+- A cursor hidden with macOS's hidden flag (Firefox's full-screen video) still shows on the client.
+
 ## v0.11.2 — USB redirection works again
 
 USB redirection has presented no devices since v0.10.10; this release fixes it, and quiets a log warning.
