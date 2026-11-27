@@ -42,8 +42,8 @@ for a in "${apps[@]}"; do [ -d "$a" ] || { echo "not a bundle: $a" >&2; exit 1; 
 # The controller must carry the camera system extension, embedded and allowed
 # by its entitlement and profile, or "Enable macrdp Camera" fails with
 # "Missing entitlement com.apple.developer.system-extension.install". The
-# v0.10.x-v0.11.2 DMGs shipped without it (#319): their controller was built
-# without CAMERA_EXTENSION=1. Build it as docs/camera-extension-setup.md says.
+# v0.11.2 DMG shipped without it (#319): its controller was built without
+# CAMERA_EXTENSION=1. Build it as docs/camera-extension-setup.md says.
 if [ "${ALLOW_NO_CAMERA:-0}" != "1" ]; then
     for a in "${apps[@]}"; do
         case "$(basename "$a")" in *Controller*.app) ;; *) continue ;; esac
