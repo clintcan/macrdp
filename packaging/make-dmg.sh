@@ -18,6 +18,8 @@
 #   OUT_DIR=<dir>                    output dir (default: target/, gitignored).
 #   DMG_NAME=<name.dmg>              output filename (default: macrdp-<version>.dmg).
 #   VOL_NAME=<name>                  mounted volume name (default: "macrdp <version>").
+#   ALLOW_NO_CAMERA=1                accept a controller without the camera system
+#                                    extension (see the check below).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,6 +38,30 @@ if [ ${#apps[@]} -eq 0 ]; then
 fi
 [ ${#apps[@]} -gt 0 ] || { echo "no .app bundles given or found in target/ — build them first" >&2; exit 1; }
 for a in "${apps[@]}"; do [ -d "$a" ] || { echo "not a bundle: $a" >&2; exit 1; }; done
+
+# The controller must carry the camera system extension, embedded and allowed
+# by its entitlement and profile, or "Enable macrdp Camera" fails with
+# "Missing entitlement com.apple.developer.system-extension.install". The
+# v0.10.x-v0.11.2 DMGs shipped without it (#319): their controller was built
+# without CAMERA_EXTENSION=1. Build it as docs/camera-extension-setup.md says.
+if [ "${ALLOW_NO_CAMERA:-0}" != "1" ]; then
+    for a in "${apps[@]}"; do
+        case "$(basename "$a")" in *Controller*.app) ;; *) continue ;; esac
+        problems=()
+        ls "$a"/Contents/Library/SystemExtensions/*camera*.systemextension >/dev/null 2>&1 \
+            || problems+=("no camera system extension in Contents/Library/SystemExtensions")
+        [ -f "$a/Contents/embedded.provisionprofile" ] \
+            || problems+=("no Contents/embedded.provisionprofile")
+        codesign -d --entitlements - "$a" 2>/dev/null | grep -q "system-extension.install" \
+            || problems+=("not signed with com.apple.developer.system-extension.install")
+        if [ ${#problems[@]} -gt 0 ]; then
+            echo "$a can't enable macrdp Camera:" >&2
+            printf '  - %s\n' "${problems[@]}" >&2
+            echo "Build it with CAMERA_EXTENSION=1 and both profiles (docs/camera-extension-setup.md), or set ALLOW_NO_CAMERA=1." >&2
+            exit 1
+        fi
+    done
+fi
 
 DMG_NAME="${DMG_NAME:-macrdp-$VERSION.dmg}"
 VOL_NAME="${VOL_NAME:-macrdp $VERSION}"
