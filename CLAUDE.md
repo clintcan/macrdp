@@ -23,11 +23,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.11.2** (USB redirection fixed, broken v0.10.10-v0.11.1, IronRDP
-fork #8, #300; RUST_LOG quieting/validation, #292; v0.11.1: multi-monitor live layout changes applied
-in place with RESET_GRAPHICS, IronRDP fork #7, and the v0.11.0 multi-monitor capture leak fixed, #298; v0.11.0:
-multi-monitor sessions #294, network auto-detect on by default #293, window-follow in plain
-virtual-display mode #296).
+(VPN/ZeroTier). **Latest release: v0.12.0** (security: concurrent takeover candidates #307 (fork div 37,
+upstream #2535), UDP SYN reflection capped #308, authenticated connections refunded by the rate
+limit #311, host-named certificate #310; quicker first connect #303; HiDPI with multi-monitor #305;
+`--main-display-while-connected` #304; camera back in the DMG #319/#320; v0.11.2: USB redirection
+fixed, #300).
 **Per-release detail — what shipped, what was verified live, the war stories — lives in
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the

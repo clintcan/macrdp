@@ -18,10 +18,11 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Latest: [v0.11.2](https://github.com/clintcan/macrdp/releases/latest)** — USB redirection works again (broken since v0.10.10), and quieter logs.
+**Latest: [v0.12.0](https://github.com/clintcan/macrdp/releases/latest)** — four security fixes, a quicker first connect after a restart, HiDPI with multi-monitor, the Dock and menu bar on the remote screen (`--main-display-while-connected`), and the camera back in the DMG.
 
 **Recent releases**
 
+- **v0.11.2** (2026-11-25) — USB redirection works again (broken since v0.10.10), and quieter logs
 - **v0.11.1** (2026-11-25) — multi-monitor follows the client's monitor changes; a multi-monitor capture leak fixed
 - **v0.11.0** (2026-11-25) — multi-monitor sessions (experimental), connection quality by default, windows that follow you
 - **v0.10.10** (2026-11-24) — IronRDP rebased onto current upstream, lossy audio and video on two UDP tunnels, clipboard and cursor fixes
