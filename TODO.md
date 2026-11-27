@@ -12,8 +12,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
   rollback: `~/macrdp-0.11.2-apps-bak`, `~/com.clintcan.macrdp.plist.pre-v0.12.0.bak`,
   `~/config.env.pre-v0.12.0.bak`). Checked 2026-11-27: Windows App for macOS over ZeroTier (one
   monitor, 1x, H.264 V10.7) — the virtual display is main (Dock seen remotely) and HiDPI (3024x1898,
-  looks like 1512x949). Still to check: two monitors, a Retina client at 2x (Windows App "Optimize
-  for Retina" on), mstsc with the UDP audio flow on the LAN, takeovers. Its camera extension is
+  looks like 1512x949). Also at 2x (Windows App "Optimize for Retina" on, same link): re-mode to
+  3024x1898 ui_scale=2, H.264 at 3024x1898, ~3 s from login to picture; "acceptable", video sometimes
+  choppy while the adaptive bitrate adjusts (176 ms, 1 Mbit/s seed, 3 Mbit/s ceiling; TCP back-pressure
+  logged). Still to check: two monitors, 2x on the LAN, mstsc with the UDP audio flow on the LAN,
+  takeovers. Its camera extension is
   still the identical 0.11.1 build (no code change since July), left in place.
 
 - [ ] **Watch: mstsc loses sound after a long idle with the client PC's screen asleep (2026-11-26).**
