@@ -201,25 +201,39 @@ pub fn pick_display_id(
 }
 
 /// Where to put the physical panels while the virtual display sits at (0,0)
-/// as main: a diagonal chain going up and to the left, each panel touching
-/// the previous one only at a corner. `panels` is `(id, width, height)` in
-/// points; the result is `(id, x, y)` origins.
+/// as main: stacked ABOVE it. `vd_width` is the virtual display's width and
+/// `panels` is `(id, width, height)`, both in points; the result is
+/// `(id, x, y)` origins.
 ///
-/// Why diagonal: the Dock sits on the left, bottom or right edge of whichever
-/// display has that edge free, and a panel beside the virtual display takes
-/// that edge. With the panels to the right (the old layout), a right-side
-/// Dock went onto the hidden panel and pushing the mouse to the right edge of
-/// the remote screen never showed it. Above-left leaves the virtual display's
-/// left, bottom and right edges free and never puts a panel further right or
-/// lower than it, whatever the sizes, so every Dock position works. macOS
-/// accepts corner-only contact (checked live on macOS 26, 2026-11-27).
-pub fn aside_origins(panels: &[(u32, i32, i32)]) -> Vec<(u32, i32, i32)> {
-    let (mut x, mut y) = (0, 0);
+/// The Dock sits on the left, bottom or right edge of whichever display has
+/// that edge free, so a panel beside the virtual display takes that edge.
+/// With the panels to the right (the old layout), a right-side Dock went onto
+/// the hidden panel and never showed at the remote screen's right edge. Above
+/// leaves all three Dock edges free.
+///
+/// A hot corner also stops working at any corner a panel touches (measured:
+/// the right-hand layout killed top-right, a diagonal one top-left). So the
+/// first panel is centered over the top edge when it is narrower than the
+/// virtual display, which leaves all four corners free. A panel too wide for
+/// that goes diagonally above-left instead, touching only the top-left corner
+/// (centering it would cover both top corners); macOS keeps a corner-only
+/// layout as set. Further panels stack above the previous one, centered on
+/// it, so they never touch the virtual display. Measured live on macOS 26,
+/// 2026-11-27: the Dock on the virtual display for left, bottom and right in
+/// both layouts, and every corner live with the centered one.
+pub fn aside_origins(vd_width: i32, panels: &[(u32, i32, i32)]) -> Vec<(u32, i32, i32)> {
+    let mut prev: Option<(i32, i32, i32)> = None; // (x, y, width)
     panels
         .iter()
         .map(|&(id, w, h)| {
-            x -= w.max(1);
-            y -= h.max(1);
+            let (w, h) = (w.max(1), h.max(1));
+            let (x, y) = match prev {
+                // At least one point of the top edge stays free on each side.
+                None if w <= vd_width - 2 => ((vd_width - w) / 2, -h),
+                None => (-w, -h),
+                Some((px, py, pw)) => (px + (pw - w) / 2, py - h),
+            };
+            prev = Some((x, y, w));
             (id, x, y)
         })
         .collect()
@@ -344,10 +358,11 @@ mod macos {
     // race and reject the second with CGError 1001.
     const TX_SETTLE: Duration = Duration::from_millis(200);
 
-    /// Adds the moves that put `physicals` up and to the left of a virtual
-    /// display at (0,0) (see `super::aside_origins`) to an open transaction.
+    /// Adds the moves that put `physicals` above the virtual display `vd`,
+    /// which the same transaction puts at (0,0) (see `super::aside_origins`).
     fn configure_physicals_aside(
         config: &core_graphics::display::CGDisplayConfigRef,
+        vd: u32,
         physicals: impl IntoIterator<Item = u32>,
     ) -> Result<()> {
         let sizes: Vec<(u32, i32, i32)> = physicals
@@ -357,7 +372,10 @@ mod macos {
                 (id, s.width.round() as i32, s.height.round() as i32)
             })
             .collect();
-        for (id, x, y) in super::aside_origins(&sizes) {
+        for (id, x, y) in super::aside_origins(
+            CGDisplay::new(vd).bounds().size.width.round() as i32,
+            &sizes,
+        ) {
             CGDisplay::new(id).configure_display_origin(config, x, y).map_err(|e| {
                 anyhow!("CGConfigureDisplayOrigin(physical {id}, {x}, {y}): CGError {e}")
             })?;
@@ -1748,6 +1766,7 @@ mod macos {
                 .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
             configure_physicals_aside(
                 &config,
+                virtual_display_id,
                 targets.iter().map(|(id, _)| *id).filter(|id| CGDisplay::new(*id).is_active()),
             )?;
             any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
@@ -2195,7 +2214,7 @@ mod macos {
                 // to sweep those windows onto the vd, but with both displays at
                 // IDENTICAL bounds "move to the vd's top-left" is also inside the
                 // physical, so macOS keeps the window there and the sweep is a
-                // no-op. Moving the physical aside (up and to the left, `aside_origins`) gives the vd
+                // no-op. Moving the physical aside (above it, `aside_origins`) gives the vd
                 // sole ownership of (0,0): the windows travel with the physical,
                 // land off the vd, and the gather then relocates them onto the vd
                 // unambiguously — exactly how the keep_physical_main=false
@@ -2225,9 +2244,9 @@ mod macos {
                     // Pin the vd at (0,0) so it owns the origin the client sees…
                     vd.configure_display_origin(&config, 0, 0)
                         .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-                    // …and move each unmirrored physical up and to the left of it,
+                    // …and move each unmirrored physical above it,
                     // off every edge the Dock can use.
-                    configure_physicals_aside(&config, broke_mirror.iter().copied())?;
+                    configure_physicals_aside(&config, virtual_display_id, broke_mirror.iter().copied())?;
                     // ConfigureForSession, NOT ForAppOnly — the #161/#162 lesson
                     // replayed on this path, from a live re-strand (2026-07-22):
                     // with ForAppOnly the WindowServer's session store never
@@ -2408,6 +2427,7 @@ mod macos {
                         .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
                     configure_physicals_aside(
                         &config,
+                        virtual_display_id,
                         targets
                             .iter()
                             .map(|(id, _)| *id)
@@ -2743,27 +2763,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aside_origins_keep_every_dock_edge_of_the_virtual_display_free() {
-        // The virtual display is at (0,0); its left, bottom and right edges
-        // must stay free whatever the panel sizes, or the Dock moves onto a
-        // hidden panel. A panel larger than the virtual display included.
+    fn aside_origins_keep_dock_edges_and_corners_of_the_virtual_display_free() {
+        // Nothing may sit beside or below the virtual display (0,0)-(vd_w,1084):
+        // that would take a Dock edge. Only the first panel may touch it, and
+        // only along the top edge; a narrower one must leave both top corners
+        // free (a touched corner kills its hot corner).
+        let vd_w = 1728;
+        let below_top = |y: i32, h: i32| y + h <= 0;
+
+        // Narrower panel (the lid-open MacBook Air): centered, corners free.
+        let one = aside_origins(vd_w, &[(1, 1440, 900)]);
+        assert_eq!(one, vec![(1, 144, -900)]);
+
+        // A stack: only the first touches the virtual display, each later one
+        // sits on top of the previous one, overlapping it so they connect.
         let panels = [(1, 1440, 900), (7, 3840, 2160), (9, 0, 0)];
-        let placed = aside_origins(&panels);
-        assert_eq!(placed[0], (1, -1440, -900));
-        assert_eq!(placed[1], (7, -1440 - 3840, -900 - 2160));
-        for (i, &(_, x, y)) in placed.iter().enumerate() {
-            let (_, w, h) = panels[i];
-            assert!(x + w.max(1) <= 0, "panel {i} reaches past the left edge");
-            assert!(y + h.max(1) <= 0, "panel {i} reaches below the top edge");
-        }
-        // Each panel touches the one before at a corner, so the chain stays
-        // one connected arrangement.
-        for i in 1..placed.len() {
-            let (_, px, py) = placed[i - 1];
+        let placed = aside_origins(vd_w, &panels);
+        let (_, x0, y0) = placed[0];
+        assert!(x0 > 0 && x0 + 1440 < vd_w, "first panel covers a top corner");
+        for i in 0..placed.len() {
             let (_, x, y) = placed[i];
-            let (_, w, h) = panels[i];
-            assert_eq!((x + w.max(1), y + h.max(1)), (px, py));
+            let (w, h) = (panels[i].1.max(1), panels[i].2.max(1));
+            assert!(below_top(y, h), "panel {i} reaches below the top edge");
+            if i > 0 {
+                let (_, px, py) = placed[i - 1];
+                let pw = panels[i - 1].1.max(1);
+                assert_eq!(y + h, py, "panel {i} doesn't sit on the one below");
+                assert!(x < px + pw && px < x + w, "panel {i} doesn't overlap the one below");
+            }
         }
+        assert_eq!(y0, -900);
+
+        // Too wide to center without covering both top corners: diagonal,
+        // touching only the top-left corner.
+        assert_eq!(aside_origins(vd_w, &[(1, 2560, 1440)]), vec![(1, -2560, -1440)]);
+        assert_eq!(aside_origins(vd_w, &[(1, vd_w, 900)]), vec![(1, -vd_w, -900)]);
     }
 
     #[test]
