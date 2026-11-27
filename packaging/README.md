@@ -204,6 +204,60 @@ Mac can listen to a live stream — see the trust note in `docs/macos-gotchas.md
   Verifying a notarized DMG: `xcrun stapler validate <dmg>` is definitive;
   `spctl` needs `--type open --context context:primary-signature` or it reports
   a misleading "Insufficient Context".
+
+- **The release DMG (`macrdp-<version>-usb.dmg`) needs three provisioning
+  profiles, and both apps built with them.** USB redirection needs the server's
+  `com.apple.developer.usb.host-controller-interface` entitlement, and camera
+  redirection needs the controller to carry the camera system extension and the
+  `com.apple.developer.system-extension.install` entitlement. Leave either out
+  and that feature fails on every user's Mac: the v0.11.2 DMG shipped a
+  controller without the camera extension (#319), and "Enable macrdp Camera"
+  failed with "Missing entitlement". `make-dmg.sh` now refuses a controller
+  without it (`ALLOW_NO_CAMERA=1` overrides). Build into a staging folder, not
+  `/Applications` and not `target/`:
+
+  ```bash
+  ID="Developer ID Application: Your Name (TEAMID)"
+  STAGE=/path/to/release-stage            # an empty folder
+  # 1. Server: the USB entitlement + its profile (macrdp.entitlements).
+  CODESIGN_IDENTITY="$ID" NOTARIZE=1 NOTARY_PROFILE=macrdp-notary \
+    PROVISION_PROFILE=/path/to/macrdp.provisionprofile \
+    APP_DIR="$STAGE" packaging/make-app.sh
+  # 2. Controller: the camera system extension, with the controller's and the
+  #    extension's profiles (docs/camera-extension-setup.md).
+  CODESIGN_IDENTITY="$ID" NOTARIZE=1 NOTARY_PROFILE=macrdp-notary \
+    CAMERA_EXTENSION=1 \
+    PROVISION_PROFILE=/path/to/macrdp-controller.provisionprofile \
+    CAMERA_PROVISION_PROFILE=/path/to/macrdp-camera.provisionprofile \
+    APP_DIR="$STAGE" gui/make-tray-app.sh
+  # 3. The DMG.
+  CODESIGN_IDENTITY="$ID" NOTARIZE=1 NOTARY_PROFILE=macrdp-notary \
+    DMG_NAME="macrdp-<version>-usb.dmg" \
+    packaging/make-dmg.sh "$STAGE/macrdp.app" "$STAGE/macrdpController.app"
+  ```
+
+  Build it **after** tagging the release, so `macrdp --version` reports the tag
+  and not a `git describe` string. Then check the DMG itself, mounted, before
+  publishing it:
+
+  ```bash
+  M=$(hdiutil attach -nobrowse -readonly macrdp-<version>-usb.dmg | tail -1 | awk -F'\t' '{print $NF}')
+  xcrun stapler validate macrdp-<version>-usb.dmg              # notarized
+  for a in macrdp macrdpController; do
+    spctl -a -vv "$M/$a.app"                                   # accepted, Notarized Developer ID
+    codesign --verify --deep --strict "$M/$a.app" && echo ok
+    codesign -d --entitlements - "$M/$a.app"                   # see below
+  done
+  ls "$M/macrdpController.app/Contents/Library/SystemExtensions"
+  hdiutil detach "$M"
+  ```
+
+  Expect the server to list `usb.host-controller-interface`, the controller
+  `system-extension.install`, both apps an `embedded.provisionprofile`, and the
+  controller a `…controller.camera.systemextension`. The helpers inside
+  `macrdp.app/Contents/Resources` (smart-card bundle, microphone driver,
+  `macrdphud`, `macrdpshield`) need no entitlements, only the Developer ID
+  signature and hardened runtime that `make-app.sh` gives them.
 - **TCC is keyed to the binary.** The grants attach to `Contents/MacOS/macrdp`
   (the process that calls ScreenCaptureKit / CGEventPost) — which is exactly the
   process launchd now runs. Keep the install path stable and the grants persist.

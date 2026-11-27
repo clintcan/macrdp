@@ -32,7 +32,10 @@ virtual-display mode #296).
 `docs/release-history.md`; read it before reasoning about when/why something changed.**
 Release cuts update that file, the README Status (replace the **Latest** line and push the
 previous release down as a one-line bullet in **Recent releases** — keep it a list, never a
-paragraph), and this Status line.
+paragraph), and this Status line. **Build the `-usb` DMG exactly as `packaging/README.md` ("The
+release DMG") says: the server with its USB profile, the controller with `CAMERA_EXTENSION=1` and
+both camera profiles, after tagging; then run the checks listed there on the mounted DMG before
+publishing.** The v0.11.2 DMG shipped without the camera extension (#319).
 
 ## Before you call a change "live"
 
