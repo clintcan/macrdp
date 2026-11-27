@@ -21,7 +21,9 @@ Four security fixes found in a review of macrdp's network-facing code, a quicker
 
 **Verified before release**
 
-- TODO tonight: the 48 h soak of v0.11.2 on the Mac mini (result), CI, the DMG checks from `packaging/README.md` on the published DMG, and the mini switched to this release.
+- Soak: v0.11.2 ran 54 h on the Mac mini (2026-11-25 to 11-27) with every redirection feature on: one process throughout, no panics, no critical log lines; memory peaked at 105 MB in the first hours and was 35 MB at the end, threads and file handles stayed bounded. It also took about 900 hostile connections, malformed handshakes and UDP floods without a restart.
+- CI green on Linux and macOS (fmt, clippy, all tests, `cargo deny`, the IronRDP pin guard, and now the fork's UDP listener tests).
+- The release build procedure in `packaging/README.md` dry-run end to end: the server with its USB entitlement, the controller with the camera extension, both checked in the DMG.
 - Live during development: the security fixes against the measured attacks (two idle connections; a 20-byte UDP SYN) and with real mstsc (UDP audio, takeovers, the new certificate's prompt); the first-connect, HiDPI and main-display changes on a MacBook Pro test server with a MacBook Air (Retina) and a Windows PC with two monitors.
 
 **Known issues**
