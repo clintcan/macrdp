@@ -640,6 +640,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].
 
+- [ ] **#321 (rophy): French/British KLID → the Windows `-PC` layouts. Test a Mac client before
+  merging.** Set a French input source on the MacBook Air, connect with Windows App to a test copy of
+  #321, and type rophy's table (6, 8, minus, AltGr+E/0/3): what KLID does Windows App for macOS announce,
+  and do the keys type Mac or Windows French? If Mac clients send 0x040C and expect Mac positions, keep
+  the Mac layout when the client fingerprint says macOS. Review posted 2026-11-27; not in v0.12.0.
+
 - [ ] **Multi-monitor (client-side multi-display), experimental.** Phase 1 shipped in v0.11.0; live
   layout changes work on mstsc and Windows App on Windows (2026-11-25, branch
   `feat/multi-monitor-live-layout` + fork branch `macrdp-mm-live-layout`). Next: a faster re-layout
