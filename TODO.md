@@ -7,10 +7,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Release v0.12.0 after the v0.11.2 soak analysis (soak ends 2026-11-27 12:42 UTC).** On `main`
-  and live-tested on MacBooks: #303 (quick first connect after a restart), #304
-  (`--main-display-while-connected`), #305 (`VD_HIDPI` with `MULTI_MONITOR`). Then switch the mini to
-  it with `VD_HIDPI=auto` and `MAIN_DISPLAY_WHILE_CONNECTED=1`, and check them there.
+- [ ] **Check v0.12.0's new settings live on the mini.** Released 2026-11-27 after a clean 54 h soak
+  of v0.11.2; the mini runs it (`VD_HIDPI=auto`, `MAIN_DISPLAY_WHILE_CONNECTED=1`, `RUST_LOG=info`;
+  rollback: `~/macrdp-0.11.2-apps-bak`, `~/com.clintcan.macrdp.plist.pre-v0.12.0.bak`,
+  `~/config.env.pre-v0.12.0.bak`). Next real sessions: the Dock and menu bar on the remote primary
+  (one and two monitors), a Retina client at 2x, the UDP audio flow, takeovers. Its camera extension is
+  still the identical 0.11.1 build (no code change since July), left in place.
 
 - [ ] **Watch: mstsc loses sound after a long idle with the client PC's screen asleep (2026-11-26).**
   Seen once on the mini (v0.11.2 soak build, audio over the lossy UDP tunnel, session up ~2 h): sound
