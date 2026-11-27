@@ -200,6 +200,31 @@ pub fn pick_display_id(
         .or_else(|| unique(&|d| !d.builtin && d.size_px == size_px && !another_macrdp(d)))
 }
 
+/// Where to put the physical panels while the virtual display sits at (0,0)
+/// as main: a diagonal chain going up and to the left, each panel touching
+/// the previous one only at a corner. `panels` is `(id, width, height)` in
+/// points; the result is `(id, x, y)` origins.
+///
+/// Why diagonal: the Dock sits on the left, bottom or right edge of whichever
+/// display has that edge free, and a panel beside the virtual display takes
+/// that edge. With the panels to the right (the old layout), a right-side
+/// Dock went onto the hidden panel and pushing the mouse to the right edge of
+/// the remote screen never showed it. Above-left leaves the virtual display's
+/// left, bottom and right edges free and never puts a panel further right or
+/// lower than it, whatever the sizes, so every Dock position works. macOS
+/// accepts corner-only contact (checked live on macOS 26, 2026-11-27).
+pub fn aside_origins(panels: &[(u32, i32, i32)]) -> Vec<(u32, i32, i32)> {
+    let (mut x, mut y) = (0, 0);
+    panels
+        .iter()
+        .map(|&(id, w, h)| {
+            x -= w.max(1);
+            y -= h.max(1);
+            (id, x, y)
+        })
+        .collect()
+}
+
 /// Old virtual display ids and the ids WindowServer re-registered them under.
 static ID_REMAP: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
 
@@ -318,6 +343,27 @@ mod macos {
     // it's fully applied — back-to-back configures on the same display can
     // race and reject the second with CGError 1001.
     const TX_SETTLE: Duration = Duration::from_millis(200);
+
+    /// Adds the moves that put `physicals` up and to the left of a virtual
+    /// display at (0,0) (see `super::aside_origins`) to an open transaction.
+    fn configure_physicals_aside(
+        config: &core_graphics::display::CGDisplayConfigRef,
+        physicals: impl IntoIterator<Item = u32>,
+    ) -> Result<()> {
+        let sizes: Vec<(u32, i32, i32)> = physicals
+            .into_iter()
+            .map(|id| {
+                let s = CGDisplay::new(id).bounds().size;
+                (id, s.width.round() as i32, s.height.round() as i32)
+            })
+            .collect();
+        for (id, x, y) in super::aside_origins(&sizes) {
+            CGDisplay::new(id).configure_display_origin(config, x, y).map_err(|e| {
+                anyhow!("CGConfigureDisplayOrigin(physical {id}, {x}, {y}): CGError {e}")
+            })?;
+        }
+        Ok(())
+    }
 
     /// Set true by `DetachedPrimary::drop` when its re-enable transaction is
     /// exhausted (the panel is left disabled). On macOS 26.x the CGS app-scoped
@@ -1653,7 +1699,6 @@ mod macos {
                 vd_bounds.origin.x.round() as i32,
                 vd_bounds.origin.y.round() as i32,
             );
-            let vd_width = vd_bounds.size.width.round() as i32;
 
             let actives = CGDisplay::active_displays()
                 .map_err(|e| anyhow!("CGGetActiveDisplayList: CGError {e}"))?;
@@ -1701,16 +1746,10 @@ mod macos {
                 .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
             vd.configure_display_origin(&config, 0, 0)
                 .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-            let mut x_off = vd_width;
-            for (id, _) in &targets {
-                let d = CGDisplay::new(*id);
-                if d.is_active() {
-                    d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
-                    })?;
-                    x_off += d.bounds().size.width.round() as i32;
-                }
-            }
+            configure_physicals_aside(
+                &config,
+                targets.iter().map(|(id, _)| *id).filter(|id| CGDisplay::new(*id).is_active()),
+            )?;
             any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
                 .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
 
@@ -2017,7 +2056,6 @@ mod macos {
                 vd_bounds.origin.x.round() as i32,
                 vd_bounds.origin.y.round() as i32,
             );
-            let vd_width = vd_bounds.size.width.round() as i32;
 
             let actives = CGDisplay::active_displays()
                 .map_err(|e| anyhow!("CGGetActiveDisplayList: CGError {e}"))?;
@@ -2157,7 +2195,7 @@ mod macos {
                 // to sweep those windows onto the vd, but with both displays at
                 // IDENTICAL bounds "move to the vd's top-left" is also inside the
                 // physical, so macOS keeps the window there and the sweep is a
-                // no-op. Moving the physical aside (x = vd_width) gives the vd
+                // no-op. Moving the physical aside (up and to the left, `aside_origins`) gives the vd
                 // sole ownership of (0,0): the windows travel with the physical,
                 // land off the vd, and the gather then relocates them onto the vd
                 // unambiguously — exactly how the keep_physical_main=false
@@ -2187,17 +2225,9 @@ mod macos {
                     // Pin the vd at (0,0) so it owns the origin the client sees…
                     vd.configure_display_origin(&config, 0, 0)
                         .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-                    // …and push each unmirrored physical to the right of it.
-                    let mut x_off = vd_width;
-                    for id in &broke_mirror {
-                        let d = CGDisplay::new(*id);
-                        d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                            anyhow!(
-                                "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
-                            )
-                        })?;
-                        x_off += d.bounds().size.width.round().max(1.0) as i32;
-                    }
+                    // …and move each unmirrored physical up and to the left of it,
+                    // off every edge the Dock can use.
+                    configure_physicals_aside(&config, broke_mirror.iter().copied())?;
                     // ConfigureForSession, NOT ForAppOnly — the #161/#162 lesson
                     // replayed on this path, from a live re-strand (2026-07-22):
                     // with ForAppOnly the WindowServer's session store never
@@ -2376,18 +2406,13 @@ mod macos {
                     })?;
                     vd.configure_display_origin(&config, 0, 0)
                         .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-                    let mut x_off = vd_width;
-                    for (id, _) in &targets {
-                        let d = CGDisplay::new(*id);
-                        if d.is_active() {
-                            d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                                anyhow!(
-                                    "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
-                                )
-                            })?;
-                            x_off += d.bounds().size.width.round() as i32;
-                        }
-                    }
+                    configure_physicals_aside(
+                        &config,
+                        targets
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .filter(|id| CGDisplay::new(*id).is_active()),
+                    )?;
                     any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
                         .map_err(|e| {
                             anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
@@ -2716,6 +2741,30 @@ mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aside_origins_keep_every_dock_edge_of_the_virtual_display_free() {
+        // The virtual display is at (0,0); its left, bottom and right edges
+        // must stay free whatever the panel sizes, or the Dock moves onto a
+        // hidden panel. A panel larger than the virtual display included.
+        let panels = [(1, 1440, 900), (7, 3840, 2160), (9, 0, 0)];
+        let placed = aside_origins(&panels);
+        assert_eq!(placed[0], (1, -1440, -900));
+        assert_eq!(placed[1], (7, -1440 - 3840, -900 - 2160));
+        for (i, &(_, x, y)) in placed.iter().enumerate() {
+            let (_, w, h) = panels[i];
+            assert!(x + w.max(1) <= 0, "panel {i} reaches past the left edge");
+            assert!(y + h.max(1) <= 0, "panel {i} reaches below the top edge");
+        }
+        // Each panel touches the one before at a corner, so the chain stays
+        // one connected arrangement.
+        for i in 1..placed.len() {
+            let (_, px, py) = placed[i - 1];
+            let (_, x, y) = placed[i];
+            let (_, w, h) = panels[i];
+            assert_eq!((x + w.max(1), y + h.max(1)), (px, py));
+        }
+    }
 
     #[test]
     fn only_a_2x_client_gets_hidpi() {
