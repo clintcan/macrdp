@@ -10,8 +10,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
 - [ ] **Check v0.12.0's new settings live on the mini.** Released 2026-11-27 after a clean 54 h soak
   of v0.11.2; the mini runs it (`VD_HIDPI=auto`, `MAIN_DISPLAY_WHILE_CONNECTED=1`, `RUST_LOG=info`;
   rollback: `~/macrdp-0.11.2-apps-bak`, `~/com.clintcan.macrdp.plist.pre-v0.12.0.bak`,
-  `~/config.env.pre-v0.12.0.bak`). Next real sessions: the Dock and menu bar on the remote primary
-  (one and two monitors), a Retina client at 2x, the UDP audio flow, takeovers. Its camera extension is
+  `~/config.env.pre-v0.12.0.bak`). Checked 2026-11-27: Windows App for macOS over ZeroTier (one
+  monitor, 1x, H.264 V10.7) — the virtual display is main (Dock seen remotely) and HiDPI (3024x1898,
+  looks like 1512x949). Still to check: two monitors, a Retina client at 2x (Windows App "Optimize
+  for Retina" on), mstsc with the UDP audio flow on the LAN, takeovers. Its camera extension is
   still the identical 0.11.1 build (no code change since July), left in place.
 
 - [ ] **Watch: mstsc loses sound after a long idle with the client PC's screen asleep (2026-11-26).**
