@@ -31,6 +31,20 @@ pub fn is_translatable_keycode(vk: u16) -> bool {
     vk <= 0x32 && vk != 0x24 && vk != 0x30 && vk != 0x31
 }
 
+/// The `--keyboard-layout` spec for a client's announced KLID. A KLID names a
+/// Windows layout, and `klid_to_source_id` picks the macOS `-PC` variant where
+/// one exists. Windows App for macOS announces 0x0809 for both the Mac British
+/// and the British – PC input sources, and Mac British is the usual one on a
+/// Mac, so a Mac client keeps it. (For Mac French it announces 0x080C, which
+/// resolves to Mac Belgian, a layout that types the same; it announces 0x040C
+/// only for French – PC.)
+pub fn client_layout_spec(klid: u32, mac_client: bool) -> String {
+    match (klid & 0xFFFF, mac_client) {
+        (0x0809, true) => "com.apple.keylayout.British".to_string(),
+        (lang, _) => format!("0x{lang:04x}"),
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub use macos::KeyboardLayout;
 
@@ -608,7 +622,25 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use super::is_translatable_keycode;
+    use super::{client_layout_spec, is_translatable_keycode};
+
+    #[test]
+    fn a_mac_client_with_a_british_klid_keeps_mac_british() {
+        assert_eq!(
+            client_layout_spec(0x0809, true),
+            "com.apple.keylayout.British"
+        );
+        // A Windows (or other) client gets the KLID, so the `-PC` variant.
+        assert_eq!(client_layout_spec(0x0809, false), "0x0809");
+        // The variant word of the KLID is ignored, as before.
+        assert_eq!(
+            client_layout_spec(0x0001_0809, true),
+            "com.apple.keylayout.British"
+        );
+        // French: a Mac client sends 0x040C only for French – PC.
+        assert_eq!(client_layout_spec(0x040C, true), "0x040c");
+        assert_eq!(client_layout_spec(0x080C, true), "0x080c");
+    }
 
     #[test]
     fn translatable_range_excludes_return_tab_space() {

@@ -8,11 +8,20 @@ use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandl
 #[cfg(not(target_os = "macos"))]
 use tracing::trace;
 
-/// Shared cell the vendored server fills with the connected client's Windows
-/// keyboard-layout identifier (KLID); 0 = unknown / not announced. Read by the
-/// input handler to auto-select a non-US layout when `--keyboard-layout` isn't
-/// given. Mirrors the `display_suppressed` shared-flag pattern.
-pub type SharedKeyboardLayout = std::sync::Arc<std::sync::atomic::AtomicU32>;
+/// What the connected client announced about its keyboard, filled per
+/// connection by `conn_hooks::KeyboardLayoutHook`. Read by the input handler to
+/// auto-select a non-US layout when `--keyboard-layout` isn't given.
+#[derive(Debug, Default)]
+pub struct ClientKeyboard {
+    /// The client's Windows keyboard-layout identifier (KLID); 0 = unknown /
+    /// not announced.
+    pub klid: std::sync::atomic::AtomicU32,
+    /// The client runs on macOS (General capability set platform), so its
+    /// keyboard has Mac key labels.
+    pub mac_client: std::sync::atomic::AtomicBool,
+}
+
+pub type SharedKeyboardLayout = std::sync::Arc<ClientKeyboard>;
 
 pub struct MacInputHandler {
     /// Live session desktop size, shared with `CaptureDisplay`. Read per
@@ -1276,6 +1285,7 @@ mod macos {
         // (e.g. a reconnect from a differently-configured client).
         klid_handle: Option<super::SharedKeyboardLayout>,
         last_klid: u32,
+        last_mac_client: bool,
         auto_layout: bool,
     }
 
@@ -1356,6 +1366,7 @@ mod macos {
                 layout,
                 klid_handle,
                 last_klid: 0,
+                last_mac_client: false,
                 auto_layout,
             })
         }
@@ -1611,17 +1622,20 @@ mod macos {
             let Some(handle) = &self.klid_handle else {
                 return;
             };
-            let klid = handle.load(std::sync::atomic::Ordering::Relaxed);
-            if klid == self.last_klid {
+            let klid = handle.klid.load(std::sync::atomic::Ordering::Relaxed);
+            let mac_client = handle.mac_client.load(std::sync::atomic::Ordering::Relaxed);
+            if klid == self.last_klid && mac_client == self.last_mac_client {
                 return;
             }
             self.last_klid = klid;
+            self.last_mac_client = mac_client;
             self.layout = if klid != 0 && (klid & 0xFFFF) != 0x0409 {
-                let spec = format!("0x{:04x}", klid & 0xFFFF);
+                let spec = crate::keyboard_layout::client_layout_spec(klid, mac_client);
                 let resolved = crate::keyboard_layout::KeyboardLayout::resolve(&spec);
                 match &resolved {
                     Some(l) => tracing::info!(
                         klid = format!("0x{klid:04X}"),
+                        mac_client,
                         layout = %l.label(),
                         "auto-selected the client's keyboard layout"
                     ),
