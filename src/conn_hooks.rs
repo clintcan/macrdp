@@ -90,6 +90,26 @@ impl ConnectionHandler for InputResetHook {
     }
 }
 
+/// Releases the keys, buttons and modifiers a connection left pressed on the
+/// Mac, when it ends. A dropped link or a killed client sends no key-up, so
+/// without this a held key stays down on the Mac, for the local user too,
+/// until the same key is pressed again. Windows, as an RDP server, also
+/// releases held keys when the connection drops. `InputResetHook` releases
+/// the same state again on the next connection.
+pub struct InputReleaseHook(pub crate::input::InputRelease);
+
+impl ConnectionHandler for InputReleaseHook {
+    fn on_disconnected(
+        &mut self,
+        _peer: SocketAddr,
+        _duration: Duration,
+        _error: Option<&ServerError>,
+    ) -> PostConnectionAction {
+        self.0.release_all("connection ended");
+        PostConnectionAction::Continue
+    }
+}
+
 /// Clears `CaptureDisplay::suppress_next_adopt` once per served connection.
 /// The capture loop arms that flag right before a reactivation it triggers, and
 /// `request_initial_size` consumes it. If the client disconnects after the flag
@@ -110,13 +130,30 @@ impl ConnectionHandler for AdoptResetHook {
 }
 
 /// Publishes the client's keyboard-layout id (KLID, from its GCC Client Core Data)
-/// so the input handler can auto-select a matching non-US layout when
-/// `--keyboard-layout` isn't given.
+/// and whether the client runs on macOS, so the input handler can auto-select a
+/// matching non-US layout when `--keyboard-layout` isn't given. The server
+/// reports the fingerprint of the served connection just before its
+/// `on_connection_info`, and not on a reactivation.
 pub struct KeyboardLayoutHook(pub SharedKeyboardLayout);
 
+/// Whether a formatted General-capset platform (`MajorPlatformType(0x06-OSX)/…`)
+/// is macOS.
+fn is_mac_platform(platform: &str) -> bool {
+    platform
+        .split('/')
+        .next()
+        .is_some_and(|major| major.ends_with("-OSX)"))
+}
+
 impl ConnectionHandler for KeyboardLayoutHook {
+    fn on_client_fingerprint(&mut self, _: &str, _: u32, _: u32, platform: &str) {
+        self.0
+            .mac_client
+            .store(is_mac_platform(platform), Ordering::Relaxed);
+    }
+
     fn on_connection_info(&mut self, info: &ConnectionInfo) {
-        self.0.store(info.keyboard_layout, Ordering::Relaxed);
+        self.0.klid.store(info.keyboard_layout, Ordering::Relaxed);
         tracing::debug!(
             klid = info.keyboard_layout,
             "client keyboard layout announced"
@@ -323,10 +360,27 @@ mod tests {
 
     #[test]
     fn the_keyboard_layout_reaches_the_shared_cell() {
-        let cell: SharedKeyboardLayout = Arc::new(AtomicU32::new(0));
+        let cell: SharedKeyboardLayout = Arc::default();
         let mut hooks = ConnectionHooks::new(vec![Box::new(KeyboardLayoutHook(cell.clone()))]);
+        hooks.on_client_fingerprint(
+            "mac",
+            0x0008_0005,
+            68687,
+            "MajorPlatformType(0x06-OSX)/MinorPlatformType(0x00-UNSPECIFIED)",
+        );
+        hooks.on_connection_info(&info(0x0809));
+        assert_eq!(cell.klid.load(Ordering::SeqCst), 0x0809);
+        assert!(cell.mac_client.load(Ordering::SeqCst));
+        // The next connection is from a Linux client.
+        hooks.on_client_fingerprint(
+            "pc",
+            0x0008_0011,
+            18363,
+            "MajorPlatformType(0x04-UNIX)/MinorPlatformType(0x07-NATIVE_XSERVER)",
+        );
         hooks.on_connection_info(&info(0x040C));
-        assert_eq!(cell.load(Ordering::SeqCst), 0x040C);
+        assert_eq!(cell.klid.load(Ordering::SeqCst), 0x040C);
+        assert!(!cell.mac_client.load(Ordering::SeqCst));
     }
 
     #[test]
