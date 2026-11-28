@@ -4214,8 +4214,7 @@ async fn async_main() -> Result<()> {
 
     // Shared cell the server fills with the connecting client's keyboard-layout
     // id, for auto-detecting a non-US layout when --keyboard-layout isn't given.
-    let keyboard_layout_klid: crate::input::SharedKeyboardLayout =
-        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let keyboard_layout_klid: crate::input::SharedKeyboardLayout = Default::default();
     let input_handler = MacInputHandler::new(
         desktop_size.clone(),
         capture_display_id,
@@ -4224,6 +4223,7 @@ async fn async_main() -> Result<()> {
         Some(keyboard_layout_klid.clone()),
     )?
     .with_active_monitors(active_monitors.clone());
+    let release_handle = input_handler.release_handle();
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
@@ -4311,7 +4311,9 @@ async fn async_main() -> Result<()> {
     // - the client's keyboard-layout id, for the input handler to auto-select a
     //   matching non-US layout when --keyboard-layout is unset.
     // - the input-reset flag, so the input handler clears held modifiers and
-    //   buttons once per served connection.
+    //   buttons once per served connection;
+    // - the input release, so keys, buttons and modifiers still down are
+    //   released when a connection ends.
     let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
     hooks.extend(auth_guard::AuthGuardHandler::from_env());
     hooks.push(Box::new(display_awake::AwakeHook));
@@ -4324,6 +4326,7 @@ async fn async_main() -> Result<()> {
     hooks.push(Box::new(conn_hooks::InputResetHook(
         input::modifier_reset_handle(),
     )));
+    hooks.push(Box::new(conn_hooks::InputReleaseHook(release_handle)));
     hooks.push(Box::new(conn_hooks::AdoptResetHook(suppress_next_adopt)));
     // `--virtual-display-hidpi=auto` sizes the virtual display from the
     // desktop scale factor the connecting client announces.
