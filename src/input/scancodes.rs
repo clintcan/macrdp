@@ -108,6 +108,7 @@ const fn build_scancode_normal() -> [u16; 256] {
     t[0x42] = 0x64; // F8
     t[0x43] = 0x65; // F9
     t[0x44] = 0x6D; // F10
+    t[0x45] = 0x47; // Num Lock → kVK_ANSI_KeypadClear (Clear sits there on a Mac keypad)
     t[0x47] = 0x59; // numpad 7
     t[0x48] = 0x5B; // numpad 8
     t[0x49] = 0x5C; // numpad 9
@@ -161,6 +162,28 @@ const fn build_scancode_extended() -> [u16; 256] {
     t[0x5C] = 0x36; // right GUI → kVK_RightCommand
     t[0x5D] = 0x6E; // Menu / Apps → kVK_ContextualMenu
     t
+}
+
+/// Keypad key with Num Lock off (non-extended scancode) → macOS navigation
+/// keycode, as Windows does: 7 Home, 8 Up, 9 PgUp, 4 Left, 5 Clear, 6 Right,
+/// 1 End, 2 Down, 3 PgDn, 0 Insert (Help), . Delete. Other keys: `None` (use
+/// the normal table). Ported from macrdp-v1 d74b3cf
+/// (`keypad_navigation_keycode`), relicensed to MIT OR Apache-2.0 by the author.
+pub(crate) fn keypad_navigation_vk(scancode: u8) -> Option<u16> {
+    Some(match scancode {
+        0x47 => 0x73, // Home
+        0x48 => 0x7E, // Up
+        0x49 => 0x74, // Page Up
+        0x4B => 0x7B, // Left
+        0x4C => 0x47, // Clear (VK_CLEAR)
+        0x4D => 0x7C, // Right
+        0x4F => 0x77, // End
+        0x50 => 0x7D, // Down
+        0x51 => 0x79, // Page Down
+        0x52 => 0x72, // Insert → Help
+        0x53 => 0x75, // Delete
+        _ => return None,
+    })
 }
 
 /// True for any macOS vk that hardware would mark with
@@ -226,6 +249,20 @@ mod tests {
         assert_eq!(scancode_to_cgkeycode(0x46, false), None); // gap (ScrollLock)
         assert_eq!(scancode_to_cgkeycode(0x00, true), None);
         assert_eq!(scancode_to_cgkeycode(0xFF, true), None);
+    }
+
+    #[test]
+    fn keypad_keys_navigate_with_num_lock_off() {
+        assert_eq!(keypad_navigation_vk(0x47), Some(0x73)); // 7 → Home
+        assert_eq!(keypad_navigation_vk(0x4B), Some(0x7B)); // 4 → Left
+        assert_eq!(keypad_navigation_vk(0x50), Some(0x7D)); // 2 → Down
+        assert_eq!(keypad_navigation_vk(0x53), Some(0x75)); // . → Delete
+        assert_eq!(keypad_navigation_vk(0x4E), None); // + stays
+        assert_eq!(keypad_navigation_vk(0x37), None); // * stays
+        assert_eq!(keypad_navigation_vk(0x1E), None); // A
+
+        // Num Lock itself is posted as keypad Clear.
+        assert_eq!(scancode_to_cgkeycode(0x45, false), Some(0x47));
     }
 
     #[test]
