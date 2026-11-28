@@ -4214,8 +4214,7 @@ async fn async_main() -> Result<()> {
 
     // Shared cell the server fills with the connecting client's keyboard-layout
     // id, for auto-detecting a non-US layout when --keyboard-layout isn't given.
-    let keyboard_layout_klid: crate::input::SharedKeyboardLayout =
-        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let keyboard_layout_klid: crate::input::SharedKeyboardLayout = Default::default();
     let input_handler = MacInputHandler::new(
         desktop_size.clone(),
         capture_display_id,
