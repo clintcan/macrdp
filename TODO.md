@@ -7,6 +7,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **#323 (antonmos, merged 2026-11-28): hidden panels above the virtual display in the Blank
+  modes.** Try a `--shield-primary` (or `--capture-primary`) session: a right-side Dock appears at
+  the remote screen's right edge, all four hot corners work. Follow-up from the review: after a live
+  resize `reanchor_as_main` re-pins only the virtual display, so a client that shrinks it below the
+  panel's width leaves the centred panel covering both top corners; re-run
+  `configure_physicals_aside` after the re-mode. Unverified: an auto-hidden menu bar.
+
 - [ ] **Clipboard: a short file-contents answer left zeros in a pasted file — fix on branch
   `fix/clipboard-short-chunk` (a9a7f5b, pushed, no PR yet).** Windows→Mac file paste wrote whatever
   each FileContentsResponse carried and moved on; MS-RDPECLIP allows a short answer, so the rest of
@@ -22,7 +29,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   Open:
   #318 (rophy: waits for his rebase onto #317, clear `keycode_keys` in `release_all`); #323
   (antonmos: hidden panels above the virtual display; to review, CI needs approval). For the next
-  release. Fork-PR CI approval: filter on `conclusion == "action_required"`, not `--status`.
+  release (#323 merged too). Fork-PR CI approval: filter on `conclusion == "action_required"`, not `--status`.
 
 - [ ] **Controller: Display captions are cut off with "…" (2026-11-28).** In the Display section's
   grouped form (its Picker rows make the form lay rows out single-line), long captions truncate.
