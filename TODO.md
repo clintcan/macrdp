@@ -7,6 +7,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **Clipboard: a short file-contents answer left zeros in a pasted file — fix on branch
+  `fix/clipboard-short-chunk` (a9a7f5b, pushed, no PR yet).** Windows→Mac file paste wrote whatever
+  each FileContentsResponse carried and moved on; MS-RDPECLIP allows a short answer, so the rest of
+  the chunk stayed zero, silently (an over-long one would overwrite the next chunk). `fill_range`
+  now asks for the remainder, fails on an empty answer, refuses an over-long one; tests +
+  mutation-checked. **Before the PR: a live paste from mstsc** (a large and a small file, compare
+  checksums) on a test copy, since every file paste goes through the new loop.
+
 - [ ] **Since v0.12.0 (2026-11-28):** merged #317 (rophy: held keys released when a connection
   ends) and #321 (rophy: Windows French/British layouts for Windows clients, Mac British kept for
   Mac clients) and #324 (controller: five settings sections, Start/Stop/Restart in the window),
