@@ -17,10 +17,10 @@ The other direction: **the client's microphone becomes a real input device on
 the Mac**, "macrdp Microphone", which Zoom, FaceTime, QuickTime and Teams can
 record from. Off by default; turn it on with `--enable-microphone-redirection`
 (config `ENABLE_MICROPHONE_REDIRECTION=1`, or the controller's Settings →
-Redirection → Microphone toggle).
+Media → Microphone toggle).
 
 **Setup, once:** install the "macrdp Microphone" driver from the menu-bar
-controller — Settings → Redirection → Microphone → **Install macrdp
+controller — Settings → Media → Microphone → **Install macrdp
 Microphone…**. It asks for an administrator password and restarts Core Audio,
 which briefly interrupts sound. The same place shows when a newer macrdp bundles
 a newer driver (**Update…**) and removes it (**Remove…**). Without a controller,
