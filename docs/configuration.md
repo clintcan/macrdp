@@ -126,7 +126,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           --enable-h264). Raise it (8–12) for sharper detail if
                           you have bandwidth headroom. With --adaptive-bitrate it
                           is the ceiling, not a fixed target. Config key: BITRATE
-                          (the menu-bar controller's Video tab sets it).
+                          (the menu-bar controller's Media section sets it).
 --keyframe-interval SECS  H.264 periodic keyframe (IDR) interval in seconds
                           (default 2; only with --enable-h264). Safety net for
                           transient decode glitches; fractional values OK.
@@ -225,7 +225,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           FreeRDP = /microphone.
                           REQUIRES the "macrdp Microphone" driver to be installed
                           ONCE — macrdp.app bundles it; open the controller →
-                          Settings → Redirection → Microphone → "Install macrdp
+                          Settings → Media → Microphone → "Install macrdp
                           Microphone…" (one admin prompt; Core Audio restarts,
                           briefly interrupting sound). The same place updates or
                           removes it. Without the driver macrdp still receives the

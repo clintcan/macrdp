@@ -412,7 +412,7 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   (logged) — mstsc offers it.
                           #   REQUIRES the driver installed once in
                           #   /Library/Audio/Plug-Ins/HAL (admin prompt + coreaudiod
-                          #   restart): the controller's Settings → Redirection →
+                          #   restart): the controller's Settings → Media →
                           #   Microphone, or Contents/Resources/install-audio-plugin.sh.
                           #   Without it macrdp negotiates + receives but has no
                           #   device to feed. Other local accounts can read a live

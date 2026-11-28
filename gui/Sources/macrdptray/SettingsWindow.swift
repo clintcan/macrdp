@@ -102,7 +102,7 @@ extension AppController {
         editItem.submenu = editMenu
 
         // Section menu — the same categories as the sidebar, navigable from the
-        // menu bar (⌘1…⌘8). Each item drives SettingsModel.section.
+        // menu bar (⌘1…⌘5). Each item drives SettingsModel.section.
         let sectionItem = NSMenuItem()
         main.addItem(sectionItem)
         let sectionMenu = NSMenu(title: "Section")
@@ -132,32 +132,24 @@ extension AppController {
 /// The settings categories — shown all-at-once in the sidebar AND as a "Section"
 /// menu in the main menu bar (each drives `SettingsModel.section`).
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case status, connection, video, audio, display, input, redirection, advanced, permissions
+    case status, connection, display, media, advanced
     var id: String { rawValue }
     var title: String {
         switch self {
         case .status: return "Status"
         case .connection: return "Connection"
-        case .video: return "Video"
-        case .audio: return "Audio"
         case .display: return "Display"
-        case .input: return "Input"
-        case .redirection: return "Redirection"
+        case .media: return "Media"
         case .advanced: return "Advanced"
-        case .permissions: return "Permissions"
         }
     }
     var icon: String {
         switch self {
         case .status: return "gauge.medium"
         case .connection: return "network"
-        case .video: return "video"
-        case .audio: return "speaker.wave.2"
         case .display: return "display"
-        case .input: return "keyboard"
-        case .redirection: return "arrow.left.arrow.right"
+        case .media: return "play.rectangle"
         case .advanced: return "gearshape.2"
-        case .permissions: return "lock.shield"
         }
     }
 }
@@ -204,13 +196,22 @@ struct SettingsView: View {
         switch model.section {
         case .status: StatusView(model: model)
         case .connection: ConnectionTab(model: model)
-        case .video: VideoTab(model: model)
-        case .audio: AudioTab(model: model)
         case .display: DisplayTab(model: model)
-        case .input: InputTab(model: model)
-        case .redirection: RedirectionTab(model: model)
-        case .advanced: AdvancedTab(model: model)
-        case .permissions: PermissionsTab(model: model)
+        case .media:
+            // Video, audio and every redirection, in one scrolling form.
+            Form {
+                VideoTab(model: model)
+                AudioTab(model: model)
+                RedirectionTab(model: model)
+            }
+            .formStyle(.grouped)
+        case .advanced:
+            Form {
+                InputTab(model: model)
+                AdvancedTab(model: model)
+                PermissionsTab(model: model)
+            }
+            .formStyle(.grouped)
         }
     }
 
@@ -279,7 +280,7 @@ private struct ConnectionTab: View {
             Section("Quick setup") {
                 Button("Set Up Remote Desktop preset") { model.applyRemoteDesktopPreset() }
                 Text("Stages a headless virtual display + detach the physical panel + H.264 + the "
-                    + "app-switcher HUD. Review the Display/Video tabs, then Apply.")
+                    + "app-switcher HUD. Review the Display and Media sections, then Apply.")
                     .font(.caption).foregroundColor(.secondary)
             }
         }
@@ -290,7 +291,8 @@ private struct ConnectionTab: View {
 private struct VideoTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
-        Form {
+        // Sections only: the Media or Advanced pane supplies the Form.
+        Group {
             Section {
                 Toggle("H.264 video (EGFX / AVC420)", isOn: model.boolBinding("ENABLE_H264"))
                 Text("Streams the screen as H.264 — far less bandwidth than legacy bitmaps. "
@@ -318,14 +320,14 @@ private struct VideoTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
         }
-        .formStyle(.grouped)
     }
 }
 
 private struct AudioTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
-        Form {
+        // Sections only: the Media or Advanced pane supplies the Form.
+        Group {
             Section {
                 Toggle("AAC audio", isOn: model.boolBinding("ENABLE_AAC"))
                 Text("Compresses forwarded audio as AAC-LC (~11× less bandwidth than PCM). Clients "
@@ -333,7 +335,6 @@ private struct AudioTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
         }
-        .formStyle(.grouped)
     }
 }
 
@@ -421,7 +422,8 @@ private struct DisplayTab: View {
 private struct InputTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
-        Form {
+        // Sections only: the Media or Advanced pane supplies the Form.
+        Group {
             Section("Keyboard") {
                 Picker("Layout", selection: model.stringBinding("KEYBOARD_LAYOUT", default: "")) {
                     ForEach(AppController.keyboardLayouts, id: \.0) { spec, label in
@@ -450,7 +452,6 @@ private struct InputTab: View {
                 Toggle("Un-minimize on Cmd+Tab", isOn: model.boolBinding("UNMINIMIZE"))
             }
         }
-        .formStyle(.grouped)
     }
 }
 
@@ -487,7 +488,8 @@ private struct RedirectionTab: View {
     /// Bumped after an install/remove so the driver status is re-read.
     @State private var micRefresh = 0
     var body: some View {
-        Form {
+        // Sections only: the Media or Advanced pane supplies the Form.
+        Group {
             Text("The connecting client must also opt in to each redirection.")
                 .font(.caption).foregroundColor(.secondary)
             Section("Drive") {
@@ -539,14 +541,14 @@ private struct RedirectionTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
         }
-        .formStyle(.grouped)
     }
 }
 
 private struct AdvancedTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
-        Form {
+        // Sections only: the Media or Advanced pane supplies the Form.
+        Group {
             Section("UDP multitransport") {
                 Toggle("Offer UDP multitransport", isOn: model.boolBinding("ENABLE_UDP_MULTITRANSPORT"))
                 Toggle("Move video onto UDP (experimental, clean link only)", isOn: model.boolBinding("UDP_MIGRATE_EGFX"))
@@ -572,7 +574,6 @@ private struct AdvancedTab: View {
                 Button("Open Logs") { model.controller.openLogs() }
             }
         }
-        .formStyle(.grouped)
     }
 }
 
@@ -582,19 +583,17 @@ private struct PermissionsTab: View {
     @State private var accessibility: Bool?
 
     var body: some View {
-        Form {
-            Text("macrdp needs these grants (owned by the server binary, not this controller). "
-                + "Status is read from the server log.")
-                .font(.caption).foregroundColor(.secondary)
-            Section("Screen Recording") {
-                permRow(granted: screen) { model.controller.openScreenRecording() }
+        // Sections only: the Media or Advanced pane supplies the Form.
+        Group {
+            Section("Permissions") {
+                permRow("Screen Recording", granted: screen) { model.controller.openScreenRecording() }
+                permRow("Accessibility", granted: accessibility) { model.controller.openAccessibility() }
+                Button("Refresh status") { refresh() }
+                Text("macrdp needs these grants (owned by the server binary, not this controller). "
+                    + "Status is read from the server log.")
+                    .font(.caption).foregroundColor(.secondary)
             }
-            Section("Accessibility") {
-                permRow(granted: accessibility) { model.controller.openAccessibility() }
-            }
-            Button("Refresh status") { refresh() }
         }
-        .formStyle(.grouped)
         .onAppear(perform: refresh)
     }
 
@@ -604,8 +603,10 @@ private struct PermissionsTab: View {
         accessibility = ps.accessibility
     }
 
-    @ViewBuilder private func permRow(granted: Bool?, open: @escaping () -> Void) -> some View {
+    @ViewBuilder private func permRow(_ name: String, granted: Bool?, open: @escaping () -> Void) -> some View {
         HStack {
+            Text(name)
+            Spacer()
             switch granted {
             case .some(true):
                 Label("Granted", systemImage: "checkmark.circle.fill").foregroundColor(.green)
@@ -665,7 +666,18 @@ private struct StatusView: View {
     var body: some View {
         Form {
             Section("Server") {
-                row("Status", stats.running ? "Running (pid \(stats.pid))" : "Stopped")
+                HStack {
+                    Text("Status")
+                    Spacer()
+                    Text(stats.running ? "Running (pid \(stats.pid))" : "Stopped")
+                        .foregroundColor(.secondary).textSelection(.enabled)
+                    if stats.running {
+                        Button("Restart") { act { $0.restart() } }
+                        Button("Stop") { act { $0.stop() } }
+                    } else {
+                        Button("Start") { act { $0.start() } }
+                    }
+                }
                 if stats.running {
                     row("Uptime", stats.uptime.isEmpty ? "—" : stats.uptime)
                     row("Memory", String(format: "%.0f MB  (%.1f%% of RAM)", stats.rssMB, stats.memPct))
@@ -701,6 +713,14 @@ private struct StatusView: View {
         .formStyle(.grouped)
         .onAppear(perform: refresh)
         .onReceive(tick) { _ in refresh() }
+    }
+
+    /// Runs a menu action (start/stop/restart) and refreshes once the server
+    /// has had a moment to change state.
+    private func act(_ action: (AppController) -> Void) {
+        action(model.controller)
+        model.objectWillChange.send()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refresh() }
     }
 
     private func refresh() {
