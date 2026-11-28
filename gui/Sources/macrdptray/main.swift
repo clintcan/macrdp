@@ -770,6 +770,11 @@ let cliArgs = CommandLine.arguments
 if cliArgs.contains("--install-agent") || cliArgs.contains("--print-paths") {
     exit(AppController().runHeadless(cliArgs))
 }
+// The user manual's screenshots (docs/user-manual.md), drawn offscreen.
+if let i = cliArgs.firstIndex(of: "--render-screenshots"), i + 1 < cliArgs.count {
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    exit(ScreenshotRenderer.run(dir: cliArgs[i + 1], controller: AppController()))
+}
 
 let app = NSApplication.shared
 let controller = AppController()

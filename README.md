@@ -62,6 +62,9 @@ Details and the path to closing the gaps: [docs/production-readiness-roadmap.md]
 
 ## Quick start
 
+**New to macrdp? Read the [user manual](docs/user-manual.md)**: installing, connecting, every
+setting in the controller with screenshots, and troubleshooting.
+
 **With Homebrew** (Apple Silicon, macOS 14+), installing the same notarized build as the releases:
 
 ```bash
@@ -160,6 +163,7 @@ Each release also carries **`macrdp-<ver>-usb.dmg`**, built and attached by hand
 
 | Guide | What's in it |
 |-------|--------------|
+| **[User manual](docs/user-manual.md)** | Start here: install, first start, connecting from each client, every controller setting (with screenshots), bringing your drives, microphone, webcam and smart card along, shortcuts, troubleshooting, and removing macrdp. |
 | **[Configuration & CLI](docs/configuration.md)** | Every flag, the auth-hardening environment variables (rate-limit/lockout/audit), headless mode (`--virtual-display`, `--detach-primary`/`--capture-primary`), and a full set of example invocations. |
 | **[Video](docs/video.md)** | The H.264/EGFX pipeline, Retina capture (`--hidpi`), client-resolution auto-adopt and letterboxing, bitrate/keyframe tuning, the mstsc reconnect-blank quirk and its in-place auto-recovery, and the vImage color-conversion benchmarks. |
 | **[Audio](docs/audio.md)** | RDPSND PCM, opt-in AAC compression (`--enable-aac`), the self-healing capture stream, mute-on-minimize — and the experimental **microphone redirection** (`--enable-microphone-redirection`): the client's mic as a real macOS input device. |
