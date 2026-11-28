@@ -954,7 +954,7 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::keystate::{NumLock, SCANCODE_NUM_LOCK};
+    use super::keystate::{KeypadKeys, NumLock, SCANCODE_NUM_LOCK};
     use super::scancodes::{
         is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode, to_iso_key_order,
     };
@@ -1268,6 +1268,8 @@ mod macos {
         // The client's Num Lock (macOS has none): with it off the keypad
         // keys post navigation keys, as on Windows.
         num_lock: NumLock,
+        // The keycode each held keypad key went down as (see `KeypadKeys`).
+        keypad_keys: KeypadKeys,
         // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
         // button, latched at button-down and reused for the drag and the up.
         // The verdict must not be recomputed per event: the down itself fires
@@ -1370,6 +1372,7 @@ mod macos {
                 unicode: UnicodeKeys::default(),
                 remapped_keys: HashSet::new(),
                 num_lock: NumLock::default(),
+                keypad_keys: KeypadKeys::default(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
                 reset_request: super::modifier_reset_handle(),
@@ -1591,6 +1594,7 @@ mod macos {
                 }
                 // A posted Num Lock press was in `held_keys`; the state stays.
                 self.num_lock.forget_key();
+                self.keypad_keys.clear();
             }
 
             // Snapshot first so the log shows WHAT was stuck.
@@ -1684,10 +1688,14 @@ mod macos {
             } else {
                 None
             };
-            let Some(mut vk) = keypad_nav.or_else(|| scancode_to_cgkeycode(scancode, extended)) else {
+            let Some(mut vk) = keypad_nav.or_else(|| scancode_to_cgkeycode(scancode, extended))
+            else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
+            if !extended && keypad_navigation_vk(scancode).is_some() {
+                vk = self.keypad_keys.route(scancode, down, vk);
+            }
             self.refresh_auto_layout();
             // Every Apple layout except the US-style ones is drawn for ISO key order.
             if let (Some(iso_vk), Some(layout)) = (to_iso_key_order(vk), self.layout.as_mut()) {

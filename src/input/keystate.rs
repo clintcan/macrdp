@@ -1,4 +1,5 @@
-//! Pure keyboard state for the input handler: the client's Num Lock.
+//! Pure keyboard state for the input handler: the client's Num Lock, and
+//! the keycode each keypad key went down as.
 //!
 //! No platform calls, so it is unit-tested on every target. Ported from
 //! macrdp-v1 (crates/macrdp-input/src/flags.rs and keyboard.rs, commits
@@ -89,6 +90,31 @@ impl NumLock {
     }
 }
 
+/// The keycode each held keypad key went down as. With Num Lock the keypad
+/// 4 is keypad 4 or Left arrow; when Num Lock changes while the key is held,
+/// its key-up must still release the keycode that went down.
+#[derive(Debug, Default)]
+pub(super) struct KeypadKeys {
+    down: std::collections::HashMap<u8, u16>,
+}
+
+impl KeypadKeys {
+    /// The keycode to post for this keypad event. `vk` is the keycode for
+    /// the current Num Lock state. An auto-repeat keeps the first keycode.
+    pub(super) fn route(&mut self, scancode: u8, down: bool, vk: u16) -> u16 {
+        if down {
+            *self.down.entry(scancode).or_insert(vk)
+        } else {
+            self.down.remove(&scancode).unwrap_or(vk)
+        }
+    }
+
+    /// Forget all held keys (their key-ups were posted by `release_all`).
+    pub(super) fn clear(&mut self) {
+        self.down.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +195,20 @@ mod tests {
         n.note_scancode(0x1D, false, true);
         n.synchronize(true);
         assert!(n.key(true), "Ctrl went up with the Synchronize");
+    }
+
+    #[test]
+    fn a_keypad_key_up_posts_the_keycode_of_its_down() {
+        let mut k = KeypadKeys::default();
+        // Keypad 4 down with Num Lock off: Left arrow.
+        assert_eq!(k.route(0x4B, true, 0x7B), 0x7B);
+        // Num Lock goes on while it is held: the repeat and the up stay Left.
+        assert_eq!(k.route(0x4B, true, 0x56), 0x7B);
+        assert_eq!(k.route(0x4B, false, 0x56), 0x7B);
+        // The next press follows the new state.
+        assert_eq!(k.route(0x4B, true, 0x56), 0x56);
+        k.clear();
+        // A key-up with no recorded down posts the current keycode.
+        assert_eq!(k.route(0x4B, false, 0x7B), 0x7B);
     }
 }
