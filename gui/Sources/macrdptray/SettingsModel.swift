@@ -31,6 +31,14 @@ final class SettingsModel: ObservableObject {
     /// main-menu "Section" items can navigate the window too.
     @Published var section: SettingsSection = .status
 
+    /// A model over `sample` instead of the on-disk config, for
+    /// `--render-screenshots`: reads and writes nothing.
+    init(controller: AppController, sample: [String: String]) {
+        self.controller = controller
+        self.saved = sample
+        self.draft = sample
+    }
+
     init(controller: AppController) {
         self.controller = controller
         controller.ensureConfigExists()

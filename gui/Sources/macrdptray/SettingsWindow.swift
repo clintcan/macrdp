@@ -158,6 +158,9 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
 struct SettingsView: View {
     @ObservedObject var model: SettingsModel
+    /// Window content height; `--render-screenshots` raises it so a long
+    /// section is drawn in full.
+    var height: CGFloat = 560
 
     var body: some View {
         VStack(spacing: 0) {
@@ -189,7 +192,7 @@ struct SettingsView: View {
             }
             .padding(12)
         }
-        .frame(width: 660, height: 560)
+        .frame(width: 660, height: height)
     }
 
     @ViewBuilder private var detail: some View {

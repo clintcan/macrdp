@@ -9,6 +9,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - `@docs/macos-gotchas.md` — TCC, CGVirtualDisplay, QoS, activation (always loaded)
 > - `@docs/known-quirks.md` — hard-won client/codec/audio behavioural notes (always loaded)
 > - `@docs/conventions.md` — conventions worth keeping when adding code (always loaded)
+> - `docs/user-manual.md` — the user-facing manual (install, connect, every controller setting with
+>   screenshots, troubleshooting). **When the controller's settings window changes, regenerate its
+>   screenshots** (`gui/.build/release/macrdptray --render-screenshots docs/images/manual`, drawn
+>   offscreen from a sample config) **and update the manual's text.**
 > - `docs/features.md` — what works today, per-feature caveats. Read before changing or
 >   describing a feature's behaviour.
 > - `docs/architecture.md` — module map + cross-cutting design (TLS, auth, session and

@@ -7,6 +7,21 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **Since v0.12.0 (2026-11-28):** merged #317 (rophy: held keys released when a connection
+  ends) and #321 (rophy: Windows French/British layouts for Windows clients, Mac British kept for
+  Mac clients) and #324 (controller: five settings sections, Start/Stop/Restart in the window),
+  then the user manual (`docs/user-manual.md`, screenshots via `macrdptray --render-screenshots`).
+  Open:
+  #318 (rophy: waits for his rebase onto #317, clear `keycode_keys` in `release_all`); #323
+  (antonmos: hidden panels above the virtual display; to review, CI needs approval). For the next
+  release. Fork-PR CI approval: filter on `conclusion == "action_required"`, not `--status`.
+
+- [ ] **Controller: Display captions are cut off with "…" (2026-11-28).** In the Display section's
+  grouped form (its Picker rows make the form lay rows out single-line), long captions truncate.
+  `.fixedSize(horizontal: false, vertical: true)` makes them wrap but the last row then overflows
+  its box (the form under-measures it); tried and reverted. Needs another layout (for example the
+  caption as the toggle's second line, or a footer).
+
 - [ ] **Check v0.12.0's new settings live on the mini.** Released 2026-11-27 after a clean 54 h soak
   of v0.11.2; the mini runs it (`VD_HIDPI=auto`, `MAIN_DISPLAY_WHILE_CONNECTED=1`, `RUST_LOG=info`;
   rollback: `~/macrdp-0.11.2-apps-bak`, `~/com.clintcan.macrdp.plist.pre-v0.12.0.bak`,
