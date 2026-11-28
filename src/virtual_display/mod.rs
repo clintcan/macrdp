@@ -376,9 +376,11 @@ mod macos {
             CGDisplay::new(vd).bounds().size.width.round() as i32,
             &sizes,
         ) {
-            CGDisplay::new(id).configure_display_origin(config, x, y).map_err(|e| {
-                anyhow!("CGConfigureDisplayOrigin(physical {id}, {x}, {y}): CGError {e}")
-            })?;
+            CGDisplay::new(id)
+                .configure_display_origin(config, x, y)
+                .map_err(|e| {
+                    anyhow!("CGConfigureDisplayOrigin(physical {id}, {x}, {y}): CGError {e}")
+                })?;
         }
         Ok(())
     }
@@ -1767,7 +1769,10 @@ mod macos {
             configure_physicals_aside(
                 &config,
                 virtual_display_id,
-                targets.iter().map(|(id, _)| *id).filter(|id| CGDisplay::new(*id).is_active()),
+                targets
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .filter(|id| CGDisplay::new(*id).is_active()),
             )?;
             any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
                 .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
@@ -2246,7 +2251,11 @@ mod macos {
                         .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
                     // …and move each unmirrored physical above it,
                     // off every edge the Dock can use.
-                    configure_physicals_aside(&config, virtual_display_id, broke_mirror.iter().copied())?;
+                    configure_physicals_aside(
+                        &config,
+                        virtual_display_id,
+                        broke_mirror.iter().copied(),
+                    )?;
                     // ConfigureForSession, NOT ForAppOnly — the #161/#162 lesson
                     // replayed on this path, from a live re-strand (2026-07-22):
                     // with ForAppOnly the WindowServer's session store never
@@ -2780,7 +2789,10 @@ mod tests {
         let panels = [(1, 1440, 900), (7, 3840, 2160), (9, 0, 0)];
         let placed = aside_origins(vd_w, &panels);
         let (_, x0, y0) = placed[0];
-        assert!(x0 > 0 && x0 + 1440 < vd_w, "first panel covers a top corner");
+        assert!(
+            x0 > 0 && x0 + 1440 < vd_w,
+            "first panel covers a top corner"
+        );
         for i in 0..placed.len() {
             let (_, x, y) = placed[i];
             let (w, h) = (panels[i].1.max(1), panels[i].2.max(1));
@@ -2789,15 +2801,24 @@ mod tests {
                 let (_, px, py) = placed[i - 1];
                 let pw = panels[i - 1].1.max(1);
                 assert_eq!(y + h, py, "panel {i} doesn't sit on the one below");
-                assert!(x < px + pw && px < x + w, "panel {i} doesn't overlap the one below");
+                assert!(
+                    x < px + pw && px < x + w,
+                    "panel {i} doesn't overlap the one below"
+                );
             }
         }
         assert_eq!(y0, -900);
 
         // Too wide to center without covering both top corners: diagonal,
         // touching only the top-left corner.
-        assert_eq!(aside_origins(vd_w, &[(1, 2560, 1440)]), vec![(1, -2560, -1440)]);
-        assert_eq!(aside_origins(vd_w, &[(1, vd_w, 900)]), vec![(1, -vd_w, -900)]);
+        assert_eq!(
+            aside_origins(vd_w, &[(1, 2560, 1440)]),
+            vec![(1, -2560, -1440)]
+        );
+        assert_eq!(
+            aside_origins(vd_w, &[(1, vd_w, 900)]),
+            vec![(1, -vd_w, -900)]
+        );
     }
 
     #[test]
