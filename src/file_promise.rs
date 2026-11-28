@@ -534,29 +534,64 @@ async fn chunk_task(
     sender: EventSender,
     file: Arc<std::fs::File>,
 ) -> Result<(), String> {
+    fill_range(position, requested_size, &file, |pos, size| {
+        let (router, sender) = (router.clone(), sender.clone());
+        async move { fetch_range(index, pos, size, &router, &sender).await }
+    })
+    .await
+}
+
+/// Fills `size` bytes of `file` at `position` from `fetch(position, size)`
+/// answers. MS-RDPECLIP lets the client answer a RANGE request with fewer
+/// bytes than asked, so this asks again for the rest until the range is full:
+/// writing one short answer and moving on left the remainder as zeros in the
+/// pasted file, with no error. An empty answer (the file is shorter than its
+/// size said) fails, and so does an answer longer than asked for, which would
+/// otherwise be written over the next range.
+async fn fill_range<F, Fut>(
+    position: u64,
+    size: u32,
+    file: &std::fs::File,
+    mut fetch: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
     use std::os::unix::fs::FileExt;
-    let bytes = fetch_range(index, position, requested_size, &router, &sender).await?;
-    if bytes.is_empty() {
-        return Err(format!(
-            "short read at {position}; expected {requested_size} bytes, got 0"
-        ));
-    }
-    // pwrite (write_at) is positional — no shared offset on the fd, so
-    // concurrent chunk tasks writing to disjoint byte ranges are safe
-    // on the same Arc<File>. A short write here means the underlying
-    // pwrite returned fewer bytes than requested; loop until done.
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let n = file
-            .write_at(&bytes[written..], position + written as u64)
-            .map_err(|e| format!("write_at @ {}: {e}", position + written as u64))?;
-        if n == 0 {
+    let end = position + u64::from(size);
+    let mut pos = position;
+    while pos < end {
+        // Each answer is non-empty and at most what's left, so `pos` advances
+        // and stays within the range.
+        let want = (end - pos) as u32;
+        let bytes = fetch(pos, want).await?;
+        if bytes.is_empty() {
             return Err(format!(
-                "write_at @ {} returned 0 bytes",
-                position + written as u64
+                "short read at {pos}; expected {want} more bytes, got 0"
             ));
         }
-        written += n;
+        if bytes.len() > want as usize {
+            return Err(format!(
+                "range at {pos}: asked for {want} bytes, got {}",
+                bytes.len()
+            ));
+        }
+        // pwrite (write_at) is positional — no shared offset on the fd, so
+        // concurrent chunk tasks writing to disjoint byte ranges are safe on
+        // the same file. It may write less than asked; loop until done.
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let at = pos + written as u64;
+            let n = file
+                .write_at(&bytes[written..], at)
+                .map_err(|e| format!("write_at @ {at}: {e}"))?;
+            if n == 0 {
+                return Err(format!("write_at @ {at} returned 0 bytes"));
+            }
+            written += n;
+        }
+        pos += bytes.len() as u64;
     }
     Ok(())
 }
@@ -627,6 +662,69 @@ fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source file and a fake client that answers a RANGE request with at
+    /// most `cap` bytes from it.
+    fn short_answers(
+        source: &[u8],
+        cap: usize,
+    ) -> impl FnMut(u64, u32) -> std::future::Ready<Result<Vec<u8>, String>> + '_ {
+        move |pos, size| {
+            let start = pos as usize;
+            let end = (start + (size as usize).min(cap)).min(source.len());
+            std::future::ready(Ok(source[start..end].to_vec()))
+        }
+    }
+
+    fn temp_file(name: &str, len: u64) -> (std::path::PathBuf, std::fs::File) {
+        let path = std::env::temp_dir().join(format!("macrdp-fill-{name}-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(len).unwrap();
+        (path, file)
+    }
+
+    #[tokio::test]
+    async fn a_short_answer_is_completed_not_left_as_zeros() {
+        let source: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8 + 1).collect();
+        let (path, file) = temp_file("short", source.len() as u64);
+        // Two ranges, as the download splits a file; the client caps every
+        // answer at 1000 bytes.
+        let mut calls = 0;
+        let mut fetch = short_answers(&source, 1000);
+        let mut counting = |pos, size| {
+            calls += 1;
+            fetch(pos, size)
+        };
+        fill_range(0, 6000, &file, &mut counting).await.unwrap();
+        fill_range(6000, 4000, &file, &mut counting).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), source, "the file has holes");
+        assert_eq!(calls, 10, "one request per 1000-byte answer");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_over_long_answer_fails() {
+        let (path, file) = temp_file("bad", 100);
+        // The file is shorter than its announced size: the second request
+        // gets nothing back.
+        let source = vec![7u8; 60];
+        let err = fill_range(0, 100, &file, short_answers(&source, 1000))
+            .await
+            .unwrap_err();
+        assert!(err.contains("short read at 60"), "{err}");
+        // A client answering with more than asked for.
+        let err = fill_range(0, 10, &file, |_, _| std::future::ready(Ok(vec![1u8; 20])))
+            .await
+            .unwrap_err();
+        assert!(err.contains("asked for 10 bytes, got 20"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
 
     fn entry(name: &str, rp: Option<&str>) -> RemoteEntry {
         RemoteEntry {
