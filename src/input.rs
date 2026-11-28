@@ -324,7 +324,8 @@ enum LayoutRoute {
     Translate { release_keycode: bool },
     /// Post the keycode, as with no layout.
     Keycode,
-    /// Swallow the key-up of a translated key-down (a string has no release).
+    /// Swallow the key-up of a translated key-down (its string already went
+    /// out as a key-down and key-up of keycode 0).
     Swallow,
 }
 
@@ -1838,9 +1839,9 @@ mod macos {
             // Cmd/Ctrl held, produce the character this key yields in the
             // configured layout and post it as a Unicode string, leaving the
             // Mac's own input source untouched. Cmd/Ctrl combos fall through to
-            // the keycode path below so shortcuts still work. The key-up of a
-            // translated key is swallowed too (Unicode string events have no
-            // release side, like the RDP Unicode-keyboard path); the key-up of a
+            // the keycode path below so shortcuts still work. A translated key
+            // posts its string as a key-down and key-up of keycode 0 at the
+            // client's key-down, and the client's key-up is swallowed; the key-up of a
             // key whose down went out as a keycode goes out as a keycode, even
             // when the Cmd/Ctrl was released first (`layout_route`).
             let route = (self.layout.is_some()
@@ -1874,13 +1875,18 @@ mod macos {
                     {
                         // Empty string = a pending dead key; swallow it and let
                         // the composed character arrive on the next keystroke.
+                        // Post the key-up at once: the client's key-up of this
+                        // key is swallowed, and without an up keycode 0 (the A
+                        // key) stays down on the Mac.
                         if !text.is_empty() {
                             let utf16: Vec<u16> = text.encode_utf16().collect();
-                            if let Ok(ev) =
-                                CGEvent::new_keyboard_event(self.source.clone(), 0, true)
-                            {
-                                ev.set_string_from_utf16_unchecked(&utf16);
-                                ev.post(CGEventTapLocation::HID);
+                            for down in [true, false] {
+                                if let Ok(ev) =
+                                    CGEvent::new_keyboard_event(self.source.clone(), 0, down)
+                                {
+                                    ev.set_string_from_utf16_unchecked(&utf16);
+                                    ev.post(CGEventTapLocation::HID);
+                                }
                             }
                         }
                     }
